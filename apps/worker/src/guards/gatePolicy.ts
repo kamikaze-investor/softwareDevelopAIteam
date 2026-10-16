@@ -6,18 +6,16 @@
  * ローカルの processGate() 結果と /api/gate/check のレスポンスを統合し、
  * 最終的な実行ポリシーを決定する純粋関数。
  *
- * 基本方針（2026-10-17 D2 で改訂）:
- *   - 「この対象を実行してよいか」の正本は API Gate（承認・人の決定・期限・commit / diff 束縛・
- *     Safety Evidence を全部見て continuationPolicy を返す）。ここではそれを**そのまま写す**。
- *     ローカルのリスク値から実行可否を再判定しない（以前の local escalation は、API が承認済み
- *     ALLOW + call_consume を返した HIGH / CRITICAL の git_commit を consume 前に止めていた: D2。
- *     specs/21 Canonical Semantic Ownership: 重複した意味の持ち主を消す）
- *   - Worker 側で行うのは**消費者側の整合確認**だけ: 応答の項目間の整合（decision / continuationPolicy /
- *     nextAction / consumedRequestId。gateClient が応答検証で全組を強制済みで、ここは二重の防御）と、
- *     ローカルのリスクが API の評価を上回っていないこと（Worker / API の rule の版ずれ）。
- *     どちらかが破れていれば既存の block_until_approved（理由つき）を返す。例外にはしない:
- *     例外は Job を running のまま poll loop へ抜けさせ、見えない停止になる。blocked なら
- *     attention に出て、版が揃った後は既存の resume が出口になる
+ * 基本方針（2026-10-17 D2 v4 で改訂）:
+ *   - 「承認済みの対象を実行してよいか」の正本は API Gate。ALLOW（proceed / call_consume）を
+ *     ローカルの HIGH / CRITICAL で格下げしない（以前の local escalation は、承認済み ALLOW + call_consume の
+ *     HIGH / CRITICAL git_commit を consume 前に止めていた: D2）。実行は直後の atomic consume が成功したときだけ進む
+ *   - ローカルのリスクが API の評価より高い（Worker / API の rule の版ずれ。ローカルの過小評価は fail closed）か、
+ *     応答の decision / continuationPolicy / nextAction の組が API の契約に無いときは、**承認の判断ではなく
+ *     技術的な不整合**として re_check で止める（理由コード risk_rule_skew / approval_contract_violation。
+ *     `@ai-team/shared` の GATE_TECHNICAL_STOP_CODES）。block_until_approved（＝承認待ち通知）にも
+ *     safe work にもしない。新しい safe work の経路を足さない
+ *   - それ以外の PENDING_APPROVAL / BLOCKED / REJECTED の扱いは従来どおり
  *   - **有効な Gate レスポンスがあるときだけ呼ぶ**
  *
  * 【技術障害の扱い（2026-08-01 変更）】
@@ -32,7 +30,7 @@
 
 import type { GateResult } from './gateProcessor.js'
 import type { GateCheckResponse, ContinuationPolicy } from './gateClient.js'
-import type { CommandKind, RiskLevel } from '@ai-team/shared'
+import type { CommandKind, GateTechnicalStopCode, RiskLevel } from '@ai-team/shared'
 
 // ────────────────────────────────────────────────────────────
 // 型定義
@@ -79,6 +77,12 @@ export const SAFE_WORK_ALLOWED_COMMAND_KINDS: readonly CommandKind[] = [
 /**
  * ローカル GateResult と API GateCheckResponse を統合し最終ポリシーを返す。
  *
+ * 判定順（D2 v4）:
+ *   1. 応答の組の整合（崩れていれば re_check approval_contract_violation）
+ *   2. STALE → re_check（従来どおり）
+ *   3. ローカルのリスク > API のリスク → re_check risk_rule_skew（continue でも非 continue でも、safe work より前）
+ *   4. continue（ALLOW）→ continue。非 continue → 従来の PENDING / BLOCKED / REJECTED の扱い
+ *
  * @param localResult  processGate() の結果（必須）
  * @param checkResponse  /api/gate/check の**成功**レスポンス（必須）。
  *   API 通信失敗・認証失敗・不正レスポンスの場合は呼び出さず、
@@ -97,11 +101,19 @@ export function resolvePolicy(
     )
   }
 
-  // ── STALE / re_check ──
-  if (
-    checkResponse.outcome.decision === 'STALE' ||
-    checkResponse.nextAction.action === 're_check'
-  ) {
+  const { outcome, nextAction, continuationPolicy: apiPolicy } = checkResponse
+
+  // ── 1. 応答の組の整合 ──
+  // 崩れた組を写すと誤った「承認待ち」や実行になる。承認の判断ではないので block_until_approved にはしない。
+  if (!isCoherentGateResponse(checkResponse)) {
+    return technicalStop(
+      'approval_contract_violation',
+      `decision=${outcome.decision} continuationPolicy=${apiPolicy} nextAction=${nextAction.action}`,
+    )
+  }
+
+  // ── 2. STALE ──
+  if (outcome.decision === 'STALE') {
     return {
       policy: 're_check',
       reason: 'Approval is stale. Re-run gate/check to start a new approval flow.',
@@ -109,83 +121,99 @@ export function resolvePolicy(
     }
   }
 
-  // ── 消費者側の整合確認（gateClient が全組を検証済み。ここは二重の防御）──
-  const incoherence = describeIncoherentGateResponse(checkResponse)
-  if (incoherence !== undefined) {
+  // ── 3. ローカルのリスク > API のリスク（Worker / API の rule の版ずれ）──
+  // 実行可否の判定には使わない。食い違う評価のまま実行・safe work・consume をしない。
+  const localRisk = localResult.finalRiskLevel
+  const apiRisk = checkResponse.riskReview.riskLevel as RiskLevel
+  if (RISK_RANK[localRisk] > RISK_RANK[apiRisk]) {
+    return technicalStop('risk_rule_skew', `local ${localRisk} > API ${apiRisk} (worker/api rule skew)`)
+  }
+
+  // ── 4a. continue（ALLOW）── 承認済み（call_consume）も Evidence / LOW（proceed）も API の判断どおり続ける
+  if (apiPolicy === 'continue') {
     return {
-      policy: 'block_until_approved',
-      reason: `incoherent Gate response: ${incoherence}`,
+      policy: 'continue',
+      reason: nextAction.message,
       apiAvailable: true,
     }
   }
 
-  // ── ローカルのリスクが API の評価を上回る ＝ Worker / API の rule の版ずれ ──
-  // 実行可否の判定には使わない（API の判断を上書きしない）。食い違う評価のまま実行・safe work・
-  // consume をしないよう、既存の block_until_approved で見える形で止める。
-  const localRank = riskRank(localResult.finalRiskLevel)
-  const apiRank = riskRank(checkResponse.riskReview.riskLevel)
-  if (localRank === undefined || apiRank === undefined || localRank > apiRank) {
+  // ── 4b. PENDING_APPROVAL / BLOCKED はリスクレベルで分岐（従来どおり）──
+  const requestId = nextAction.requestId ?? outcome.requestId ?? ''
+  if (outcome.decision === 'PENDING_APPROVAL' || outcome.decision === 'BLOCKED') {
+    if (apiRisk === 'CRITICAL') {
+      return {
+        policy: 'block_until_approved',
+        reason: `${outcome.decision}: CRITICAL risk — waiting for CEO approval. requestId=${requestId}`,
+        apiAvailable: true,
+      }
+    }
+    // HIGH（および policy 起因で承認必須の LOW / MEDIUM）: safe work のみ継続
     return {
-      policy: 'block_until_approved',
-      reason:
-        `risk inconsistency: local ${String(localResult.finalRiskLevel)} > API ${String(checkResponse.riskReview.riskLevel)} ` +
-        '(worker/api rule skew)',
+      policy: 'continue_safe_work_only',
+      reason: `${outcome.decision}: ${apiRisk} risk — safe work only until approved. requestId=${requestId}`,
       apiAvailable: true,
     }
   }
 
-  const apiPolicy = checkResponse.continuationPolicy
+  // ── 4c. REJECTED: API の policy を採用。safe work only でもローカルが CRITICAL なら止める（従来どおり）──
+  if (apiPolicy === 'continue_safe_work_only' && localRisk === 'CRITICAL') {
+    return {
+      policy: 'block_until_approved',
+      reason: `Local analysis: CRITICAL risk (${localResult.reason ?? 'no reason'}). Escalating from API 'continue_safe_work_only'.`,
+      apiAvailable: true,
+    }
+  }
 
-  // ── API の policy をそのまま採用 ──
   const policyMap: Record<ContinuationPolicy, EffectivePolicy> = {
     continue:               'continue',
     continue_safe_work_only: 'continue_safe_work_only',
     block_until_approved:   'block_until_approved',
   }
 
-  const requestId = checkResponse.nextAction.requestId ?? checkResponse.outcome.requestId
   return {
     policy: policyMap[apiPolicy],
-    reason: apiPolicy === 'continue'
-      ? checkResponse.nextAction.message
-      : `${checkResponse.outcome.decision} (${checkResponse.riskReview.riskLevel}): ${checkResponse.nextAction.message}` +
-        (requestId ? ` requestId=${requestId}` : ''),
+    reason: nextAction.message,
     apiAvailable: true,
   }
 }
 
 // 比較専用の順位。Record<RiskLevel, …> なので RiskLevel が増えれば compile で検出される。
+// 値の妥当性（既知の RiskLevel か）は gateClient の応答検証が保証する。
 const RISK_RANK: Record<RiskLevel, number> = { LOW: 0, MEDIUM: 1, HIGH: 2, CRITICAL: 3 }
 
-function riskRank(value: unknown): number | undefined {
-  return typeof value === 'string' && Object.prototype.hasOwnProperty.call(RISK_RANK, value)
-    ? RISK_RANK[value as RiskLevel]
-    : undefined
+/** 技術的な不整合による停止（re_check）。理由は `<code>: ...` で始め、Worker が stderr に残す。 */
+function technicalStop(code: GateTechnicalStopCode, detail: string): ResolvePolicyResult {
+  return {
+    policy: 're_check',
+    reason: `${code}: ${detail}; technical Gate inconsistency, not an approval decision`,
+    apiAvailable: true,
+  }
 }
 
 /**
  * API の gate/check が返しうる組か（computeContinuationPolicy / computeNextAction と同じ対応）。
- *   - ALLOW            → continuationPolicy=continue、nextAction は proceed か call_consume
- *   - call_consume     → decision=ALLOW、consumedRequestId が非空で outcome.consumedRequestId と一致
- *   - PENDING_APPROVAL / BLOCKED / REJECTED → continuationPolicy は continue 以外、nextAction=wait_for_approval
- * STALE / re_check はこの前に処理済み。整合なら undefined、食い違いならその説明を返す。
+ *   - ALLOW                       → continue + (proceed | call_consume)
+ *   - PENDING_APPROVAL / BLOCKED  → wait_for_approval + (continue_safe_work_only | block_until_approved)
+ *   - REJECTED                    → wait_for_approval + (continue_safe_work_only | block_until_approved)
+ *   - STALE                       → re_check
+ * call_consume の id 一致・RiskLevel の妥当性は gateClient が応答検証で保証する。
  */
-function describeIncoherentGateResponse(checkResponse: GateCheckResponse): string | undefined {
-  const { outcome, nextAction, continuationPolicy } = checkResponse
-  const at = ` (decision=${outcome.decision} continuationPolicy=${continuationPolicy} nextAction=${nextAction.action})`
-  if (nextAction.action === 'call_consume') {
-    if (outcome.decision !== 'ALLOW') return 'call_consume without ALLOW' + at
-    if (typeof nextAction.consumedRequestId !== 'string' || nextAction.consumedRequestId.length === 0) {
-      return 'call_consume without consumedRequestId' + at
-    }
-    if (outcome.consumedRequestId !== nextAction.consumedRequestId) return 'consumedRequestId mismatch' + at
+function isCoherentGateResponse(checkResponse: GateCheckResponse): boolean {
+  const decision = checkResponse.outcome.decision
+  const policy = checkResponse.continuationPolicy
+  const action = checkResponse.nextAction.action
+  switch (decision) {
+    case 'ALLOW':
+      return policy === 'continue' && (action === 'proceed' || action === 'call_consume')
+    case 'PENDING_APPROVAL':
+    case 'BLOCKED':
+    case 'REJECTED':
+      return action === 'wait_for_approval'
+        && (policy === 'continue_safe_work_only' || policy === 'block_until_approved')
+    case 'STALE':
+      return action === 're_check'
+    default:
+      return false
   }
-  if (outcome.decision === 'ALLOW') {
-    if (continuationPolicy !== 'continue') return 'ALLOW without continue' + at
-    if (nextAction.action !== 'proceed' && nextAction.action !== 'call_consume') return 'ALLOW with a waiting nextAction' + at
-    return undefined
-  }
-  if (continuationPolicy === 'continue') return `${outcome.decision} with continue` + at
-  if (nextAction.action !== 'wait_for_approval') return `${outcome.decision} without wait_for_approval` + at
-  return undefined
 }

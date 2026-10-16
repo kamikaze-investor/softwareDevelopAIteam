@@ -9,6 +9,7 @@ import { resolvePolicy, SAFE_WORK_ALLOWED_COMMAND_KINDS } from './gatePolicy.js'
 import type { ResolvePolicyResult } from './gatePolicy.js'
 import type { GateResult } from './gateProcessor.js'
 import type { GateCheckResponse } from './gateClient.js'
+import { findGateTechnicalStopCode } from '@ai-team/shared'
 
 // ────────────────────────────────────────────────────────────
 // ヘルパー
@@ -105,7 +106,7 @@ describe('resolvePolicy — STALE / re_check', () => {
 
 
 // ────────────────────────────────────────────────────────────
-// D2（2026-10-17）: API の continuationPolicy をそのまま写す。ローカルのリスクで実行可否を再判定しない。
+// D2 v4（2026-10-17）
 // ────────────────────────────────────────────────────────────
 
 type Risk = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'
@@ -143,33 +144,29 @@ function allowProceed(risk: Risk): GateCheckResponse {
   })
 }
 
-describe('resolvePolicy — PENDING_APPROVAL / BLOCKED / REJECTED は API の continuationPolicy をそのまま写す', () => {
-  // API の computeContinuationPolicy: HIGH → continue_safe_work_only、CRITICAL → block_until_approved、
-  // policy 起因（git_commit の人間承認）→ riskLevel に関わらず block_until_approved。REJECTED も API の値をそのまま写す。
+describe('resolvePolicy — PENDING_APPROVAL / BLOCKED は従来どおり API の riskLevel で分岐', () => {
   it.each([
-    ['PENDING_APPROVAL', 'HIGH', 'continue_safe_work_only'],
-    ['BLOCKED', 'HIGH', 'continue_safe_work_only'],
-    ['PENDING_APPROVAL', 'CRITICAL', 'block_until_approved'],
-    ['BLOCKED', 'CRITICAL', 'block_until_approved'],
-    ['BLOCKED', 'LOW', 'block_until_approved'],
-    ['BLOCKED', 'HIGH', 'block_until_approved'],
-    ['PENDING_APPROVAL', 'MEDIUM', 'block_until_approved'],
-    ['REJECTED', 'HIGH', 'continue_safe_work_only'],
-    ['REJECTED', 'HIGH', 'block_until_approved'],
-    ['REJECTED', 'CRITICAL', 'block_until_approved'],
-    ['REJECTED', 'LOW', 'block_until_approved'],
-  ] as const)('%s（%s）+ API %s → そのまま', (decision, risk, apiPolicy) => {
+    ['PENDING_APPROVAL', 'HIGH', 'continue_safe_work_only', 'continue_safe_work_only'],
+    ['BLOCKED', 'HIGH', 'continue_safe_work_only', 'continue_safe_work_only'],
+    ['BLOCKED', 'HIGH', 'block_until_approved', 'continue_safe_work_only'],
+    ['PENDING_APPROVAL', 'CRITICAL', 'block_until_approved', 'block_until_approved'],
+    ['BLOCKED', 'CRITICAL', 'block_until_approved', 'block_until_approved'],
+    ['BLOCKED', 'LOW', 'block_until_approved', 'continue_safe_work_only'],
+    ['PENDING_APPROVAL', 'MEDIUM', 'block_until_approved', 'continue_safe_work_only'],
+  ] as const)('%s（%s, API %s）→ %s', (decision, risk, apiPolicy, expected) => {
     const result = resolvePolicy(makeGateResult({ finalRiskLevel: risk }), waiting(decision, risk, apiPolicy, 'req-1'))
-    expect(result.policy).toBe(apiPolicy)
+    expect(result.policy).toBe(expected)
     expect(result.apiAvailable).toBe(true)
   })
 
-  it('非 continue の理由には decision・risk・requestId を載せる（通知用）', () => {
-    const result = resolvePolicy(
-      makeGateResult({ finalRiskLevel: 'CRITICAL' }),
-      waiting('BLOCKED', 'CRITICAL', 'block_until_approved', 'approval-critical-1'),
-    )
-    expect(result.reason).toContain('BLOCKED (CRITICAL)')
+  it('LOW / MEDIUM（policy 起因の承認待ち）の理由は実際の riskLevel を書く（HIGH と偽らない）', () => {
+    const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'LOW' }), waiting('BLOCKED', 'LOW', 'block_until_approved', 'req-low'))
+    expect(result.reason).toBe('BLOCKED: LOW risk — safe work only until approved. requestId=req-low')
+    expect(result.reason).not.toContain('HIGH')
+  })
+
+  it('CRITICAL の理由には requestId を載せる', () => {
+    const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'CRITICAL' }), waiting('BLOCKED', 'CRITICAL', 'block_until_approved', 'approval-critical-1'))
     expect(result.reason).toContain('approval-critical-1')
   })
 
@@ -178,73 +175,108 @@ describe('resolvePolicy — PENDING_APPROVAL / BLOCKED / REJECTED は API の co
     expect(result.policy).toBe('continue_safe_work_only')
     expect(SAFE_WORK_ALLOWED_COMMAND_KINDS).toContain('git_status')
   })
-
 })
 
-describe('resolvePolicy — ALLOW はローカルのリスクで格下げしない（D2）', () => {
+describe('resolvePolicy — REJECTED は API の policy を採用（従来どおり）', () => {
+  it.each([
+    ['HIGH', 'continue_safe_work_only', 'continue_safe_work_only'],
+    ['HIGH', 'block_until_approved', 'block_until_approved'],
+    ['CRITICAL', 'block_until_approved', 'block_until_approved'],
+    ['CRITICAL', 'continue_safe_work_only', 'block_until_approved'],
+  ] as const)('REJECTED（%s, API %s）→ %s', (risk, apiPolicy, expected) => {
+    expect(resolvePolicy(makeGateResult({ finalRiskLevel: risk }), waiting('REJECTED', risk, apiPolicy, 'r')).policy).toBe(expected)
+  })
+})
+
+describe('resolvePolicy — ALLOW はローカルの HIGH / CRITICAL で格下げしない（D2）', () => {
   it.each(['LOW', 'MEDIUM', 'HIGH', 'CRITICAL'] as const)('ALLOW + call_consume（%s）、ローカル同じ → continue', (risk) => {
     const result = resolvePolicy(makeGateResult({ finalRiskLevel: risk }), approvedConsume(risk))
     expect(result.policy).toBe('continue')
     expect(result.reason).toBe('consume it')
   })
 
-  it.each(['HIGH', 'CRITICAL'] as const)('ALLOW + proceed（%s、将来の Evidence 経路）、ローカル同じ → continue（再ブロックしない）', (risk) => {
-    const result = resolvePolicy(makeGateResult({ finalRiskLevel: risk }), allowProceed(risk))
-    expect(result.policy).toBe('continue')
+  it.each(['HIGH', 'CRITICAL'] as const)('ALLOW + proceed（%s、Evidence 経路）、ローカル同じ → continue（再ブロックしない）', (risk) => {
+    expect(resolvePolicy(makeGateResult({ finalRiskLevel: risk }), allowProceed(risk)).policy).toBe('continue')
   })
 
-  it('ローカルが API より低い（LOW < HIGH）→ API に従う', () => {
+  it('ローカルが API より低い → API に従う', () => {
     expect(resolvePolicy(makeGateResult({ finalRiskLevel: 'LOW' }), approvedConsume('HIGH')).policy).toBe('continue')
     expect(resolvePolicy(makeGateResult({ finalRiskLevel: 'LOW' }), waiting('BLOCKED', 'CRITICAL', 'block_until_approved')).policy)
       .toBe('block_until_approved')
   })
 })
 
-describe('resolvePolicy — ローカルのリスク > API のリスク は block_until_approved（rule の版ずれ。実行も safe work も consume もしない）', () => {
+describe('resolvePolicy — ローカルのリスク > API のリスク → re_check risk_rule_skew（技術的不整合。承認待ちにも safe work にもしない）', () => {
   it.each([
     ['ALLOW + proceed', 'HIGH', allowProceed('LOW')],
     ['ALLOW + proceed', 'CRITICAL', allowProceed('MEDIUM')],
     ['ALLOW + call_consume', 'CRITICAL', approvedConsume('HIGH')],
-    ['BLOCKED', 'CRITICAL', waiting('BLOCKED', 'HIGH', 'continue_safe_work_only')],
+    ['ALLOW + call_consume', 'HIGH', approvedConsume('LOW')],
+    ['BLOCKED（safe work only）', 'CRITICAL', waiting('BLOCKED', 'HIGH', 'continue_safe_work_only')],
+    ['BLOCKED（policy 起因）', 'HIGH', waiting('BLOCKED', 'LOW', 'block_until_approved', 'r')],
     ['PENDING_APPROVAL', 'CRITICAL', waiting('PENDING_APPROVAL', 'HIGH', 'continue_safe_work_only', 'r')],
-  ] as const)('%s: ローカル %s > API → block_until_approved（例外にしない）', (_label, local, response) => {
+    ['REJECTED', 'CRITICAL', waiting('REJECTED', 'HIGH', 'continue_safe_work_only', 'r')],
+  ] as const)('%s: ローカル %s > API → re_check', (_label, local, response) => {
     const result = resolvePolicy(makeGateResult({ finalRiskLevel: local }), response)
-    expect(result.policy).toBe('block_until_approved')
-    expect(result.reason).toBe(`risk inconsistency: local ${local} > API ${response.riskReview.riskLevel} (worker/api rule skew)`)
+    expect(result.policy).toBe('re_check')
+    expect(result.reason).toMatch(/^risk_rule_skew: /)
+    expect(result.reason).toContain(`local ${local} > API ${response.riskReview.riskLevel}`)
+    expect(findGateTechnicalStopCode(result.reason)).toBe('risk_rule_skew')
   })
 
-  it('ローカルのリスク値が読めない → block_until_approved', () => {
-    const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'SEVERE' as never }), allowProceed('CRITICAL'))
-    expect(result.policy).toBe('block_until_approved')
-    expect(result.reason).toContain('risk inconsistency')
-  })
-
-  it('STALE / re_check はリスク比較より先に re_check（従来どおり）', () => {
+  it('STALE は risk 比較より先に re_check（従来どおり、技術停止の理由コードは付かない）', () => {
     const result = resolvePolicy(
       makeGateResult({ finalRiskLevel: 'CRITICAL' }),
       makeCheckResponse({
         outcome: { decision: 'STALE', requestId: 'r', reason: 'diff changed' },
         riskReview: { riskLevel: 'LOW', triggeredRules: [], requiresIndependentReview: false },
+        continuationPolicy: 'continue_safe_work_only',
         nextAction: { action: 're_check', message: 're-check' },
       }),
     )
     expect(result.policy).toBe('re_check')
+    expect(findGateTechnicalStopCode(result.reason)).toBeUndefined()
   })
 })
 
-describe('resolvePolicy — 項目間の契約が破れた応答は block_until_approved（gateClient が先に技術障害にする。二重の防御）', () => {
-  it.each<[string, GateCheckResponse]>([
-    ['call_consume なのに decision が ALLOW でない', { ...approvedConsume('HIGH'), outcome: { decision: 'PENDING_APPROVAL', riskLevel: 'HIGH', requestId: 'approval-d2' } }],
-    ['call_consume なのに consumedRequestId が空', { ...approvedConsume('HIGH'), nextAction: { action: 'call_consume', consumedRequestId: '', message: 'x' } }],
-    ['outcome と nextAction の consumedRequestId が違う', { ...approvedConsume('HIGH'), outcome: { decision: 'ALLOW', riskLevel: 'HIGH', consumedRequestId: 'other' } }],
-    ['ALLOW なのに continue でない', { ...approvedConsume('HIGH'), continuationPolicy: 'continue_safe_work_only' }],
-    ['ALLOW なのに wait_for_approval', { ...allowProceed('LOW'), nextAction: { action: 'wait_for_approval', message: 'x' } }],
-    ['BLOCKED なのに continue', { ...waiting('BLOCKED', 'HIGH', 'continue_safe_work_only'), continuationPolicy: 'continue' }],
-    ['REJECTED なのに continue', { ...waiting('REJECTED', 'HIGH', 'block_until_approved'), continuationPolicy: 'continue' }],
-    ['PENDING_APPROVAL なのに proceed', { ...waiting('PENDING_APPROVAL', 'HIGH', 'continue_safe_work_only'), nextAction: { action: 'proceed', message: 'x' } }],
-  ])('%s → block_until_approved', (_label, response) => {
-    const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'LOW' }), response)
-    expect(result.policy).toBe('block_until_approved')
-    expect(result.reason).toContain('incoherent Gate response')
+describe('resolvePolicy — 組の整合（全 decision × continuationPolicy × nextAction）', () => {
+  const decisions = ['ALLOW', 'PENDING_APPROVAL', 'BLOCKED', 'REJECTED', 'STALE'] as const
+  const policies = ['continue', 'continue_safe_work_only', 'block_until_approved'] as const
+  const actions = ['proceed', 'call_consume', 'wait_for_approval', 're_check'] as const
+  const coherent = new Set<string>([
+    'ALLOW|continue|proceed',
+    'ALLOW|continue|call_consume',
+    ...['PENDING_APPROVAL', 'BLOCKED', 'REJECTED'].flatMap((d) => [
+      `${d}|continue_safe_work_only|wait_for_approval`,
+      `${d}|block_until_approved|wait_for_approval`,
+    ]),
+    ...policies.map((p) => `STALE|${p}|re_check`),
+  ])
+  const all = decisions.flatMap((d) => policies.flatMap((p) => actions.map((a) => [d, p, a] as const)))
+
+  function build(decision: string, policy: string, action: string): GateCheckResponse {
+    return makeCheckResponse({
+      outcome: { decision: decision as never, riskLevel: 'HIGH', ...(action === 'call_consume' ? { consumedRequestId: 'x' } : { requestId: 'x' }) },
+      riskReview: { riskLevel: 'HIGH', triggeredRules: [], requiresIndependentReview: true },
+      continuationPolicy: policy as never,
+      nextAction: { action: action as never, message: 'm', ...(action === 'call_consume' ? { consumedRequestId: 'x' } : {}) },
+    })
+  }
+
+  it.each(all.filter((t) => !coherent.has(t.join('|'))))('%s / %s / %s → re_check approval_contract_violation', (d, p, a) => {
+    const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'HIGH' }), build(d, p, a))
+    expect(result.policy).toBe('re_check')
+    expect(findGateTechnicalStopCode(result.reason)).toBe('approval_contract_violation')
+    expect(result.reason).toContain(`decision=${d} continuationPolicy=${p} nextAction=${a}`)
+  })
+
+  it.each(all.filter((t) => coherent.has(t.join('|'))))('%s / %s / %s → 契約違反にしない', (d, p, a) => {
+    const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'HIGH' }), build(d, p, a))
+    expect(findGateTechnicalStopCode(result.reason)).toBeUndefined()
+  })
+
+  it('契約違反はローカルのリスク比較より先（ローカル CRITICAL でも理由は approval_contract_violation）', () => {
+    const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'CRITICAL' }), build('BLOCKED', 'continue', 'wait_for_approval'))
+    expect(findGateTechnicalStopCode(result.reason)).toBe('approval_contract_violation')
   })
 })

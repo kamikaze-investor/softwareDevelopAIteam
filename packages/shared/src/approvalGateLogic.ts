@@ -20,6 +20,27 @@ import type { CommandKind } from './types/command'
 // ────────────────────────────────────────────────────────────
 
 /**
+ * Worker の Gate policy（`resolvePolicy()`）が **承認の判断ではなく技術的な不整合**で止めたときの理由コード（D2 2026-10-17）。
+ *   - `risk_rule_skew`: Worker のローカル risk が API の評価より高い（Worker / API の rule の版ずれ）
+ *   - `approval_contract_violation`: Gate 応答の decision / continuationPolicy / nextAction の組が API の契約に無い
+ * どちらも re_check で止まり、Worker は理由を Job の stderr に `<code>: ...` として残す。PL triage はこれを見て
+ * 自動 resume しない（原因を直した後に resume すれば新しい承認が求められる）。
+ */
+export const GATE_TECHNICAL_STOP_CODES = ['risk_rule_skew', 'approval_contract_violation'] as const
+export type GateTechnicalStopCode = typeof GATE_TECHNICAL_STOP_CODES[number]
+
+/** `<code>: ...` で始まる行があればその理由コードを返す（stderr / gate 理由のどちらにも使う）。 */
+export function findGateTechnicalStopCode(text: string | undefined): GateTechnicalStopCode | undefined {
+  if (!text) return undefined
+  for (const line of text.split(/\r?\n/)) {
+    const trimmed = line.trimStart()
+    const code = GATE_TECHNICAL_STOP_CODES.find((candidate) => trimmed.startsWith(`${candidate}:`))
+    if (code !== undefined) return code
+  }
+  return undefined
+}
+
+/**
  * HIGH の承認待ち（`continue_safe_work_only`）の間も実行してよい CommandKind。
  * 読み取り・テスト・品質チェックだけで、コード変更・commit は含めない。
  *
