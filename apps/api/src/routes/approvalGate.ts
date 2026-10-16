@@ -52,7 +52,7 @@ import { gateEvaluationRoutes } from './gateEvaluations'
 // v2 の evidence を読む側（roadmapAdoption の Candidate commit 証明）は v2 / v3 の両方を受け付ける。
 // 2026-10-17（RC6 / DA trigger 2）の RISK_RULES 拡張（authority・admission・recovery の定義ファイル）も v3 に含める。
 // v3 は同じ lifecycle repair の一連の変更で未リリース（origin/master は v2）なので、v4 へは上げない。
-const GATE_POLICY_VERSION = 'gate-policy-v3'
+export const GATE_POLICY_VERSION = 'gate-policy-v3'
 
 /** 承認 PATCH が期限切れの WAITING を決定しなかったときの 409 `code`（Mobile が文言へ写す）。 */
 const APPROVAL_EXPIRED_CODE = 'APPROVAL_EXPIRED'
