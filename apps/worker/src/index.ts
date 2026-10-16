@@ -1580,9 +1580,34 @@ function resolveResultStatus(result: Awaited<ReturnType<typeof runJob>>): Job['s
   return result.status
 }
 
+/**
+ * startup recovery の**前に** durable Outbox を1回だけ再送する（lifecycle repair C2 / H-01）。
+ *
+ * 前回の Worker が terminal update を Outbox に記録した後、API へ届く前に落ちた場合、
+ * API 上の Job はまだ running である。recovery が先に動くと、その Job を fail-if-running で
+ * failed / blocked へ動かしてしまい、後から届く replay（write-once の workspaceEndFingerprint を含む）は
+ * running→terminal 以外で 409 になる。event は pending のまま残り、pollJobs() は pending がある間
+ * queued Job を一切取らないため intake が止まり続けていた。
+ *
+ * ここは既存の resendPending() / patchJobWithRetry() を使うだけで、待ち続けない
+ * （1回の bounded な再送。失敗は pollJobs() の既存再送・既存 CRITICAL 通知に任せる）。
+ */
+async function replayOutboxAtStartup(): Promise<void> {
+  try {
+    if (!outboxStore.hasPending()) return
+    await outboxStore.resendPending(async (jobId, payload) => (await patchJobWithRetry(jobId, payload)).ok)
+  } catch (err: unknown) {
+    console.error(`[Worker] 起動時 Outbox 再送エラー: ${formatUnknownError(err)}。通常ポーリングで再試行します`)
+  }
+}
+
 async function recoverJobsAtStartup(): Promise<void> {
   try {
-    const recovered = await recoverStaleJobs(API_BASE, buildApiAuthHeaders())
+    // 再送できなかった（一時失敗・確定拒否のどちらでも）terminal update を持つ Job には、
+    // recovery が競合する terminal 遷移を作らない。結果の適用は Outbox replay に任せる。
+    const recovered = await recoverStaleJobs(API_BASE, buildApiAuthHeaders(), {
+      hasPendingTerminalEvent: (jobId) => outboxStore.hasPendingFor(jobId),
+    })
     if (recovered > 0) {
       console.log(`[Worker] ${recovered} 件の stale Job を復旧しました`)
     }
@@ -1592,9 +1617,12 @@ async function recoverJobsAtStartup(): Promise<void> {
 }
 
 export async function start(): Promise<void> {
-  // pending Outboxがあっても待たない。pollJobs()自身がpoll cycleごとに
+  // pending Outboxの解消は待たない。pollJobs()自身がpoll cycleごとに
   // pendingの再送とnew Job fetchのskipを行うため、起動直後からwatchdog/pollingを
   // 開始してよい（起動専用の別blockingループは持たない）。
+  // ただし**recoveryより前に1回だけ再送する**（H-01）。前回 Worker の terminal 結果を
+  // recovery が上書きしないようにするため。再送できずに残った Job は recovery が skip する。
+  await replayOutboxAtStartup()
   await recoverJobsAtStartup()
   // ウォッチドッグを pollJobs と並行して起動
   void startWatchdog(API_BASE, buildApiAuthHeaders())
