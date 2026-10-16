@@ -27,6 +27,7 @@ export type PrincipleSlug =
   | 'observation-closes-loop'
   | 'unknown-driven-staging'
   | 'canonical-domain-meaning'
+  | 'root-cause-generalization'
 
 /** core = signal によらず毎回適用される。contextual = signal から選ばれたときだけ適用される。 */
 export type PrincipleTier = 'core' | 'contextual'
@@ -87,6 +88,7 @@ const ALL_PRINCIPLE_SLUGS: readonly PrincipleSlug[] = [
   'observation-closes-loop',
   'unknown-driven-staging',
   'canonical-domain-meaning',
+  'root-cause-generalization',
 ] as const
 
 const SLUG_SET = new Set<string>(ALL_PRINCIPLE_SLUGS)
@@ -335,6 +337,7 @@ export function buildEngineeringPrincipleReviewGuidance(principles: EngineeringP
   const standardDesignFrame = principles.bySlug.get('standard-design-frame')
   const honestUnverifiable = principles.bySlug.get('honest-unverifiable')
   const unknownDrivenStaging = principles.bySlug.get('unknown-driven-staging')
+  const rootCause = principles.bySlug.get('root-cause-generalization')
 
   return [
     '## Engineering Principle Review Guidance',
@@ -343,6 +346,9 @@ export function buildEngineeringPrincipleReviewGuidance(principles: EngineeringP
     // unnecessary_staging は over_constraint の一種として報告させる（新しい category を作らない）。
     `- over_constraint (unnecessary_staging; report it as over_constraint): ${unknownDrivenStaging?.oneLiner ?? 'Principle unknown-driven-staging was not available; do not treat it as applied.'}`,
     `- unverifiable_assumption: ${honestUnverifiable?.oneLiner ?? 'Principle honest-unverifiable was not available; do not treat it as applied.'}`,
+    // root-cause-generalization は core なので、per-principle verdict を持たない Meta Review（PR）にも
+    // ここから届ける。修正の原因・探索範囲の欠落は unverifiable_assumption の一種として報告させる。
+    `- unverifiable_assumption (unexamined_root_cause; report it as unverifiable_assumption): ${rootCause?.oneLiner ?? 'Principle root-cause-generalization was not available; do not treat it as applied.'}`,
   ].join('\n')
 }
 
@@ -364,6 +370,10 @@ export function buildApplicablePrinciplesSection(selection: readonly PrincipleSe
     '## Applicable Principles',
     'Judge each principle below separately against this change and report one verdict per principle id.',
     'ALIGNED = the change respects it. CONFLICT = the change violates it. UNCERTAIN = you cannot tell from the material given.',
+    // core 原則は変更の種類によらず載る（例: 修正でない変更に root-cause-generalization）。
+    // 判定対象が無いときに UNCERTAIN が返ると、core 降格センサー（CONFLICT / UNCERTAIN 0 件が条件）が
+    // 永久に発火せず、core にした判断の再評価ループが閉じない。
+    'If a principle has nothing to judge in this change, answer ALIGNED with reason "not exercised"; keep UNCERTAIN for a principle that applies but cannot be judged from the material given.',
     'Do not invent principle ids that are not in this list.',
     ...selection.map((item) => `- ${item.slug}: ${item.oneLiner}`),
   ].join('\n')

@@ -422,7 +422,7 @@ export function evaluatePrincipleSensors(input: PrincipleSensorInput): Principle
       sensorId: 'principle-review-not-discriminating',
       summary: 'Re-review the principle-compliance mechanism itself: it has never produced a CONFLICT or UNCERTAIN verdict.',
       evidence: `applications=${totalApplications} across ${input.aggregates.length} principles, conflict+uncertain=0`,
-      thresholdNote: `provisional threshold: total applications >= ${PRINCIPLE_SENSOR_THRESHOLDS.MECHANISM_REVIEW_MIN_APPLICATIONS} with zero CONFLICT and zero UNCERTAIN. Chosen as 4x the per-principle threshold because there are 4 core principles; not derived from an observed distribution.`,
+      thresholdNote: `provisional threshold: total applications >= ${PRINCIPLE_SENSOR_THRESHOLDS.MECHANISM_REVIEW_MIN_APPLICATIONS} with zero CONFLICT and zero UNCERTAIN. Chosen as 4x the per-principle threshold when there were 4 core principles (2026-09-17); not re-derived when core principles were added, and not derived from an observed distribution.`,
     })
   }
 

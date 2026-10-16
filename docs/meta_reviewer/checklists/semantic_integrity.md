@@ -32,11 +32,23 @@ domain fact の判断（authority / safety / lifecycle / completion / supersessi
       （chronology 自体が domain rule の場合を除く。そのときはその rule を名指しできる）
 - [ ] **Error semantics**: human-readable error message の文字列で program logic を分岐していない
       （typed error / error code / typed state を使う）
+- [ ] **Single owner**: 同じ domain fact を独立に定義・判定する第二の正本
+      （並行する table / enum / mapping / predicate / 正規表現 / prompt 上の rule）を**新たに足していない**。
+      今は owner と一致していても対象（一致は次の変更で崩れる）。owner から生成される copy・
+      owner へ委譲する層・owner との一致がテストで検証される enforcement（schema check / DB 制約）は
+      第二の正本ではない。**独立に判断していること**が条件
+- [ ] **Distinct meanings**: 名前・値・表現が似ているだけの別概念を統合していない。
+      統合するなら「表現ではなく意味が同じ」根拠があり、似た別概念を分けておくなら
+      その違いが両方の定義箇所に書かれている
 
 ## ⚪ ADVISORY（指摘するが blocking しない）
 
-- [ ] **Duplicate authority**: 同じ意味を複数の consumer がそれぞれ解釈していない
-      （新たに増やす変更なら IMPORTANT として扱う）
+- [ ] **Duplicate authority (existing)**: 既存コードで同じ意味を複数の consumer がそれぞれ解釈している
+      （今回の変更が増やすなら上の Single owner として扱う）
+- [ ] **Owner placement**: owner が欠けている・分裂している・置き場所が違うために consumer が
+      再推論している場合、consumer 側の回避策を重ねず、既存 owner に typed field / predicate を
+      出す・判定を owner へ移すといった**最小の構造的リファクタリング**を提案する
+      （この変更の範囲外なら finding / roadmap item として記録させ、この変更では要求しない）
 - [ ] **Test adequacy**: semantic boundary のテストが両方向ある
   - same meaning / different representation → same result
   - similar representation / different meaning → different result
@@ -54,6 +66,10 @@ domain fact の判断（authority / safety / lifecycle / completion / supersessi
   新たに再推論を持ち込む / 広げる箇所を対象にする
 - finding は既存 category `implementation_coupling` で報告し、message の先頭に
   `[semantic_reinference]` を付ける。新しい category・status は使わない
+- 1箇所で再推論・二重 owner を見つけたら、それは原因の兆候である（`root-cause-generalization`）。
+  diff 内・diff が触る範囲で**同じ表現を読む他の consumer / 同じ fact を判定する他の箇所**が
+  見えていれば、箇所ごとに finding を量産せず、原因（どの fact をどの表現から再推論しているか）
+  1件の finding にまとめて該当箇所を列挙する。reviewer が repository 全体を探索し直す必要はない
 - 新しい resolver / abstraction / Gate / status / workflow の追加を、この checklist を理由に
   求めない。既存の owner で自然に表現できるならそれを使わせる
 

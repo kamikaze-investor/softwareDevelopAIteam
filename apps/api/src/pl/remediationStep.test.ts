@@ -796,6 +796,8 @@ describe('prompt', () => {
     expect(prompt).toContain('スマホだけでAI開発チームを運営できる世界を作る')
     expect(prompt).toContain('CONFLICT した項目')
     expect(prompt).toContain('Design Contract')
+    // 修正経路には root cause を一般化する原則が core として届く（tier を動かしたら気づけるように）。
+    expect(prompt).toContain('remove its cause, not only its site')
   })
 
   it('system prompt は Review を覆す権限が無いことと権限拡大の禁止を明示する', () => {

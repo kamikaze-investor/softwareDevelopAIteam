@@ -43,6 +43,8 @@ describe('buildRepairPrompt', () => {
     expect(contractPos).toBeGreaterThan(-1)
     expect(contractPos).toBeLessThan(fencePos)
     expect(prompt).toContain('current implementation is evidence, not specification')
+    // 自動修復は症状ではなく原因を直す原則を受け取る。core から外すとここが落ちる。
+    expect(prompt).toContain('remove its cause, not only its site')
   })
 
   it('Task Contractを保持し、repair指示をその上に追加する', () => {

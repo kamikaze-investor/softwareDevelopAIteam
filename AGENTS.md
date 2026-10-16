@@ -309,6 +309,9 @@ gh run view <run-id> --log-failed
 
 1. `gh run view <run-id> --log-failed` で全エラーを収集する
 2. 根本原因（症状ではなく原因）を特定する
+   - 原因を再発しうる単位（欠けた不変条件・成り立たない前提・owner の外での再推論など）で言語化し、
+     同じ原因が他の機能・層・状態遷移でも発火しうるかを risk に応じた範囲で確認する
+     （正本: `specs/21` `root-cause-generalization`。全体監査を毎回行う意味ではない）
 3. 前提条件を洗い出してリスト化する
    ```
    例:
@@ -343,6 +346,8 @@ gh pr view <PR番号> --comments
 **`changes_requested`（⚠️）の場合:**
 - コメント内の「検出事項」を全件リストアップする
 - 依存順（根本原因が先）に並べ替える
+- 同じ原因を共有する検出事項は、箇所ごとのパッチではなく原因 1 件の修正として扱う
+  （Rule-014 との関係は `docs/project_memory/rules/003_codex_usage_saving_policy.md` Rule-014 が正本）
 - **1件ずつ修正 → `git commit` → 次の件へ**
 - 全件完了したら `git push` → ループへ戻る
 - （CIと同様：1件1コミットでMeta Reviewerが追跡できる状態を保つ）

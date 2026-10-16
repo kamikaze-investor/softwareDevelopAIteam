@@ -172,7 +172,7 @@ would direct-to-target plus scale-down diagnosis on failure cost less in total; 
 justified.
 
 <!-- principle-id: canonical-domain-meaning -->
-<!-- principle-oneliner: Decide domain facts through their canonical owner; never re-infer them from incidental representation (string shape, prefix, ID format, ordering, timestamps, message text). -->
+<!-- principle-oneliner: Decide each domain fact through its single canonical owner; never add a second independent owner or re-infer the fact from incidental representation (string shape, prefix, ID format, ordering, timestamps, message text), and never merge concepts that only look alike. -->
 <!-- principle-category: coupling -->
 <!-- principle-scope: universal -->
 <!-- principle-tier: contextual -->
@@ -182,7 +182,20 @@ current / superseded, lineage, entity relation, candidate selection, error meani
 owner: the spec, policy, type or function already responsible for it. Consumers ask that owner instead
 of each re-deriving the fact from string shape, prefix / suffix, ID format, naming, ordering or
 "latest", timestamps, human-readable message text or fixture shape. Use the owner where it naturally
-lives; this principle alone never justifies a new resolver, abstraction, Gate, status or workflow.
+lives; this principle alone never justifies a new Gate, status or workflow, nor a new resolver layer in
+front of an owner that already answers the question.
+One fact, one owner: do not add a second independent definition or decision of the same fact (a
+parallel table, enum, mapping, predicate, regex or prompt rule), even when it agrees with the owner
+today; two owners that agree now diverge on the next change. A copy generated from the owner, a layer
+that delegates to it, or an enforcement mirror (schema check, DB constraint) whose agreement with the
+owner is verified by a test is not a second owner; what matters is whether it decides independently. When consumers must re-derive a fact
+because no single owner exposes it (the owner is missing, split or misplaced), prefer the smallest
+structural refactor that gives the fact one owner (expose a typed field or predicate on the existing
+owner, move the decision into it, make the other sites delegate) over another consumer-side
+workaround. The reverse also holds: do not merge concepts that only share a name, value or
+representation. When two facts look alike but differ in meaning (scope, lifecycle, authority,
+audience), keep them separate and state the difference where both are defined; a unification must
+show that the meanings, not the representations, are the same.
 Distinguish contractual representation (persisted schema, external API, event format, stable
 identifier) from incidental representation; changing a contractual one requires a migration /
 compatibility strategy. When it is unclear which one a persisted or externally observable
@@ -196,6 +209,48 @@ escalation); fail-closed never means silent fallback, silent stall, invisible ha
 Test semantic boundaries both ways: same meaning in different representations gives the same result,
 and similar representation with different meaning gives a different result. Report a violation as
 `implementation_coupling` (sub-kind `semantic_reinference`); it is not a separate review.
+A re-inference or a duplicate owner found at one site is a root-cause signal, not a single defect:
+apply `root-cause-generalization` to the other consumers of the same representation and the other
+deciders of the same fact.
+
+<!-- principle-id: root-cause-generalization -->
+<!-- principle-oneliner: When fixing a defect, remove its cause, not only its site: name the abstracted root cause, check in proportion to risk where else that cause can fire, fix a shared cause once instead of patching each site, and record same-cause instances outside the authorized scope instead of fixing them. -->
+<!-- principle-category: outcome-definition -->
+<!-- principle-scope: universal -->
+<!-- principle-tier: core -->
+<!-- principle-tags: debugging, root-cause, repair, recurrence, review -->
+■ Root Cause Generalization. This is `evidence-not-spec` applied to a fix: the Required Outcome of a
+fix is that the cause can no longer produce the failure, not that the reported symptom is gone. It
+applies to bugs, errors, review findings and design inconsistencies, in code, specs, prompts and
+operations alike.
+1) Name the cause at the level it would recur, as a mechanism rather than a line: a missing or
+unenforced invariant, an assumption that does not hold, a decision duplicated or re-inferred outside
+its owner (`canonical-domain-meaning`), a step whose failure or partial completion is not handled, a
+misused contract. "Line 42 was wrong" is a site, not a cause.
+2) Search where that cause can fire, using the cause as the search key: the same assumption, the same
+bypassed owner, the same representation, the same transition or step pattern, the same contract usage,
+across features, modules, layers and state transitions. Look for different symptoms of the same cause
+and for instances that have not failed yet, not only for repeats of the known symptom.
+3) Scale the search to how likely the cause is shared and what a missed instance would cost
+(`scale-to-risk`): a typo or a self-contained local mistake needs only the statement that the cause is
+local and why; a cause in a shared helper, contract, owner or recovery / state-transition path warrants
+checking its other users. This never means an unconditional whole-system audit.
+4) When several instances share the cause, fix the cause once (at the owner, in the shared contract,
+or with a type, test or invariant check that makes the class impossible or visible) rather than
+patching each site; treat them as one finding about the cause. Unrelated findings are still not
+bundled. Recurrence prevention uses existing means (owner, type, test, checklist); it is not a reason
+to add a Gate, review step, status or workflow.
+5) Group by cause, not by resemblance: sites that merely share syntax, a name or a symptom are not
+one class unless the same mechanism is shown; do not widen a fix on resemblance alone.
+6) Respect the authorized scope: instances outside the current change's scope (its task contract,
+allowed paths or approval, whatever the project uses) are not silently fixed; record them through an existing path (finding, roadmap item,
+report) with the cause they share. Existing code is still grandfathered (`existing-code-grandfather`);
+an incident only opens the instances of its own cause.
+The fix report states the abstracted cause, the searched scope and why it was enough, and each
+instance found (fixed / recorded / ruled out). Reviewers do not redo the search; they check that the
+stated cause explains the failure, that the scope is plausible for the risk, and that no visible
+same-cause instance was left unaddressed. Report a gap as `unverifiable_assumption` (sub-kind
+`unexamined_root_cause`); it is not a separate review.
 
 <!-- principle-id: home-and-criteria -->
 This file is the authoritative home for the Outcome-Oriented Generalization Principle. Completion
