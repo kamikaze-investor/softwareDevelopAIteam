@@ -723,7 +723,8 @@ export default function ApprovalsScreen(): ReactElement {
                 <TouchableOpacity
                   accessibilityLabel={`${approvalIdLabel(item.id)} をコピー`}
                   hitSlop={8}
-                  onPress={() => {
+                  onPress={(event) => {
+                    event.stopPropagation()
                     const message = copyApprovalId(item.id, (text) => Clipboard.setString(text))
                     setCopiedApprovalMessage({ id: item.id, message })
                   }}
