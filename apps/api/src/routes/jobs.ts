@@ -497,6 +497,14 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
     if (!task) {
       return reply.status(404).send({ error: 'Task not found' })
     }
+    // Job の projectId は Task の Project と一致しなければならない。食い違う行は、Project 単位の
+    // lifecycle 判定（pause / archive / 所有権）を Job の自己申告でずらせてしまう（lifecycle repair W5）。
+    if (result.data.projectId !== task.projectId) {
+      return reply.status(409).send({
+        error: 'Job projectId must match the Task projectId',
+        code: 'JOB_PROJECT_MISMATCH',
+      })
+    }
 
     const project = storage.projects.findById(task.projectId)
     if (!project) {
@@ -1194,6 +1202,20 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
         return reply.status(409).send({ error: updated.reason })
       }
       return reply.status(updated.code === 'JOB_NOT_FOUND' ? 404 : 500).send({ error: updated.reason })
+    }
+    // claim（queued -> running）が storage で拒否された（quarantine / Project が running でない）。
+    // 以前は 200 + queued の Job を返しており、Worker はそれを claim 成功と区別できなかった。
+    // 非 2xx にして Worker に実行させない（lifecycle repair W5）。Job は queued のまま残る。
+    if (
+      jobUpdate.status === 'running'
+      && existing.status === 'queued'
+      && !updated.deduplicated
+      && updated.job.status !== 'running'
+    ) {
+      return reply.status(409).send({
+        error: 'Job claim refused: the workspace is quarantined or the Project is not running',
+        code: 'JOB_CLAIM_REFUSED',
+      })
     }
     if (updated.queuedDesignReviewRun && preparation?.action === 'queue') {
       kickQueuedDesignReview(storage, req.log, updated.queuedDesignReviewRun, preparation.stepKey)

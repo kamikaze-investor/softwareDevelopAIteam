@@ -612,7 +612,7 @@ describe('Task API', () => {
 
   it('GET /api/tasks/summary returns task summaries across projects', async () => {
     await withApp(async (app) => {
-      const alpha = await createProject(app, { name: 'Alpha' })
+      const alpha = await createProject(app, { name: 'Alpha', status: 'running' })
       const beta = await createProject(app, { name: 'Beta' })
       const alphaTask = await createTask(app, alpha.id, { title: 'Alpha task' })
       const betaTask = await createTask(app, beta.id, { title: 'Beta task' })
@@ -737,7 +737,7 @@ describe('Task API', () => {
 
   it('GET /api/tasks/summary treats REJECTED as stale once a newer Job is running', async () => {
     await withApp(async (app) => {
-      const project = await createProject(app)
+      const project = await createProject(app, { status: 'running' })
       const task = await createTask(app, project.id, { title: 'Retrying task' })
 
       const blockedJob = await createJob(app, task)
@@ -962,7 +962,7 @@ describe('Task API', () => {
   describe('POST /api/tasks/:id/resume', () => {
     it('rejects resume with 409 while the Task workspace is quarantined (fail-closed)', async () => {
       await withApp(async (app) => {
-        const project = await createProject(app)
+        const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id)
         const job = await createJob(app, task)
         await updateJob(app, job.id, { status: 'running' })
@@ -992,7 +992,7 @@ describe('Task API', () => {
 
     it('resume succeeds after a verified clear-quarantine (workflow: quarantine -> resume refused -> cleared -> resume succeeds)', async () => {
       await withApp(async (app) => {
-        const project = await createProject(app)
+        const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id, {
           title: 'Fix blocked deployment',
           description: 'Update only the allowed API files.',
@@ -1279,7 +1279,7 @@ describe('Task API', () => {
       'rejects resume when a %s job already exists',
       async (activeStatus) => {
         await withApp(async (app) => {
-          const project = await createProject(app)
+          const project = await createProject(app, { status: 'running' })
           const task = await createTask(app, project.id)
           await createBlockedAiCliJob(app, task)
           await wait(5)

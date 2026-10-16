@@ -364,12 +364,21 @@ export async function fetchQueuedJob(): Promise<QueuedWork | null> {
   for (const project of projects) {
     if (project.status === 'archived') continue
 
+    // **一覧を1つでも読めなければ、この poll では何も claim しない。** 読めなかった Project /
+    // Task を黙って飛ばすと、そこにいる所有者（paused Project の blocked Job 等）が判定から
+    // 消え、所有者不在として別 Task を claim してしまう（fail-open。W5 独立レビュー指摘）。
     const tasks = await fetchJson<Task[]>(`/api/tasks?projectId=${encodeURIComponent(project.id)}`)
-    if (!tasks) continue
+    if (!tasks) {
+      console.warn(`[Worker] Project ${project.id} の Task 一覧を読めないため、この poll では claim しません`)
+      return null
+    }
 
     for (const task of tasks) {
       const jobs = await fetchJson<Job[]>(`/api/jobs?taskId=${encodeURIComponent(task.id)}`)
-      if (!jobs) continue
+      if (!jobs) {
+        console.warn(`[Worker] Task ${task.id} の Job 一覧を読めないため、この poll では claim しません`)
+        return null
+      }
       perTask.push({ task, jobs })
       if (project.status === 'running') claimableTaskIds.add(task.id)
     }
@@ -872,8 +881,12 @@ async function confirmRunningTransition(
     startedAt: (dependencies.now ?? (() => new Date().toISOString()))(),
     workspaceBaseline: baseline.baseline,
   }
-  const confirmed = await (dependencies.patchJob ?? patchJobWithRetry)(job.id, runningPayload)
-  if (confirmed) return true
+  // `patchJobWithRetry()` は失敗時も `{ ok: false }`（truthy なオブジェクト）を返す。
+  // そのまま `if (confirmed)` で見ると claim の失敗・拒否を成功とみなして実行してしまう。
+  const confirmed = normalizePatchJobResult(
+    await (dependencies.patchJob ?? patchJobWithRetry)(job.id, runningPayload),
+  )
+  if (confirmed.ok) return true
 
   await reconcileAfterPatchFailure(
     job.id,

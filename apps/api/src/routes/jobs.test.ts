@@ -474,6 +474,63 @@ describe('Job API', () => {
     })
   })
 
+  it('POST /api/jobs refuses a projectId that differs from the Task Project (W5)', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const other = await createProject(app)
+      const task = await createTask(app, project.id)
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/jobs',
+        payload: { taskId: task.id, projectId: other.id, agentRole: 'developer_ai', safeCommand: { kind: 'git_status' } },
+      })
+
+      expect(res.statusCode).toBe(409)
+      expect(parseBody<{ code: string }>(res.body).code).toBe('JOB_PROJECT_MISMATCH')
+      const { getStorage } = await import('../storage/index.js')
+      expect(getStorage().jobs.findByTaskId(task.id)).toEqual([])
+    })
+  })
+
+  // running -> draft は queued Job がある間は lifecycle guard が拒否するので、到達できる停止は paused だけ。
+  it.each(['paused'] as const)(
+    'PATCH queued -> running is refused with 409 while the Task Project is %s; the Job stays queued (W5)',
+    async (status) => {
+      await withApp(async (app) => {
+        const project = await createProject(app, { status: 'running' })
+        const task = await createTask(app, project.id)
+        const job = await createJob(app, task)
+        // Worker の poll の後・claim の前に CEO が止めた。
+        const { getStorage } = await import('../storage/index.js')
+        getStorage().projects.update(project.id, { status })
+
+        const res = await app.inject({
+          method: 'PATCH', url: `/api/jobs/${job.id}`, payload: { status: 'running' },
+        })
+
+        expect(res.statusCode).toBe(409)
+        expect(parseBody<{ code: string }>(res.body).code).toBe('JOB_CLAIM_REFUSED')
+        expect(getStorage().jobs.findById(job.id)?.status).toBe('queued')
+      })
+    },
+  )
+
+  it('PATCH queued -> running still succeeds for a running Project', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const task = await createTask(app, project.id)
+      const job = await createJob(app, task)
+
+      const res = await app.inject({
+        method: 'PATCH', url: `/api/jobs/${job.id}`, payload: { status: 'running' },
+      })
+
+      expect(res.statusCode).toBe(200)
+      expect(parseBody<Job>(res.body).status).toBe('running')
+    })
+  })
+
   it('POST /api/jobs rejects a client-supplied workingDir with 400', async () => {
     await withApp(async (app) => {
       const project = await createProject(app)
@@ -866,7 +923,7 @@ describe('Job API', () => {
 
   it('PATCH /api/jobs/:id updates status', async () => {
     await withApp(async (app) => {
-      const project = await createProject(app)
+      const project = await createProject(app, { status: 'running' })
       const task = await createTask(app, project.id)
       const created = await createJob(app, task)
 
@@ -885,7 +942,7 @@ describe('Job API', () => {
 
   it('PATCH /api/jobs/:id accepts and persists a value-free workspace END fingerprint', async () => {
     await withApp(async (app) => {
-      const project = await createProject(app)
+      const project = await createProject(app, { status: 'running' })
       const task = await createTask(app, project.id)
       const created = await createJob(app, task)
       const workspaceEndFingerprint = {
@@ -966,7 +1023,7 @@ describe('Job API', () => {
 
   it('PATCH /api/jobs/:id rejects rewriting an existing workspace END fingerprint', async () => {
     await withApp(async (app) => {
-      const project = await createProject(app)
+      const project = await createProject(app, { status: 'running' })
       const task = await createTask(app, project.id)
       const created = await createJob(app, task)
       const { getStorage } = await import('../storage/index.js')
@@ -1151,7 +1208,7 @@ describe('Job API', () => {
 
   it('PATCH /api/jobs/:id accepts an Outbox event and returns Outbox metadata', async () => {
     await withApp(async (app) => {
-      const project = await createProject(app)
+      const project = await createProject(app, { status: 'running' })
       const task = await createTask(app, project.id)
       const created = await createJob(app, task)
       const payload = { status: 'running' as const, startedAt: '2026-08-08T01:02:03.000Z' }
@@ -1215,7 +1272,7 @@ describe('Job API', () => {
 
   it('PATCH /api/jobs/:id rejects the same eventId with a different valid payload', async () => {
     await withApp(async (app) => {
-      const project = await createProject(app)
+      const project = await createProject(app, { status: 'running' })
       const task = await createTask(app, project.id)
       const created = await createJob(app, task)
 
@@ -1241,7 +1298,7 @@ describe('Job API', () => {
 
   it('PATCH /api/jobs/:id/fail-if-running changes running to blocked when a repair is queued', async () => {
     await withApp(async (app) => {
-      const project = await createProject(app)
+      const project = await createProject(app, { status: 'running' })
       const task = await createTask(app, project.id)
       const created = await createJob(app, task)
       await app.inject({
@@ -1330,7 +1387,7 @@ describe('Job API', () => {
 
   it('PATCH /api/jobs/:id/fail-if-running returns 409 while the Task workspace is quarantined', async () => {
     await withApp(async (app) => {
-      const project = await createProject(app)
+      const project = await createProject(app, { status: 'running' })
       const task = await createTask(app, project.id)
       const first = await createJob(app, task)
       await app.inject({
@@ -1426,7 +1483,7 @@ describe('Job API', () => {
 
     it('clears quarantine when the observation matches the persisted baseline, and records it', async () => {
       await withApp(async (app) => {
-        const project = await createProject(app)
+        const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id)
         const created = await createJob(app, task)
         await quarantineJob(app, created.id, CLEAN_OBSERVATION)
@@ -1458,7 +1515,7 @@ describe('Job API', () => {
 
     it('rejects a request carrying only a boolean (no observation) — no bypass remains', async () => {
       await withApp(async (app) => {
-        const project = await createProject(app)
+        const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id)
         const created = await createJob(app, task)
         await quarantineJob(app, created.id)
@@ -1477,7 +1534,7 @@ describe('Job API', () => {
 
     it('rejects clearance when the observation is missing', async () => {
       await withApp(async (app) => {
-        const project = await createProject(app)
+        const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id)
         const created = await createJob(app, task)
         await quarantineJob(app, created.id)
@@ -1494,7 +1551,7 @@ describe('Job API', () => {
 
     it('rejects clearance when the observation does NOT match the persisted baseline (quarantine remains)', async () => {
       await withApp(async (app) => {
-        const project = await createProject(app)
+        const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id)
         const created = await createJob(app, task)
         await quarantineJob(app, created.id, CLEAN_OBSERVATION)
@@ -1516,7 +1573,7 @@ describe('Job API', () => {
 
     it('clears WITHOUT a persisted baseline when a full known-good state is presented (baseline-computation failure case)', async () => {
       await withApp(async (app) => {
-        const project = await createProject(app)
+        const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id)
         const created = await createJob(app, task)
         await quarantineJob(app, created.id)
@@ -1537,7 +1594,7 @@ describe('Job API', () => {
 
     it('refuses WITHOUT a persisted baseline when a known-good condition is false (quarantine remains)', async () => {
       await withApp(async (app) => {
-        const project = await createProject(app)
+        const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id)
         const created = await createJob(app, task)
         await quarantineJob(app, created.id)
@@ -1560,7 +1617,7 @@ describe('Job API', () => {
 
     it('is idempotent: a second clearance reports alreadyCleared and preserves the recorded state', async () => {
       await withApp(async (app) => {
-        const project = await createProject(app)
+        const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id)
         const created = await createJob(app, task)
         await quarantineJob(app, created.id, CLEAN_OBSERVATION)
@@ -1592,7 +1649,7 @@ describe('Job API', () => {
 
     it('does NOT clear a quarantined Job for a DIFFERENT workingDir', async () => {
       await withApp(async (app) => {
-        const project = await createProject(app)
+        const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id)
         const created = await createJob(app, task)
         await quarantineJob(app, created.id, CLEAN_OBSERVATION)

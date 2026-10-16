@@ -653,15 +653,18 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   /**
    * Project を放棄すると所有者が見えなくなる lifecycle の種類。
    *
-   * blocked Job は「blocked なら所有者」とは決めない。done な Task に残る行は履歴であり
-   * （`holdsWorkspaceWhenBlocked`）、Human Resume で後継が作られた旧行は superseded である
+   * blocked Job は Human Resume で後継が作られた旧行だけを superseded として除く
    * （`readJobsSupersededByHumanResume`。attention と同じ reader を使い、ここで再実装しない）。
-   * それ以外を所有者として残すと、放棄した Project の中で誰も解消できない停止になる。
+   * done な Task に残る blocked 行も除かない。Worker はその行を、worktree が clean・git 操作なし・
+   * HEAD 解決可能と**観測できるまで**所有者として扱い（`isStaleBlockedJobCandidate` の契約）、
+   * その観測は API 側に永続化されていない。証明が無い以上、所有者として数える（fail-closed）。
+   * Project は Job の自己申告（`jobs.project_id`）ではなく Task の `project_id` から引く。
    */
   function activeLifecycleKindsOf(projectId: string): ProjectActiveLifecycleKind[] {
     const kinds: ProjectActiveLifecycleKind[] = []
     const movingJob = db.prepare(
-      "SELECT id FROM jobs WHERE project_id = ? AND status IN ('queued','running') LIMIT 1",
+      "SELECT j.id FROM jobs j JOIN tasks t ON t.id = j.task_id "
+      + "WHERE t.project_id = ? AND j.status IN ('queued','running') LIMIT 1",
     ).get(projectId)
     if (movingJob) kinds.push('queued_or_running_job')
 
@@ -670,11 +673,9 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       + "WHERE t.project_id = ? AND j.status = 'blocked'",
     ).all(projectId) as Array<{ task_id: string }>).map((row) => row.task_id)
     const hasBlockedOwner = blockedTaskIds.some((taskId) => {
-      const task = tasks.findById(taskId)
-      if (!task) return false
       const taskJobs = jobs.findByTaskId(taskId)
       const superseded = readJobsSupersededByHumanResume(storage, taskJobs)
-      return taskJobs.some((job) => holdsWorkspaceWhenBlocked(task, job) && !superseded.has(job.id))
+      return taskJobs.some((job) => job.status === 'blocked' && !superseded.has(job.id))
     })
     if (hasBlockedOwner) kinds.push('blocked_job')
 
@@ -1964,6 +1965,15 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       if (data.status === 'running' && existing.status === 'queued') {
         if (isWorkspaceQuarantined(jobs.findByTaskId(existing.taskId))) {
           // 承認競合時（下記）と同じく、状態を変えずに現在値を返す。
+          return existing
+        }
+        // **pause は claim を原子的に止める**（lifecycle repair W5）。Worker の poll と claim の間に
+        // Project が running でなくなった場合、Job は queued のまま残す。Project は Job の
+        // 自己申告（project_id）ではなく Task から引く。
+        const claimingProject = db.prepare(
+          'SELECT p.status AS status FROM tasks t JOIN projects p ON p.id = t.project_id WHERE t.id = ?',
+        ).get(existing.taskId) as { status: string } | undefined
+        if (claimingProject?.status !== 'running') {
           return existing
         }
       }

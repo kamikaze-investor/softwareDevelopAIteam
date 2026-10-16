@@ -900,6 +900,24 @@ describe('running transition', () => {
     expect(alert).not.toHaveBeenCalled()
   })
 
+  it('treats a structured { ok: false } claim result as failure and never runs the Job (W5)', async () => {
+    // patchJobWithRetry() は失敗時に { ok: false } を返す。truthy なので以前は claim 成功とみなされていた。
+    const executeJob = vi.fn()
+    const reconcileJob = vi.fn().mockResolvedValue({ outcome: 'reconciled' as const, updated: false, currentStatus: 'queued' as const })
+
+    const status = await processQueuedWork({ job, task, jobs: [job] }, {
+      patchJob: vi.fn().mockResolvedValue({ ok: false }),
+      reconcileJob,
+      executeJob,
+      alert: vi.fn().mockResolvedValue([]),
+      now: () => NOW,
+    })
+
+    expect(status).toBeNull()
+    expect(executeJob).not.toHaveBeenCalled()
+    expect(reconcileJob).toHaveBeenCalledTimes(1)
+  })
+
   it('sends CRITICAL and skips runJob only when reconciliation is unrecoverable', async () => {
     const executeJob = vi.fn()
     const alert = vi.fn().mockResolvedValue([])

@@ -612,15 +612,48 @@ describe('Project API', () => {
       })
     })
 
-    it('a blocked row left on a done Task is history and does not block archive', async () => {
+    it('a blocked row left on a done Task still blocks archive: release is only proven by a Worker observation', async () => {
+      // Worker はこの行を、worktree clean / git 操作なし / HEAD 解決可能と観測するまで所有者として扱う。
+      // その観測は API 側に永続化されていないので、done を理由に履歴とはみなさない（fail-closed）。
       await withApp(async (app) => {
         const project = await createProject(app, { status: 'paused' })
         await createProjectJob(project.id, 'blocked', 'done')
 
         const res = await patchStatus(app, project.id, 'archived')
 
+        expect(res.statusCode).toBe(409)
+        expect(parseBody<{ blockers: string[] }>(res.body).blockers).toEqual(['blocked_job'])
+      })
+    })
+
+    it('a terminalized (failed) Job on a done Task does not block archive', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app, { status: 'paused' })
+        await createProjectJob(project.id, 'failed', 'done')
+
+        const res = await patchStatus(app, project.id, 'archived')
+
         expect(res.statusCode).toBe(200)
-        expect(parseBody<Project>(res.body).status).toBe('archived')
+      })
+    })
+
+    it("attributes a moving Job to the Task's Project, not to the Job's own projectId", async () => {
+      await withApp(async (app) => {
+        const storage = await storageOf()
+        const project = await createProject(app, { status: 'paused' })
+        const other = await createProject(app, { status: 'draft' })
+        const task = storage.tasks.create({
+          projectId: project.id, title: 'T', description: '', status: 'pending',
+          assignee: 'developer_ai', dependencies: [],
+        })
+        // storage は不一致な project_id を許す（POST /api/jobs は拒否する）。判定は Task 側で行う。
+        storage.jobs.create({
+          taskId: task.id, projectId: other.id, agentRole: 'developer_ai', status: 'queued',
+          safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+        })
+
+        expect((await patchStatus(app, project.id, 'archived')).statusCode).toBe(409)
+        expect((await patchStatus(app, other.id, 'archived')).statusCode).toBe(200)
       })
     })
 

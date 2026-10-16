@@ -67,9 +67,14 @@ function mockEndpoints(input: {
   projects: Project[]
   tasksByProjectId: Record<string, Task[]>
   jobsByTaskId: Record<string, Job[]>
+  /** この部分文字列を含む URL は 500 を返す（一覧取得の失敗注入）。 */
+  failingUrls?: string[]
 }): void {
   fetchMock.mockImplementation(async (url) => {
     const href = String(url)
+    if (input.failingUrls?.some((fragment) => href.includes(fragment))) {
+      return new Response('unavailable', { status: 500 })
+    }
     const body = href.includes('/api/projects')
       ? input.projects
       : href.includes('/api/tasks?projectId=')
@@ -292,6 +297,33 @@ describe('fetchQueuedJob workspace exclusivity', () => {
 
     expect(result).toBeNull()
     expect(warn.mock.calls.some(([message]) => String(message).includes('task-b, task-a'))).toBe(true)
+    warn.mockRestore()
+  })
+
+  it.each([
+    ["the paused Project's Task listing", '/api/tasks?projectId=project-paused'],
+    ["the paused owner's Job listing", '/api/jobs?taskId=task-a'],
+  ])('claims nothing when %s cannot be read (fail-closed, W5)', async (_label, failingUrl) => {
+    // 読めなかった一覧を飛ばすと、paused Project の blocked 所有者が判定から消え、
+    // running Project の initial-implement を claim してしまう。
+    const taskA = task({ id: 'task-a', projectId: 'project-paused', status: 'blocked' })
+    const taskB = task({ id: 'task-b', projectId: 'project-1' })
+    mockEndpoints({
+      projects: [project({ id: 'project-paused', status: 'paused' }), project()],
+      tasksByProjectId: { 'project-1': [taskB], 'project-paused': [taskA] },
+      jobsByTaskId: {
+        'task-a': [job({ id: 'job-a-1', taskId: 'task-a', status: 'blocked' })],
+        'task-b': [job({
+          id: 'job-b-1', taskId: 'task-b', status: 'queued', workflowStepKey: 'task:task-b:initial-implement',
+        })],
+      },
+      failingUrls: [failingUrl],
+    })
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+
+    const result = await fetchQueuedJob()
+
+    expect(result).toBeNull()
     warn.mockRestore()
   })
 
