@@ -12,7 +12,9 @@ import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
-import { ensureInitialWorkflowsForActiveTasks } from '../ctoAi/projectInitialization'
+import { ensureInitialWorkflowsForActiveTasks, recoverReadyTasksWithoutJob } from '../ctoAi/projectInitialization'
+import { executeQueuedRun } from '../designReview/queuedRunDispatch'
+import { buildSystemState } from '../state/systemState'
 import { adoptRoadmapItem, buildAdoptedDescription } from '../ctoAi/roadmapAdoption'
 import {
   buildRemediatedScope,
@@ -882,5 +884,74 @@ describe('applyRevisedSpec — rawScope と submittedScope を取り違えない
 
     expect(details).toContain('rejected_fspec=')
     expect(details).not.toContain('rejected_fspec=-')
+  })
+})
+/**
+ * **判定がまだ出ていない fresh Review は否定扱いしない**（独立レビュー round 5・2026-10-16）。
+ *
+ * requeued を still_not_aligned に潰すと、後で rekick が ALIGNED evidence を登録しても誰も
+ * Job を作らない。pending として返し、継続は保存済み状態から既存 `recoverReadyTasksWithoutJob()`
+ * が導く（同じ `createInitialImplementWorkflow()`・stepKey 一意で1回だけ）。
+ */
+describe('fresh Review が判定を出さなかった（requeued）場合', () => {
+  function runnerDeps(stdout: string) {
+    return {
+      runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+      execute: async () => ({ ok: true, stdout, timedOut: false }),
+    }
+  }
+
+  async function remediateWithPendingReview() {
+    const seeded = seedConflictedTask({ roadmapTaskKey: 'conflicted-item#2' })
+    const { storage, taskId } = seeded
+    const result = await runRemediationStep(storage, taskId, deps({
+      adopt: (s, input) => adoptRoadmapItem(s, input, {
+        ensureInitialWorkflows: (st, pid) => ensureInitialWorkflowsForActiveTasks(st, pid, runnerDeps('null')),
+      }),
+    }))
+    return { ...seeded, result }
+  }
+
+  it('review_pending を返し、Job を作らず、run は queued のまま残る', async () => {
+    const { storage, taskId, result } = await remediateWithPendingReview()
+
+    expect(result).toMatchObject({ status: 'review_pending', taskId })
+    expect(storage.jobs.findByTaskId(taskId)).toEqual([])
+    expect(storage.designReviewRuns.findLatestByTaskId(taskId)?.status).toBe('queued')
+  })
+
+  it('rekick で同じ run が ALIGNED になれば、既存の回収が Job を1回だけ作る（rekick 自体は作らない）', async () => {
+    const { storage, taskId } = await remediateWithPendingReview()
+    const run = storage.designReviewRuns.findLatestByTaskId(taskId)!
+
+    // design_review_idle → rekick_design_review が使う経路と同じ dispatcher。
+    const rekicked = await executeQueuedRun(storage, run, runnerDeps(ALIGNED_RESULT_JSON))
+    expect(rekicked).toMatchObject({ kind: 'review', result: { status: 'evidence_registered' } })
+    expect(storage.jobs.findByTaskId(taskId)).toEqual([])
+
+    const first = await recoverReadyTasksWithoutJob(storage, runnerDeps(ALIGNED_RESULT_JSON))
+    const second = await recoverReadyTasksWithoutJob(storage, runnerDeps(ALIGNED_RESULT_JSON))
+
+    expect(first.recovered).toBe(1)
+    expect(second.recovered).toBe(0)
+    expect(storage.jobs.findByTaskId(taskId)).toHaveLength(1)
+    // 同じ run を再度 rekick しても終端済みなので何も起きない。
+    expect(await executeQueuedRun(storage, storage.designReviewRuns.findById(run.id)!, runnerDeps(ALIGNED_RESULT_JSON)))
+      .toMatchObject({ kind: 'review', result: { status: 'not_claimable' } })
+    expect(storage.jobs.findByTaskId(taskId)).toHaveLength(1)
+  })
+
+  it('attempt 上限で failed になれば、既存の design_review_failed attention になる', async () => {
+    const { storage, taskId } = await remediateWithPendingReview()
+    const runId = storage.designReviewRuns.findLatestByTaskId(taskId)!.id
+    for (let i = 0; i < 5; i += 1) {
+      const current = storage.designReviewRuns.findById(runId)!
+      if (current.status !== 'queued') break
+      await executeQueuedRun(storage, current, runnerDeps('null'))
+    }
+
+    expect(storage.designReviewRuns.findById(runId)?.status).toBe('failed')
+    expect(buildSystemState(storage).attention.some((item) =>
+      item.kind === 'design_review_failed' && item.referenceId === runId)).toBe(true)
   })
 })

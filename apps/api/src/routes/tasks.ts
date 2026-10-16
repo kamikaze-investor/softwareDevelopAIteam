@@ -30,6 +30,7 @@ import type { CoordinatorDeps } from '../designReview/designReviewCoordinator'
 import { classifyResumeActorFromRequest, recordResumeActor } from '../designReview/resumeActor'
 import {
   RESUME_DESIGN_REVIEW_FAILED,
+  RESUME_DESIGN_REVIEW_PENDING,
   resumeBlockedTaskWithDesignReview,
 } from '../designReview/resumeBlockedTask'
 
@@ -543,6 +544,12 @@ export async function taskRoutes(
         ? { coordinatorDeps: options.resumeDesignReviewDeps }
         : {}),
     })
+
+    // 判定がまだ出ていないだけ。否定ではないので 409 にせず、同じ instruction の再送で
+    // 同じ queued run が再開されることを示す（503 + retryable）。
+    if (!resumed.ok && resumed.code === RESUME_DESIGN_REVIEW_PENDING) {
+      return reply.status(503).send({ error: resumed.reason, code: resumed.code, retryable: true })
+    }
 
     if (!resumed.ok && resumed.code === RESUME_DESIGN_REVIEW_FAILED) {
       return reply.status(409).send({

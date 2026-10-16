@@ -346,6 +346,13 @@ export type ConflictRoundStatus =
   | 'challenge_not_aligned'
   /** 同一 (spec, finding) の再評価は既に使い切っている。 */
   | 'challenge_cap_reached'
+  /**
+   * 再評価 / 修正版の fresh Review が**まだ判定を出していない**（run が queued に戻った）。
+   * 否定的な判定ではないので escalation しない。run は design_review_idle → rekick で再開され、
+   * ALIGNED なら既存 `recoverReadyTasksWithoutJob()` が `createInitialImplementWorkflow()` で
+   * Job を作る（stepKey 一意で1回だけ）。CONFLICT なら次の Round がその判定から始まる。
+   */
+  | 'review_pending'
   /** Independent Remediation へ移行した（結果は `remediation` に入る）。 */
   | 'remediation'
   /** Round 予算を使い切った。 */
@@ -506,6 +513,24 @@ async function runChallenge(
     },
     deps.coordinatorDeps ?? buildDefaultCoordinatorDeps(),
   )
+
+  // **requeued は判定ではない。** 評価済み（outcome=evaluated）とも否定とも記録しない。
+  // 再評価 run は queued のまま残り、design_review_idle → rekick で同じ run が判定まで進む。
+  // Challenge は1回きりのまま —— 新しい run を引き直さず、この run の判定がこの Challenge の
+  // 判定になる（上の starting 行は「この Challenge は始まった」の記録として残す）。
+  if (outcome.status === 'requeued') {
+    recordRemediationFailure(
+      storage,
+      taskId,
+      `stage=challenge chal=${key} orig_verdict=CONFLICT outcome=pending`
+      + ` reason=${outcome.decision ?? 'no_judgment'}`,
+    )
+    return {
+      ...base,
+      status: 'review_pending',
+      reason: 'the fresh re-evaluation has not produced a judgment yet; the queued run will be resumed',
+    }
+  }
 
   const verdict = outcome.decision ?? outcome.status
   // verdict reversal を観測可能な事実として残す（新しい metrics backend は作らない）。
@@ -760,6 +785,9 @@ async function runPlRevision(
   }
   if (outcome.status === 'still_not_aligned') {
     return { ...base, status: 'revised_not_aligned', failureCode: outcome.failureCode, reason: outcome.reason }
+  }
+  if (outcome.status === 'review_pending') {
+    return { ...base, status: 'review_pending', taskId: outcome.taskId, reason: outcome.reason }
   }
   return { ...base, status: 'revision_rejected', failureCode: outcome.failureCode, reason: outcome.reason }
 }

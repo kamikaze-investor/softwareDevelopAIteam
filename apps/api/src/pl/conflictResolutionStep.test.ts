@@ -6,7 +6,8 @@ import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
-import { ensureInitialWorkflowsForActiveTasks } from '../ctoAi/projectInitialization'
+import { ensureInitialWorkflowsForActiveTasks, recoverReadyTasksWithoutJob } from '../ctoAi/projectInitialization'
+import { executeQueuedRun } from '../designReview/queuedRunDispatch'
 import { adoptRoadmapItem, buildAdoptedDescription } from '../ctoAi/roadmapAdoption'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
 import {
@@ -600,5 +601,50 @@ describe('parsePlRevision', () => {
   it('空の allowedPaths / acceptanceCriteria は拒否する', () => {
     expect(parsePlRevision(JSON.stringify({ ...PL_REVISION, allowedPaths: [] }))).toBeUndefined()
     expect(parsePlRevision(JSON.stringify({ ...PL_REVISION, acceptanceCriteria: [] }))).toBeUndefined()
+  })
+})
+/**
+ * **Challenge の再評価が判定を出さなかった（requeued）場合**（独立レビュー round 5・2026-10-16）。
+ *
+ * 評価済み・否定として記録せず pending で返す。同じ run が rekick で判定まで進み、ALIGNED なら
+ * 既存 `recoverReadyTasksWithoutJob()` が Job を1回だけ作る。Challenge を引き直すことはしない。
+ */
+describe('Challenge の再評価が requeued になった場合', () => {
+  function coordinator(stdout: string) {
+    return {
+      runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+      execute: async () => ({ ok: true, stdout, timedOut: false }),
+    }
+  }
+
+  it('review_pending を返し、evaluated と記録せず、Job も作らない', async () => {
+    const { storage, taskId } = seed()
+
+    const result = await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
+      coordinatorDeps: coordinator('null'),
+      ensureJob: async () => { throw new Error('must not create a job before a judgment') },
+    }) as never)
+
+    expect(result).toMatchObject({ stage: 'challenge', status: 'review_pending' })
+    const details = stageEntries(storage, taskId, 'challenge').map((entry) => entry.detail ?? '')
+    expect(details.some((detail) => detail.includes('outcome=evaluated'))).toBe(false)
+    expect(details.some((detail) => detail.includes('outcome=pending'))).toBe(true)
+    expect(storage.designReviewRuns.findLatestByTaskId(taskId)?.status).toBe('queued')
+  })
+
+  it('同じ run が rekick で ALIGNED になれば、既存の回収が Job を1回だけ作る', async () => {
+    const { storage, taskId } = seed()
+    await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
+      coordinatorDeps: coordinator('null'),
+    }) as never)
+    const run = storage.designReviewRuns.findLatestByTaskId(taskId)!
+
+    await executeQueuedRun(storage, run, coordinator(ALIGNED_RESULT_JSON))
+    expect(storage.designReviewEvidence.findLatestByTaskId(taskId)?.decision).toBe('ALIGNED')
+    expect(storage.jobs.findByTaskId(taskId)).toEqual([])
+
+    expect((await recoverReadyTasksWithoutJob(storage, coordinator(ALIGNED_RESULT_JSON))).recovered).toBe(1)
+    expect((await recoverReadyTasksWithoutJob(storage, coordinator(ALIGNED_RESULT_JSON))).recovered).toBe(0)
+    expect(storage.jobs.findByTaskId(taskId)).toHaveLength(1)
   })
 })

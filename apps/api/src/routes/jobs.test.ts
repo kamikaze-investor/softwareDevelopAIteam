@@ -813,8 +813,14 @@ describe('Job API', () => {
           payload: { instruction: 'Resume with a new plan.' },
         })
 
-        expect(res.statusCode).toBe(409)
-        expect(parseBody<{ error: string }>(res.body).error).toContain('Design Review')
+        // test 環境の runner は判定を返さない（requeued）。否定的な判定ではないので 409 ではなく
+        // 503 + retryable で「同じ instruction の再送で同じ run が再開される」ことを返す。
+        // evidence が無い resume を通さない（Job を作らない）ことは従来どおり。
+        expect(res.statusCode).toBe(503)
+        const body = parseBody<{ error: string; code: string; retryable: boolean }>(res.body)
+        expect(body.error).toContain('Design Review')
+        expect(body).toMatchObject({ code: 'RESUME_DESIGN_REVIEW_PENDING', retryable: true })
+        expect(storage.jobs.findByTaskId(task.id).filter((job) => job.status === 'queued')).toEqual([])
       })
     })
   })

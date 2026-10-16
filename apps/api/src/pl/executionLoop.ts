@@ -104,7 +104,7 @@ import {
 import type { AuditLogEntry } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
 import { recordResumeActor } from '../designReview/resumeActor'
-import { resumeBlockedTaskWithDesignReview } from '../designReview/resumeBlockedTask'
+import { RESUME_DESIGN_REVIEW_PENDING, resumeBlockedTaskWithDesignReview } from '../designReview/resumeBlockedTask'
 import {
   countPlTechnicalResumes,
   PL_MAX_TECHNICAL_RESUMES_PER_TASK,
@@ -686,6 +686,15 @@ async function remediateConflict(
   const reason = result?.reason ?? round.reason
   const provider = result?.provider ?? round.criticProvider
   const model = result?.model ?? round.criticModel
+
+  // **fresh Review がまだ判定を出していない（requeued）。** 否定的な判定ではないので
+  // 試行として数えず（'idle' は ATTEMPT_RESULTS に入らない）、escalation もしない。
+  // queued run は design_review_idle → rekick で再開され、ALIGNED なら既存
+  // `recoverReadyTasksWithoutJob()` が Job を作る。CONFLICT ならこの Round の続きがそこから始まる。
+  if (status === 'review_pending') {
+    record(storage, key, 'idle', `stage=${round.stage} outcome=${status} ${reason ?? ''}`)
+    return { status: 'idle', reason: `design review pending (stage=${round.stage}): ${reason ?? ''}` }
+  }
 
   /** 設計が既存 Review Pipeline を通って実装へ進める状態になったか。 */
   const resolved = status === 'remediated'
@@ -1429,7 +1438,7 @@ async function executeAction(
   item: AttentionItem,
   deps: Required<Pick<PlLoopDeps, 'rekickDesignReview'>> & PlLoopDeps,
   technicalResume: boolean,
-): Promise<{ ok: boolean; summary: string; stale?: boolean }> {
+): Promise<{ ok: boolean; summary: string; stale?: boolean; pending?: boolean }> {
   if (kind === 'escalate_to_ceo') {
     // Escalation は「実行」ではなく報告である。ここでは成功扱いにせず、呼び出し側が escalated を返す。
     return { ok: true, summary: 'escalation requested by PL' }
@@ -1494,6 +1503,12 @@ async function executeAction(
       ),
       ...(deps.coordinatorDeps !== undefined ? { coordinatorDeps: deps.coordinatorDeps } : {}),
     })
+    // 判定がまだ出ていない Design Review は否定ではない。試行を消費せず、attention を残す。
+    // 次の tick で同じ（決定的な）instruction を再送すれば、active-run dedup で同じ run が
+    // 再開され、ALIGNED evidence があれば resume が通る。
+    if (!resumed.ok && resumed.code === RESUME_DESIGN_REVIEW_PENDING) {
+      return { ok: false, pending: true, summary: `resume pending: ${resumed.reason}` }
+    }
     if (!resumed.ok) {
       return { ok: false, summary: `resume refused: ${resumed.reason}` }
     }
@@ -1884,14 +1899,15 @@ async function handleTarget(
       }),
   }, diagnosis.rootCauseClass === 'review_execution_failed')
 
-  // 対象が既に actionable でない（run の差し替え等）。何も実行していないので試行として記録しない。
-  if (execution.stale) {
+  // 対象が既に actionable でない（run の差し替え等）、または Design Review の判定がまだ出ていない
+  // （pending）。どちらも否定的な結果ではなく何も実行していないので、試行として記録しない。
+  if (execution.stale || execution.pending) {
     return {
       status: 'idle',
       target,
       triage,
       proposedKind: proposal.kind,
-      reason: `stale target: ${execution.summary}`,
+      reason: execution.stale ? `stale target: ${execution.summary}` : execution.summary,
       attempt,
     }
   }

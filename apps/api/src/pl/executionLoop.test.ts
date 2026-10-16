@@ -2040,6 +2040,41 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     expect(readResumeActorClasses(storage, storage.jobs.findByTaskId(taskId)).get(resumeJob!.id)).toBe('pl')
   })
 
+  // **判定が出ていない resume の Design Review は否定ではない**（独立レビュー round 5・2026-10-16）。
+  // 試行を消費せず attention を残し、次の tick で同じ instruction を再送すると active-run dedup で
+  // **同じ run** が再開され、ALIGNED なら resume Job が1回だけ作られる。
+  it('a resume re-review with no judgment yet is pending: no attempt, no escalation, same run resumes later', async () => {
+    const { storage, taskId, projectId } = seed()
+    const sourceJobId = blockedAiCliJob(storage, taskId, projectId)
+    const escalations: string[] = []
+    const noJudgment = { ...alignedCoordinatorDeps, execute: async () => ({ ok: true as const, timedOut: false, stdout: 'null' }) }
+
+    const pending = await runPlTick(storage, deps({
+      diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: 'technical recovery', riskLevel: 'LOW' }),
+      escalate: async (p) => { escalations.push(p.title); return DELIVERED },
+      coordinatorDeps: noJudgment,
+    }))
+
+    expect(pending.status).toBe('idle')
+    expect(pending.reason).toContain('resume pending')
+    expect(escalations).toEqual([])
+    expect(countPriorAttempts(storage, `job_blocked:${sourceJobId}`)).toBe(0)
+    const queuedRun = storage.designReviewRuns.findActiveByTaskId(taskId)
+    expect(queuedRun?.status).toBe('queued')
+    expect(storage.jobs.findByTaskId(taskId).some((j) => j.workflowStepKey === `resume:${sourceJobId}:1`)).toBe(false)
+
+    resetPlLoopInFlightForTest()
+    const resumed = await runPlTick(storage, deps({
+      diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: 'technical recovery', riskLevel: 'LOW' }),
+      coordinatorDeps: alignedCoordinatorDeps,
+    }))
+
+    expect(resumed.status).toBe('acted')
+    // 新しい run を引き直さず、同じ queued run が判定まで進んだ。
+    expect(storage.designReviewRuns.findById(queuedRun!.id)?.status).toBe('succeeded')
+    expect(storage.jobs.findByTaskId(taskId).filter((j) => j.workflowStepKey === `resume:${sourceJobId}:1`)).toHaveLength(1)
+  })
+
   it('a CONFLICT re-review creates no resume Job and leaves the source blocked', async () => {
     const { storage, taskId, projectId } = seed()
     const sourceJobId = blockedAiCliJob(storage, taskId, projectId)

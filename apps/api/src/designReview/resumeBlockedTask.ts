@@ -7,12 +7,19 @@ import {
 } from './designReviewCoordinator'
 
 export const RESUME_DESIGN_REVIEW_FAILED = 'RESUME_DESIGN_REVIEW_FAILED' as const
+/**
+ * Resume instruction の Design Review が**まだ判定を出していない**（runner が判定を返さず
+ * run が queued に戻った）。否定的な判定ではない。同じ instruction で再度呼べば、
+ * `designReviewRuns.create()` の active-run dedup により**同じ run** が再開され、ALIGNED に
+ * なっていればその evidence で resume が通る（継続は保存済み状態から導かれる）。
+ */
+export const RESUME_DESIGN_REVIEW_PENDING = 'RESUME_DESIGN_REVIEW_PENDING' as const
 
 export type ResumeBlockedTaskWithDesignReviewResult =
   | ResumeBlockedTaskResult
   | {
       ok: false
-      code: typeof RESUME_DESIGN_REVIEW_FAILED
+      code: typeof RESUME_DESIGN_REVIEW_FAILED | typeof RESUME_DESIGN_REVIEW_PENDING
       reason: string
       reviewError?: string
     }
@@ -47,6 +54,14 @@ export async function resumeBlockedTaskWithDesignReview(
       changedFiles: [],
     }, input.coordinatorDeps ?? buildDefaultCoordinatorDeps())
 
+    if (review.status === 'requeued') {
+      return {
+        ok: false,
+        code: RESUME_DESIGN_REVIEW_PENDING,
+        reason: 'Resume instruction Design Review has not produced a judgment yet; retry the same instruction',
+        ...(review.error !== undefined ? { reviewError: review.error } : {}),
+      }
+    }
     if (review.status !== 'evidence_registered') {
       return {
         ok: false,

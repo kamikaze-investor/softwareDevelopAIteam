@@ -236,6 +236,13 @@ export type PlRemediationStatus =
   | 'adoption_rejected'
   /** 採用し直したが fresh Review が通らず Job が作られなかった。 */
   | 'still_not_aligned'
+  /**
+   * 採用し直した fresh Review が**まだ判定を出していない**（runner が判定を返さず run が
+   * queued に戻った）。否定的な判定ではないので escalation しない。run は
+   * design_review_idle → rekick で再開され、ALIGNED になれば既存の
+   * `recoverReadyTasksWithoutJob()` が同じ `createInitialImplementWorkflow()` で Job を作る。
+   */
+  | 'review_pending'
   /** fresh Review が通り implement Job が作られた。 */
   | 'remediated'
 
@@ -866,6 +873,9 @@ export async function runRemediationStep(
       reason: outcome.reason,
     }
   }
+  if (outcome.status === 'review_pending') {
+    return { ...common, status: 'review_pending', taskId: outcome.taskId, reason: outcome.reason }
+  }
   return {
     ...common,
     status: outcome.status === 'blocked'
@@ -879,6 +889,7 @@ export async function runRemediationStep(
 /** 修正版 spec を適用した結果。Remediation と PL revision が共有する。 */
 export type ApplyRevisedSpecOutcome =
   | { status: 'applied'; taskId: string; proposedHash: string; specKey: string }
+  | { status: 'review_pending'; taskId: string; reason: string; proposedHash: string; specKey: string }
   | {
       status: 'not_materially_different' | 'blocked' | 'adoption_rejected' | 'still_not_aligned'
       failureCode: string
@@ -1037,6 +1048,19 @@ export async function applyRevisedSpec(
     (job) => job.aiCliPrompt !== undefined && computeDesignTextHash(job.aiCliPrompt) === proposedHash,
   )
   if (!applied) {
+    // **判定がまだ出ていないだけなら否定扱いしない。** この spec の fresh Review run が
+    // queued のまま残っている（runner が判定を返さず requeue された）なら pending として返す。
+    // 判定は保存済みの run から引き直す（メモリ上の結果を持ち回らない）。
+    const active = storage.designReviewRuns.findActiveByTaskId(result.taskId)
+    if (active !== undefined && active.designTextHash === proposedHash) {
+      return {
+        status: 'review_pending',
+        taskId: result.taskId,
+        reason: `the fresh design review of the revised design has not produced a judgment yet (run ${active.id} is ${active.status})`,
+        proposedHash,
+        specKey,
+      }
+    }
     return {
       status: 'still_not_aligned',
       failureCode: 'fresh_review_not_aligned',
