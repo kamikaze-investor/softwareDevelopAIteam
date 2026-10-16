@@ -965,10 +965,20 @@ function readDurableRunOutcome(storage: IStorage, runId: string): ExecuteDesignR
     ? storage.designReviewEvidence.findByTaskId(run.taskId)
       .find((item) => item.designTextHash === run.designTextHash && item.decision === 'ALIGNED')
     : storage.designReviewEvidence.findLatestBySubjectId(run.reviewKind, run.subjectId)
-  if (evidence !== undefined && evidence.designTextHash === run.designTextHash && evidence.decision === 'ALIGNED') {
+  if (evidence === undefined || evidence.designTextHash !== run.designTextHash || evidence.decision !== 'ALIGNED') {
+    return undefined
+  }
+  // **evidence も単一の失効規則を通す。** 読み直すまでの間に、同じ設計の新しい run が始まっている・
+  // CONFLICT で終わっていることがある。その evidence を返すと最新の判定を上書きする（独立レビュー round 9）。
+  const superseding = storage.designReviewEvidence.findSupersedingRun(evidence)
+  if (superseding === undefined) {
     return { status: 'evidence_registered', decision: 'ALIGNED', evidence }
   }
-  return undefined
+  if (superseding.status === 'queued' || superseding.status === 'running') {
+    return { status: 'requeued', error: `a newer design review run ${superseding.id} for the same design is ${superseding.status}` }
+  }
+  return readDurableRunOutcome(storage, superseding.id)
+    ?? { status: 'not_aligned', error: `a newer design review run ${superseding.id} for the same design did not align` }
 }
 
 export interface CreateAndExecuteRoadmapReviewInput {

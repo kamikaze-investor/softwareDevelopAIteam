@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach, vi, afterAll } from 'vitest'
+import { describe, expect, it, beforeEach, afterEach, vi, afterAll } from 'vitest'
 import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -1355,6 +1355,69 @@ describe('別 executor が終端させた run の読み直し（独立レビュ�
       { taskId, taskTitle: 'design', designText, changedFiles: LOW_LOAD_FILES },
       deps(async () => { throw new Error('must not run') }),
     )
+
+    expect(result).toMatchObject({ status: 'not_aligned', decision: 'CONFLICT' })
+    expect(result.evidence).toBeUndefined()
+  })
+})
+describe('読み直しの evidence も単一の失効規則を通す（独立レビュー round 9）', () => {
+  afterEach(() => { vi.useRealTimers() })
+
+  const ALIGNED_LOW = JSON.stringify({
+    focusedReviewResults: [],
+    integrationReviewResult: { decision: 'ALIGNED' },
+    finalDecision: 'ALIGNED',
+  })
+  const CONFLICT_LOW = JSON.stringify({
+    focusedReviewResults: [],
+    integrationReviewResult: { decision: 'CONFLICT' },
+    finalDecision: 'CONFLICT',
+  })
+
+  /**
+   * 別 executor がこの run を ALIGNED で終端させ、その直後に同じ設計の新しい run が起票された、
+   * という読み直しの競合を作る。`after` が新しい run をどう終わらせるかを決める。
+   */
+  async function rereadWithNewerRun(after: (storage: IStorage, newerRunId: string) => void) {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-16T09:00:00.000Z'))
+    const storage = createStorage()
+    const taskId = seedTask(storage)
+    const designText = 'design text'
+    const designTextHash = computeHashForTest(designText)
+    const claim = storage.designReviewRuns.claim
+    storage.designReviewRuns.claim = (id, max) => {
+      const won = claim.call(storage.designReviewRuns, id, max)
+      storage.designReviewRuns.completeWithEvidence(id, won.claimToken!, ALIGNED_LOW, {
+        reviewKind: 'task', subjectId: taskId, taskId, designTextHash,
+        reviewLoad: 'low', decision: 'ALIGNED', independentReviewRequired: false,
+      })
+      vi.setSystemTime(new Date('2026-10-16T09:10:00.000Z'))
+      storage.designReviewRuns.claim = claim
+      const newer = storage.designReviewRuns.create({ ...baseInput(taskId), designText, designTextHash })
+      after(storage, newer.id)
+      return {}
+    }
+
+    return createAndExecuteDesignReview(
+      storage,
+      { taskId, taskTitle: 'design', designText, changedFiles: LOW_LOAD_FILES },
+      deps(async () => { throw new Error('must not run') }),
+    )
+  }
+
+  it('新しい同じ設計の run が active なら evidence_registered にせず requeued', async () => {
+    const result = await rereadWithNewerRun(() => {})
+
+    expect(result.status).toBe('requeued')
+    expect(result.evidence).toBeUndefined()
+  })
+
+  it('新しい同じ設計の run が CONFLICT で終わっていれば not_aligned / CONFLICT', async () => {
+    const result = await rereadWithNewerRun((storage, newerRunId) => {
+      const claimed = storage.designReviewRuns.claim(newerRunId, 3)
+      storage.designReviewRuns.complete(newerRunId, claimed.claimToken!, 'succeeded', CONFLICT_LOW)
+    })
 
     expect(result).toMatchObject({ status: 'not_aligned', decision: 'CONFLICT' })
     expect(result.evidence).toBeUndefined()

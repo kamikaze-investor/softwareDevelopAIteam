@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import os from 'node:os'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -465,5 +465,42 @@ describe('U2: ALIGNED 終端した repair run の successor を回収する', ()
       expect(repairJobsOf(storage, ids.taskId, stepKey)).toHaveLength(0)
       expect(storage.tasks.findById(ids.taskId)?.status).not.toBe('blocked')
     })
+  })
+})
+/**
+ * **R1 の ALIGNED evidence は、より新しい同じ hash の R2 CONFLICT に覆される**（独立レビュー round 9）。
+ * 回収は R1 自身が ALIGNED でも、覆された evidence を根拠に repair Job を作らない。
+ */
+describe('U2: 新しい同じ設計の判定に覆された evidence からは回収しない', () => {
+  afterEach(() => { vi.useRealTimers() })
+
+  it('R1 ALIGNED evidence → 新しい同じ hash の R2 CONFLICT → startup 回収は repair Job を作らない', () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-16T09:00:00.000Z'))
+    const storage = createSQLiteStorage(':memory:')
+    const { ids, run: r1, stepKey } = seedTerminalAlignedRepairRun(storage)
+
+    vi.setSystemTime(new Date('2026-10-16T09:10:00.000Z'))
+    const r2 = storage.designReviewRuns.create({
+      taskId: ids.taskId,
+      taskTitle: 'U2 task',
+      designText: r1.designText,
+      designTextHash: r1.designTextHash,
+      changedFiles: r1.changedFiles,
+      repairSourceJobId: r1.repairSourceJobId,
+    })
+    const claimed = storage.designReviewRuns.claim(r2.id, 3)
+    storage.designReviewRuns.complete(r2.id, claimed.claimToken!, 'succeeded', JSON.stringify({
+      focusedReviewResults: [],
+      integrationReviewResult: { decision: 'CONFLICT' },
+      finalDecision: 'CONFLICT',
+    }))
+
+    recoverTerminalRepairSuccessors(storage)
+    // R1 を名指しで回収しても同じ。
+    const outcome = recoverTerminalRepairSuccessor(storage, storage.designReviewRuns.findById(r1.id)!)
+
+    expect(outcome.status).toBe('skipped')
+    expect(repairJobsOf(storage, ids.taskId, stepKey)).toHaveLength(0)
   })
 })
