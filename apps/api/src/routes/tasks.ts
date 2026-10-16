@@ -618,6 +618,7 @@ export async function taskRoutes(
         || resumed.code === 'TASK_DONE'
         || resumed.code === 'PROJECT_NOT_RUNNING'
         || resumed.code === 'HUMAN_DECISION_PENDING'
+        || resumed.code === 'RESUME_TARGET_CHANGED'
       ) {
         return reply.status(409).send({ error: resumed.reason, code: resumed.code })
       }

@@ -2862,6 +2862,33 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     expect(counter.count()).toBe(1)
   })
 
+  it('cooldown wait does not hide the same Job when the PL would resume it with a different instruction', async () => {
+    const { storage, taskId, projectId } = seed()
+    const source = blockedAiCliJob(storage, taskId, projectId)
+    const noJudgment = { ...alignedCoordinatorDeps, execute: async () => ({ ok: true as const, timedOut: false, stdout: 'null' }) }
+    // The cooling review was requested for this Job with instruction A (e.g. another resume actor).
+    await runPlTick(storage, deps({
+      diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: 'technical recovery', riskLevel: 'LOW' }),
+      coordinatorDeps: noJudgment,
+      resumeInstruction: 'instruction A',
+    }))
+    const run = storage.designReviewRuns.findActiveByTaskId(taskId)!
+    expect(run).toMatchObject({ status: 'queued', attemptCount: 1, resumeSourceJobId: source })
+
+    // Same instruction: proven to wait on this run, so there is no diagnosis.
+    const same = diagnoseCounter()
+    resetPlLoopInFlightForTest()
+    await runPlTick(storage, deps({ diagnose: same.diagnose, coordinatorDeps: alignedCoordinatorDeps, resumeInstruction: 'instruction A' }))
+    expect(same.count()).toBe(0)
+
+    // Different instruction B: the PL's resume would not use this run, so the Job stays actionable.
+    const other = diagnoseCounter()
+    resetPlLoopInFlightForTest()
+    const tick = await runPlTick(storage, deps({ diagnose: other.diagnose, coordinatorDeps: alignedCoordinatorDeps, resumeInstruction: 'instruction B' }))
+    expect(tick.target?.key).toBe(`job_blocked:${source}`)
+    expect(other.count()).toBe(1)
+  })
+
   it('cooldown wait does not hide an older blocked Job that the resume would not target', async () => {
     const { storage, taskId, projectId } = seed()
     const older = blockedAiCliJob(storage, taskId, projectId)

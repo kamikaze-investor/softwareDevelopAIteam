@@ -83,10 +83,14 @@ export async function resumeBlockedTaskWithDesignReview(
       }
     }
 
+    // review を起票したときの resume 対象を固定する。待つ間に別の Job が最新になっていたら
+    // storage が RESUME_TARGET_CHANGED で拒否する（review が見ていない Job を resume しない）。
+    const reviewedSourceJobId = resumed.sourceJobId
     resumed = storage.jobs.resumeBlockedTask({
       taskId: input.task.id,
       instructionPrompt: input.instructionPrompt,
       resumedBy: input.resumedBy,
+      ...(reviewedSourceJobId !== undefined ? { expectedSourceJobId: reviewedSourceJobId } : {}),
     })
   }
 

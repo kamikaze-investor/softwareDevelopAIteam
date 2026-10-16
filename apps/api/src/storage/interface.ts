@@ -62,6 +62,11 @@ export type ResumeBlockedTaskResult =
          * WAITING の abort_task 等）がある間は行わない。否定ではなく正当な人の判断待ち。
          */
         | 'HUMAN_DECISION_PENDING'
+        /**
+         * Design Review を待つ間に resume 対象（最新 Job）が変わった。何も作っていない。
+         * 否定ではなく再試行可能（PL は pending、route は 409）。
+         */
+        | 'RESUME_TARGET_CHANGED'
       reason: string
       /**
        * `DESIGN_REVIEW_PRECONDITION_FAILED` のときだけ入る、この resume が再開する Job の id。
@@ -592,6 +597,12 @@ export interface IJobStorage {
      * `human` の resume は新しい人の判断として、その Task の Task 単位の承認を置き換える（C-03）。
      */
     resumedBy?: ResumeActorEvidence
+    /**
+     * resume-with-design-review の2回目の呼び出しが渡す、review を起票したときの resume 対象 Job
+     * （1回目が返した `sourceJobId`）。transaction 内で最新 Job がこれと違えば、successor を作らず
+     * `RESUME_TARGET_CHANGED` を返す（review が見ていない Job を resume しない。C3-c）。
+     */
+    expectedSourceJobId?: string
   }): ResumeBlockedTaskResult
   /**
    * PR-C finding 14 修復 (BLOCKER B): quarantine を解除する（単一transaction・冪等）。

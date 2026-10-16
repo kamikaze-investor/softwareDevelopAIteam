@@ -3173,6 +3173,14 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         if (!latestJob) {
           return { ok: false, code: 'NO_JOBS', reason: 'No jobs exist for this task' }
         }
+        // review を起票したときの resume 対象から変わっていたら、review が見ていない Job を resume しない（C3-c）。
+        if (input.expectedSourceJobId !== undefined && latestJob.id !== input.expectedSourceJobId) {
+          return {
+            ok: false,
+            code: 'RESUME_TARGET_CHANGED',
+            reason: `resume target changed from ${input.expectedSourceJobId} to ${latestJob.id} while the Design Review was pending`,
+          }
+        }
         const isJobDirectlyBlocked = latestJob.status === 'blocked'
 
         // **park された Task は resume しない。** abort_task は Task を done にせず
