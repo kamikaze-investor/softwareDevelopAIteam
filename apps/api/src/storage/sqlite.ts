@@ -2242,34 +2242,6 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     return { ok: true, job: implementJob }
   }
 
-  /**
-   * `resume:<sourceJobId>:<n>` の claim baseline が source の終了 fingerprint と一致しなければ理由を返す。
-   * 比較は clear-quarantine / abort cleanup と同じ `baselineEqualsObservation()`（空 dirty は clean と同義）。
-   * source に終了 fingerprint が無い（legacy・source 不明）ときは判定しない（undefined）。
-   */
-  function resumeBaselineContinuityRefusal(
-    job: Job,
-    observed: JobWorkspaceBaseline | undefined,
-  ): string | undefined {
-    const segments = job.workflowStepKey?.split(':')
-    if (segments === undefined || segments.length !== 3 || segments[0] !== 'resume' || segments[1] === '') {
-      return undefined
-    }
-    const source = db.prepare('SELECT * FROM jobs WHERE id = ?').get(segments[1]) as Record<string, unknown> | undefined
-    if (!source) return undefined
-    const sourceJob = deserializeJob(source)
-    if (sourceJob.taskId !== job.taskId) return undefined
-    const expected = sourceJob.failureMetadata?.workspaceEndFingerprint
-    if (expected === undefined) return undefined
-    if (observed === undefined) {
-      return `resume_baseline_mismatch: resumed job ${job.id} claimed without a workspace baseline; `
-        + `source job ${sourceJob.id} recorded one (workspace quarantined)`
-    }
-    if (baselineEqualsObservation(expected, observed)) return undefined
-    return `resume_baseline_mismatch: the workspace no longer matches what source job ${sourceJob.id} left `
-      + '(changed after it ended); refusing to adopt it as this task\'s work (workspace quarantined)'
-  }
-
   const jobs: IJobStorage = {
     classifyOutboxEvent(jobId, outboxEvent) {
       return checkOutboxEvent(db, jobId, outboxEvent).status
@@ -2402,29 +2374,6 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           .map((row) => row.task_id))]
         if (blockedTaskIds.some(taskHoldsWorkspaceViaBlockedRow)) {
           return existing
-        }
-        // **resume は「source Job が残した workspace」だけを引き継ぐ**（Codex review c3-b round 2 P2）。
-        // `resume:` は INTENTIONALLY-DIRTY として現在の worktree を丸ごと baseline に採るので、
-        // abort / escalation から Resume までの間に足された無関係な差分（手作業・同じ workspace を使う
-        // 別 Project の後続 Job）まで、この Task の成果として commit され得た。source が記録した
-        // 終了 fingerprint と、claim で申告された baseline が既存の比較（`baselineEqualsObservation`）で
-        // 一致しなければ claim を書かず、既存の quarantine（blocked + workspace_baseline_failure）へ倒して
-        // 止まったことを見せる。fingerprint の無い legacy source は従来どおり（証明材料が無い）。
-        const continuityRefusal = resumeBaselineContinuityRefusal(existing, data.workspaceBaseline)
-        if (continuityRefusal !== undefined) {
-          const quarantined = jobs.update(id, {
-            status: 'blocked',
-            completedAt: now(),
-            stderr: continuityRefusal,
-            failureMetadata: {
-              ...(existing.failureMetadata ?? {}),
-              kind: 'workspace_baseline_failure',
-              workspaceState: 'unknown',
-              quarantined: true,
-              quarantineReason: continuityRefusal,
-            },
-          })
-          return quarantined ?? existing
         }
       }
       // Approval承認とWorkerのblocked結果保存が競合した場合、承認transactionがqueuedへ
