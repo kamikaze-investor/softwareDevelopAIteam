@@ -3034,6 +3034,66 @@ describe('SQLiteStorage', () => {
     })
   })
 
+  describe('design_review_evidence.run_id migration', () => {
+    const runIdColumn = (dbPath: string): { name: string; notnull: number; dflt_value: unknown } | undefined =>
+      readDatabase(dbPath, (db) => (
+        db.pragma('table_info(design_review_evidence)') as Array<{ name: string; notnull: number; dflt_value: unknown }>
+      )).find((column) => column.name === 'run_id')
+
+    it('pre-subject legacy DB: rebuild keeps run_id, legacy rows stay NULL, new evidence is run-bound', () => {
+      const dbPath = path.join(os.tmpdir(), `ai-team-evidence-run-id-legacy-${randomUUID()}.db`)
+      const before = createLegacyDesignReviewDatabase(dbPath)
+      const storage = createSQLiteStorage(dbPath)
+
+      expect(runIdColumn(dbPath)).toMatchObject({ notnull: 0, dflt_value: null })
+      for (const row of before.evidenceRows) {
+        expect(storage.designReviewEvidence.findById(row.id)?.runId).toBeUndefined()
+      }
+
+      // legacy fixture の Task には active run があるので、別の Task で新しい evidence を作る。
+      const taskId = storage.tasks.create({
+        projectId: 'project-legacy', title: 'after migration', description: '', status: 'pending',
+        assignee: 'developer_ai', dependencies: [],
+      } as Parameters<IStorage['tasks']['create']>[0]).id
+      const run = storage.designReviewRuns.create({
+        taskId, taskTitle: 't', designText: 'migrated design', designTextHash: 'hash-migrated', changedFiles: [],
+      })
+      const claimed = storage.designReviewRuns.claim(run.id, 3)
+      const evidence = storage.designReviewRuns.completeWithEvidence(run.id, claimed.claimToken!, '{}', {
+        reviewKind: 'task', subjectId: taskId, taskId, designTextHash: 'hash-migrated',
+        reviewLoad: 'low', decision: 'ALIGNED', independentReviewRequired: false,
+      } as never)
+      expect(evidence?.runId).toBe(run.id)
+      expect(storage.designReviewEvidence.findById(evidence!.id)?.runId).toBe(run.id)
+    })
+
+    it('post-subject DB without run_id: the column is added idempotently and existing rows stay NULL', () => {
+      const dbPath = path.join(os.tmpdir(), `ai-team-evidence-run-id-existing-${randomUUID()}.db`)
+      createSQLiteStorage(dbPath)
+      // 列追加前の schema を再現する（列を落とし、既存行を1件置く）。
+      const db = new Database(dbPath)
+      try {
+        db.exec('ALTER TABLE design_review_evidence DROP COLUMN run_id')
+        db.prepare(`
+          INSERT INTO design_review_evidence
+            (id, review_kind, subject_id, task_id, design_text_hash, review_load, decision,
+             independent_review_required, independent_review_verdict, created_at)
+          VALUES ('evidence-before-run-id', 'roadmap', 'project-x', NULL, 'h', 'critical', 'ALIGNED', 0, NULL,
+                  '2026-10-16T09:00:00.000Z')
+        `).run()
+      } finally {
+        db.close()
+      }
+      expect(runIdColumn(dbPath)).toBeUndefined()
+
+      const storage = createSQLiteStorage(dbPath)
+      createSQLiteStorage(dbPath)
+
+      expect(runIdColumn(dbPath)).toMatchObject({ notnull: 0 })
+      expect(storage.designReviewEvidence.findById('evidence-before-run-id')?.runId).toBeUndefined()
+    })
+  })
+
   describe('designReviewEvidence', () => {
     it('creates the table in a new database', () => {
       const dbPath = path.join(os.tmpdir(), `ai-team-design-review-evidence-${randomUUID()}.db`)

@@ -50,16 +50,24 @@ export type StoredRunJudgment = 'aligned' | 'negative' | 'none'
  * storage の `findSupersedingRun()` 経由でこの関数を使う）。
  *
  * `runs` は evidence と同じ subject の run（呼び出し側が subject で絞る）。evidence を登録した run
- * 自身は ALIGNED なので数えない。evidence より**厳密に新しく**作られた run だけを比べる（同じ ms の run は
- * evidence を登録した側の経路でしか生じず、順序を決められないので覆さない）。
+ * 自身は ALIGNED なので数えない。
+ *
+ * **「新しい」の順序（`isAfterEvidence`）:**
+ *   - evidence が生んだ run を知っている（`runId` あり）なら、呼び出し側（storage）が
+ *     **その run より後に挿入された run** を渡す。run の挿入順（rowid）は表の中で単調で、
+ *     同じ ms の作成や時計の巻き戻りに左右されない（独立レビュー round 10）。
+ *   - 生んだ run が分からない evidence（`runId` の無い legacy 行・手動登録）だけは、既定の
+ *     **timestamp 規則**（evidence より厳密に後に作られた run）に落とす。同じ ms の run は順序を
+ *     決められないので覆さない —— legacy 行に限った、既知の弱さである。
  */
 export function findSupersedingRun<TRun extends { status: string; designTextHash: string; createdAt: string }>(
   evidence: Pick<DesignReviewEvidence, 'designTextHash' | 'createdAt'>,
   runs: readonly TRun[],
   judgmentOf: (run: TRun) => StoredRunJudgment,
+  isAfterEvidence: (run: TRun) => boolean = (run) => run.createdAt > evidence.createdAt,
 ): TRun | undefined {
   return runs.find((run) => {
-    if (run.designTextHash !== evidence.designTextHash || run.createdAt <= evidence.createdAt) return false
+    if (run.designTextHash !== evidence.designTextHash || !isAfterEvidence(run)) return false
     if (run.status === 'queued' || run.status === 'running') return true
     if (run.status !== 'succeeded') return false
     return judgmentOf(run) === 'negative'

@@ -191,12 +191,27 @@ describe('findSupersedingRun — evidence の失効規則', () => {
     ])).toBeUndefined()
   })
 
-  it('古い run・同じ ms の run・別の hash の run は覆さない', () => {
-    expect(find([
-      run({ createdAt: '2026-10-16T09:59:59.999Z' }),
-      run({ designTextHash: 'h2' }),
-    ])).toBeUndefined()
+  it('別の hash の run は覆さない', () => {
+    expect(find([run({ designTextHash: 'h2' })])).toBeUndefined()
+  })
+
+  // **順序は evidence を生んだ run の挿入順で決める**（独立レビュー round 10）。timestamp は ms 精度で
+  // 時計も巻き戻りうるので、run に結び付いた evidence では同じ timestamp の新しい run も覆す。
+  it('run に結び付いた evidence: 生んだ run より後に挿入された run は、同じ timestamp でも覆す', () => {
+    const insertedAfterOrigin = new Set(['same-ts-active', 'same-ts-conflict'])
+    const runBound = (runs: Run[]) => findSupersedingRun(evidence, runs, (r) => r.judgment, (r) => insertedAfterOrigin.has(r.id))
+
+    expect(runBound([run({ id: 'same-ts-active', status: 'queued', judgment: 'none', createdAt: evidence.createdAt })])?.id)
+      .toBe('same-ts-active')
+    expect(runBound([run({ id: 'same-ts-conflict', createdAt: evidence.createdAt })])?.id).toBe('same-ts-conflict')
+    // 生んだ run より前に挿入された run は、timestamp が新しくても覆さない（時計の巻き戻り）。
+    expect(runBound([run({ id: 'inserted-before', createdAt: '2026-10-16T11:00:00.000Z' })])).toBeUndefined()
+  })
+
+  it('legacy evidence（生んだ run が不明）だけは timestamp 規則: 厳密に後の run だけが覆す', () => {
+    expect(find([run({ createdAt: '2026-10-16T09:59:59.999Z' })])).toBeUndefined()
     expect(find([run({ id: 'same-ms', createdAt: evidence.createdAt })])).toBeUndefined()
+    expect(find([run({ id: 'later' })])?.id).toBe('later')
   })
 })
 

@@ -4,7 +4,9 @@ import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createSQLiteStorage } from '../storage/sqlite'
 import { DesignReviewRunContentionError, type IStorage } from '../storage/interface'
-import { computeDesignTextHash as computeHashForTest } from '../designReviewEvidencePolicy'
+import { checkImplementJobDesignReviewEvidence, computeDesignTextHash as computeHashForTest } from '../designReviewEvidencePolicy'
+import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
+import { recoverReadyTasksWithoutJob } from '../ctoAi/projectInitialization'
 import {
   DESIGN_REVIEW_MAX_ATTEMPTS,
   DESIGN_REVIEW_RUNNER_MAX_OUTPUT_BYTES,
@@ -1421,5 +1423,164 @@ describe('読み直しの evidence も単一の失効規則を通す（独立レ
 
     expect(result).toMatchObject({ status: 'not_aligned', decision: 'CONFLICT' })
     expect(result.evidence).toBeUndefined()
+  })
+})
+/**
+ * **evidence の失効順序は、それを生んだ run の挿入順で決める**（独立レビュー round 10・2026-10-16）。
+ *
+ * 時計を止めて全行を同じ timestamp にしても、run に結び付いた evidence は後から挿入された
+ * 同じ設計の run（active / CONFLICT）に覆される。生んだ run の無い legacy evidence だけは
+ * 従来の timestamp 規則のまま。
+ */
+describe('run に結び付いた evidence の失効（同じ timestamp）', () => {
+  afterEach(() => { vi.useRealTimers() })
+
+  // changedFiles [] の review は scope_simplicity を選ぶ（medium load）。
+  const ALIGNED_MEDIUM = JSON.stringify({
+    focusedReviewResults: [{ focus: 'scope_simplicity', decision: 'ALIGNED' }],
+    integrationReviewResult: { decision: 'ALIGNED' },
+    finalDecision: 'ALIGNED',
+  })
+  const CONFLICT_MEDIUM = JSON.stringify({
+    focusedReviewResults: [{ focus: 'scope_simplicity', decision: 'CONFLICT' }],
+    integrationReviewResult: { decision: 'CONFLICT' },
+    finalDecision: 'CONFLICT',
+  })
+
+  function freeze(): void {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-16T09:00:00.000Z'))
+  }
+
+  /** 初回 workflow の対象 Task（running Project・pending・roadmapActive・developer_ai）。 */
+  function seedInitialTarget(storage: IStorage): { taskId: string; designText: string } {
+    const project = storage.projects.create({ name: 'P', goal: 'g', designPhilosophy: [], status: 'running' })
+    const task = storage.tasks.create({
+      projectId: project.id, title: 'T', description: 'd', status: 'pending', assignee: 'developer_ai',
+      dependencies: [], roadmapActive: true, phase: 1,
+    } as Parameters<IStorage['tasks']['create']>[0])
+    return { taskId: task.id, designText: buildInitialImplementAiCliPrompt(task) }
+  }
+
+  async function alignThenAddSameDesignRun(
+    storage: IStorage,
+    taskId: string,
+    designText: string,
+    finish: 'active' | 'conflict',
+  ): Promise<void> {
+    const aligned = await createAndExecuteDesignReview(
+      storage, { taskId, taskTitle: 'T', designText, changedFiles: [] },
+      deps(async () => ({ ok: true, stdout: ALIGNED_MEDIUM, timedOut: false })),
+    )
+    expect(aligned.status).toBe('evidence_registered')
+    expect(aligned.evidence?.runId).toBeDefined()
+    const newer = storage.designReviewRuns.create({
+      taskId, taskTitle: 'T', designText, designTextHash: computeHashForTest(designText), changedFiles: [],
+    })
+    if (finish === 'conflict') {
+      const claimed = storage.designReviewRuns.claim(newer.id, 3)
+      storage.designReviewRuns.complete(newer.id, claimed.claimToken!, 'succeeded', CONFLICT_MEDIUM)
+    }
+    // 全行が同じ timestamp であること（timestamp では順序を決められない状態）を明示する。
+    expect(storage.designReviewRuns.findById(newer.id)?.createdAt).toBe(aligned.evidence?.createdAt)
+  }
+
+  for (const finish of ['active', 'conflict'] as const) {
+    it(`Job Gate: 同じ timestamp の新しい ${finish} run が evidence を覆す`, async () => {
+      freeze()
+      const storage = createStorage()
+      const { taskId, designText } = seedInitialTarget(storage)
+      await alignThenAddSameDesignRun(storage, taskId, designText, finish)
+
+      expect(checkImplementJobDesignReviewEvidence(
+        { taskId, aiCliMode: 'implement', aiCliPrompt: designText }, storage.designReviewEvidence,
+      )).toMatchObject({ ok: false, code: 'DESIGN_REVIEW_SUPERSEDED' })
+    })
+
+    it(`回収経路: 同じ timestamp の新しい ${finish} run があれば初回 Job を作らない`, async () => {
+      freeze()
+      const storage = createStorage()
+      const { taskId, designText } = seedInitialTarget(storage)
+      await alignThenAddSameDesignRun(storage, taskId, designText, finish)
+
+      const summary = await recoverReadyTasksWithoutJob(
+        storage, deps(async () => { throw new Error('the recovery sweep must not run a review') }),
+      )
+
+      expect(summary.recovered).toBe(0)
+      expect(storage.jobs.findByTaskId(taskId)).toEqual([])
+    })
+  }
+
+  it('回収経路の対照: 新しい run が無ければ同じ evidence から初回 Job を1つ作る', async () => {
+    freeze()
+    const storage = createStorage()
+    const { taskId, designText } = seedInitialTarget(storage)
+    await createAndExecuteDesignReview(
+      storage, { taskId, taskTitle: 'T', designText, changedFiles: [] },
+      deps(async () => ({ ok: true, stdout: ALIGNED_MEDIUM, timedOut: false })),
+    )
+
+    expect((await recoverReadyTasksWithoutJob(storage, deps(async () => { throw new Error('no review') }))).recovered)
+      .toBe(1)
+  })
+
+  it('読み直し: 同じ timestamp の新しい active / CONFLICT run があれば evidence_registered にしない', async () => {
+    for (const finish of ['active', 'conflict'] as const) {
+      freeze()
+      const storage = createStorage()
+      const taskId = seedTask(storage)
+      const designText = 'design text'
+      const designTextHash = computeHashForTest(designText)
+      const claim = storage.designReviewRuns.claim
+      storage.designReviewRuns.claim = (id, max) => {
+        const won = claim.call(storage.designReviewRuns, id, max)
+        storage.designReviewRuns.completeWithEvidence(id, won.claimToken!, JSON.stringify({
+          focusedReviewResults: [], integrationReviewResult: { decision: 'ALIGNED' }, finalDecision: 'ALIGNED',
+        }), {
+          reviewKind: 'task', subjectId: taskId, taskId, designTextHash,
+          reviewLoad: 'low', decision: 'ALIGNED', independentReviewRequired: false,
+        })
+        storage.designReviewRuns.claim = claim
+        const newer = storage.designReviewRuns.create({ ...baseInput(taskId), designText, designTextHash })
+        if (finish === 'conflict') {
+          const c = storage.designReviewRuns.claim(newer.id, 3)
+          storage.designReviewRuns.complete(newer.id, c.claimToken!, 'succeeded', JSON.stringify({
+            focusedReviewResults: [], integrationReviewResult: { decision: 'CONFLICT' }, finalDecision: 'CONFLICT',
+          }))
+        }
+        return {}
+      }
+
+      const result = await createAndExecuteDesignReview(
+        storage, { taskId, taskTitle: 'design', designText, changedFiles: LOW_LOAD_FILES },
+        deps(async () => { throw new Error('must not run') }),
+      )
+
+      expect(result.status, finish).not.toBe('evidence_registered')
+      expect(result.status, finish).toBe(finish === 'active' ? 'requeued' : 'not_aligned')
+      vi.useRealTimers()
+    }
+  })
+
+  it('legacy evidence（run_id 無し）は従来の timestamp 規則: 同じ ms の run は覆さず、後の run は覆す', () => {
+    freeze()
+    const storage = createStorage()
+    const taskId = seedTask(storage)
+    const designTextHash = computeHashForTest('legacy design')
+    const evidence = storage.designReviewEvidence.create({
+      taskId, reviewKind: 'task', subjectId: taskId, designTextHash,
+      reviewLoad: 'low', decision: 'ALIGNED', independentReviewRequired: false,
+    } as Parameters<IStorage['designReviewEvidence']['create']>[0])
+    expect(evidence.runId).toBeUndefined()
+    const sameMs = storage.designReviewRuns.create({ ...baseInput(taskId), designText: 'legacy design', designTextHash })
+
+    expect(storage.designReviewEvidence.findSupersedingRun(evidence)).toBeUndefined()
+
+    const claimed = storage.designReviewRuns.claim(sameMs.id, 3)
+    storage.designReviewRuns.complete(sameMs.id, claimed.claimToken!, 'failed', undefined, 'boom')
+    vi.setSystemTime(new Date('2026-10-16T09:10:00.000Z'))
+    const later = storage.designReviewRuns.create({ ...baseInput(taskId), designText: 'legacy design', designTextHash })
+    expect(storage.designReviewEvidence.findSupersedingRun(evidence)?.id).toBe(later.id)
   })
 })

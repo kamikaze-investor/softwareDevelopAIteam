@@ -4467,10 +4467,26 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       // 規則は designReviewEvidencePolicy.findSupersedingRun() の1箇所。ここは同じ subject・同じ hash の
       // 候補 run を新しい順に渡し、終端 run の判定は API と同じ再計算（classifyStoredRunJudgment）で決める。
       const rows = db.prepare(
-        'SELECT * FROM design_review_runs WHERE review_kind = ? AND subject_id = ? AND design_text_hash = ?'
-        + ' ORDER BY created_at DESC, rowid DESC'
+        'SELECT *, rowid AS _rowid FROM design_review_runs WHERE review_kind = ? AND subject_id = ? AND design_text_hash = ?'
+        + ' ORDER BY rowid DESC'
       ).all(evidence.reviewKind, evidence.subjectId, evidence.designTextHash) as any[]
-      return findSupersedingRun(evidence, rows.map(deserializeDesignReviewRun), classifyStoredRunJudgment)
+      // **順序は run の挿入順（rowid）で決める。** evidence が生んだ run を知っていれば、それより後に
+      // 挿入された run だけが「新しい」。timestamp（ms 精度・時計の巻き戻り）には頼らない。
+      // 生んだ run が分からない（legacy / 手動登録）・見つからない evidence だけ timestamp 規則に落とす。
+      const origin = evidence.runId !== undefined
+        ? db.prepare('SELECT rowid AS _rowid FROM design_review_runs WHERE id = ?').get(evidence.runId) as
+          | { _rowid: number }
+          | undefined
+        : undefined
+      const insertionOrder = new Map<string, number>(rows.map((row) => [row.id as string, row._rowid as number]))
+      return findSupersedingRun(
+        evidence,
+        rows.map(deserializeDesignReviewRun),
+        classifyStoredRunJudgment,
+        origin !== undefined
+          ? (run) => (insertionOrder.get(run.id) ?? 0) > origin._rowid
+          : undefined,
+      )
     },
     create(data) {
       const subject = resolveDesignReviewSubject(data)
@@ -4485,8 +4501,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       db.prepare(`
         INSERT INTO design_review_evidence
           (id, review_kind, subject_id, task_id, design_text_hash, review_load, decision,
-           independent_review_required, independent_review_verdict, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           independent_review_required, independent_review_verdict, created_at, run_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         evidence.id,
         evidence.reviewKind,
@@ -4498,6 +4514,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         evidence.independentReviewRequired ? 1 : 0,
         evidence.independentReviewVerdict ?? null,
         evidence.createdAt,
+        evidence.runId ?? null,
       )
       return evidence
     },
@@ -4986,7 +5003,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           return undefined
         }
 
-        return designReviewEvidence.create(evidenceData)
+        // evidence を生んだ run を結び付ける（失効順序を timestamp ではなく run の挿入順で決めるため）。
+        return designReviewEvidence.create({ ...evidenceData, runId: id })
       })
       return completeTransaction()
     },
@@ -6175,6 +6193,7 @@ function deserializeDesignReviewEvidence(row: any): DesignReviewEvidence {
     independentReviewRequired: row.independent_review_required === 1,
     independentReviewVerdict: (row.independent_review_verdict ?? undefined) as DesignReviewEvidence['independentReviewVerdict'] | undefined,
     createdAt: row.created_at,
+    runId: row.run_id ?? undefined,
   }
 }
 
@@ -6764,15 +6783,18 @@ function runDesignReviewSubjectMigration(db: Database.Database): void {
         independent_review_required INTEGER NOT NULL DEFAULT 0,
         independent_review_verdict TEXT,
         created_at TEXT NOT NULL,
+        -- この rebuild は runMigrations() の後に走るので、追加済みの run_id もここに書く
+        -- （書かないと同一起動中の evidence 作成が no such column で落ちる）。legacy 行は NULL。
+        run_id TEXT,
         FOREIGN KEY (task_id) REFERENCES tasks(id)
       );
 
       INSERT INTO design_review_evidence_new
         (id, review_kind, subject_id, task_id, design_text_hash, review_load, decision,
-         independent_review_required, independent_review_verdict, created_at)
+         independent_review_required, independent_review_verdict, created_at, run_id)
       SELECT
         id, 'task', task_id, task_id, design_text_hash, review_load, decision,
-        independent_review_required, independent_review_verdict, created_at
+        independent_review_required, independent_review_verdict, created_at, NULL
       FROM design_review_evidence;
 
       DROP TABLE design_review_evidence;
