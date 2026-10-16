@@ -464,6 +464,78 @@ describe('resume / repair 中の dirty ownership を壊さないこと', () => {
   })
 })
 
+describe('非 initial の queued 所有者がいても、別 Task の stale 行が残した dirt を継承させない（独立レビュー P1）', () => {
+  // Task A は done。stale blocked 行（git_commit）を残し、dirt（a.ts）が worktree に残っている。
+  const staleA = () => {
+    const done = task('task-a', { status: 'done' })
+    return {
+      task: done,
+      jobs: [
+        job('a-implement', done.id, { status: 'success', changedFiles: ['a.ts'] }),
+        job('a-stale-commit', done.id, { status: 'blocked', workflowStepKey: 'review:a-review:git-commit' }),
+      ],
+    }
+  }
+  // Task B は repair: Job が queued（非 initial なので baseline は dirty worktree を受け入れる）。
+  const ownerB = (changedFiles: string[] = ['b.ts']) => {
+    const b = task('task-b', { status: 'blocked' })
+    return {
+      task: b,
+      jobs: [
+        job('b-implement', b.id, { status: 'failed', changedFiles }),
+        job('b-repair', b.id, { status: 'queued', workflowStepKey: 'repair:b-implement:1' }),
+      ],
+    }
+  }
+
+  it('stale A が dirty（B で説明できない dirt）なら B を確定せず ambiguous（claim しない）', () => {
+    expect(resolve([staleA(), ownerB()], ['a.ts'])).toEqual({ kind: 'ambiguous' })
+  })
+
+  it('B の dirt に A 由来の path が混ざっていても ambiguous', () => {
+    expect(resolve([staleA(), ownerB()], ['a.ts', 'b.ts'])).toEqual({ kind: 'ambiguous' })
+  })
+
+  it('stale A があっても worktree が clean なら従来どおり B が owner（claim できる）', () => {
+    expect(resolve([staleA(), ownerB()], [])).toEqual({ kind: 'owner', taskId: 'task-b' })
+  })
+
+  it('dirt がすべて B の記録（baseline HEAD 一致 + changedFiles）で説明できれば B が owner', () => {
+    expect(resolve([staleA(), ownerB()], ['b.ts'])).toEqual({ kind: 'owner', taskId: 'task-b' })
+  })
+
+  it('worktree を観測できなければ ambiguous（fail-closed）', () => {
+    const result = resolveWorkspaceOwnership(
+      [staleA(), ownerB()], '/workspace/target',
+      () => { throw new Error('git failed') }, () => HEAD, () => [],
+    )
+    expect(result).toEqual({ kind: 'ambiguous' })
+  })
+
+  it('stale 候補が無ければ従来どおり worktree を観測せず B が owner', () => {
+    const readDirty = vi.fn(() => ['a.ts'])
+    const result = resolveWorkspaceOwnership([ownerB()], '/workspace/target', readDirty, () => HEAD, () => [])
+    expect(result).toEqual({ kind: 'owner', taskId: 'task-b' })
+    expect(readDirty).not.toHaveBeenCalled()
+  })
+
+  it('fetchQueuedJob: stale dirty A + B の非 initial queued Job → claim しない', async () => {
+    const a = staleA()
+    const b = ownerB()
+    mockApi([a.task, b.task], { [a.task.id]: a.jobs, [b.task.id]: b.jobs })
+    manifestMocks.buildWorktreeManifest.mockReturnValue({ changes: [], paths: ['a.ts'] })
+    expect(await fetchQueuedJob()).toBeNull()
+  })
+
+  it('fetchQueuedJob: stale clean A + B の非 initial queued Job → B の Job を claim する', async () => {
+    const a = staleA()
+    const b = ownerB()
+    mockApi([a.task, b.task], { [a.task.id]: a.jobs, [b.task.id]: b.jobs })
+    manifestMocks.buildWorktreeManifest.mockReturnValue({ changes: [], paths: [] })
+    expect((await fetchQueuedJob())?.job.id).toBe('b-repair')
+  })
+})
+
 describe('fetchQueuedJob: clean になれば running Project でも所有権を手放す', () => {
   it('commit 成功で clean になった後、archive/pause せずに次 Task を claim できる', async () => {
     const done = task('task-1', { status: 'done' })

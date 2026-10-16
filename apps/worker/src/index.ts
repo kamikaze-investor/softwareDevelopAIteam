@@ -249,6 +249,74 @@ function isReleasableForNextTask(
   }
 }
 
+/**
+ * 既存所有者（live な Job / 非 stale の blocked 行を持つ Task）がいても、**別 Task に stale 候補の
+ * blocked 行がある**なら、worktree の dirt が所有者 Task のものだと説明できるときだけ所有者を確定する。
+ *
+ * repair: / resume: / retry: / review / git_commit などの非 initial Job は baseline 取得時に dirty
+ * worktree を受け入れる（`computeWorkspaceBaseline()`）。所有者確定を stale 行の観測より前に返すと、
+ * 終わった（または park された）Task A が残した dirt を、所有者 Task B の次の Job が自分の baseline
+ * として取り込み、A の変更を B の成果として継承しうる（独立レビュー P1）。
+ *
+ * 判定は既存の材料だけを使う: worktree の実観測 + durable な `changedFiles` と baseline HEAD の一致
+ * （`jobOwnsRecordedDirt()`、fallback 所有者判定と同じ帰属）。
+ * - stale 候補が無い / worktree が clean → 従来どおり所有者を返す
+ * - 観測できない / 所有者 Task で説明できない dirt がある → ambiguous（この cycle は誰も claim しない）
+ */
+function confirmOwnerAgainstStaleDirt(
+  ownerTaskId: string,
+  perTask: readonly { task: Task; jobs: Job[] }[],
+  workingDir: string,
+  readDirtyPaths: (dir: string) => readonly string[],
+  readHead: (dir: string) => string | undefined,
+): WorkspaceOwnership {
+  const owner: WorkspaceOwnership = { kind: 'owner', taskId: ownerTaskId }
+  const hasStaleElsewhere = perTask.some(({ task, jobs }) => (
+    task.id !== ownerTaskId && jobs.some((job) => isStaleBlockedJobOfFinishedTask(task, job))
+  ))
+  if (!hasStaleElsewhere) return owner
+
+  let dirtyPaths: ReadonlySet<string>
+  let head: string | undefined
+  try {
+    dirtyPaths = new Set(readDirtyPaths(workingDir))
+    if (dirtyPaths.size === 0) return owner
+    head = readHead(workingDir)
+  } catch (err: unknown) {
+    console.error(`[Worker] workspace 所有権の判定に失敗しました: ${formatUnknownError(err)}`)
+    return { kind: 'ambiguous' }
+  }
+
+  const ownerJobs = perTask.find(({ task }) => task.id === ownerTaskId)?.jobs ?? []
+  const explained = new Set(
+    ownerJobs
+      .filter((job) => jobOwnsRecordedDirt(job, head, dirtyPaths))
+      .flatMap((job) => job.changedFiles ?? []),
+  )
+  const unexplained = [...dirtyPaths].filter((path) => !explained.has(path))
+  if (unexplained.length > 0) {
+    console.warn(
+      `[Worker] dirty workspace に帰属不明の変更が含まれます ` +
+      `(${unexplained.slice(0, 5).join(', ')})。owner を決めず claim を見送ります。`,
+    )
+    return { kind: 'ambiguous' }
+  }
+  return owner
+}
+
+/**
+ * Job の記録した変更が、いまの worktree の dirt だと主張できるか（CLAIM 7）。
+ * baseline commit が現在の HEAD と一致し、かつ記録された `changedFiles` が今 dirty であること。
+ * baseline が無い Job は帰属を証明できないので false（fail-closed）。
+ */
+function jobOwnsRecordedDirt(job: Job, head: string | undefined, dirtyPaths: ReadonlySet<string>): boolean {
+  return (
+    head !== undefined &&
+    job.workspaceBaseline?.startCommitHash === head &&
+    (job.changedFiles ?? []).some((path) => dirtyPaths.has(path))
+  )
+}
+
 export function resolveWorkspaceOwnership(
   perTask: readonly { task: Task; jobs: Job[] }[],
   workingDir: string = TARGET_ROOT,
@@ -264,7 +332,9 @@ export function resolveWorkspaceOwnership(
     )
     return { kind: 'ambiguous' }
   }
-  if (existing.length === 1) return { kind: 'owner', taskId: existing[0] }
+  if (existing.length === 1) {
+    return confirmOwnerAgainstStaleDirt(existing[0], perTask, workingDir, readDirtyPaths, readHead)
+  }
 
   // 終わった Task に取り残された blocked 行。次の Task をまだ始められない間だけ所有権を保持する。
   const staleOwners = perTask.filter(({ task, jobs }) => (
@@ -312,11 +382,7 @@ export function resolveWorkspaceOwnership(
   //     もう worktree 上の同じものではない（= 帰属を主張できない）。
   //     baseline が無い Job も帰属を証明できないので候補にしない（fail-closed）。
   const head = readHead(workingDir)
-  const ownsRecordedDirt = (job: Job): boolean => (
-    head !== undefined &&
-    job.workspaceBaseline?.startCommitHash === head &&
-    (job.changedFiles ?? []).some((path) => dirtyPaths.has(path))
-  )
+  const ownsRecordedDirt = (job: Job): boolean => jobOwnsRecordedDirt(job, head, dirtyPaths)
 
   const candidates = blockedTasks.filter(({ jobs }) => (
     canInheritDirtyWorkspace(jobs) && jobs.some(ownsRecordedDirt)
