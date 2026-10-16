@@ -52,6 +52,7 @@ import {
   holdsWorkspaceWhenBlocked,
   isLiveJob,
   isLiveApprovedApproval,
+  isLiveTaskScopedDecision,
   isLiveWaitingApproval,
   isStaleBlockedJobCandidate,
   occupiesProject,
@@ -100,6 +101,7 @@ export type AbortTaskResult =
       | 'JOB_QUARANTINED'
       | 'OWNERSHIP_UNPROVEN'
       | 'UNATTRIBUTED_DIRTY_WORKSPACE'
+      | 'TASK_STATE_CHANGED'
       | 'TECHNICAL_EVIDENCE_INELIGIBLE'
       | 'NOT_AUTHORIZED'
       | 'PARK_FAILED'
@@ -132,6 +134,59 @@ function findUnattributedDirtyEnd(taskJobs: readonly Job[], otherJobs: readonly 
   const supersededByLaterJob = otherJobs.some((job) =>
     job.createdAt > latest.createdAt && job.safeCommand?.workingDir === workingDir)
   return supersededByLaterJob ? undefined : latest
+}
+
+/**
+ * dirty refusal の escalation を書く直前（IMMEDIATE transaction の中）に、判定の前提をすべて読み直す。
+ * 崩れていれば理由を返す（undefined なら成立）。
+ * - Task: pending・roadmapActive・park されていない
+ * - 最新 Job: 判定した Job と同一で、status と dirty な終了 fingerprint が変わっていない
+ * - その後に同じ workingDir で走った Job が無い（`findUnattributedDirtyEnd` を同じ入力で再評価）
+ * - project に live Job が無い
+ * - 人の判断: 未期限の WAITING が無く、この abort を承認した request 以外に生きた Task 単位の判断が無い。
+ *   承認した request 自体はまだ使える APPROVED のまま
+ */
+/** `findUnattributedDirtyEnd` に渡す「この Task 以外の Job」。 */
+function laterJobCandidates(storage: IStorage, taskId: string): Job[] {
+  const task = storage.tasks.findById(taskId)
+  if (task === undefined) return []
+  return storage.tasks.findByProjectId(task.projectId)
+    .filter((candidate) => candidate.id !== taskId)
+    .flatMap((candidate) => storage.jobs.findByTaskId(candidate.id))
+}
+
+function dirtyRefusalStillHolds(
+  storage: IStorage,
+  current: Task,
+  expectedJob: Job,
+  approvalRequestId: string,
+): string | undefined {
+  if (current.status !== 'pending') return `task is ${current.status}, not pending`
+  if (current.roadmapActive !== true) return 'task is no longer roadmap-active'
+  if (storage.tasks.isParked(current.id)) return 'task was parked'
+  const taskJobs = storage.jobs.findByTaskId(current.id)
+  const latest = taskJobs[0]
+  if (latest?.id !== expectedJob.id) return 'the latest job changed'
+  if (latest.status !== expectedJob.status) return `latest job is ${latest.status}`
+  if (JSON.stringify(latest.failureMetadata?.workspaceEndFingerprint)
+    !== JSON.stringify(expectedJob.failureMetadata?.workspaceEndFingerprint)) {
+    return 'the latest job end fingerprint changed'
+  }
+  const projectJobs = storage.tasks.findByProjectId(current.projectId)
+    .flatMap((candidate) => storage.jobs.findByTaskId(candidate.id))
+  if (projectJobs.some((job) => isLiveJob(job))) return 'the project has a live job'
+  if (findUnattributedDirtyEnd(taskJobs, laterJobCandidates(storage, current.id)) === undefined) {
+    return 'a later job ran in the same workspace'
+  }
+  const nowMs = Date.now()
+  const approvals = storage.approvalRequests.findByTaskId(current.id)
+  if (approvals.some((approval) => isLiveWaitingApproval(approval, nowMs))) return 'a human decision is waiting'
+  if (approvals.some((approval) => approval.id !== approvalRequestId && isLiveTaskScopedDecision(approval, nowMs))) {
+    return 'another live task-scoped human decision exists'
+  }
+  const authorizing = approvals.find((approval) => approval.id === approvalRequestId)
+  if (!isLiveApprovedApproval(authorizing, nowMs)) return 'the authorizing approval is no longer live'
+  return undefined
 }
 
 function recordAbortAuthorizationConflict(
@@ -362,15 +417,29 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
     // （Codex review c3-b P2）。既存の `escalateTaskToHuman()` で Task を blocked へ上げ、b8d0fc5d と同じ
     // 「blocked Task + 最新 Job failed」形にする。Human Resume（指示付き）が admit され、attention は通常の
     // blocked Task のものになる。escalateTaskToHuman は done / park 済みの Task を動かさない。
-    const dirtyLeftover = findUnattributedDirtyEnd(taskJobs, otherTasks.flatMap((candidate) =>
-      storage.jobs.findByTaskId(candidate.id)))
+    const dirtyLeftover = findUnattributedDirtyEnd(taskJobs, laterJobCandidates(storage, task.id))
     if (dirtyLeftover !== undefined) {
       const workingDir = dirtyLeftover.safeCommand?.workingDir
-      escalateTaskToHuman(
+      // **判定に使った事実を、blocked へ上げるのと同じ IMMEDIATE transaction の中で読み直す**
+      // （Codex review c3-b round 2）。崩れていれば何も書かずに TASK_STATE_CHANGED を返す。
+      const escalation = escalateTaskToHuman(
         storage,
         task.id,
         `abort_task refused: job ${dirtyLeftover.id} left an unowned dirty workspace (UNATTRIBUTED_DIRTY_WORKSPACE)`,
+        {
+          precondition: (current) => dirtyRefusalStillHolds(storage, current, dirtyLeftover, input.approvalRequestId),
+        },
       )
+      if (escalation.result !== 'blocked') {
+        return {
+          ok: false,
+          code: 'TASK_STATE_CHANGED',
+          reason:
+            `task ${task.id} changed while the abort was being decided (${
+              escalation.result === 'precondition_failed' ? escalation.reason : escalation.result
+            }); nothing was written, re-read the task and decide again`,
+        }
+      }
       return {
         ok: false,
         code: 'UNATTRIBUTED_DIRTY_WORKSPACE',

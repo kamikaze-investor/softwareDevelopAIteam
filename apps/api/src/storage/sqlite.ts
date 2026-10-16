@@ -18,7 +18,7 @@ import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IPrincipleApplicationStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReplaceActiveApprovalAndCreateResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, ConsumeApprovalForCommandJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult, RepairHandoffRefusalCode } from './interface'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IPrincipleApplicationStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReplaceActiveApprovalAndCreateResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, ConsumeApprovalForCommandJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult, RepairHandoffRefusalCode, TaskEscalationResult } from './interface'
 import { DesignReviewRunContentionError } from './interface'
 import { isTaskScopedApprovalAction, computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS, evaluateRecoverAdmission, evaluateResumeAdmission, isSupervisedRunKind, isLiveApprovedApproval, isLiveWaitingApproval } from '@ai-team/shared'
 import type { SupervisedRunKind } from '@ai-team/shared'
@@ -1458,6 +1458,52 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       // それでは transaction 内で status を読み直している意味が無い。
       // `jobs.update()` の claim が同じ理由で IMMEDIATE にしてあるのと同じ扱いである。
       return tx.immediate(input.taskId, input.detail)
+    },
+    escalateToHuman(input) {
+      // **判定と書き込みを同じ IMMEDIATE transaction に置く**（Codex review c3-b round 2）。
+      // 以前は呼び出し側が park / done を読んでから無条件の tasks.update で blocked にしていたため、
+      // その間に別 connection が Task を動かすと、読んだ前提の崩れた Task を blocked にできた。
+      const tx = db.transaction((): TaskEscalationResult => {
+        const row = db.prepare('SELECT * FROM tasks WHERE id = ?').get(input.taskId) as any
+        if (!row) return { result: 'not_found' }
+        const current = deserializeTask(row)
+        const refusal = input.precondition?.(current)
+        if (refusal !== undefined) return { result: 'precondition_failed', reason: refusal }
+
+        let result: 'blocked' | 'already_blocked' | 'not_moved_done' | 'not_moved_parked'
+        if (isParkedTaskId(input.taskId)) {
+          result = 'not_moved_parked'
+        } else if (current.status === 'done') {
+          result = 'not_moved_done'
+        } else if (current.status !== 'blocked') {
+          const changed = db.prepare(
+            "UPDATE tasks SET status = 'blocked', updated_at = ? WHERE id = ? AND status = ?",
+          ).run(now(), input.taskId, current.status)
+          if (changed.changes !== 1) {
+            return { result: 'precondition_failed', reason: `task ${input.taskId} changed concurrently` }
+          }
+          result = 'blocked'
+        } else {
+          result = 'already_blocked'
+        }
+        // 記録の失敗で escalation 自体を失敗させない（従来の escalateTaskToHuman と同じ扱い）。
+        try {
+          auditLog.record({
+            actor: 'api',
+            operation: input.audit.operation,
+            entityType: 'task',
+            entityId: input.taskId,
+            result,
+            detail: input.audit.detail,
+          })
+        } catch (error: unknown) {
+          console.warn(
+            `[storage] failed to record the escalation of task ${input.taskId}: ${error instanceof Error ? error.message : String(error)}`,
+          )
+        }
+        return { result }
+      })
+      return tx.immediate()
     },
     findByProjectId(projectId) {
       const rows = db.prepare('SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at ASC').all(projectId) as any[]

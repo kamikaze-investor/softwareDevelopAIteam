@@ -482,6 +482,49 @@ describe('abortTask — 段階1: 前提条件と承認', () => {
     expect(evaluateResumeAdmission(admissionInput())).toEqual({ ok: true })
   })
 
+  // Codex review c3-b round 2: 判定の後・blocked へ上げる前に前提が崩れたら、何も書かずに TASK_STATE_CHANGED。
+  // 読み直しは escalation と同じ IMMEDIATE transaction の中で行う（ここでは transaction 開始直前に割り込む）。
+  it.each([
+    {
+      label: 'project に live Job が入った',
+      mutate: (fx: Fixture) => fx.storage.jobs.create({
+        taskId: fx.taskId, projectId: fx.projectId, agentRole: 'developer_ai', status: 'queued',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, workspaceBaseline: BASELINE,
+      } as Parameters<IStorage['jobs']['create']>[0]),
+    },
+    {
+      label: 'Task が別経路で blocked になった',
+      mutate: (fx: Fixture) => fx.storage.tasks.update(fx.taskId, { status: 'blocked' }),
+    },
+    {
+      label: '最新 Job の fingerprint が変わった',
+      mutate: (fx: Fixture) => fx.storage.jobs.update(fx.jobId, { failureMetadata: { workspaceEndFingerprint: BASELINE } }),
+    },
+    {
+      label: '承認した request が使えなくなった',
+      mutate: (fx: Fixture, approvalRequestId: string) =>
+        fx.storage.approvalRequests.updateStatus(approvalRequestId, 'SUPERSEDED', undefined, true),
+    },
+  ])('前提が崩れたら TASK_STATE_CHANGED で何も書かない: $label', ({ mutate }) => {
+    const fx = seed({ kind: 'git_commit', workingDir: '/workspace/target' })
+    fx.storage.jobs.update(fx.jobId, { status: 'failed', failureMetadata: { workspaceEndFingerprint: DIRTY_END } })
+    const approvalRequestId = approve(fx.storage, fx.taskId)
+    const original = fx.storage.tasks.escalateToHuman.bind(fx.storage.tasks)
+    fx.storage.tasks.escalateToHuman = (input) => {
+      mutate(fx, approvalRequestId)
+      return original(input)
+    }
+    const statusBefore = () => fx.storage.tasks.findById(fx.taskId)!.status
+
+    const result = abortTask(fx.storage, { taskId: fx.taskId, approvalRequestId, reason: 'r' })
+
+    expect(result).toMatchObject({ ok: false, code: 'TASK_STATE_CHANGED' })
+    expect(fx.storage.auditLog.findByEntity('task', fx.taskId)
+      .filter((entry) => entry.operation === 'task_escalated_to_human')).toEqual([])
+    expect(fx.storage.tasks.isParked(fx.taskId)).toBe(false)
+    expect(['pending', 'blocked']).toContain(statusBefore())
+  })
+
   it('終了 workspace が clean / fingerprint 無し（legacy）なら従来どおり park する', () => {
     for (const fingerprint of [BASELINE, undefined]) {
       const fx = seed()

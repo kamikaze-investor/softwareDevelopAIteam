@@ -366,6 +366,12 @@ export interface IProjectStorage {
  * （独立レビュー round 7 指摘）。呼び出し側はこの値をそのまま上へ伝播すればよく、
  * `reason` 文字列を突き合わせて分類し直してはならない。
  */
+/** `ITaskStorage.escalateToHuman()` の結果。前4つは `task_escalated_to_human` audit の result と同じ語彙。 */
+export type TaskEscalationResult =
+  | { result: 'blocked' | 'already_blocked' | 'not_moved_done' | 'not_moved_parked' }
+  | { result: 'not_found' }
+  | { result: 'precondition_failed'; reason: string }
+
 export type RecoverFromBlockedResult =
   | { ok: true; task: Task }
   | { ok: false; code?: RecoverAdmissionCode; reason: string }
@@ -404,6 +410,20 @@ export interface ITaskStorage {
    * 戻すような実装はしないこと。
    */
   recoverFromBlocked(input: { taskId: string; detail: string }): RecoverFromBlockedResult
+  /**
+   * Human escalation（Task → `blocked`）と、その理由の audit 行を**1つの IMMEDIATE transaction**で書く。
+   * 意味論（park 済み・done は動かさない、既に blocked なら記録だけ）の正本は
+   * `designReview/repairFlow.ts` の `escalateTaskToHuman()` で、ここはそれを原子的に行う器である。
+   *
+   * `precondition` を渡すと、lock を取った後・書き込みの前に**同じ transaction の中で**評価する
+   * （呼び出し側が precheck に使った事実を読み直すため）。文字列を返したら何も書かずに
+   * `precondition_failed` を返す。precondition は park / done の判定より先に評価する。
+   */
+  escalateToHuman(input: {
+    taskId: string
+    audit: { operation: string; detail: string }
+    precondition?: (task: Task) => string | undefined
+  }): TaskEscalationResult
   findById(id: string): Task | undefined
   findSummaries(options?: { limit?: number; projectId?: string; status?: TaskStatus }): TaskSummary[]
   /**

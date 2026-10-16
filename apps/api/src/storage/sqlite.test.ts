@@ -1848,7 +1848,8 @@ describe('SQLiteStorage', () => {
       })
       it('rolls back the whole transition when a side effect throws (atomic CAS + side effects)', () => {
         const job = createRunningJob()
-        vi.spyOn(storage.tasks, 'update').mockImplementation(() => {
+        // side effect は Task の escalation（2026-10-17 から tasks.escalateToHuman の単一 transaction）。
+        vi.spyOn(storage.tasks, 'escalateToHuman').mockImplementation(() => {
           throw new Error('simulated side effect failure')
         })
         try {
