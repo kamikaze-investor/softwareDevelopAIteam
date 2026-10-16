@@ -1473,6 +1473,34 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
       expect(held[0]!.detail).not.toContain('cause=inactive_project')
     })
 
+    it.each(['paused', 'draft'] as const)(
+      'a sole done-Task blocked row in a %s Project reports cause=done_task_blocked_row, not inactive_project',
+      (status) => {
+        const { storage, projectId, taskId } = seed()
+        storage.jobs.create({
+          taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+          workflowStepKey: `task:${taskId}:initial-implement`,
+          safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+        } as Parameters<IStorage['jobs']['create']>[0])
+        const stopped = storage.projects.create({ name: 'Stopped', goal: 'g', designPhilosophy: [], status })
+        const doneTask = storage.tasks.create({
+          projectId: stopped.id, title: 'Done', description: '', status: 'done', assignee: 'developer_ai', dependencies: [],
+        } as Parameters<IStorage['tasks']['create']>[0])
+        const staleRow = storage.jobs.create({
+          taskId: doneTask.id, projectId: stopped.id, agentRole: 'developer_ai', status: 'blocked',
+          safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+        } as Parameters<IStorage['jobs']['create']>[0])
+
+        const held = buildSystemState(storage, { now: () => NOW }).attention
+          .filter((item) => item.kind === 'workspace_held_by_stalled_owner')
+
+        expect(held).toHaveLength(1)
+        expect(held[0]).toMatchObject({ projectId: stopped.id, referenceId: staleRow.id })
+        expect(held[0]!.detail).toMatch(/^cause=done_task_blocked_row: /)
+        expect(held[0]!.detail).toContain('No automated exit exists')
+      },
+    )
+
     it('runPlTick escalates it to the CEO exactly once, without diagnosis', async () => {
       const { storage, ownerJobId } = seedHeldWorkspace('queued')
       let diagnosed = 0

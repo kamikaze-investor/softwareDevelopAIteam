@@ -490,12 +490,18 @@ export function buildSystemState(
         const blockedOwner = jobs.find((job) => job.status === 'blocked' && !ownershipSuperseded.has(job.id))
         const owner = jobs.find((job) => isLiveWorkspaceOwnerJob(task.id, job)) ?? blockedOwner
         if (owner !== undefined) allOwners.push({ project, task, job: owner })
-        if (project.status !== 'running') {
-          if (owner !== undefined) stalledOwners.push({ project, task, job: owner, cause: 'inactive_project' })
-        } else if (blockedOwner !== undefined && task.status === 'done') {
-          stalledOwners.push({ project, task, job: blockedOwner, cause: 'done_task_blocked_row' })
-        } else if (blockedOwner !== undefined && parentIsParked) {
-          stalledOwners.push({ project, task, job: blockedOwner, cause: 'parked_task_blocked_row' })
+        // 選ばれた所有者が done / park された Task の blocked 行なら、Project の status に関係なく
+        // stale 行の原因を使う。inactive_project として Project の再開を案内しても、その Task は
+        // 終わっている / 動かせないので所有者は消えない（W5 独立レビュー指摘）。
+        const staleRowCause: StalledOwnerCause | undefined = owner?.status !== 'blocked'
+          ? undefined
+          : task.status === 'done'
+            ? 'done_task_blocked_row'
+            : parentIsParked ? 'parked_task_blocked_row' : undefined
+        if (owner !== undefined && staleRowCause !== undefined) {
+          stalledOwners.push({ project, task, job: owner, cause: staleRowCause })
+        } else if (owner !== undefined && project.status !== 'running') {
+          stalledOwners.push({ project, task, job: owner, cause: 'inactive_project' })
         }
       }
       const hasMovableJob = jobs.some((job) => (
