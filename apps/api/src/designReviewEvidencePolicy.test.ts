@@ -5,6 +5,7 @@ import {
   checkRoadmapDesignReviewFreshness,
   computeDesignTextHash,
   findSupersedingRun,
+  findUnresolvedDisagreementRun,
   type StoredRunJudgment,
 } from './designReviewEvidencePolicy'
 
@@ -245,5 +246,39 @@ describe('checkRoadmapDesignReviewFreshness — 新しい同じ material の CON
 
     expect(checkRoadmapDesignReviewFreshness(projectId, REVIEW_MATERIAL, storage.designReviewEvidence))
       .toMatchObject({ ok: false, code: 'ROADMAP_DESIGN_REVIEW_SUPERSEDED' })
+  })
+})
+
+/**
+ * **同じ設計への古い未回答の不一致は、後の ALIGNED で洗い流されない**（lifecycle repair C2 / C-05）。
+ */
+describe('findUnresolvedDisagreementRun — 古い未回答の不一致', () => {
+  const evidence = { designTextHash: 'h1', createdAt: '2026-10-16T10:00:00.000Z', runId: 'aligned-run' }
+  type Run = { id: string; status: string; designTextHash: string; createdAt: string; judgment: StoredRunJudgment; answered?: boolean }
+  const run = (over: Partial<Run>): Run => ({
+    id: 'r', status: 'succeeded', designTextHash: 'h1', createdAt: '2026-10-16T09:00:00.000Z', judgment: 'negative', ...over,
+  })
+  const find = (runs: Run[]) => findUnresolvedDisagreementRun(evidence, runs, (r) => r.judgment, (r) => r.answered === true)
+
+  it('古い同じ hash の CONFLICT / UNCERTAIN（negative）で、人が答えていないものを返す', () => {
+    expect(find([run({ id: 'conflict' })])?.id).toBe('conflict')
+  })
+
+  it('Human Resume で答えられた run は返さない', () => {
+    expect(find([run({ answered: true })])).toBeUndefined()
+  })
+
+  it('別の hash（設計が実質的に変わった）の run は返さない', () => {
+    expect(find([run({ designTextHash: 'h2' })])).toBeUndefined()
+  })
+
+  it('判定の無い終端・ALIGNED・evidence を生んだ run 自身・新しい run は返さない', () => {
+    expect(find([
+      run({ status: 'failed', judgment: 'none' }),
+      run({ judgment: 'none' }),
+      run({ judgment: 'aligned' }),
+      run({ id: 'aligned-run' }),
+      run({ id: 'newer', createdAt: '2026-10-16T11:00:00.000Z' }),
+    ])).toBeUndefined()
   })
 })

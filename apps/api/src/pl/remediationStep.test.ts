@@ -305,7 +305,10 @@ describe('findRemediationSubject — 対象の判定', () => {
     expect(findRemediationSubject(storage, task.id)).toBeUndefined()
   })
 
-  it('ALIGNED evidence が同じ hash で登録済みなら対象外', () => {
+  // **同じ設計への未回答の CONFLICT の後から登録された ALIGNED は、不一致を解消しない**
+  // （lifecycle repair C2 / C-05・spec 22 DA trigger 7）。Task は CONFLICT 解決の対象のまま残る。
+  // 以前はこの ALIGNED で対象外になり、reviewer を引き直すだけで CONFLICT が見えなくなっていた。
+  it('CONFLICT の後に同じ hash の ALIGNED evidence が登録されても、未回答の不一致なので対象のまま', () => {
     const { storage, taskId } = seedConflictedTask()
     const run = storage.designReviewRuns.findLatestByTaskId(taskId)
     storage.designReviewEvidence.create({
@@ -318,7 +321,7 @@ describe('findRemediationSubject — 対象の判定', () => {
       independentReviewRequired: false,
     } as never)
 
-    expect(findRemediationSubject(storage, taskId)).toBeUndefined()
+    expect(findRemediationSubject(storage, taskId)).toBeDefined()
   })
 })
 

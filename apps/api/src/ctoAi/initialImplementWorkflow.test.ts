@@ -5,6 +5,8 @@ import type { IStorage } from '../storage/interface'
 import { checkImplementJobDesignReviewEvidence, computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { abortTask } from '../pl/abortTask'
 import { ensureInitialWorkflowsForActiveTasks } from './projectInitialization'
+import { buildSystemState } from '../state/systemState'
+import { recordResumeActor } from '../designReview/resumeActor'
 
 function alignedDeps() {
   return {
@@ -266,5 +268,92 @@ describe('ensureInitialWorkflowsForActiveTasks の dependency eligibility', () =
     expect(jobCount(a)).toBe(1)
     expect(jobCount(b)).toBe(0)
     expect(jobCount(c)).toBe(0)
+  })
+})
+
+/**
+ * **同じ設計の CONFLICT の後の ALIGNED は不一致を解消しない**（lifecycle repair C2 / C-05）。
+ * reviewer を引き直して通る経路を作らない。解消するのは Human Resume か設計の変更だけ。
+ */
+describe('initial implement workflow: 同じ設計の未回答の不一致', () => {
+  let storage: IStorage
+  let taskId: string
+  const tick = () => new Promise((resolve) => setTimeout(resolve, 5))
+
+  beforeEach(() => {
+    storage = createSQLiteStorage(':memory:')
+    const project = storage.projects.create({ name: 'P', goal: 'G', designPhilosophy: [], status: 'running' })
+    taskId = storage.tasks.create({
+      projectId: project.id, title: 'T', description: 'Implement T.', status: 'pending',
+      assignee: 'developer_ai', dependencies: [], roadmapActive: true,
+    }).id
+  })
+
+  function countingAlignedDeps() {
+    const deps = { ...alignedDeps(), calls: 0 }
+    const execute = deps.execute
+    deps.execute = async () => { deps.calls += 1; return execute() }
+    return deps
+  }
+
+  async function designConflictFirst(): Promise<void> {
+    expect((await createInitialImplementWorkflow(storage, taskId, conflictingDeps())).status).toBe('skipped')
+    await tick()
+  }
+
+  it('CONFLICT の後の同じ hash の ALIGNED では Job を作らず、型付きの理由を返す', async () => {
+    await designConflictFirst()
+    const deps = countingAlignedDeps()
+
+    const second = await createInitialImplementWorkflow(storage, taskId, deps)
+
+    expect(second).toMatchObject({ status: 'skipped', code: 'DESIGN_REVIEW_DISAGREEMENT' })
+    expect(storage.jobs.findByTaskId(taskId)).toHaveLength(0)
+    const prompt = buildInitialImplementAiCliPrompt(storage.tasks.findById(taskId)!)
+    expect(checkImplementJobDesignReviewEvidence({ taskId, aiCliMode: 'implement', aiCliPrompt: prompt }, storage.designReviewEvidence))
+      .toMatchObject({ ok: false, code: 'DESIGN_REVIEW_DISAGREEMENT' })
+
+    // 以降は reviewer を引き直さない（同じ停止を作り直すだけなので）。
+    const callsBefore = deps.calls
+    expect(await createInitialImplementWorkflow(storage, taskId, deps)).toMatchObject({ code: 'DESIGN_REVIEW_DISAGREEMENT' })
+    expect(deps.calls).toBe(callsBefore)
+  })
+
+  it('不一致で止まった Task は Job 無しの Task として attention に出る（task_ready_without_job）', async () => {
+    await designConflictFirst()
+    await createInitialImplementWorkflow(storage, taskId, alignedDeps())
+
+    const attention = buildSystemState(storage).attention
+    expect(attention.some((item) => item.kind === 'task_ready_without_job' && item.taskId === taskId)).toBe(true)
+  })
+
+  it('設計を変えた（別 hash）なら ALIGNED で Job を作る', async () => {
+    await designConflictFirst()
+    storage.tasks.update(taskId, { description: 'Implement T, revised after the CONFLICT.' })
+
+    expect(await createInitialImplementWorkflow(storage, taskId, alignedDeps())).toMatchObject({ status: 'created' })
+  })
+
+  it('CONFLICT の完了後の Human Resume は不一致への回答になる。PL の resume はならない', async () => {
+    await designConflictFirst()
+    const project = storage.tasks.findById(taskId)!.projectId
+    const resumeJob = (actor: 'human' | 'pl') => {
+      const created = storage.jobs.create({
+        taskId, projectId: project, agentRole: 'developer_ai', status: 'queued',
+        workflowStepKey: `resume:${actor}-source:1`,
+        safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+      } as never)
+      storage.jobs.update(created.id, { status: 'failed' } as never)
+      if (actor === 'human') {
+        recordResumeActor(storage, { jobId: created.id, taskId, actorClass: 'human', evidence: 'admin_credential' })
+      } else {
+        recordResumeActor(storage, { jobId: created.id, taskId, actorClass: 'pl', evidence: 'in_process_pl', technicalResume: true })
+      }
+    }
+    resumeJob('pl')
+    expect(await createInitialImplementWorkflow(storage, taskId, alignedDeps())).toMatchObject({ code: 'DESIGN_REVIEW_DISAGREEMENT' })
+
+    resumeJob('human')
+    expect(await createInitialImplementWorkflow(storage, taskId, alignedDeps())).toMatchObject({ status: 'created' })
   })
 })

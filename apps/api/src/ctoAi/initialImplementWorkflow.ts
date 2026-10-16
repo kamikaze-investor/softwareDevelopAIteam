@@ -5,13 +5,26 @@ import {
   createAndExecuteDesignReview,
   type CoordinatorDeps,
 } from '../designReview/designReviewCoordinator'
-import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
+import {
+  checkImplementJobDesignReviewEvidence,
+  type ImplementDesignReviewPreconditionFailureCode,
+} from '../designReviewEvidencePolicy'
 import { buildTaskContract, buildTaskDesignContract } from '../implementPrompt'
 import type { IStorage } from '../storage/interface'
 
 export type InitialImplementWorkflowResult =
   | { taskId: string; status: 'created'; job: Job }
-  | { taskId: string; status: 'skipped'; reason: string; retryable?: boolean }
+  | {
+      taskId: string
+      status: 'skipped'
+      reason: string
+      retryable?: boolean
+      /**
+       * Job Gate が型付きの理由で止めたときだけ入る。`DESIGN_REVIEW_DISAGREEMENT` は
+       * 同じ設計に未回答の CONFLICT / UNCERTAIN があることを示し、reviewer を引き直しても解消しない。
+       */
+      code?: ImplementDesignReviewPreconditionFailureCode
+    }
 
 /**
  * 初回 workflow Job が既に在るために作らなかったときの skipped reason。呼び出し側が
@@ -88,6 +101,12 @@ export async function createInitialImplementWorkflow(
     aiCliMode: 'implement',
   }
   let gate = checkImplementJobDesignReviewEvidence(jobInput, storage.designReviewEvidence)
+  // **同じ設計に未回答の不一致があるなら Review を引き直さない**（lifecycle repair C2 / C-05）。
+  // 引き直して ALIGNED が出ても Gate は同じ理由で止める（evidence policy）。毎回 reviewer を起動して
+  // 同じ停止を作り直すだけで、不一致を解消できるのは Human Resume か設計の変更だけである。
+  if (!gate.ok && gate.code === 'DESIGN_REVIEW_DISAGREEMENT') {
+    return { taskId, status: 'skipped', reason: gate.reason, code: gate.code }
+  }
   if (!gate.ok) {
     const review = await createAndExecuteDesignReview(storage, {
       taskId: task.id,
@@ -96,6 +115,12 @@ export async function createInitialImplementWorkflow(
       changedFiles: [],
     }, deps)
     if (review.status !== 'evidence_registered') {
+      // 今回の Review が ALIGNED でも、同じ設計の古い未回答の不一致に覆されていれば coordinator は
+      // not_aligned を返す。その停止は型付きの理由で返す（見えない停止にしない）。
+      const after = checkImplementJobDesignReviewEvidence(jobInput, storage.designReviewEvidence)
+      if (!after.ok && after.code === 'DESIGN_REVIEW_DISAGREEMENT') {
+        return { taskId, status: 'skipped', reason: after.reason, code: after.code }
+      }
       return {
         taskId,
         status: 'skipped',
@@ -106,7 +131,7 @@ export async function createInitialImplementWorkflow(
     }
     gate = checkImplementJobDesignReviewEvidence(jobInput, storage.designReviewEvidence)
   }
-  if (!gate.ok) return { taskId, status: 'skipped', reason: gate.reason }
+  if (!gate.ok) return { taskId, status: 'skipped', reason: gate.reason, code: gate.code }
 
   // **Job を作る直前に Task をもう一度読む。**
   //

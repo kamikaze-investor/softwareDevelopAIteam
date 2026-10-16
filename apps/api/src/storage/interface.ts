@@ -794,10 +794,18 @@ export interface IDesignReviewEvidenceStorage {
   findLatestByTaskId(taskId: string): DesignReviewEvidence | undefined
   findLatestBySubjectId(reviewKind: DesignReviewKind, subjectId: string): DesignReviewEvidence | undefined
   /**
-   * この evidence を覆す、同じ subject・同じ design hash の新しい run（active か、ALIGNED 以外の判定で
-   * 終端したもの）。無ければ undefined。規則は `designReviewEvidencePolicy.findSupersedingRun()`。
+   * この evidence を覆す、同じ subject・同じ design hash の run。無ければ undefined。
+   *   - 新しい run（active か、ALIGNED 以外の判定で終端したもの）。規則は
+   *     `designReviewEvidencePolicy.findSupersedingRun()`
+   *   - それが無ければ、古い未回答の不一致（`findUnresolvedDisagreementRun()` と同じもの）
    */
   findSupersedingRun(evidence: DesignReviewEvidence): DesignReviewRun | undefined
+  /**
+   * 同じ subject・同じ design hash で、evidence より古い、CONFLICT / UNCERTAIN の判定で終端し、
+   * その後の Human Resume で答えられていない run（lifecycle repair C2 / C-05）。無ければ undefined。
+   * 規則は `designReviewEvidencePolicy.findUnresolvedDisagreementRun()`。
+   */
+  findUnresolvedDisagreementRun(evidence: DesignReviewEvidence): DesignReviewRun | undefined
   create(data: DesignReviewEvidenceCreateInput): DesignReviewEvidence
 }
 
