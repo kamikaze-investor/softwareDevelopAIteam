@@ -2478,6 +2478,41 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     expect(visible?.detail).toContain('technical recovery budget is exhausted')
   })
 
+  // Codex round 3: audit の書き込み自体が全部失敗する（DB 書き込み障害）と、試行回数も technical_exhausted も
+  // 残せない。プロセス内の対象別カウンタで同じ上限まで数え、それ以上その対象を試さない。
+  it('when every audit write fails, the PL still stops retrying the target after the attempt bound', async () => {
+    const { storage, taskId, projectId } = seed()
+    const sourceJobId = blockedAiCliJob(storage, taskId, projectId)
+    vi.spyOn(storage.auditLog, 'record').mockImplementation(() => { throw new Error('SQLITE_IOERR: disk I/O error') })
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+    let diagnoses = 0
+    const tickDeps = deps({
+      diagnose: async () => {
+        diagnoses += 1
+        return JSON.stringify({ actionKind: 'resume_task', rationale: 'technical recovery', riskLevel: 'LOW' })
+      },
+      escalate: async () => DELIVERED,
+      coordinatorDeps: alignedCoordinatorDeps,
+    })
+    const results: string[] = []
+    for (let tick = 0; tick < PL_MAX_ATTEMPTS_PER_TARGET + 5; tick += 1) {
+      resetPlLoopInFlightForTest()
+      try {
+        results.push((await runPlTick(storage, tickDeps)).status)
+      } catch (error: unknown) {
+        results.push(`threw:${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    const fallbackErrors = errors.mock.calls.filter((call) => String(call[0]).includes('in-process attempt counter'))
+    vi.restoreAllMocks()
+
+    expect(diagnoses).toBeLessThanOrEqual(PL_MAX_ATTEMPTS_PER_TARGET)
+    expect(results.slice(-3).every((r) => r === 'idle')).toBe(true)
+    expect(storage.jobs.findByTaskId(taskId).some((j) => j.workflowStepKey === `resume:${sourceJobId}:1`)).toBe(false)
+    // 対象ごとに1回だけ記録する（毎 tick ログを流さない）。
+    expect(fallbackErrors).toHaveLength(1)
+  })
+
   // **判定が出ていない resume の Design Review は否定ではない**（独立レビュー round 5・2026-10-16）。
   // 試行を消費せず attention を残し、次の tick で同じ instruction を再送すると active-run dedup で
   // **同じ run** が再開され、ALIGNED なら resume Job が1回だけ作られる。

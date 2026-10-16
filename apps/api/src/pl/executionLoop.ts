@@ -364,6 +364,33 @@ export interface PlLoopDeps {
  */
 let inFlight = false
 
+/**
+ * **audit に試行を残せないときの、プロセス内の対象別試行カウンタ**（Codex round 3）。
+ *
+ * 試行回数と technical_exhausted は audit（SQLite）に残すのが正本だが、DB の書き込み経路そのものが
+ * 壊れている（インフラ障害）と、それも残せず同じ対象を毎 tick 無限に試すことになる。対象の処理が例外で
+ * 終わったら（＝書き込みに失敗した）ここで数え、同じ `PL_MAX_ATTEMPTS_PER_TARGET` で打ち切る。
+ * プロセス再起動でリセットされる（障害が直っていれば audit の正本に戻る）。正常時は増えない。
+ */
+const inProcessFailedAttempts = new Map<string, number>()
+const inProcessFallbackLogged = new Set<string>()
+
+function hasExhaustedInProcessAttempts(targetKey: string): boolean {
+  return (inProcessFailedAttempts.get(targetKey) ?? 0) >= PL_MAX_ATTEMPTS_PER_TARGET
+}
+
+function recordInProcessFailedAttempt(targetKey: string, error: unknown): void {
+  inProcessFailedAttempts.set(targetKey, (inProcessFailedAttempts.get(targetKey) ?? 0) + 1)
+  if (inProcessFallbackLogged.has(targetKey)) return
+  inProcessFallbackLogged.add(targetKey)
+  // 対象ごとに1回だけ。error の message だけを出す（payload / 秘密は載せない）。
+  console.error(
+    `[pl-loop] handling target ${targetKey} failed (audit/storage write may be failing); using the `
+    + `in-process attempt counter, bound=${PL_MAX_ATTEMPTS_PER_TARGET}: `
+    + `${error instanceof Error ? error.message : String(error)}`.slice(0, 500),
+  )
+}
+
 /** 直前の tick が Operator Request を処理したか（自律ループとの交互実行に使う）。 */
 let lastTickHandledOperatorRequest = false
 
@@ -439,6 +466,7 @@ function isActionableNow(storage: IStorage, item: AttentionItem): boolean {
     // 通知が鳴り続けることはない。
     && (!hasEscalated(storage, targetKeyOf(item)) || isRemediableConflict(storage, item))
     && !hasExhaustedTargetTechnicalRecovery(storage, item)
+    && !hasExhaustedInProcessAttempts(targetKeyOf(item))
     && hasStalledLongEnough(item)
   )
 }
@@ -1698,7 +1726,14 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
       }
     }
 
-    return await handleTarget(storage, deps, item, before)
+    try {
+      return await handleTarget(storage, deps, item, before)
+    } catch (error: unknown) {
+      // 例外は従来どおり呼び出し側へ返す。ただし audit に試行を残せていない可能性があるので、
+      // プロセス内で数えて同じ上限で打ち切る（DB 書き込み障害で無限に再試行しない）。
+      recordInProcessFailedAttempt(targetKeyOf(item), error)
+      throw error
+    }
   } finally {
     inFlight = false
   }
