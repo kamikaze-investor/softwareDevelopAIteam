@@ -209,6 +209,10 @@ export const CREATE_TABLES = `
     -- durable state から復元できない (review_kind は対象の種別、subject_id は task_id で、
     -- どちらも successor を表さない)。
     repair_source_job_id TEXT,
+    -- resume provenance: resume-with-design-review が起票した run でだけ入り、その resume が
+    -- 再開する Job id。retry cooldown 中の PL 待機が「この Job の復旧はこの run 待ち」を
+    -- timestamp ではなく同一性で証明するために使う。それ以外（legacy 含む）は NULL。
+    resume_source_job_id TEXT,
     FOREIGN KEY (task_id) REFERENCES tasks(id)
   );
 
@@ -487,6 +491,9 @@ export const MIGRATION_STATEMENTS: Array<{ table: string; column: string; defini
   // 既存の queued repair run から source Job を推論して backfill しない —— 推論で
   // durable な lineage を書くことは、この列が防ごうとしている害そのものである。
   { table: 'design_review_runs', column: 'repair_source_job_id', definition: 'TEXT' },
+  // resume provenance（C3-c）。**nullable・default 無し**。既存行は NULL のまま（推論で backfill しない）
+  // で、NULL の run は「resume 元を証明できない」として扱われる。
+  { table: 'design_review_runs', column: 'resume_source_job_id', definition: 'TEXT' },
   // evidence を生んだ run（失効順序を timestamp ではなく run の挿入順で決めるため）。
   // **nullable・default 無し**。既存の evidence は NULL のまま（推測で run を結び付けない）で、
   // その行には従来の timestamp 規則が残る（designReviewEvidencePolicy.findSupersedingRun）。

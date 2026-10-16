@@ -35,6 +35,7 @@ import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInp
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 import { checkImplementJobDesignReviewEvidence, findSupersedingRun } from '../designReviewEvidencePolicy'
 import { classifyStoredRunJudgment } from '../designReview/designReviewCoordinator'
+import { designReviewRetryNotBeforeMs } from '../designReview/retryCooldown'
 import { escalateTaskToHuman, isWorkspaceQuarantined, prepareRepairFlow } from '../designReview/repairFlow'
 import {
   parseResumeSource,
@@ -3256,6 +3257,16 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         ).all(taskId) as any[]
         const taskJobs = jobRows.map(deserializeJob)
         const latestJob = taskJobs[0]
+        // review を起票したときの resume 対象から変わっていたら、review が見ていない Job を resume しない（C3-c）。
+        // **admission より前に判定する。** 差し替わった Job が admission に落ちる形（AI CLI metadata 無し・
+        // queued / running）でも、呼び出し側に返すべき事実は「対象が変わった」である。
+        if (input.expectedSourceJobId !== undefined && latestJob?.id !== input.expectedSourceJobId) {
+          return {
+            ok: false,
+            code: 'RESUME_TARGET_CHANGED',
+            reason: `resume target changed from ${input.expectedSourceJobId} to ${latestJob?.id ?? 'none'} while the Design Review was pending`,
+          }
+        }
         const projectRow = db.prepare('SELECT status FROM projects WHERE id = ?').get(taskRow.project_id) as
           { status: string } | undefined
         const approvalRows = db.prepare(
@@ -3493,6 +3504,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
               ok: false,
               code: 'DESIGN_REVIEW_PRECONDITION_FAILED',
               reason: rejectedDesignReviewCheck.reason,
+              sourceJobId: latestJob.id,
             }
           }
 
@@ -3560,6 +3572,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             ok: false,
             code: 'DESIGN_REVIEW_PRECONDITION_FAILED',
             reason: designReviewCheck.reason,
+            sourceJobId: latestJob.id,
           }
         }
 
@@ -5801,18 +5814,19 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           attemptCount: 0,
           createdAt: now(),
           repairSourceJobId: data.repairSourceJobId,
+          resumeSourceJobId: data.resumeSourceJobId,
         }
         try {
           db.prepare(`
             INSERT INTO design_review_runs
               (id, review_kind, subject_id, task_id, design_text, design_text_hash, task_title, changed_files, status,
                attempt_count, claim_token, result_json, error, created_at, started_at, completed_at,
-               repair_source_job_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL, ?)
+               repair_source_job_id, resume_source_job_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL, ?, ?)
           `).run(
             run.id, run.reviewKind, run.subjectId, run.taskId ?? null, run.designText, run.designTextHash, run.taskTitle,
             JSON.stringify(run.changedFiles), run.status, run.attemptCount, run.createdAt,
-            run.repairSourceJobId ?? null,
+            run.repairSourceJobId ?? null, run.resumeSourceJobId ?? null,
           )
         } catch (err) {
           // partial unique index (ux_design_review_runs_subject_active) 違反は「別経路が先に
@@ -5846,10 +5860,19 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           return {}
         }
 
+        // 判定の出なかった attempt の後の retry cooldown（designReview/retryCooldown.ts）。
+        // 全実行経路がこの claim を通るので、cooldown の強制はここ1箇所に置く。
+        const retryNotBeforeMs = designReviewRetryNotBeforeMs(deserializeDesignReviewRun(current))
+        if (retryNotBeforeMs !== undefined && Date.now() < retryNotBeforeMs) {
+          return { retryNotBefore: new Date(retryNotBeforeMs).toISOString() }
+        }
+
         const claimToken = randomUUID()
+        // completed_at は queued の間だけ「直前の attempt の終了時刻」を表すので、running では消す。
         const result = db.prepare(`
           UPDATE design_review_runs
-          SET status = 'running', attempt_count = attempt_count + 1, claim_token = ?, started_at = ?
+          SET status = 'running', attempt_count = attempt_count + 1, claim_token = ?, started_at = ?,
+              completed_at = NULL
           WHERE id = ? AND status = 'queued'
         `).run(claimToken, now(), id)
 
@@ -5889,11 +5912,12 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       return completeTransaction()
     },
     requeue(id, claimToken, error) {
+      // completed_at = 直前の attempt の終了時刻（retry cooldown の起点。次の claim で消える）。
       const result = db.prepare(`
         UPDATE design_review_runs
-        SET status = 'queued', claim_token = NULL, error = ?, started_at = NULL
+        SET status = 'queued', claim_token = NULL, error = ?, started_at = NULL, completed_at = ?
         WHERE id = ? AND claim_token = ? AND status = 'running'
-      `).run(error, id, claimToken)
+      `).run(error, now(), id, claimToken)
       return result.changes === 1
     },
     recoverStaleRunningAtStartup(maxAttempts, startedBefore) {
@@ -7155,6 +7179,7 @@ function deserializeDesignReviewRun(row: any): DesignReviewRun {
     startedAt: row.started_at ?? undefined,
     completedAt: row.completed_at ?? undefined,
     repairSourceJobId: row.repair_source_job_id ?? undefined,
+    resumeSourceJobId: row.resume_source_job_id ?? undefined,
   }
 }
 
@@ -7708,17 +7733,19 @@ function runDesignReviewSubjectMigration(db: Database.Database): void {
         -- 列をここに書かないと直前に追加された列がこの入れ替えで消え、同一起動中の
         -- create() が no such column で落ちる。legacy 行に intent は無いので値は NULL。
         repair_source_job_id TEXT,
+        -- resume provenance（C3-c）。理由は repair_source_job_id と同じ。legacy 行は NULL。
+        resume_source_job_id TEXT,
         FOREIGN KEY (task_id) REFERENCES tasks(id)
       );
 
       INSERT INTO design_review_runs_new
         (id, review_kind, subject_id, task_id, design_text, design_text_hash, task_title,
          changed_files, status, attempt_count, claim_token, result_json, error, created_at,
-         started_at, completed_at, repair_source_job_id)
+         started_at, completed_at, repair_source_job_id, resume_source_job_id)
       SELECT
         id, 'task', task_id, task_id, design_text, design_text_hash, task_title,
         changed_files, status, attempt_count, claim_token, result_json, error, created_at,
-        started_at, completed_at, NULL
+        started_at, completed_at, NULL, NULL
       FROM design_review_runs;
 
       DROP TABLE design_review_runs;

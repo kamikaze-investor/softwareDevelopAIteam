@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeAll, afterAll } from 'vitest'
+import { describe, expect, it, beforeAll, afterAll, afterEach, vi } from 'vitest'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
@@ -8,6 +8,7 @@ import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { buildInitialImplementAiCliPrompt, INITIAL_WORKFLOW_JOB_EXISTS } from '../ctoAi/initialImplementWorkflow'
 import { ensureInitialWorkflowsForActiveTasks, recoverReadyTasksWithoutJob } from '../ctoAi/projectInitialization'
 import { executeQueuedRun } from '../designReview/queuedRunDispatch'
+import { passDesignReviewRetryCooldown } from '../designReview/retryCooldownTestClock'
 import { adoptRoadmapItem, buildAdoptedDescription } from '../ctoAi/roadmapAdoption'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
 import {
@@ -610,6 +611,9 @@ describe('parsePlRevision', () => {
  * 既存 `recoverReadyTasksWithoutJob()` が Job を1回だけ作る。Challenge を引き直すことはしない。
  */
 describe('Challenge の再評価が requeued になった場合', () => {
+  // 判定の出なかった attempt の後の retry cooldown（retryCooldown.ts）は時計で明けさせる。
+  afterEach(() => { vi.useRealTimers() })
+
   function coordinator(stdout: string) {
     return {
       runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
@@ -639,6 +643,7 @@ describe('Challenge の再評価が requeued になった場合', () => {
     }) as never)
     const run = storage.designReviewRuns.findLatestByTaskId(taskId)!
 
+    passDesignReviewRetryCooldown()
     await executeQueuedRun(storage, run, coordinator(ALIGNED_RESULT_JSON))
     expect(storage.designReviewEvidence.findLatestByTaskId(taskId)?.decision).toBe('ALIGNED')
     expect(storage.jobs.findByTaskId(taskId)).toEqual([])

@@ -701,7 +701,10 @@ export async function executeDesignReviewRun(
 
   const claimed = storage.designReviewRuns.claim(run.id, DESIGN_REVIEW_MAX_ATTEMPTS)
   if (!claimed.run || !claimed.claimToken) {
-    return { status: 'not_claimable' }
+    // retry cooldown 中（retryCooldown.ts）は判定待ちであって失敗ではない。理由だけ残す。
+    return claimed.retryNotBefore !== undefined
+      ? { status: 'not_claimable', error: `design review retry is cooling down until ${claimed.retryNotBefore}` }
+      : { status: 'not_claimable' }
   }
 
   const claimToken = claimed.claimToken
@@ -873,6 +876,8 @@ export async function createAndExecuteDesignReview(
     taskTitle: string
     designText: string
     changedFiles: string[]
+    /** resume-with-design-review だけが渡す、resume 対象 Job の id（`DesignReviewRun.resumeSourceJobId`）。 */
+    resumeSourceJobId?: string
   },
   deps: CoordinatorDeps,
 ): Promise<ExecuteDesignReviewResult> {
