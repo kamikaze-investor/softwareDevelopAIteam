@@ -57,6 +57,7 @@ import {
   storedReviewRecoveryNotice,
   storedReviewRecoveryView,
 } from '../../lib/taskWorkflow'
+import { formatResumeErrorMessage, RESUME_ERROR_MESSAGE_FALLBACK } from '../../lib/resumeErrorMessage'
 import { POLLING_INTERVAL_MS, usePolling } from '../../lib/usePolling'
 
 const RESUME_INSTRUCTION_MAX_LENGTH = 2000
@@ -69,22 +70,6 @@ const RESUME_HELP_TEXT =
   + '技術的な原因の修正はAI開発チーム側で対応します。'
   + '入力すると、元の停止した作業は履歴として残し、追加指示を含む新しい作業を開始します。'
   + '危険な変更が含まれる場合は再び承認待ちになります。'
-const RESUME_ERROR_MESSAGE_FALLBACK =
-  '追加指示の送信に失敗しました。時間をおいて再度お試しください。'
-const RESUME_ERROR_MESSAGE_BY_REASON: Record<string, string> = {
-  'already exists for this task':
-    '既に実行中または待機中の作業があるため、追加指示を送れませんでした。',
-  'missing AI CLI':
-    'AI実行設定が不足しているため、再開できませんでした。',
-  'No jobs exist':
-    '対象の作業履歴が見つからないため、再開できませんでした。',
-  'not blocked':
-    '現在は停止状態ではないため、追加指示を送れませんでした。',
-  instruction: '入力内容を確認してください。',
-  validation: '入力内容を確認してください。',
-  'waiting for user review':
-    '承認待ちの操作があるため、追加指示を送れませんでした。',
-}
 
 const TASK_STATUS_LABEL: Record<TaskStatus, string> = {
   blocked: '停止中',
@@ -451,19 +436,6 @@ async function readResumeApiError(response: Response): Promise<string | null> {
   } catch {
     return null
   }
-}
-
-function formatResumeErrorMessage(errorMessage: string | null): string {
-  if (errorMessage === null || errorMessage.length === 0) {
-    return RESUME_ERROR_MESSAGE_FALLBACK
-  }
-
-  const normalizedErrorMessage = errorMessage.toLowerCase()
-  const matchingMessage = Object.entries(RESUME_ERROR_MESSAGE_BY_REASON).find(
-    ([reason]) => normalizedErrorMessage.includes(reason.toLowerCase()),
-  )
-
-  return matchingMessage?.[1] ?? RESUME_ERROR_MESSAGE_FALLBACK
 }
 
 async function postResumeInstruction(
