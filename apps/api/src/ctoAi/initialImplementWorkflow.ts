@@ -107,7 +107,8 @@ export async function createInitialImplementWorkflow(
         taskId,
         status: 'skipped',
         reason: `design review did not align (${review.status})`,
-        retryable: review.status === 'requeued' || review.status === 'not_claimable' || review.status === 'stale',
+        retryable: review.status === 'requeued' || review.status === 'contended'
+          || review.status === 'not_claimable' || review.status === 'stale',
       }
     }
     gate = checkImplementJobDesignReviewEvidence(jobInput, storage.designReviewEvidence)

@@ -648,3 +648,62 @@ describe('Challenge の再評価が requeued になった場合', () => {
     expect(storage.jobs.findByTaskId(taskId)).toHaveLength(1)
   })
 })
+describe('Challenge と他の review / 回収経路の重なり（独立レビュー round 6）', () => {
+  it('別の設計の review が active なら Challenge を消費せず pending（再評価も呼ばない）', async () => {
+    const { storage, taskId } = seed()
+    let otherId = ''
+
+    const result = await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
+      // Critic を待っている間に、同じ Task へ別の設計の review（例: resume instruction）が起票された。
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async () => {
+          otherId = storage.designReviewRuns.create({
+            taskId, taskTitle: 'other', designText: 'a different resume instruction',
+            designTextHash: computeDesignTextHash('a different resume instruction'), changedFiles: [],
+          }).id
+          return { ok: true, stdout: JSON.stringify(DISPUTED_CRITIQUE), timedOut: false }
+        },
+      },
+      reEvaluate: async () => { throw new Error('must not re-evaluate while another review is active') },
+    }) as never)
+
+    expect(result).toMatchObject({ stage: 'challenge', status: 'review_pending' })
+    expect(result.reason).toContain(otherId)
+    // starting 行が無い = Challenge は消費されていない。
+    expect(stageEntries(storage, taskId, 'challenge')).toEqual([])
+  })
+
+  it('ALIGNED の後に回収経路が先に初回 Job を作っていても、challenge_aligned として扱う', async () => {
+    const { storage, taskId, designText } = seed()
+    const task = storage.tasks.findById(taskId)!
+
+    const result = await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
+      reEvaluate: async () => {
+        // 再評価が ALIGNED になった直後に、recoverReadyTasksWithoutJob() が同じ prompt で Job を作った。
+        storage.jobs.create({
+          taskId, projectId: task.projectId, agentRole: 'developer_ai', status: 'queued',
+          workflowStepKey: `task:${taskId}:initial-implement`,
+          safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+          aiCliMode: 'implement', aiCliPrompt: designText,
+        } as never)
+        return { status: 'evidence_registered', decision: 'ALIGNED' }
+      },
+      ensureJob: async () => ({ taskId, status: 'skipped', reason: 'initial workflow job already exists' }),
+    }) as never)
+
+    expect(result.status).toBe('challenge_aligned')
+    expect(storage.jobs.findByTaskId(taskId)).toHaveLength(1)
+  })
+
+  it('ensureJob が skipped で、レビューした prompt の Job も無ければ従来どおり not_aligned', async () => {
+    const { storage, taskId } = seed()
+
+    const result = await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
+      reEvaluate: async () => ({ status: 'evidence_registered', decision: 'ALIGNED' }),
+      ensureJob: async () => ({ taskId, status: 'skipped', reason: 'task was parked by abort_task' }),
+    }) as never)
+
+    expect(result).toMatchObject({ status: 'challenge_not_aligned', failureCode: 'gate_did_not_release' })
+  })
+})

@@ -1061,6 +1061,17 @@ export async function applyRevisedSpec(
         specKey,
       }
     }
+    // 別の設計の review が active で、この spec の review を始められなかった（contention）。
+    // この spec は**まだ一度も審査されていない**ので「通らなかった」とは言えない。
+    if (active !== undefined) {
+      return {
+        status: 'review_pending',
+        taskId: result.taskId,
+        reason: `another design review (run ${active.id}) is active for this task; the revised design has not been reviewed yet`,
+        proposedHash,
+        specKey,
+      }
+    }
     return {
       status: 'still_not_aligned',
       failureCode: 'fresh_review_not_aligned',

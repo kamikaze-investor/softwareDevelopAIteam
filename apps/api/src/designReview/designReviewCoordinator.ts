@@ -30,7 +30,7 @@ import {
   type DesignReviewKind,
 } from '@ai-team/shared'
 import { resolveDefaultControlContextDir } from '@ai-team/shared/src/constitutionPrinciples.js'
-import type { IStorage, DesignReviewRun } from '../storage/interface'
+import { DesignReviewRunContentionError, type IStorage, type DesignReviewRun } from '../storage/interface'
 import type { AppliedPrinciple } from '@ai-team/shared'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { recordPrincipleApplications } from '../principles/ledger'
@@ -678,7 +678,10 @@ export function executeRunner(deps: CoordinatorDeps, input: string): Promise<Run
 }
 
 export interface ExecuteDesignReviewResult {
-  status: 'evidence_registered' | 'not_aligned' | 'requeued' | 'failed' | 'not_claimable' | 'stale'
+  /**
+   * `contended`: 同じ subject に別の同一性の active run が居て、この review を始められない（判定待ち）。
+   */
+  status: 'evidence_registered' | 'not_aligned' | 'requeued' | 'failed' | 'not_claimable' | 'stale' | 'contended'
   decision?: RecomputedDecision
   evidence?: DesignReviewEvidence
   error?: string
@@ -877,11 +880,67 @@ export async function createAndExecuteDesignReview(
   // これにより design_text → design_text_hash → evidence.designTextHash →
   // Job Gate が計算する computeDesignTextHash(job.aiCliPrompt) が同一内容でのみ一致し、
   // review後にpromptを書き換えた実行を通せない。
-  const run = storage.designReviewRuns.create({
+  return createAndExecute(storage, () => storage.designReviewRuns.create({
     ...input,
     designTextHash: computeDesignTextHash(input.designText),
-  })
-  return executeDesignReviewRun(storage, run, deps)
+  }), deps)
+}
+
+/**
+ * run の作成（または同一性の一致する active run の再利用）→ 実行 → 終端しなかった場合の読み直し。
+ *
+ * - 別の同一性の active run が居る（`DesignReviewRunContentionError`）→ `contended`。
+ *   subject ごとに active は1本なので、相手が終わるまで判定は得られない（否定ではない）。
+ * - 別の executor が同じ run を握っていた（`not_claimable` / `stale`）→ **保存済み状態を読み直す**。
+ *   queued / running なら `requeued`（判定待ち）、ALIGNED evidence があれば `evidence_registered`、
+ *   本当に終端した否定・失敗だけを `not_aligned` / `failed` にする。読み直さずに返すと、
+ *   同じ要求が重なっただけで（2本目の resume 等）レビュー失敗として扱われる。
+ */
+async function createAndExecute(
+  storage: IStorage,
+  createRun: () => DesignReviewRun,
+  deps: CoordinatorDeps,
+): Promise<ExecuteDesignReviewResult> {
+  let run: DesignReviewRun
+  try {
+    run = createRun()
+  } catch (err) {
+    if (err instanceof DesignReviewRunContentionError) {
+      return { status: 'contended', error: err.message }
+    }
+    throw err
+  }
+  const result = await executeDesignReviewRun(storage, run, deps)
+  if (result.status !== 'not_claimable' && result.status !== 'stale') return result
+  return readDurableRunOutcome(storage, run.id) ?? result
+}
+
+/** 他の executor が扱った run の、保存済みの結果。読めなければ undefined（呼び出し側は元の結果を返す）。 */
+function readDurableRunOutcome(storage: IStorage, runId: string): ExecuteDesignReviewResult | undefined {
+  const run = storage.designReviewRuns.findById(runId)
+  if (run === undefined) return undefined
+  if (run.status === 'queued' || run.status === 'running') {
+    return { status: 'requeued', error: `design review run ${run.id} is ${run.status} in another executor` }
+  }
+  if (run.status === 'failed') {
+    return { status: 'failed', error: run.error }
+  }
+  const evidence = run.reviewKind === 'task' && run.taskId !== undefined
+    ? storage.designReviewEvidence.findByTaskId(run.taskId)
+      .find((item) => item.designTextHash === run.designTextHash && item.decision === 'ALIGNED')
+    : storage.designReviewEvidence.findLatestBySubjectId(run.reviewKind, run.subjectId)
+  if (evidence !== undefined && evidence.designTextHash === run.designTextHash && evidence.decision === 'ALIGNED') {
+    return { status: 'evidence_registered', decision: 'ALIGNED', evidence }
+  }
+  if (run.resultJson === undefined) return undefined
+  try {
+    const parsed: unknown = JSON.parse(run.resultJson)
+    if (!isUsableRunnerOutput(parsed)) return undefined
+    const outcome = recomputeDecision(parsed, run.reviewKind, run.changedFiles)
+    return { status: 'not_aligned', decision: outcome.decision, error: run.error ?? outcome.rejectedReason }
+  } catch {
+    return undefined
+  }
 }
 
 export interface CreateAndExecuteRoadmapReviewInput {
@@ -898,15 +957,14 @@ export async function createAndExecuteRoadmapReview(
   input: CreateAndExecuteRoadmapReviewInput,
   deps: CoordinatorDeps,
 ): Promise<ExecuteDesignReviewResult> {
-  const run = storage.designReviewRuns.create({
+  return createAndExecute(storage, () => storage.designReviewRuns.create({
     reviewKind: 'roadmap',
     subjectId: input.projectId,
     taskTitle: input.taskTitle ?? 'Whole-Roadmap Review',
     designText: input.reviewMaterial,
     designTextHash: computeDesignTextHash(input.reviewMaterial),
     changedFiles: [],
-  })
-  return executeDesignReviewRun(storage, run, deps)
+  }), deps)
 }
 
 /**

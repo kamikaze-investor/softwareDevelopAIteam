@@ -3,7 +3,8 @@ import { mkdtempSync, writeFileSync, rmSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createSQLiteStorage } from '../storage/sqlite'
-import type { IStorage } from '../storage/interface'
+import { DesignReviewRunContentionError, type IStorage } from '../storage/interface'
+import { computeDesignTextHash as computeHashForTest } from '../designReviewEvidencePolicy'
 import {
   DESIGN_REVIEW_MAX_ATTEMPTS,
   DESIGN_REVIEW_RUNNER_MAX_OUTPUT_BYTES,
@@ -1246,5 +1247,82 @@ describe('recomputeDecision の判定 pipeline（kind × load × 妥当性 × un
     expect(run.status).toBe('queued')
     expect(run.error).toContain('no usable output')
     expect(storage.designReviewEvidence.findByTaskId(taskId)).toEqual([])
+  })
+})
+/**
+ * **active run の再利用は、runner から見える同一性が一致するときだけ**（独立レビュー round 6・2026-10-16）。
+ *
+ * active run は subject ごとに1本。別の design text / changedFiles の run を返すと、その判定が
+ * レビューされていない設計に帰属する。一致しなければ contention（判定待ち）として返す。
+ */
+describe('active run の同一性による再利用と contention', () => {
+  const ALIGNED_LOW = JSON.stringify({
+    focusedReviewResults: [],
+    integrationReviewResult: { decision: 'ALIGNED' },
+    finalDecision: 'ALIGNED',
+  })
+
+  function seedActiveRun(storage: IStorage, taskId: string) {
+    return storage.designReviewRuns.create({
+      ...baseInput(taskId),
+      designText: 'original design',
+      designTextHash: computeHashForTest('original design'),
+    })
+  }
+
+  it('別の design text の active run があれば、それを返さず contended（相手の run には触れない）', async () => {
+    const storage = createStorage()
+    const taskId = seedTask(storage)
+    const active = seedActiveRun(storage, taskId)
+    let executed = 0
+
+    const result = await createAndExecuteDesignReview(
+      storage,
+      { taskId, taskTitle: 'design', designText: 'a different instruction', changedFiles: LOW_LOAD_FILES },
+      deps(async () => { executed += 1; return { ok: true, stdout: ALIGNED_LOW, timedOut: false } }),
+    )
+
+    expect(result.status).toBe('contended')
+    expect(executed).toBe(0)
+    expect(storage.designReviewRuns.findById(active.id)).toMatchObject({ status: 'queued', attemptCount: 0 })
+    expect(storage.designReviewRuns.findByTaskId(taskId)).toHaveLength(1)
+    expect(storage.designReviewEvidence.findByTaskId(taskId)).toEqual([])
+  })
+
+  it('同じ design text でも changedFiles が違えば contended', async () => {
+    const storage = createStorage()
+    const taskId = seedTask(storage)
+    seedActiveRun(storage, taskId)
+
+    const result = await createAndExecuteDesignReview(
+      storage,
+      { taskId, taskTitle: 'design', designText: 'original design', changedFiles: ['specs/00_constitution.md'] },
+      deps(async () => ({ ok: true, stdout: ALIGNED_LOW, timedOut: false })),
+    )
+
+    expect(result.status).toBe('contended')
+    expect(() => storage.designReviewRuns.create({
+      ...baseInput(taskId),
+      designText: 'original design',
+      designTextHash: computeHashForTest('original design'),
+      changedFiles: ['specs/00_constitution.md'],
+    })).toThrow(DesignReviewRunContentionError)
+  })
+
+  it('同一性が一致すれば同じ active run を再利用して実行する', async () => {
+    const storage = createStorage()
+    const taskId = seedTask(storage)
+    const active = seedActiveRun(storage, taskId)
+
+    const result = await createAndExecuteDesignReview(
+      storage,
+      // changedFiles の順序は同一性に効かない。
+      { taskId, taskTitle: 'design', designText: 'original design', changedFiles: [...LOW_LOAD_FILES].reverse() },
+      deps(async () => ({ ok: true, stdout: ALIGNED_LOW, timedOut: false })),
+    )
+
+    expect(result.status).toBe('evidence_registered')
+    expect(storage.designReviewRuns.findById(active.id)?.status).toBe('succeeded')
+    expect(storage.designReviewRuns.findByTaskId(taskId)).toHaveLength(1)
   })
 })

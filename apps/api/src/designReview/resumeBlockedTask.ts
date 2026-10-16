@@ -54,7 +54,13 @@ export async function resumeBlockedTaskWithDesignReview(
       changedFiles: [],
     }, input.coordinatorDeps ?? buildDefaultCoordinatorDeps())
 
-    if (review.status === 'requeued') {
+    // 判定がまだ無い（queued / 別の同一性の active run と競合 / 別 executor が実行中で読み直しても
+    // 終端していない）。否定ではないので FAILED にしない。終端していれば coordinator が読み直した
+    // 結果（evidence_registered / not_aligned / failed）がここへ届く。
+    if (
+      review.status === 'requeued' || review.status === 'contended'
+      || review.status === 'not_claimable' || review.status === 'stale'
+    ) {
       return {
         ok: false,
         code: RESUME_DESIGN_REVIEW_PENDING,

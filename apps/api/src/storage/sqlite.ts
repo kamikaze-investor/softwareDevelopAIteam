@@ -18,6 +18,7 @@ import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
 import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IPrincipleApplicationStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult, RepairHandoffRefusalCode } from './interface'
+import { DesignReviewRunContentionError } from './interface'
 import { computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS, isSupervisedRunKind } from '@ai-team/shared'
 import type { SupervisedRunKind } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, JobWorkspaceBaseline, JobWorkspaceBaselineEntry, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
@@ -4877,7 +4878,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           "SELECT * FROM design_review_runs WHERE review_kind = ? AND subject_id = ? AND status IN ('queued','running') LIMIT 1"
         ).get(subject.reviewKind, subject.subjectId) as any
         if (existing) {
-          return reuseActiveRun(existing, data.repairSourceJobId)
+          return reuseActiveRun(existing, data)
         }
 
         const run: DesignReviewRun = {
@@ -4915,7 +4916,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           if (!existingAfterConflict) {
             throw err
           }
-          return reuseActiveRun(existingAfterConflict, data.repairSourceJobId)
+          return reuseActiveRun(existingAfterConflict, data)
         }
         return run
       })
@@ -6266,13 +6267,30 @@ function deserializeDesignReviewRun(row: any): DesignReviewRun {
  * `repairFlow.ts` の `createRepairJobWithHandoff` 周辺が依拠しているのと同じ不変条件）。
  * ここはその不変条件が将来崩れたときに**黙って壊れない**ための保険である。
  */
-function reuseActiveRun(existingRow: any, requestedRepairSourceJobId: string | undefined): DesignReviewRun {
+function reuseActiveRun(
+  existingRow: any,
+  requested: { repairSourceJobId?: string; designTextHash: string; changedFiles: readonly string[] },
+): DesignReviewRun {
   const existing = deserializeDesignReviewRun(existingRow)
-  if (existing.repairSourceJobId !== requestedRepairSourceJobId) {
-    throw new Error(
+  if (existing.repairSourceJobId !== requested.repairSourceJobId) {
+    throw new DesignReviewRunContentionError(
       'design review run intent mismatch: an active run for this subject has repairSourceJobId='
-      + `${existing.repairSourceJobId ?? 'null'} but ${requestedRepairSourceJobId ?? 'null'} was requested`
+      + `${existing.repairSourceJobId ?? 'null'} but ${requested.repairSourceJobId ?? 'null'} was requested`
       + ` (runId=${existing.id})`,
+      existing.id,
+    )
+  }
+  // **intent が同じでも、runner から見える同一性が違えば別の review である。** 以前は intent だけを
+  // 見ていたため、別の design text / changedFiles の run（例: Challenge の再評価や resume instruction とは
+  // 別の review）を返し、その判定がレビューされていない設計に帰属しえた（独立レビュー指摘・2026-10-16）。
+  // changedFiles は focus 選択に順序が効かないので集合として比べる。
+  const sameFiles = JSON.stringify([...existing.changedFiles].sort())
+    === JSON.stringify([...requested.changedFiles].sort())
+  if (existing.designTextHash !== requested.designTextHash || !sameFiles) {
+    throw new DesignReviewRunContentionError(
+      'design review run identity mismatch: an active run for this subject reviews a different design'
+      + ` (runId=${existing.id})`,
+      existing.id,
     )
   }
   return existing

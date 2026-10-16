@@ -170,6 +170,18 @@ export type FailAndPrepareRepairResult =
  *   - repair Job の作成が失敗したら transaction 全体が rollback し、
  *     source Job は `blocked` のまま（所有権保持）となる。
  */
+/**
+ * 同じ subject に**別の同一性**の active Design Review run があり、要求された run を作れない。
+ * active run は subject ごとに1本（partial unique index）なので、相手が終わるまで待つしかない。
+ * 呼び出し側はこれを「判定がまだ無い」（pending）として扱う —— 否定的な判定ではない。
+ */
+export class DesignReviewRunContentionError extends Error {
+  constructor(message: string, readonly activeRunId: string) {
+    super(message)
+    this.name = 'DesignReviewRunContentionError'
+  }
+}
+
 export type CreateRepairJobWithHandoffResult =
   | { ok: true; repairJob: Job }
   | {
@@ -929,7 +941,12 @@ export interface IDesignReviewRunStorage {
    * repair admission が「Human Resume で回答済みの run」を根拠から外すための read-only 導出。
    */
   findByTaskId(taskId: string): DesignReviewRun[]
-  /** 同一Taskにqueued/running中のrunがある場合は作成せず既存を返す（partial unique index準拠）。 */
+  /**
+   * 同一 subject に queued/running の run があれば作成しない（partial unique index 準拠で active は1本）。
+   * **runner から見える同一性**（designTextHash・changedFiles・repairSourceJobId）が一致するときだけ
+   * 既存 run を返し、一致しなければ `DesignReviewRunContentionError` を投げる —— 別の設計の run を
+   * 黙って返すと、レビューされていない設計にその判定が帰属してしまう。
+   */
   create(input: DesignReviewRunCreateInput): DesignReviewRun
   /** startup recovery後に再kick対象となるqueued run一覧。 */
   findQueued(): DesignReviewRun[]
