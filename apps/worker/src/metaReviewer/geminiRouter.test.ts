@@ -40,7 +40,7 @@ import { spawnSync } from 'node:child_process'
 import { callGeminiForReview } from './geminiClient.js'
 import { writeFileSync } from 'node:fs'
 import {
-  AGY_LIGHT_MODEL, AGY_REVIEW_MODEL,
+  AGY_ARGV_PROMPT_BYTE_LIMIT, AGY_LIGHT_MODEL, AGY_REVIEW_MODEL,
   callGeminiWithFallback, classifyFailure, sanitizeMessage, MetaReviewProviderError,
 } from './geminiRouter.js'
 
@@ -445,6 +445,63 @@ describe('callGeminiWithFallback', () => {
       // CLI が ENOENT（unavailable）でも、API 段が実際に得た transient 信号がそのまま採用される
       expect(error).toBeInstanceOf(MetaReviewProviderError)
       expect((error as MetaReviewProviderError).failureClass).toBe('transient')
+    })
+
+    describe('agy の argv 上限を超える prompt（E2BIG guard）', () => {
+      // 1 文字 3 バイトの日本語で、文字数は上限未満でもバイト数で超える prompt
+      const oversized = 'あ'.repeat(Math.ceil(AGY_ARGV_PROMPT_BYTE_LIMIT / 3) + 10)
+
+      it('バイト数で上限を超えたら agy を spawn せず、API の結果を使う（prompt は切り詰めない）', async () => {
+        expect(oversized.length).toBeLessThan(AGY_ARGV_PROMPT_BYTE_LIMIT)
+        mockCallApi.mockResolvedValue('API response text')
+
+        const result = await callGeminiWithFallback(oversized, {
+          preferCli: true, featureName: 'test', sleepImpl: noSleep,
+        })
+
+        expect(result).toBe('API response text')
+        expect(mockSpawnSync).not.toHaveBeenCalled()
+        expect(mockCallApi).toHaveBeenCalledOnce()
+        expect(mockCallApi.mock.calls[0]![0]).toBe(oversized)
+      })
+
+      it('API が transient なら合成も transient になり、既存の Copilot fallback の対象のまま', async () => {
+        mockCallApi.mockRejectedValue(new Error('503 Service Unavailable'))
+
+        const error = await callGeminiWithFallback(oversized, {
+          preferCli: false, featureName: 'test', sleepImpl: noSleep,
+        }).catch((e: unknown) => e)
+
+        expect(mockSpawnSync).not.toHaveBeenCalled()
+        expect(error).toBeInstanceOf(MetaReviewProviderError)
+        expect((error as MetaReviewProviderError).failureClass).toBe('transient')
+      })
+
+      it('API が quota / transient 以外で失敗したら fallback 対象にせず fail-closed のまま', async () => {
+        mockCallApi.mockRejectedValue(new Error('unexpected failure without a known signature'))
+
+        const error = await callGeminiWithFallback(oversized, {
+          preferCli: false, featureName: 'test', sleepImpl: noSleep,
+        }).catch((e: unknown) => e)
+
+        expect(mockSpawnSync).not.toHaveBeenCalled()
+        expect(error).toBeInstanceOf(MetaReviewProviderError)
+        expect(['quota', 'transient']).not.toContain((error as MetaReviewProviderError).failureClass)
+      })
+
+      it('上限以下の prompt は従来どおり agy へ全文を渡す', async () => {
+        const fits = 'a'.repeat(AGY_ARGV_PROMPT_BYTE_LIMIT)
+        mockSpawnSync.mockReturnValue(cliSuccess('CLI response'))
+
+        const result = await callGeminiWithFallback(fits, {
+          preferCli: true, featureName: 'test', sleepImpl: noSleep,
+        })
+
+        expect(result).toBe('CLI response')
+        expect(mockSpawnSync).toHaveBeenCalledOnce()
+        const argv = mockSpawnSync.mock.calls[0]![1] as string[]
+        expect(argv[argv.indexOf('--print') + 1]).toBe(fits)
+      })
     })
 
     it('診断情報（allowlist フィールドのみ）をログに出し、raw stderr をそのまま漏らさない', async () => {
