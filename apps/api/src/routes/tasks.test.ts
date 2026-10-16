@@ -1073,9 +1073,18 @@ describe('Task API', () => {
           title: 'Resume a profiled implementation',
           description: 'Update only the allowed API files.',
         })
-        const blockedJob = await createBlockedAiCliJob(app, task, {
+        // profile はサーバー側 producer だけが付ける（POST /api/jobs は受けない）ので、storage で作る。
+        const { getStorage } = await import('../storage/index.js')
+        const blockedJob = getStorage().jobs.create({
+          taskId: task.id,
+          projectId: task.projectId,
           agentRole: 'developer_ai',
-          safeCommand: { kind: 'test', params: { verificationProfile: 'implement' } },
+          status: 'blocked',
+          safeCommand: {
+            kind: 'test',
+            workingDir: '/workspace/target',
+            params: { verificationProfile: 'implement' },
+          },
           aiCliProvider: 'codex',
           aiCliPrompt: 'Original rejected prompt',
           aiCliMode: 'implement',
