@@ -2810,30 +2810,56 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     }
   }
 
-  it('cooldown wait does not hide an unrelated failed Job created on the same Task after the review', async () => {
-    const { storage, taskId, projectId } = seed()
-    blockedAiCliJob(storage, taskId, projectId)
-    const runId = await coolingPlResumeReview(storage, taskId)
-    // A manual, non-implement Job (POST /api/jobs) that failed after the resume review was requested.
-    advanceWallClock(1_000)
-    const manual = storage.jobs.create({
+  function manualBlockedJob(storage: IStorage, taskId: string, projectId: string): string {
+    // A manual, non-implement Job (POST /api/jobs) on the same Task. It is not what the resume review is for.
+    return storage.jobs.create({
       taskId,
       projectId,
       agentRole: 'developer_ai',
-      status: 'failed',
+      status: 'blocked',
       safeCommand: { kind: 'test', workingDir: '/workspace/target' },
       dryRun: false,
-    } as Parameters<IStorage['jobs']['create']>[0])
+    } as Parameters<IStorage['jobs']['create']>[0]).id
+  }
+
+  it('cooldown wait does not hide an unrelated blocked Job created on the same Task after the review', async () => {
+    const { storage, taskId, projectId } = seed()
+    const source = blockedAiCliJob(storage, taskId, projectId)
+    const runId = await coolingPlResumeReview(storage, taskId)
+    // The resume review records the Job it was requested for (identity, not timestamps).
+    expect(storage.designReviewRuns.findById(runId)?.resumeSourceJobId).toBe(source)
+    advanceWallClock(1_000)
+    const manual = manualBlockedJob(storage, taskId, projectId)
 
     const counter = diagnoseCounter()
     resetPlLoopInFlightForTest()
     const tick = await runPlTick(storage, deps({ diagnose: counter.diagnose, coordinatorDeps: alignedCoordinatorDeps }))
 
-    expect(storage.designReviewRuns.findById(runId)).toMatchObject({ status: 'queued', attemptCount: 1 })
+    // The source Job waits on the cooling run; the manual Job is acted on.
+    expect(tick.target?.key).toBe(`job_blocked:${manual}`)
     expect(counter.count()).toBe(1)
-    expect(tick.target).toBeDefined()
-    // Neither the manual Job nor the (no longer latest) source Job is proven to wait on this run.
-    expect([`job_failed:${manual.id}`, `job_blocked:${storage.jobs.findByTaskId(taskId).at(-1)!.id}`]).toContain(tick.target?.key)
+    expect(storage.designReviewRuns.findById(runId)).toMatchObject({ status: 'queued', attemptCount: 1 })
+  })
+
+  it('cooldown wait does not hide an unrelated Job inserted in the same millisecond as the review', async () => {
+    // Same createdAt and latest by rowid: timestamps and "latest Job" cannot tell it apart; identity can.
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-17T03:00:00.000Z'))
+    const { storage, taskId, projectId } = seed()
+    const source = blockedAiCliJob(storage, taskId, projectId)
+    const runId = await coolingPlResumeReview(storage, taskId)
+    const manual = manualBlockedJob(storage, taskId, projectId)
+    const run = storage.designReviewRuns.findById(runId)!
+    expect(storage.jobs.findById(manual)?.createdAt).toBe(run.createdAt)
+    expect(storage.jobs.findByTaskId(taskId)[0]?.id).toBe(manual)
+    expect(run.resumeSourceJobId).toBe(source)
+
+    const counter = diagnoseCounter()
+    resetPlLoopInFlightForTest()
+    const tick = await runPlTick(storage, deps({ diagnose: counter.diagnose, coordinatorDeps: alignedCoordinatorDeps }))
+
+    expect(tick.target?.key).toBe(`job_blocked:${manual}`)
+    expect(counter.count()).toBe(1)
   })
 
   it('cooldown wait does not hide an older blocked Job that the resume would not target', async () => {

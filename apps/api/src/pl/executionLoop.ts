@@ -105,7 +105,7 @@ import {
 } from './conflictResolutionStep'
 import type { AuditLogEntry } from '@ai-team/shared'
 import type { DesignReviewRun, IStorage } from '../storage/interface'
-import { computeDesignTextHash, isUsableAlignedEvidence } from '../designReviewEvidencePolicy'
+import { isUsableAlignedEvidence } from '../designReviewEvidencePolicy'
 import { RESUME_DESIGN_REVIEW_PENDING, resumeBlockedTaskWithDesignReview } from '../designReview/resumeBlockedTask'
 import {
   countPlTechnicalResumes,
@@ -464,7 +464,7 @@ function hasStalledLongEnough(item: AttentionItem): boolean {
  * 自律 tick の選択と Operator Request からの対象指定の**両方がこの1つを使う**。
  * Operator Request はこの条件を緩めない（Escalation 済み・停滞前の対象は依頼があっても扱わない）。
  */
-function isActionableNow(storage: IStorage, item: AttentionItem, resumeInstruction?: string): boolean {
+function isActionableNow(storage: IStorage, item: AttentionItem): boolean {
   return (
     ACTIONABLE_ATTENTION_KINDS.includes(item.kind)
     // **Independent Remediation は Escalation 済みでも対象にする。**
@@ -477,7 +477,7 @@ function isActionableNow(storage: IStorage, item: AttentionItem, resumeInstructi
     && !hasExhaustedTargetTechnicalRecovery(storage, item)
     && !hasExhaustedInProcessAttempts(targetKeyOf(item))
     && hasStalledLongEnough(item)
-    && designReviewRetryWaitUntil(storage, item, resumeInstruction) === undefined
+    && designReviewRetryWaitUntil(storage, item) === undefined
   )
 }
 
@@ -498,17 +498,13 @@ const WAITS_FOR_DESIGN_REVIEW_RETRY_KINDS: readonly AttentionItem['kind'][] = ['
  * （`isRetryRunLinkedToAttentionJob()`）。証明できなければ従来どおり actionable のまま残す
  * （同じ Task の無関係な Job の停止を、最大 30 分黙らせない。独立レビュー指摘・C3-c）。
  */
-function designReviewRetryWaitUntil(
-  storage: IStorage,
-  item: AttentionItem,
-  resumeInstruction: string | undefined,
-): string | undefined {
+function designReviewRetryWaitUntil(storage: IStorage, item: AttentionItem): string | undefined {
   if (item.taskId === undefined || !WAITS_FOR_DESIGN_REVIEW_RETRY_KINDS.includes(item.kind)) return undefined
   const run = storage.designReviewRuns.findLatestByTaskId(item.taskId)
   if (run === undefined) return undefined
   const notBeforeMs = designReviewRetryNotBeforeMs(run)
   if (notBeforeMs === undefined || Date.now() >= notBeforeMs) return undefined
-  return isRetryRunLinkedToAttentionJob(storage, run, item, resumeInstruction)
+  return isRetryRunLinkedToAttentionJob(storage, run, item)
     ? new Date(notBeforeMs).toISOString()
     : undefined
 }
@@ -519,19 +515,12 @@ function designReviewRetryWaitUntil(
  *
  * - **repair 目的の run**（`repairSourceJobId` あり）: attention の Job がその source 実装 Job 自身か、
  *   その実装を review した Job（`resolveReviewedImplementation()` の lineage）である。
- * - **PL の resume review**（`repairSourceJobId` なし）: 次の3つがすべて成り立つ。
- *   1. run がこの Task に対する PL の resume prompt そのものを review している
- *      （`designTextHash` が `buildPlResumeAiCliPrompt()` の hash と一致する）
- *   2. attention の Job が Task の最新 Job である（`resumeBlockedTask()` が再開するのはこの Job だけ。
- *      古い Job は対象外）
- *   3. run がその Job の停止後に起票された（Job の後から来た無関係な Job は対象外）
+ * - **resume review**（`repairSourceJobId` なし）: run の `resumeSourceJobId`（resume-with-design-review が
+ *   起票時に、resume しようとした Job の id を記録したもの）が attention の Job と**完全一致**する。
+ *   timestamp や「最新 Job」からは推論しない（RC1）。NULL（legacy・他経路の run）は証明なし。
+ *   後から来た別の Job は id が一致しないので、同じ Task でも actionable のまま残る。
  */
-function isRetryRunLinkedToAttentionJob(
-  storage: IStorage,
-  run: DesignReviewRun,
-  item: AttentionItem,
-  resumeInstruction: string | undefined,
-): boolean {
+function isRetryRunLinkedToAttentionJob(storage: IStorage, run: DesignReviewRun, item: AttentionItem): boolean {
   const job = item.jobId === undefined ? undefined : storage.jobs.findById(item.jobId)
   if (job === undefined || job.taskId !== item.taskId) return false
 
@@ -542,14 +531,7 @@ function isRetryRunLinkedToAttentionJob(
     return reviewed.ok && reviewed.implementJob.id === run.repairSourceJobId
   }
 
-  const task = storage.tasks.findById(job.taskId)
-  if (task === undefined) return false
-  const plResumePrompt = buildPlResumeAiCliPrompt(task, resumeInstruction ?? DEFAULT_RESUME_INSTRUCTION)
-  if (run.designTextHash !== computeDesignTextHash(plResumePrompt)) return false
-  if (storage.jobs.findByTaskId(task.id)[0]?.id !== job.id) return false
-  const jobStoppedAt = Date.parse(job.completedAt ?? job.createdAt)
-  const runCreatedAt = Date.parse(run.createdAt)
-  return Number.isFinite(jobStoppedAt) && Number.isFinite(runCreatedAt) && runCreatedAt >= jobStoppedAt
+  return run.resumeSourceJobId !== undefined && run.resumeSourceJobId === job.id
 }
 
 /**
@@ -916,7 +898,7 @@ import {
  * PL の自律ループがその attention をどう扱っているかの**読み取り専用**の要約。
  * Operator Request への回答材料であり、ループの判断そのものには使わない。
  */
-function describePlLoopStatus(storage: IStorage, item: AttentionItem, resumeInstruction?: string) {
+function describePlLoopStatus(storage: IStorage, item: AttentionItem) {
   const key = targetKeyOf(item)
   return {
     handledByPlLoop: ACTIONABLE_ATTENTION_KINDS.includes(item.kind),
@@ -924,7 +906,7 @@ function describePlLoopStatus(storage: IStorage, item: AttentionItem, resumeInst
     priorAttempts: countPriorAttempts(storage, key),
     maxAttempts: PL_MAX_ATTEMPTS_PER_TARGET,
     escalatedToCeo: hasEscalated(storage, key),
-    actionableNow: isActionableNow(storage, item, resumeInstruction),
+    actionableNow: isActionableNow(storage, item),
   }
 }
 
@@ -946,15 +928,15 @@ async function actOnOperatorTarget(
     return { attempted: false, status: 'not_found', reason: 'the target is no longer an attention item' }
   }
   observeTechnicalRecoveryExhaustion(storage, item)
-  if (!isActionableNow(storage, item, deps.resumeInstruction)) {
+  if (!isActionableNow(storage, item)) {
     const reason = !ACTIONABLE_ATTENTION_KINDS.includes(item.kind)
       ? `the PL has no executor for ${item.kind}; it is only observed`
       : hasEscalated(storage, targetKeyOf(item)) && !isRemediableConflict(storage, item)
         ? 'already escalated to the CEO; the PL waits for the CEO decision'
         : hasExhaustedTargetTechnicalRecovery(storage, item)
           ? 'technical recovery budget exhausted; the PL will not resume this target'
-          : designReviewRetryWaitUntil(storage, item, deps.resumeInstruction) !== undefined
-            ? `the Design Review retry is cooling down until ${designReviewRetryWaitUntil(storage, item, deps.resumeInstruction)}; the PL will look at it automatically`
+          : designReviewRetryWaitUntil(storage, item) !== undefined
+            ? `the Design Review retry is cooling down until ${designReviewRetryWaitUntil(storage, item)}; the PL will look at it automatically`
             : 'not stalled long enough yet; the PL will look at it automatically'
     return { attempted: false, status: 'not_eligible', reason }
   }
@@ -1750,7 +1732,7 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
     const operatorRequest = lastTickHandledOperatorRequest ? undefined : await runOperatorRequestStep(storage, {
       ...(deps.answerOperatorRequest ? { answer: deps.answerOperatorRequest } : {}),
       escalate: deps.escalate ?? defaultEscalate,
-      describePlLoopStatus: (target) => describePlLoopStatus(storage, target, deps.resumeInstruction),
+      describePlLoopStatus: (target) => describePlLoopStatus(storage, target),
       targetKeyOf,
       actOnTarget: (targetKey) => actOnOperatorTarget(storage, deps, targetKey),
       ...(deps.now ? { now: deps.now } : {}),
@@ -1776,7 +1758,7 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
     // 実測 25 秒）を走らせ、最後に「already escalated」で捨てることになる。
     // CEO の判断待ちの間ずっとモデル枠を焼く挙動であり、
     // 「一時的・既知の異常による不要な PL 起動を減らす」という本項目の目的に反する。
-    const actionable = before.attention.filter((item) => isActionableNow(storage, item, deps.resumeInstruction))
+    const actionable = before.attention.filter((item) => isActionableNow(storage, item))
     const item = selectTarget(actionable)
     if (!item) {
       // **手が空いたら次の Roadmap 項目を採用する。**

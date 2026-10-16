@@ -56,6 +56,8 @@ export async function resumeBlockedTaskWithDesignReview(
       taskTitle: input.task.title,
       designText: input.instructionPrompt,
       changedFiles: [],
+      // resume provenance: この review の判定を待つのは、いま resume しようとした Job である（C3-c）。
+      ...(resumed.sourceJobId !== undefined ? { resumeSourceJobId: resumed.sourceJobId } : {}),
     }, input.coordinatorDeps ?? buildDefaultCoordinatorDeps())
 
     // 判定がまだ無い（queued / 別の同一性の active run と競合 / 別 executor が実行中で読み直しても

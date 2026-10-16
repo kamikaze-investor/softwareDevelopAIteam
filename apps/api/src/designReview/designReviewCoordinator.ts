@@ -876,6 +876,8 @@ export async function createAndExecuteDesignReview(
     taskTitle: string
     designText: string
     changedFiles: string[]
+    /** resume-with-design-review だけが渡す、resume 対象 Job の id（`DesignReviewRun.resumeSourceJobId`）。 */
+    resumeSourceJobId?: string
   },
   deps: CoordinatorDeps,
 ): Promise<ExecuteDesignReviewResult> {

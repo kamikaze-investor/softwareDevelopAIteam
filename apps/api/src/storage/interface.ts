@@ -63,6 +63,11 @@ export type ResumeBlockedTaskResult =
          */
         | 'HUMAN_DECISION_PENDING'
       reason: string
+      /**
+       * `DESIGN_REVIEW_PRECONDITION_FAILED` のときだけ入る、この resume が再開する Job の id。
+       * resume-with-design-review が起票する run の `resumeSourceJobId` になる（推論せずここから渡す）。
+       */
+      sourceJobId?: string
     }
 
 /**
@@ -892,6 +897,15 @@ export interface DesignReviewRun {
    * repair 予算の計算へは一切関与しない。
    */
   repairSourceJobId?: string
+  /**
+   * **resume provenance。** resume-with-design-review（PL / Human）が起票した run でだけ入り、
+   * その resume が再開する Job の id（`ResumeBlockedTaskResult.sourceJobId`）。
+   *
+   * retry cooldown 中に PL が「この Job の復旧はこの run の判定待ち」と判断する唯一の根拠で、
+   * timestamp や「最新 Job」から推論しない（RC1）。NULL（legacy・他経路）は証明なしとして扱う。
+   * `repairSourceJobId` とは別の事実であり、流用しない。active run の再利用時は最初の値が残る。
+   */
+  resumeSourceJobId?: string
 }
 
 /** claim結果。claimできなかった場合は run=undefined。 */
