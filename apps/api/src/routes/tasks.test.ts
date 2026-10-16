@@ -1239,6 +1239,54 @@ describe('Task API', () => {
       })
     })
 
+    // C3-c: the Job that was reviewed is pinned. If another Job becomes the latest while the review runs,
+    // the resume is refused with a stable 409 code, even if that Job would also fail admission.
+    it('returns 409 RESUME_TARGET_CHANGED when the resume target changes while the instruction review runs', async () => {
+      let replacement = ''
+      let insertReplacement: () => void = () => {}
+      const execute = vi.fn(async () => {
+        insertReplacement()
+        return {
+          ok: true,
+          stdout: JSON.stringify({
+            focusedReviewResults: [{ focus: 'scope_simplicity', decision: 'ALIGNED' }],
+            integrationReviewResult: { decision: 'ALIGNED' },
+          }),
+          timedOut: false,
+        }
+      })
+
+      await withApp(async (app) => {
+        const { getStorage } = await import('../storage/index.js')
+        const storage = getStorage()
+        const project = await createProject(app, { status: 'running' })
+        const task = await createTask(app, project.id)
+        const blocked = await createBlockedAiCliJob(app, task, { aiCliPrompt: 'Original blocked prompt' })
+        // A queued manual Job without AI CLI metadata appears while the review is pending.
+        insertReplacement = () => {
+          replacement = storage.jobs.create({
+            taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status: 'queued',
+            safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+          } as Parameters<typeof storage.jobs.create>[0]).id
+        }
+
+        const res = await app.inject({
+          method: 'POST', url: `/api/tasks/${task.id}/resume`, payload: { instruction: 'Use docs only.' },
+        })
+
+        expect(res.statusCode).toBe(409)
+        expect(parseBody<{ code: string }>(res.body).code).toBe('RESUME_TARGET_CHANGED')
+        expect(execute).toHaveBeenCalledTimes(1)
+        expect(storage.jobs.findByTaskId(task.id).some((job) => job.workflowStepKey?.startsWith('resume:'))).toBe(false)
+        expect(storage.jobs.findById(blocked.id)?.status).toBe('blocked')
+        expect(storage.jobs.findById(replacement)?.status).toBe('queued')
+      }, {
+        resumeDesignReviewDeps: {
+          runnerCommand: 'mock', runnerArgs: [], homeDirectory: '/tmp', workingDir: '/tmp', execute,
+        },
+      })
+    })
+
     it('normalizes workingDir to the canonical TARGET_WORKING_DIR even if the blocked job stored a different value', async () => {
       await withApp(async (app) => {
         const { getStorage } = await import('../storage/index.js')

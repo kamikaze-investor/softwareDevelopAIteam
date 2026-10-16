@@ -3103,6 +3103,16 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         ).all(taskId) as any[]
         const taskJobs = jobRows.map(deserializeJob)
         const latestJob = taskJobs[0]
+        // review を起票したときの resume 対象から変わっていたら、review が見ていない Job を resume しない（C3-c）。
+        // **admission より前に判定する。** 差し替わった Job が admission に落ちる形（AI CLI metadata 無し・
+        // queued / running）でも、呼び出し側に返すべき事実は「対象が変わった」である。
+        if (input.expectedSourceJobId !== undefined && latestJob?.id !== input.expectedSourceJobId) {
+          return {
+            ok: false,
+            code: 'RESUME_TARGET_CHANGED',
+            reason: `resume target changed from ${input.expectedSourceJobId} to ${latestJob?.id ?? 'none'} while the Design Review was pending`,
+          }
+        }
         const projectRow = db.prepare('SELECT status FROM projects WHERE id = ?').get(taskRow.project_id) as
           { status: string } | undefined
         const approvalRows = db.prepare(
@@ -3172,14 +3182,6 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         }
         if (!latestJob) {
           return { ok: false, code: 'NO_JOBS', reason: 'No jobs exist for this task' }
-        }
-        // review を起票したときの resume 対象から変わっていたら、review が見ていない Job を resume しない（C3-c）。
-        if (input.expectedSourceJobId !== undefined && latestJob.id !== input.expectedSourceJobId) {
-          return {
-            ok: false,
-            code: 'RESUME_TARGET_CHANGED',
-            reason: `resume target changed from ${input.expectedSourceJobId} to ${latestJob.id} while the Design Review was pending`,
-          }
         }
         const isJobDirectlyBlocked = latestJob.status === 'blocked'
 
