@@ -1,5 +1,5 @@
 /**
- * Lifecycle E2E — Approval paths（A1 REJECT / A2 expiry / A3 HIGH safe-work / A4 APPROVED expiry）。
+ * Lifecycle E2E — Approval paths（A1 REJECT / A2 expiry / A3 HIGH safe-work / A4 APPROVED expiry / A5 abort over dirt）。
  *
  * git_commit を人間承認へ送るために、LOW の docs 変更でも review に high finding を付ける
  * （Safety Evidence の `review_has_high_or_critical_finding`）。HIGH diff を使わないのは、
@@ -226,6 +226,58 @@ describe('A4: approved git_commit whose approval expires before the Worker consu
     expect(env.storage.approvalRequests.findById(approval.id)?.status).toBe('EXPIRED')
     expect(waitingRows(task.id)).toEqual([])
     expect((await env.systemState()).attention).toEqual([])
+  })
+})
+
+describe('A5: abort over an unowned dirty workspace escalates to blocked → Human Resume → completes', () => {
+  // Codex review c3-b P2: abort_task の UNATTRIBUTED_DIRTY_WORKSPACE 拒否だけでは、Task は pending + 最新 Job failed
+  // のまま resume（LATEST_JOB_NOT_BLOCKED）も recover（TASK_NOT_BLOCKED）も通らない。拒否と同時に既存の
+  // escalateTaskToHuman で blocked へ上げ、Human Resume で続けられることを route 経由で確かめる。
+  it('a5', async () => {
+    // Start: git_commit blocked on a Job-linked approval with uncommitted (dirty) changes in the worktree.
+    const { task, commitJob, approval } = await blockedOnHumanGate('a5', 'docs/a5', [HIGH_FINDING])
+    // Simulated pre-F-1 terminal state (the shape the old 409 → failTechnical produced): approval EXPIRED,
+    // git_commit failed with its dirty end fingerprint, Task back to pending.
+    env.storage.approvalRequests.updateStatus(approval.id, 'EXPIRED', undefined, true)
+    const dirty = env.storage.jobs.findById(commitJob.id)!.workspaceBaseline
+    expect(dirty?.mode).toBe('dirty')
+    env.storage.jobs.update(commitJob.id, { status: 'failed', failureMetadata: { workspaceEndFingerprint: dirty } })
+    env.storage.tasks.update(task.id, { status: 'pending' })
+    expect((await env.mobileAdmission(task.id)).resume).toEqual({ ok: false, code: 'LATEST_JOB_NOT_BLOCKED' })
+
+    // Operation 1: ADMIN-approved abort_task. Expected: 409 UNATTRIBUTED_DIRTY_WORKSPACE, not parked, Task blocked,
+    // the worktree changes are untouched.
+    const created = await env.api<{ id: string }>('POST', '/api/approval-requests', {
+      taskId: task.id, targetBranch: 'master', targetCommit: 'n/a', targetDiffHash: 'n/a', riskLevel: 'HIGH',
+      requestedAction: 'abort_task',
+    })
+    expect(created.statusCode, JSON.stringify(created.body)).toBe(201)
+    expect((await env.ceo.approve(created.body.id)).statusCode).toBe(200)
+    const abort = await env.api<{ code?: string }>('POST', `/api/tasks/${task.id}/abort`, {
+      approvalRequestId: created.body.id, reason: 'give up on this commit',
+    })
+    expect(abort.statusCode, JSON.stringify(abort.body)).toBe(409)
+    expect(abort.body.code).toBe('UNATTRIBUTED_DIRTY_WORKSPACE')
+    expect(env.task(task.id).status).toBe('blocked')
+    expect(env.storage.tasks.isParked(task.id)).toBe(false)
+    expect(git(['status', '--porcelain']).trim()).not.toBe('')
+    expect((await env.mobileAdmission(task.id)).resume).toEqual({ ok: true })
+
+    // Operation 2: Human Resume. Expected: a new git_commit Job in the resume lineage.
+    const resume = await env.ceo.resume(task.id, 'Commit the reviewed change.')
+    expect(resume.statusCode, JSON.stringify(resume.body)).toBe(201)
+    expect(resume.body.workflowStepKey).toBe(`resume:${commitJob.id}:1`)
+
+    // Operation 3: the resumed git_commit needs a fresh human approval (same review evidence) → approve → done.
+    const blocked = await env.worker.runUntilIdle()
+    expect(blocked.map((step) => [step.kind, step.reported])).toEqual([['git_commit', 'blocked']])
+    const [waiting] = waitingRows(task.id)
+    expect(waiting).toBeDefined()
+    expect((await env.ceo.approve(waiting!.id)).statusCode).toBe(200)
+    const done = await env.worker.runUntilIdle()
+    expect(done.map((step) => [step.kind, step.reported])).toEqual([['git_commit', 'success']])
+    expect(env.task(task.id).status).toBe('done')
+    expect(waitingRows(task.id)).toEqual([])
   })
 })
 

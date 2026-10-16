@@ -63,6 +63,7 @@ import { buildSystemState, type AttentionItem } from '../state/systemState'
 import { protectedViolations, triageBlocked } from './blockedTriage'
 import { readAdoptionCandidates } from './adoptionStep'
 import { resolveLinkedGitCommitRejection } from '../linkedGitCommitRejection'
+import { escalateTaskToHuman } from '../designReview/repairFlow'
 import {
   hasTechnicalAbortMetadata,
   isEligibleTechnicalAbortDiagnosis,
@@ -355,16 +356,29 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
     // 所有でもないまま残る。park すると次の採用がその差分の上で始まり quarantine される。
     // 判定材料は Worker が報告した既存の `workspaceEndFingerprint` だけで、ファイルには触れない
     // （何も破棄しない）。fingerprint の無い legacy 行は従来どおり（証明材料が無いので判定しない）。
+    //
+    // 拒否だけだと Task は pending + 最新 Job failed のまま残り、resume（最新 Job が blocked、または
+    // Task が blocked で最新 Job が failed を要求）も recover（Task が blocked を要求）も通らない行き止まりになる
+    // （Codex review c3-b P2）。既存の `escalateTaskToHuman()` で Task を blocked へ上げ、b8d0fc5d と同じ
+    // 「blocked Task + 最新 Job failed」形にする。Human Resume（指示付き）が admit され、attention は通常の
+    // blocked Task のものになる。escalateTaskToHuman は done / park 済みの Task を動かさない。
     const dirtyLeftover = findUnattributedDirtyEnd(taskJobs, otherTasks.flatMap((candidate) =>
       storage.jobs.findByTaskId(candidate.id)))
     if (dirtyLeftover !== undefined) {
+      const workingDir = dirtyLeftover.safeCommand?.workingDir
+      escalateTaskToHuman(
+        storage,
+        task.id,
+        `abort_task refused: job ${dirtyLeftover.id} left an unowned dirty workspace (UNATTRIBUTED_DIRTY_WORKSPACE)`,
+      )
       return {
         ok: false,
         code: 'UNATTRIBUTED_DIRTY_WORKSPACE',
         reason:
-          `job ${dirtyLeftover.id} ended with a dirty workspace in ${dirtyLeftover.safeCommand?.workingDir} `
-          + 'and no job holds it for cleanup; parking would leave those changes unowned for the next '
-          + 'adoption. Resolve the workspace through the existing resume / cleanup path first',
+          `job ${dirtyLeftover.id} ended with a dirty workspace in ${workingDir} and no job holds it for cleanup; `
+          + 'parking would leave those changes unowned for the next adoption. The task was escalated to blocked: '
+          + 'use Human Resume (with an instruction) to continue from that workspace',
+        details: { escalatedTaskStatus: storage.tasks.findById(task.id)?.status },
       }
     }
 

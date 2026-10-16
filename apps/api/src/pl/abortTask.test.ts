@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest'
-import { occupiesProject, type JobWorkspaceBaseline } from '@ai-team/shared'
+import { evaluateResumeAdmission, occupiesProject, type JobWorkspaceBaseline } from '@ai-team/shared'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import { recordApprovalActor } from '../designReview/resumeActor'
@@ -445,17 +445,41 @@ describe('abortTask — 段階1: 前提条件と承認', () => {
     entries: [{ path: 'docs/a.md', kind: 'modified' }],
   } as JobWorkspaceBaseline
 
-  it('解放すべき Job が無くても、最新 Job の終了 workspace が dirty なら park せず UNATTRIBUTED_DIRTY_WORKSPACE', () => {
+  it('解放すべき Job が無くても、最新 Job の終了 workspace が dirty なら park せず blocked へ escalation し、Human Resume が admit される', () => {
     const fx = seed({ kind: 'git_commit', workingDir: '/workspace/target' })
     fx.storage.jobs.update(fx.jobId, { status: 'failed', failureMetadata: { workspaceEndFingerprint: DIRTY_END } })
-
-    const result = abortTask(fx.storage, {
-      taskId: fx.taskId, approvalRequestId: approve(fx.storage, fx.taskId), reason: 'r',
+    // 前提: pending + 最新 Job failed は resume も recover も admit されない（これが行き止まりだった）
+    const admissionInput = () => ({
+      taskStatus: fx.storage.tasks.findById(fx.taskId)!.status,
+      parked: fx.storage.tasks.isParked(fx.taskId),
+      projectStatus: fx.storage.projects.findById(fx.projectId)!.status,
+      jobs: fx.storage.jobs.findByTaskId(fx.taskId),
+      approvals: fx.storage.approvalRequests.findByTaskId(fx.taskId),
+      nowMs: Date.now(),
+      resumedByHuman: true,
     })
+    const approvalRequestId = approve(fx.storage, fx.taskId)
+    expect(evaluateResumeAdmission(admissionInput())).toEqual({ ok: false, code: 'LATEST_JOB_NOT_BLOCKED' })
 
-    expect(result).toMatchObject({ ok: false, code: 'UNATTRIBUTED_DIRTY_WORKSPACE' })
-    expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(true)
+    const result = abortTask(fx.storage, { taskId: fx.taskId, approvalRequestId, reason: 'r' })
+
+    expect(result).toMatchObject({
+      ok: false, code: 'UNATTRIBUTED_DIRTY_WORKSPACE', details: { escalatedTaskStatus: 'blocked' },
+    })
+    expect(result.ok ? '' : result.reason).toContain('Human Resume')
+    const task = fx.storage.tasks.findById(fx.taskId)!
+    expect(task.status).toBe('blocked')
+    expect(task.roadmapActive).toBe(true)
     expect(fx.storage.tasks.isParked(fx.taskId)).toBe(false)
+    // 何も破棄していない: Job も fingerprint もそのまま
+    expect(fx.storage.jobs.findById(fx.jobId)).toMatchObject({
+      status: 'failed', failureMetadata: { workspaceEndFingerprint: DIRTY_END },
+    })
+    // escalation の理由が既存の audit に残る
+    expect(fx.storage.auditLog.findByEntity('task', fx.taskId)
+      .some((entry) => entry.operation === 'task_escalated_to_human' && entry.result === 'blocked')).toBe(true)
+    // 共有 admission（API / Mobile と同じ関数）で Human Resume が通る
+    expect(evaluateResumeAdmission(admissionInput())).toEqual({ ok: true })
   })
 
   it('終了 workspace が clean / fingerprint 無し（legacy）なら従来どおり park する', () => {
