@@ -201,19 +201,12 @@ function isGateCheckResponse(value: unknown): value is GateCheckResponse {
     if (typeof nextAction.consumedRequestId !== 'string' || nextAction.consumedRequestId.length === 0) {
       return false
     }
-    // D2（2026-10-17）: gatePolicy は整合した call_consume を「承認済み対象の実行」として
-    // ローカル escalation の対象外にする。その前提となる tuple の整合をここで強制する
-    // （API は decideGateOutcome の APPROVED 分岐でだけこの組を返す）。食い違う応答は技術障害。
-    if (outcome.decision !== 'ALLOW' || v.continuationPolicy !== 'continue') return false
+    // D2（2026-10-17）: consume する承認の id が応答内で一致していること（outcome / nextAction / approvalRequest）。
+    // decision / continuationPolicy / nextAction の組の整合は resolvePolicy が先に確かめ、食い違えば
+    // re_check（approval_contract_violation）にする。ここで技術障害（failed）にすると Job の出口が無くなるため。
     if (outcome.consumedRequestId !== nextAction.consumedRequestId) return false
     const approvalRequest = asRecord(v.approvalRequest)
-    if (
-      !approvalRequest ||
-      approvalRequest.id !== nextAction.consumedRequestId ||
-      approvalRequest.status !== 'APPROVED'
-    ) {
-      return false
-    }
+    if (!approvalRequest || approvalRequest.id !== nextAction.consumedRequestId) return false
   }
 
   return true

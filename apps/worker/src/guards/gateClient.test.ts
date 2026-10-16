@@ -565,8 +565,8 @@ describe('callConsume', () => {
 })
 
 // ────────────────────────────────────────────────────────────
-// D2（2026-10-17）: call_consume tuple の整合。gatePolicy は整合した call_consume を
-// ローカル escalation の対象外にするので、食い違う応答は technical failure にする。
+// D2（2026-10-17）: call_consume の承認 id の一致（outcome / nextAction / approvalRequest）。
+// 食い違う id は technical failure。decision / policy の組の不整合は resolvePolicy が re_check にする（v4）。
 // ────────────────────────────────────────────────────────────
 
 describe('callGateCheck — call_consume tuple の整合（D2）', () => {
@@ -585,18 +585,24 @@ describe('callGateCheck — call_consume tuple の整合（D2）', () => {
   })
 
   it.each<[string, (r: GateCheckResponse) => unknown]>([
-    ['decision が ALLOW でない', (r) => ({ ...r, outcome: { decision: 'PENDING_APPROVAL', requestId: 'req-d2', riskLevel: 'HIGH' } })],
-    ['continuationPolicy が continue でない', (r) => ({ ...r, continuationPolicy: 'continue_safe_work_only' })],
     ['outcome.consumedRequestId が無い', (r) => ({ ...r, outcome: { decision: 'ALLOW', riskLevel: 'HIGH' } })],
     ['outcome.consumedRequestId が違う', (r) => ({ ...r, outcome: { ...r.outcome, consumedRequestId: 'req-other' } })],
     ['approvalRequest が無い', (r) => { const { approvalRequest: _omit, ...rest } = r; return rest }],
     ['approvalRequest.id が違う', (r) => ({ ...r, approvalRequest: { ...r.approvalRequest!, id: 'req-other' } })],
-    ['approvalRequest.status が APPROVED でない', (r) => ({ ...r, approvalRequest: { ...r.approvalRequest!, status: 'CONSUMED' } })],
   ])('%s → technical failure', async (_label, mutate) => {
     mockFetch.mockResolvedValueOnce(makeJsonResponse(mutate(coherent())))
     const err = await callGateCheck(makeGateCheckParams()).catch(e => e)
     expect(err).toBeInstanceOf(GateClientError)
     expect(err.technicalFailure).toBe(true)
     expect(err.message).toContain('invalid response')
+  })
+
+  it.each<[string, (r: GateCheckResponse) => unknown]>([
+    ['decision が ALLOW でない', (r) => ({ ...r, outcome: { decision: 'PENDING_APPROVAL', requestId: 'req-d2', riskLevel: 'HIGH', consumedRequestId: 'req-d2' } })],
+    ['continuationPolicy が continue でない', (r) => ({ ...r, continuationPolicy: 'continue_safe_work_only' })],
+  ])('%s → 受理して resolvePolicy に渡す（そこで re_check approval_contract_violation。failed にしない）', async (_label, mutate) => {
+    mockFetch.mockResolvedValueOnce(makeJsonResponse(mutate(coherent())))
+    const result = await callGateCheck(makeGateCheckParams())
+    expect(result.nextAction.action).toBe('call_consume')
   })
 })
