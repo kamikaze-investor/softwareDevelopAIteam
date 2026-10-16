@@ -587,7 +587,13 @@ function RunningTaskJobsSection({
         <Text style={styles.sectionEmpty}>実行中のTask / Jobはありません</Text>
       )}
       {runningTaskJobs.map(({ jobs, task }) => (
-        <View key={task.id} style={styles.itemCard}>
+        <TouchableOpacity
+          key={task.id}
+          activeOpacity={0.85}
+          accessibilityRole="button"
+          onPress={() => router.push(`/tasks/${task.id}`)}
+          style={styles.itemCard}
+        >
           <View style={styles.itemHeader}>
             <Text style={styles.itemTitle} numberOfLines={2}>
               {task.title}
@@ -611,7 +617,7 @@ function RunningTaskJobsSection({
               </Text>
             </View>
           ))}
-        </View>
+        </TouchableOpacity>
       ))}
     </View>
   )
@@ -633,7 +639,13 @@ function FailedTasksSection({
         <Text style={styles.sectionEmpty}>要対応Taskはありません</Text>
       )}
       {failedTaskJobs.map(({ jobs, task }) => (
-        <View key={task.id} style={styles.itemCard}>
+        <TouchableOpacity
+          key={task.id}
+          activeOpacity={0.85}
+          accessibilityRole="button"
+          onPress={() => router.push(`/tasks/${task.id}`)}
+          style={styles.itemCard}
+        >
           <Text style={styles.itemTitle} numberOfLines={2}>
             {task.title}
           </Text>
@@ -652,7 +664,7 @@ function FailedTasksSection({
               実行失敗: {jobs.length}件
             </Text>
           )}
-        </View>
+        </TouchableOpacity>
       ))}
     </View>
   )
@@ -675,7 +687,13 @@ function RecentJobsSection({
         <Text style={styles.sectionEmpty}>Job履歴はありません</Text>
       )}
       {recentJobs.map((job) => (
-        <View key={job.id} style={styles.itemCard}>
+        <TouchableOpacity
+          key={job.id}
+          activeOpacity={0.85}
+          accessibilityRole="button"
+          onPress={() => router.push(`/tasks/${job.taskId}`)}
+          style={styles.itemCard}
+        >
           <Text style={styles.itemTitle} numberOfLines={1}>
             {taskTitleById.get(job.taskId) ?? job.taskId}
           </Text>
@@ -689,7 +707,7 @@ function RecentJobsSection({
               {job.status}
             </Text>
           </View>
-        </View>
+        </TouchableOpacity>
       ))}
     </View>
   )
