@@ -85,6 +85,11 @@ import {
   extractItemDescription,
 } from '../ctoAi/roadmapAdoption'
 import type { IStorage } from '../storage/interface'
+import {
+  REMEDIATION_AUDIT_ENTITY_TYPE,
+  REMEDIATION_AUDIT_OPERATION,
+  remediationAuditKey,
+} from './challengeAnswer'
 import { ADOPTION_REPOSITORY_MAP, authorizeAdoptionScope, resolveLedgerPath } from './adoptionStep'
 
 /**
@@ -97,9 +102,12 @@ import { ADOPTION_REPOSITORY_MAP, authorizeAdoptionScope, resolveLedgerPath } fr
  */
 export const PL_MAX_REMEDIATION_ATTEMPTS = 2
 
-/** audit_log の語彙。**新しいテーブルも metrics backend も作らない。** */
-const AUDIT_ENTITY_TYPE = 'pl_remediation'
-const AUDIT_OPERATION = 'pl_independent_remediation'
+/**
+ * audit_log の語彙。**新しいテーブルも metrics backend も作らない。**
+ * 値は `challengeAnswer.ts` が唯一の定義（evidence policy が Challenge の回答を読むため）。
+ */
+const AUDIT_ENTITY_TYPE = REMEDIATION_AUDIT_ENTITY_TYPE
+const AUDIT_OPERATION = REMEDIATION_AUDIT_OPERATION
 
 /**
  * 却下された提案を書いた側（PL）の provider / model。
@@ -274,6 +282,8 @@ export interface RemediationSubject {
    */
   reviewedDesignText: string
   reviewedDesignTextHash: string
+  /** CONFLICT を出した run の id。Challenge はこの run への回答として記録される（`challengeAnswer.ts`）。 */
+  reviewedRunId: string
   /**
    * 元 run の `changedFiles`。**再評価でも同じものを渡す。**
    *
@@ -351,6 +361,7 @@ export function findRemediationSubject(
     findings: extractDesignReviewFindings(run.resultJson),
     reviewedDesignText: run.designText,
     reviewedDesignTextHash: run.designTextHash,
+    reviewedRunId: run.id,
     reviewedChangedFiles: run.changedFiles,
     rejectedSpecKeys: collectRejectedSpecKeys(storage, task),
   }
@@ -402,7 +413,7 @@ export function shortSpecKey(spec: { implementationScope: string; allowedPaths: 
 }
 
 function remediationKey(taskId: string): string {
-  return `remediate:${taskId}`
+  return remediationAuditKey(taskId)
 }
 
 /**

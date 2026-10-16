@@ -613,3 +613,54 @@ describe('A-01: review lineage の Human Resume は実装の stepKey 形に依�
     expect(result.reason).toContain('outside allowedPaths')
   })
 })
+
+describe('step 7: 同じ設計（同じ hash）のより新しい ALIGNED は古い CONFLICT を解消しない（C-05 の一般化）', () => {
+  async function runWithText(shape: Shape, decision: 'CONFLICT' | 'ALIGNED', designText: string, repairSourceJobId?: string): Promise<string> {
+    const created = shape.storage.designReviewRuns.create({
+      taskId: shape.taskId, taskTitle: 'VPS docs', designText,
+      designTextHash: computeDesignTextHash(designText), changedFiles: [DOC],
+      ...(repairSourceJobId === undefined ? {} : { repairSourceJobId }),
+    })
+    const claimed = shape.storage.designReviewRuns.claim(created.id, 3)
+    shape.storage.designReviewRuns.complete(created.id, claimed.claimToken!, 'succeeded', JSON.stringify({
+      reviewLoad: 'low', selectedFocuses: [], focusedReviewResults: [],
+      integrationReviewResult: { decision, summary: decision, findings: [] },
+      finalDecision: decision,
+    }))
+    await tick()
+    return created.id
+  }
+
+  it('repair run: 同じ hash の ALIGNED は reviewer の引き直しにすぎず、CONFLICT が止める', async () => {
+    const shape = await b8d0fc5dShape()
+    const conflict = await runWithText(shape, 'CONFLICT', 'same repair design', shape.impl.id)
+    await runWithText(shape, 'ALIGNED', 'same repair design', shape.impl.id)
+    const r1 = await resumedReview(shape, 'pl')
+
+    expect(prepareRepairFlow(shape.storage, { failedJob: shape.impl, reviewJobId: r1.id })).toMatchObject({
+      action: 'skip',
+      runId: conflict,
+    })
+  })
+
+  it('repair run: 別 hash（repair 設計が実質的に変わった）の ALIGNED は解消する', async () => {
+    const shape = await b8d0fc5dShape()
+    await runWithText(shape, 'CONFLICT', 'first repair design', shape.impl.id)
+    await runWithText(shape, 'ALIGNED', 'materially changed repair design', shape.impl.id)
+    const r1 = await resumedReview(shape, 'human')
+
+    expect(prepareRepairFlow(shape.storage, { failedJob: shape.impl, reviewJobId: r1.id }).action).toBe('queue')
+  })
+
+  it('Task 設計の run: 同じ hash の ALIGNED は古い CONFLICT を解消しない', async () => {
+    const shape = await b8d0fc5dShape()
+    const conflict = await runWithText(shape, 'CONFLICT', 'same task design')
+    await runWithText(shape, 'ALIGNED', 'same task design')
+    const r1 = await resumedReview(shape, 'pl')
+
+    expect(prepareRepairFlow(shape.storage, { failedJob: shape.impl, reviewJobId: r1.id })).toMatchObject({
+      action: 'skip',
+      runId: conflict,
+    })
+  })
+})
