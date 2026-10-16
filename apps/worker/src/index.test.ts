@@ -59,6 +59,7 @@ import {
   persistJobResult,
   processQueuedWork,
   reportAbortCleanupObservations,
+  clearPendingAbortCleanupSubmissions,
   start,
 } from './index.js'
 
@@ -440,6 +441,115 @@ describe('abort cleanup observation reporting', () => {
         headValid: true, blindSpotsAbsent: true,
       },
     })
+  })
+})
+
+describe('dirty Technical Abort cleanup — identical resubmission after a retryable refusal', () => {
+  // 同じ carrier + generation の保留があれば、観測も cleanup もやり直さず同じ payload を再送する
+  // （Codex review ba0cdae: 観測し直すと clean な workspace が dirty な fingerprint と食い違い quarantine になる）。
+  const dirtyEnd = {
+    mode: 'dirty' as const,
+    startCommitHash: 'end-head',
+    entries: [{ path: 'apps/worker/src/index.ts', kind: 'modified' as const, xyStatus: '.M', worktreeHash: 'sha256:owned' }],
+  }
+  const cleanEnd = { mode: 'clean' as const, startCommitHash: 'end-head' }
+  const knownGoodClean = {
+    gitOperationMarkers: [], worktreeClean: true, indexClean: true, headValid: true, blindSpotsAbsent: true,
+  }
+  const knownGoodDirty = { ...knownGoodClean, worktreeClean: false }
+
+  beforeEach(() => {
+    clearPendingAbortCleanupSubmissions()
+  })
+
+  function arrange(responses: Array<() => Response>, markerGoneAfterCall?: number): {
+    reports: () => string[]
+  } {
+    const project = {
+      id: 'project-1', name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+      createdAt: NOW, updatedAt: NOW,
+    }
+    const requestedTask: Task = { ...task, status: 'blocked', roadmapActive: true }
+    const markedJob: Job = {
+      ...job,
+      id: 'job-dirty',
+      status: 'failed',
+      failureMetadata: {
+        workspaceEndFingerprint: dirtyEnd,
+        abortCleanupRequestedAt: NOW,
+        abortTechnicalEvidenceId: 'evidence-1',
+        abortTechnicalStateFingerprint: 'fp-1',
+      },
+    }
+    const cancelledJob: Job = { ...markedJob, failureMetadata: { workspaceEndFingerprint: dirtyEnd } }
+    // 1回目の観測は dirty（cleanup 前）、cleanup 後は clean。以後の観測も clean のまま。
+    workspaceVerificationMocks.observeWorkspace
+      .mockReturnValueOnce({ observation: dirtyEnd, knownGood: knownGoodDirty })
+      .mockReturnValue({ observation: cleanEnd, knownGood: knownGoodClean })
+    let reportCount = 0
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const value = String(url)
+      if (value.endsWith('/api/projects')) return new Response(JSON.stringify([project]), { status: 200 })
+      if (value.includes('/api/tasks?projectId=')) return new Response(JSON.stringify([requestedTask]), { status: 200 })
+      if (value.includes('/api/jobs?taskId=')) {
+        const gone = markerGoneAfterCall !== undefined && reportCount >= markerGoneAfterCall
+        return new Response(JSON.stringify([gone ? cancelledJob : markedJob]), { status: 200 })
+      }
+      if (value.includes('/abort-cleanup-result')) {
+        const respond = responses[reportCount] ?? responses[responses.length - 1]!
+        reportCount += 1
+        return respond()
+      }
+      throw new Error(`unexpected fetch ${value}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    return {
+      reports: () => fetchMock.mock.calls
+        .filter(([url]) => String(url).includes('/abort-cleanup-result'))
+        .map(([, init]) => String(init?.body)),
+    }
+  }
+
+  const busy = (): Response => new Response(JSON.stringify({ error: 'busy', code: 'STORAGE_BUSY' }), { status: 409 })
+
+  it('STORAGE_BUSY → the next poll resends the identical evidence without re-observing or re-cleaning → success', async () => {
+    const { reports } = arrange([busy, () => new Response(null, { status: 200 })])
+
+    await expect(reportAbortCleanupObservations()).resolves.toBe(false)
+    expect(jobRunnerMocks.revertBlockedJobChanges).toHaveBeenCalledTimes(1)
+    const observationsAfterFirstPoll = workspaceVerificationMocks.observeWorkspace.mock.calls.length
+
+    await expect(reportAbortCleanupObservations()).resolves.toBe(true)
+
+    // 2回目の poll では観測も cleanup もやり直さない。
+    expect(workspaceVerificationMocks.observeWorkspace.mock.calls.length).toBe(observationsAfterFirstPoll)
+    expect(jobRunnerMocks.revertBlockedJobChanges).toHaveBeenCalledTimes(1)
+    const [first, second] = reports()
+    expect(second).toBe(first)
+    expect(JSON.parse(first!)).toMatchObject({
+      observation: cleanEnd,
+      preCleanupObservation: dirtyEnd,
+      cleanupSummary: { changedPathCount: 1 },
+    })
+    // refusal（quarantine につながる）は一度も送らない。
+    expect(reports().some((body) => body.includes('refusalCode'))).toBe(false)
+  })
+
+  it('a resubmission refused by a human decision stops resending; the cancelled generation is not re-observed', async () => {
+    const conflict = (): Response =>
+      new Response(JSON.stringify({ error: 'conflict', code: 'HUMAN_DECISION_CONFLICT' }), { status: 409 })
+    const { reports } = arrange([busy, conflict], 2)
+
+    await expect(reportAbortCleanupObservations()).resolves.toBe(false)
+    await expect(reportAbortCleanupObservations()).resolves.toBe(false)
+    // API が generation を取り消した後の poll では、何も観測せず何も送らない。
+    const observations = workspaceVerificationMocks.observeWorkspace.mock.calls.length
+    await expect(reportAbortCleanupObservations()).resolves.toBe(false)
+
+    expect(workspaceVerificationMocks.observeWorkspace.mock.calls.length).toBe(observations)
+    expect(reports()).toHaveLength(2)
+    expect(reports()[1]).toBe(reports()[0])
+    expect(reports().some((body) => body.includes('refusalCode'))).toBe(false)
   })
 })
 

@@ -41,7 +41,16 @@ function tempDbPath(): string {
   return path.join(os.tmpdir(), `abort-wal-race-${randomUUID()}.db`)
 }
 
-function seedPendingTechnicalAbort(storage: IStorage): { taskId: string; carrierId: string } {
+const DIRTY: JobWorkspaceBaseline = {
+  mode: 'dirty',
+  startCommitHash: BASELINE.startCommitHash,
+  entries: [{ path: 'apps/worker/src/index.ts', kind: 'modified', xyStatus: '.M', worktreeHash: 'sha256:task-owned' }],
+}
+
+function seedPendingTechnicalAbort(
+  storage: IStorage,
+  options: { dirty?: boolean } = {},
+): { taskId: string; carrierId: string } {
   const project = storage.projects.create({
     name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
   })
@@ -57,17 +66,19 @@ function seedPendingTechnicalAbort(storage: IStorage): { taskId: string; carrier
     allowedPaths: ['apps/worker/src/index.ts'],
     acceptanceCriteria: ['done'],
   } as Parameters<IStorage['tasks']['create']>[0])
+  const end = options.dirty === true ? DIRTY : BASELINE
   storage.jobs.create({
     taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status: 'success',
     safeCommand: { kind: 'test', workingDir: '/workspace/target' },
     workspaceBaseline: BASELINE,
-    failureMetadata: { workspaceEndFingerprint: BASELINE },
+    failureMetadata: { workspaceEndFingerprint: end },
   } as Parameters<IStorage['jobs']['create']>[0])
   const carrier = storage.jobs.create({
     taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status: 'blocked',
     safeCommand: { kind: 'test', workingDir: '/workspace/target' },
-    workspaceBaseline: BASELINE,
-    failureMetadata: { workspaceEndFingerprint: BASELINE },
+    workspaceBaseline: end,
+    ...(options.dirty === true ? { changedFiles: ['apps/worker/src/index.ts'] } : {}),
+    failureMetadata: { workspaceEndFingerprint: end },
   } as Parameters<IStorage['jobs']['create']>[0])
   storage.jobs.update(carrier.id, {
     guardResult: {
@@ -98,6 +109,28 @@ function finish(storage: IStorage, carrierId: string): ReturnType<typeof complet
     knownGood: KNOWN_GOOD,
     cleanupSummary: { changedPathCount: 0, restoredPathCount: 0, removedPathCount: 0 },
   })
+}
+
+/**
+ * dirty cleanup の Worker 報告。Worker は revert 済みなので post は clean。STORAGE_BUSY の後は
+ * **同じ値**（pre = 永続化済みの dirty fingerprint、post = clean、summary）をそのまま再送する。
+ */
+const DIRTY_REPORT = {
+  preCleanupObservation: DIRTY,
+  observation: BASELINE,
+  knownGood: KNOWN_GOOD,
+  cleanupSummary: { changedPathCount: 1, restoredPathCount: 1, removedPathCount: 0 },
+}
+
+function finishDirty(storage: IStorage, carrierId: string): ReturnType<typeof completeAbortCleanup> {
+  return completeAbortCleanup(storage, { jobId: carrierId, ...DIRTY_REPORT })
+}
+
+function holdWriteLock(dbPath: string, write: (db: Database.Database) => void): Database.Database {
+  const other = new Database(dbPath)
+  other.exec('BEGIN IMMEDIATE')
+  write(other)
+  return other
 }
 
 describe('Technical Abort finalization vs. a concurrent human write on another connection (WAL)', () => {
@@ -163,4 +196,57 @@ describe('Technical Abort finalization vs. a concurrent human write on another c
       (entry) => entry.operation === 'task_aborted' && entry.result === 'success',
     )).toHaveLength(1)
   })
+})
+
+describe('dirty Technical Abort cleanup: STORAGE_BUSY, then the identical report is resubmitted (WAL)', () => {
+  it('an unrelated write held the lock: the identical dirty report succeeds on resubmission', () => {
+    const dbPath = tempDbPath()
+    const storage = createSQLiteStorage(dbPath)
+    const { taskId, carrierId } = seedPendingTechnicalAbort(storage, { dirty: true })
+    const metadataBefore = storage.jobs.findById(carrierId)?.failureMetadata
+
+    const other = holdWriteLock(dbPath, (db) => {
+      db.prepare(
+        "INSERT INTO audit_log (id, actor, operation, entity_type, entity_id, result, detail, created_at) "
+        + "VALUES (?, 'api', 'unrelated', 'project', 'p', 'success', '', ?)",
+      ).run(randomUUID(), new Date().toISOString())
+    })
+    expect(finishDirty(storage, carrierId)).toMatchObject({ ok: false, code: 'STORAGE_BUSY' })
+    // 何も変えていない: 永続化済みの dirty fingerprint と cleanup generation はそのまま。
+    expect(storage.jobs.findById(carrierId)?.failureMetadata).toEqual(metadataBefore)
+    other.exec('COMMIT')
+    other.close()
+
+    // Worker は観測し直さず、同じ証拠を再送する。
+    expect(finishDirty(storage, carrierId)).toMatchObject({ ok: true })
+    expect(storage.tasks.findById(taskId)?.roadmapActive).toBe(false)
+    expect(storage.jobs.findById(carrierId)?.failureMetadata?.quarantined).toBeUndefined()
+  }, 30_000)
+
+  it('a human approval held the lock: the identical resubmission yields to it without quarantine', () => {
+    const dbPath = tempDbPath()
+    const storage = createSQLiteStorage(dbPath)
+    const { taskId, carrierId } = seedPendingTechnicalAbort(storage, { dirty: true })
+
+    const approvalId = `approval-${randomUUID()}`
+    const other = holdWriteLock(dbPath, (db) => {
+      db.prepare(`
+        INSERT INTO approval_requests
+          (id, task_id, target_branch, target_commit, target_diff_hash, risk_level, requested_action,
+           status, expires_at, invalid_if, changed_files, triggered_rules, created_at)
+        VALUES (?, ?, 'b', 'c', 'd', 'HIGH', 'repair_from_stored_review:r', 'WAITING_FOR_USER', ?, '[]', '[]', '[]', ?)
+      `).run(approvalId, taskId, FUTURE(), new Date().toISOString())
+    })
+    expect(finishDirty(storage, carrierId)).toMatchObject({ ok: false, code: 'STORAGE_BUSY' })
+    other.exec('COMMIT')
+    other.close()
+
+    expect(finishDirty(storage, carrierId)).toMatchObject({ ok: false, code: 'HUMAN_DECISION_CONFLICT' })
+    const carrier = storage.jobs.findById(carrierId)
+    expect(carrier?.failureMetadata?.quarantined).toBeUndefined()
+    expect(carrier?.failureMetadata?.abortCleanupRequestedAt).toBeUndefined()
+    expect(carrier?.failureMetadata?.workspaceEndFingerprint).toEqual(DIRTY)
+    expect(storage.tasks.findById(taskId)?.roadmapActive).toBe(true)
+    expect(storage.approvalRequests.findById(approvalId)?.status).toBe('WAITING_FOR_USER')
+  }, 30_000)
 })
