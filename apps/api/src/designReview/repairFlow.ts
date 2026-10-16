@@ -25,7 +25,7 @@
 
 import type { Job, JobRefusalMetadata, Task, ReviewResult, QAResult } from '@ai-team/shared'
 import type { IStorage, DesignReviewRun, RepairHandoffRefusalCode } from '../storage/interface'
-import { computeDesignTextHash, findUnresolvedDisagreementRun } from '../designReviewEvidencePolicy'
+import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import {
   buildDefaultCoordinatorDeps,
   createAndExecuteDesignReview,
@@ -34,7 +34,7 @@ import {
 } from './designReviewCoordinator'
 import { buildRepairPrompt } from './repairPromptBuilder'
 import { posix } from 'node:path'
-import { classifyStoredRunJudgment, recomputeDecision, type RawStrategicResult } from './designReviewCoordinator'
+import { recomputeDecision, type RawStrategicResult } from './designReviewCoordinator'
 import {
   REPAIR_STEP_PREFIX,
   decideRepairAction,
@@ -797,29 +797,16 @@ function blockingDesignReviewRun(
     const recomputed = safeRecomputedDecision(run)
     if (recomputed === 'ALIGNED') continue
 
+    const resolvedLater = runs.slice(0, index).some((newer) =>
+      sameSubject(newer, run)
+      && newer.status === 'succeeded'
+      && safeRecomputedDecision(newer) === 'ALIGNED')
+    if (resolvedLater) continue
+
     const answerableHops = new Set(context.lineageJobIds.slice(0, subjectIndex))
     const answeredInLineage = context.lineageHumanResumes.some((job) =>
       answerableHops.has(job.id) && createdAfterCompletion(run, job))
     if (answeredInLineage) continue
-
-    // **より新しい同じ対象の ALIGNED が解消するのは、設計が変わった（別 hash の）ときだけ**
-    // （lifecycle repair C2 / C-05 の一般化）。同じ hash の ALIGNED は reviewer の引き直しにすぎず、
-    // 答えられていない CONFLICT を解消しない（DA trigger 7）。規則は evidence policy と同じ
-    // `findUnresolvedDisagreementRun()` 1か所で、ここに二本目の実装は作らない。この時点で run は
-    // D3 / lineage の Human Resume のどちらでも答えられていないので、isAnswered は false。
-    const resolvedLater = runs.slice(0, index).some((newer) =>
-      sameSubject(newer, run)
-      && newer.status === 'succeeded'
-      && safeRecomputedDecision(newer) === 'ALIGNED'
-      && findUnresolvedDisagreementRun(
-        { designTextHash: newer.designTextHash, createdAt: newer.createdAt, runId: newer.id },
-        [run],
-        classifyStoredRunJudgment,
-        () => false,
-        // runs は新しい順で、run は newer より古い。
-        () => false,
-      ) === undefined)
-    if (resolvedLater) continue
 
     if (recomputed === undefined) {
       return { reason: 'latest design review decision could not be recomputed', runId: run.id }

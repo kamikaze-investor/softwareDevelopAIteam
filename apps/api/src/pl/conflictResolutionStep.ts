@@ -58,8 +58,6 @@ import {
 } from '../ctoAi/initialImplementWorkflow'
 import { extractImplementationScope, extractItemDescription } from '../ctoAi/roadmapAdoption'
 import type { DesignReviewRun, IStorage } from '../storage/interface'
-import { DesignReviewRunContentionError } from '../storage/interface'
-import { challengeRunBindingTokens } from './challengeAnswer'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { ADOPTION_REPOSITORY_MAP, resolveLedgerPath } from './adoptionStep'
 import {
@@ -508,39 +506,13 @@ async function runChallenge(
     }
   }
 
-  // **再評価する run を先に作り、その id を開始行に載せる**（lifecycle repair C2 / C-05）。
-  // 同じ設計への CONFLICT の後の ALIGNED は、原則として未解消の不一致のまま使えない（DA trigger 7）。
-  // 唯一の例外が、この1回きりの Challenge の run である。それを機械的に識別できるよう、
-  // 「どの CONFLICT run に、どの run で答えたか」を既存 audit 行に残す（`challengeAnswer.ts`）。
-  // 同じ同一性の active run があれば storage はそれを返す（下の再評価も同じ run を再開する）。
-  let challengeRun: DesignReviewRun
-  try {
-    challengeRun = storage.designReviewRuns.create({
-      taskId,
-      taskTitle: subject.task.title,
-      designText: subject.reviewedDesignText,
-      designTextHash: computeDesignTextHash(subject.reviewedDesignText),
-      changedFiles: [...subject.reviewedChangedFiles],
-    })
-  } catch (error: unknown) {
-    if (error instanceof DesignReviewRunContentionError) {
-      return {
-        ...base,
-        status: 'review_pending',
-        reason: `another design review is active for this task; the challenge waits for it (${error.message})`,
-      }
-    }
-    throw error
-  }
-
   // **先に消費を記録する。** 後で書くと、途中で落ちた場合に何度でも引けてしまう。
   // `orig_provider` / `orig_model` は取得不能なので `unavailable` と明示する
   // （owner: review-provider-exhausted-alternate-rereview）。
   recordRemediationFailure(
     storage,
     taskId,
-    `stage=challenge chal=${key} ${challengeRunBindingTokens(subject.reviewedRunId, challengeRun.id)}`
-    + ` orig_provider=unavailable orig_model=unavailable`
+    `stage=challenge chal=${key} orig_provider=unavailable orig_model=unavailable`
     + ` orig_verdict=CONFLICT finding=${dispute.source} grounds=${dispute.grounds ?? '-'}`
     + ` evidence=${dispute.evidence !== undefined ? 'yes' : 'no'} outcome=starting`,
   )
@@ -620,7 +592,11 @@ async function runChallenge(
     ...(released
       ? {}
       : {
-          failureCode: 'gate_did_not_release',
+          // 同じ frozen spec の再評価が ALIGNED でも、元の CONFLICT は未回答の不一致として残り、
+          // Job Gate が止める（lifecycle repair C2 / C-05・spec 22 DA trigger 7）。理由を型で残す。
+          failureCode: job.status === 'skipped' && job.code === 'DESIGN_REVIEW_DISAGREEMENT'
+            ? 'design_review_disagreement'
+            : 'gate_did_not_release',
           reason: `re-evaluation aligned but the existing job gate did not create a job: ${job.reason}`,
         }),
   }

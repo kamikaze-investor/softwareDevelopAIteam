@@ -62,12 +62,6 @@ import {
 } from '../gitCommitResumeLineage'
 import { resolveLinkedGitCommitRejection } from '../linkedGitCommitRejection'
 import { readJobsSupersededByHumanResume, readResumeActorClasses } from '../designReview/resumeActor'
-import {
-  isChallengeAnswerDetail,
-  REMEDIATION_AUDIT_ENTITY_TYPE,
-  REMEDIATION_AUDIT_OPERATION,
-  remediationAuditKey,
-} from '../pl/challengeAnswer'
 
 export class SingleRunningProjectError extends Error {
   constructor() {
@@ -5000,14 +4994,10 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   /**
    * 古い未回答の不一致（designReviewEvidencePolicy.findUnresolvedDisagreementRun）。
    *
-   * 「答えた」は次の 2 つだけ:
-   *   (a) D3 と同じ意味の Human Resume: その run の完了後に作られた、actor が human と証明された
-   *       resume Job（resume actor audit が admin_credential の human）
-   *   (b) evidence を生んだ run が、その CONFLICT run に対する1回きりの PL Challenge の run として
-   *       既存の Remediation audit 行に記録されている（`pl/challengeAnswer.ts`）
-   * PL / AI / unknown の resume、Human Recovery、承認、それ以外の同じ設計の再 review は答えではない。
-   * Task を持たない subject（roadmap）には Human Resume も Challenge も無いので、設計（material）を
-   * 変える以外に解消しない。
+   * 「人が答えた」は D3 と同じ意味だけを使う: その run の完了後に作られた、actor が human と
+   * 証明された Human Resume Job（resume actor audit が admin_credential の human）。PL / AI /
+   * unknown の resume、Human Recovery、承認は答えではない。Task を持たない subject（roadmap）には
+   * Human Resume が無いので、設計（material）を変える以外に解消しない。
    */
   const unresolvedDisagreementOf = (
     evidence: DesignReviewEvidence,
@@ -5031,19 +5021,11 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       if (!Number.isFinite(completedAt)) return false
       return readHumanResumeTimes().some((createdAt) => createdAt > completedAt)
     }
-    let challengeRows: AuditLogEntry[] | undefined
-    const isAnsweredByChallenge = (run: DesignReviewRun): boolean => {
-      if (evidence.taskId === undefined || evidence.runId === undefined) return false
-      challengeRows ??= auditLog.findByEntity(REMEDIATION_AUDIT_ENTITY_TYPE, remediationAuditKey(evidence.taskId))
-        .filter((entry) => entry.operation === REMEDIATION_AUDIT_OPERATION)
-      const challengeRunId = evidence.runId
-      return challengeRows.some((entry) => isChallengeAnswerDetail(entry.detail, run.id, challengeRunId))
-    }
     return findUnresolvedDisagreementRun(
       evidence,
       runs,
       classifyStoredRunJudgment,
-      (run) => isAnsweredByHuman(run) || isAnsweredByChallenge(run),
+      isAnsweredByHuman,
       isAfterEvidence,
     )
   }

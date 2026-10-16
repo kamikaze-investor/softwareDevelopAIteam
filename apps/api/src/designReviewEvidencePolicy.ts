@@ -88,12 +88,8 @@ export function findSupersedingRun<TRun extends { status: string; designTextHash
  *   - evidence と同じ design hash（呼び出し側が同じ subject で絞る）
  *   - evidence より**新しくない**（`isAfterEvidence` が false）で、evidence を生んだ run 自身ではない
  *   - `succeeded` で終端し、再計算した判定が `negative`（CONFLICT / UNCERTAIN）
- *   - **答えられていない**（`isAnswered` が false）。答えは次の 2 つだけ:
- *       (a) D3 と同じ意味の Human Resume: その run の完了後に作られた、human と証明された resume
- *       (b) evidence を生んだ run が、その CONFLICT に対する1回きりの PL Challenge の run として
- *           記録されている（`pl/challengeAnswer.ts`。CEO 指示 2026-09-18 の sanctioned second opinion）
- *     PL / AI / unknown の resume、Human Recovery、それ以外の同じ設計の再 review（回収・再 adoption・
- *     rekick の繰り返し等）は答えではない（spec 22 DA trigger 7）。
+ *   - **人が答えていない**（`isAnsweredByHuman` が false。D3 と同じ意味: その run の完了後に作られた
+ *     human と証明された Human Resume。PL / AI / unknown の resume や Human Recovery は答えではない）
  *
  * 判定の無い終端（failed / REVIEW_UNAVAILABLE / 結果なし）は不一致ではない。design hash が違う
  * （設計が実質的に変わった）run は対象外。
@@ -102,14 +98,14 @@ export function findUnresolvedDisagreementRun<TRun extends { id: string; status:
   evidence: Pick<DesignReviewEvidence, 'designTextHash' | 'createdAt' | 'runId'>,
   runs: readonly TRun[],
   judgmentOf: (run: TRun) => StoredRunJudgment,
-  isAnswered: (run: TRun) => boolean,
+  isAnsweredByHuman: (run: TRun) => boolean,
   isAfterEvidence: (run: TRun) => boolean = (run) => run.createdAt > evidence.createdAt,
 ): TRun | undefined {
   return runs.find((run) => {
     if (run.designTextHash !== evidence.designTextHash) return false
     if (run.id === evidence.runId || isAfterEvidence(run)) return false
     if (run.status !== 'succeeded' || judgmentOf(run) !== 'negative') return false
-    return !isAnswered(run)
+    return !isAnsweredByHuman(run)
   })
 }
 
