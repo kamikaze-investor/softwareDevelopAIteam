@@ -1,6 +1,6 @@
 import cors from '@fastify/cors'
 import Fastify, { type FastifyInstance } from 'fastify'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { canonicalizeJobUpdate, type Job, type Project, type Task } from '@ai-team/shared'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
@@ -155,6 +155,7 @@ async function resumeTask(app: FastifyInstance, taskId: string, instruction: str
   return parseBody<Job>(res.body)
 }
 
+// The Worker delivers `success` only as an Outbox event (`withOutbox`); a direct write is refused (R-FINAL-OPPATCH).
 function successPatchPayload(overrides: Partial<Job> = {}): Record<string, unknown> {
   return {
     status: 'success',
@@ -188,7 +189,7 @@ describe('resume success reconnects to the existing review-creation flow', () =>
       const res = await app.inject({
         method: 'PATCH',
         url: `/api/jobs/${resumed.id}`,
-        payload: successPatchPayload(),
+        payload: withOutbox(successPatchPayload(), randomUUID()),
       })
 
       expect(res.statusCode).toBe(200)
@@ -271,7 +272,7 @@ describe('resume success reconnects to the existing review-creation flow', () =>
       const res = await app.inject({
         method: 'PATCH',
         url: `/api/jobs/${initial.id}`,
-        payload: successPatchPayload(),
+        payload: withOutbox(successPatchPayload(), randomUUID()),
       })
 
       expect(res.statusCode).toBe(200)
@@ -302,7 +303,7 @@ describe('resume success reconnects to the existing review-creation flow', () =>
       await app.inject({
         method: 'PATCH',
         url: `/api/jobs/${resumed.id}`,
-        payload: successPatchPayload(),
+        payload: withOutbox(successPatchPayload(), randomUUID()),
       })
       const reviews = await reviewJobsOf(source.id)
       expect(reviews).toHaveLength(1)
@@ -312,13 +313,13 @@ describe('resume success reconnects to the existing review-creation flow', () =>
       const reviewRes = await app.inject({
         method: 'PATCH',
         url: `/api/jobs/${review.id}`,
-        payload: {
+        payload: withOutbox({
           status: 'success',
           exitCode: 0,
           changedFiles: ['test.js'],
           guardResult: { permissionAllowed: true, fileChangeAllowed: true },
           reviewResult: { status: 'approved', summary: 'looks good', findings: [] },
-        },
+        }, randomUUID()),
       })
       expect(reviewRes.statusCode).toBe(200)
       const commitJobs = storage.jobs.findByTaskId(source.id).filter((j) => j.safeCommand.kind === 'git_commit')
@@ -332,7 +333,7 @@ describe('resume success reconnects to the existing review-creation flow', () =>
       await app.inject({
         method: 'PATCH',
         url: `/api/jobs/${commit.id}`,
-        payload: { status: 'success', exitCode: 0, changedFiles: ['test.js'] },
+        payload: withOutbox({ status: 'success', exitCode: 0, changedFiles: ['test.js'] }, randomUUID()),
       })
 
       expect(storage.tasks.findById(source.id)?.status).toBe('done')
@@ -414,7 +415,7 @@ describe('resume success reconnects to the existing review-creation flow', () =>
       const res = await app.inject({
         method: 'PATCH',
         url: `/api/jobs/${secondResume.id}`,
-        payload: successPatchPayload(),
+        payload: withOutbox(successPatchPayload(), randomUUID()),
       })
 
       expect(res.statusCode).toBe(200)

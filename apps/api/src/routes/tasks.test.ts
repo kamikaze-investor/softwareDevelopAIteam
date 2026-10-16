@@ -1,7 +1,8 @@
 import cors from '@fastify/cors'
 import Fastify, { type FastifyInstance } from 'fastify'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { ApprovalRequest, Job, Project, SafeCommand, Task, TaskDetail, TaskSummary } from '@ai-team/shared'
+import { createHash, randomUUID } from 'node:crypto'
+import { canonicalizeJobUpdate, type ApprovalRequest, type Job, type Project, type SafeCommand, type Task, type TaskDetail, type TaskSummary } from '@ai-team/shared'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { appendImplementContracts } from '../implementPrompt'
 import { buildSystemState } from '../state/systemState'
@@ -129,10 +130,14 @@ async function updateJob(
   jobId: string,
   body: Partial<Job>,
 ): Promise<Job> {
+  // `success` arrives only as the Worker's Outbox delivery; a direct write is refused (R-FINAL-OPPATCH).
+  const payload = body.status === 'success'
+    ? { ...body, eventId: randomUUID(), payloadHash: createHash('sha256').update(canonicalizeJobUpdate(body as Record<string, unknown>)).digest('hex') }
+    : body
   const res = await app.inject({
     method: 'PATCH',
     url: `/api/jobs/${jobId}`,
-    payload: body,
+    payload,
   })
 
   expect(res.statusCode).toBe(200)

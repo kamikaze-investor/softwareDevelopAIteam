@@ -1,6 +1,7 @@
 import Fastify, { type FastifyInstance } from 'fastify'
 import { describe, expect, it } from 'vitest'
-import type { Job, Task } from '@ai-team/shared'
+import { createHash } from 'node:crypto'
+import { canonicalizeJobUpdate, type Job, type Task } from '@ai-team/shared'
 import { MAX_REPAIR_ATTEMPTS } from '../designReview/repairPolicy'
 
 /**
@@ -124,10 +125,16 @@ describe('M1: PATCH /api/jobs/:id が workspace cleanup の開始条件を返す
       const task = await seedTask()
       const job = await createImplementJob(task, `task:${task.id}:initial-implement`, 'running')
 
+      // `success` arrives only as the Worker's Outbox delivery (R-FINAL-OPPATCH).
+      const success = { status: 'success', exitCode: 0, completedAt: new Date().toISOString() }
       const res = await app.inject({
         method: 'PATCH',
         url: `/api/jobs/${job.id}`,
-        payload: { status: 'success', exitCode: 0, completedAt: new Date().toISOString() },
+        payload: {
+          ...success,
+          eventId: 'cleanup-signal-success',
+          payloadHash: createHash('sha256').update(canonicalizeJobUpdate(success)).digest('hex'),
+        },
       })
       expect(res.statusCode).toBe(200)
       const body = parseBody<Job & { workspaceCleanupRequired?: boolean }>(res.body)

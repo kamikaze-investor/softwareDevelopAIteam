@@ -1,4 +1,5 @@
 import type { JobWorkspaceBaseline } from '@ai-team/shared'
+import { getCredentialClass } from '../auth/credentialClass'
 import { completeAbortCleanup } from '../pl/abortTask'
 import { TECHNICAL_ABORT_WORKER_REFUSAL_CODES } from '../pl/technicalAbortEvidence'
 import type { FastifyInstance } from 'fastify'
@@ -799,6 +800,37 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
         return reply.status(404).send({ error: 'Job not found' })
       }
       // NOW_APPLICABLE: 読み直した時点で適用先の状態にある。通常の経路で評価する。
+    }
+
+    // **`success` は Worker 自身の結果配送（Outbox event 付き）だけが書ける**（lifecycle repair residual
+    // R-FINAL-OPPATCH）。汎用 Task CRUD が lifecycle の所有する status を書けないのと同じ扱いである。
+    //
+    // success の下流（post-implement review の作成・git_commit の Task 完了 + continuation・resulting commit の
+    // bind）は Worker の結果欄（changedFiles / guardResult / exitCode / commitHash / end fingerprint）を前提にする。
+    // eventId の無い直接の `success`（operator の ADMIN / legacy credential）はそれを持たないので、
+    //   - implement: review が作られず、後から届く Worker の本物の success は「適用先の状態に無い配送」として
+    //     何も適用されずに ack される。Task は pending・最新 Job = success・worktree は dirty のまま、
+    //     attention も PL の駆動も無い**黙った停止**になる（residuals.lifecycle.test.ts で実測）
+    //   - git_commit: commit していないのに Task が done になり continuation が走る
+    // Worker は terminal 結果を必ず `persistTerminalUpdate()`（eventId 付き）で送り、eventId 無しで送るのは
+    // claim（→ running）だけなので、この拒否は Worker の配送を何も変えない。止まった running Job の出口は
+    // 従来どおり `PATCH /:id/fail-if-running`・eventId 無しの failed / blocked・requeue（→ queued）である。
+    // **Outbox event の由来も確かめる**（Codex review r5）: eventId と payloadHash は呼び出し側が計算できるので、
+    // split credential では Worker credential の配送だけを Worker の結果として受ける。ADMIN が event 欄を付けても
+    // success は書けない。legacy（単一 token）と未認証のテスト構成は由来を区別できないため従来どおり。
+    const credentialClass = getCredentialClass(req)
+    const workerProvenance = credentialClass === undefined || credentialClass === 'worker' || credentialClass === 'legacy'
+    if (
+      (outboxEvent === undefined || !workerProvenance)
+      && jobUpdate.status === 'success'
+      && existing.status !== 'success'
+    ) {
+      return reply.status(409).send({
+        error: 'success can only be recorded by the Worker\'s own result delivery (an Outbox event); '
+          + 'a direct status write cannot carry the result fields the workflow needs. '
+          + 'To stop a stuck job, use PATCH /api/jobs/:id/fail-if-running or set it to failed / blocked',
+        code: 'JOB_SUCCESS_REQUIRES_WORKER_RESULT',
+      })
     }
 
     const workspaceEndFingerprint = jobUpdate.failureMetadata?.workspaceEndFingerprint
