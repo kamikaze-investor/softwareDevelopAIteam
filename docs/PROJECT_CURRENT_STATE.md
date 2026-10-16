@@ -289,7 +289,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 **未完了・保留項目:**
 - **障害復旧E2E・自律実行有効化**（state: planned）
 - CEO Alignment Checkpoint: Phase完了・主要機能完成時にサマリーと当初計画との差分をCEOへ通知する。（state: planned）
-- **Safety / Authority 変更に対する Independent Review の判定が安定しない**（state: planned）
+- **Safety / Authority 変更に対する Independent Review の判定が安定しない**（state: deferred）
 - **Worker安全コアの物理分離**（state: deferred）
 - **Context Pack実接続**（state: deferred）
 - **複数Worker対応**（state: deferred）
@@ -366,6 +366,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Design Review CONFLICT で止まった採用を、独立した flagship AI が作り直す（Independent Remediation）**（state: in_progress）
 - **Remediation の試行受付が原子的でない（複数 API プロセス前提でのみ問題になる）**（state: planned）
 - **System One Decision Layer の一般化（Principle 以外の Question category / 外部 Decision Engine 評価）**（state: deferred）
+- **Lifecycle 横断監査（RC1〜RC6）と一括修復 W1〜W7: 同じ意味を経路ごとに別の表現・述語で判定していた**（state: in_progress）
 
 詳細は `tasks/roadmap.md`「スマホ操作MVP残タスク」を参照。
 <!-- AUTO-GENERATED:ROADMAP_CURRENT_STATE:END -->

@@ -1614,7 +1614,7 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       **今回実装しないもの（明記）**: 本項目はFinding記録であり、PR-C（#98）のmergeとは分離する。
       新しいReviewer種別・新しいReview基盤・新しいmerge gate・base最新化専用gateは追加しない。
 
-<!-- roadmap:id=independent-review-verdict-instability state=planned -->
+<!-- roadmap:id=independent-review-verdict-instability state=deferred -->
 13. [ ] **Safety / Authority 変更に対する Independent Review の判定が安定しない** — 2026-09-14登録
       （CEO 指示により独立 Finding として記録）。**本項目は記録であり、今は実装しない。**
 
@@ -1916,6 +1916,11 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       で APPROVED（指摘なし）、文言修正後の `bf71474` で APPROVED（DA(2) の advisory 付き）と揺れた。
       CEO が chat で SHA 限定の Code Owner 承認を与えて merge した。**承認されたことは揺れの解消ではない**
       （CEO 指示）。同一 PR 内で DA 判定そのものが反転しうるため、DA 判定も verdict instability の対象に含める。
+
+      **2026-10-16 追記（Lifecycle 一括修復 `lifecycle-semantic-integrity-batch-repair`）**: `state=deferred` へ変更した
+      （本文どおり本項目は記録であり、`planned` のままだと PL が自律採用しうるため）。同修復は git_commit Approval に
+      DA trigger 7（未解決の review 不一致）の開示を追加した。verdict の再抽選そのものは本項目の範囲のまま未解決だが、
+      失敗 review の resume による再抽選は `review_resumed` 経由で引き続き fail-closed に止まる。
 
 <!-- roadmap:id=project-auto-worker-core-split state=deferred -->
 1. [ ] **Worker安全コアの物理分離** — CONTROL REPOSITORY保護対象を「安全コア」単位へ縮小する。
@@ -8139,7 +8144,7 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       **関連項目（重複実装しないこと）**:
       - `mandatory-gate-policy`（in_progress）— 必要 Gate を決める入口。**本項目はその入力を精緻化する**もので、
         Gate を減らす仕組みではない。`plRiskOpinion` を `requiredGates` の算出に使わない不変条件は維持する
-      - `independent-review-verdict-instability`（planned）— 同じ差分への判定が実行ごとに反転する実測。
+      - `independent-review-verdict-instability`（deferred）— 同じ差分への判定が実行ごとに反転する実測。
         本項目の disagreement fail-closed と**同じ問題の別側面**であり、着手時は一緒に扱う。
         当該項目の「着手時に確認すること」（Safety/Authority 差分は LLM より先に機械ルールで拾う／
         新しい分類器を作る前に `reviewLoadClassifier`・`runMechanicalGate` の再利用を確認する）は
@@ -11931,6 +11936,67 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       **残り**: 例えば lifecycle（`apps/api/src/pl/`・`designReview/`）・API 側 approval / git_commit・target app のファイルでは、
       どの経路でも `canonical-domain-meaning` が選ばれない。原因は prompt 側ではなく focus routing であり、
       selection coverage の owner である `principle-registry-coverage-and-threshold-review` Task A へ移した。
+
+<!-- roadmap:id=lifecycle-semantic-integrity-batch-repair state=in_progress -->
+11. [~] **Lifecycle 横断監査（RC1〜RC6）と一括修復 W1〜W7: 同じ意味を経路ごとに別の表現・述語で判定していた** —
+      2026-10-16登録・実装中（Lifecycle 横断監査に基づく一括修復）。
+
+      **事象（production 実測・Task `b8d0fc5d`）**: initial-implement + `REVIEW_UNAVAILABLE` の repair で止まった Task が、
+      stored-review 再駆動でも Human Resume でも admission で拒否され、復旧経路が無いまま止まった。
+      個別に塞ぐと同じ形の欠落が別の Lifecycle に残るため、Lifecycle 全体を横断監査し、
+      **同じ根から出た欠落を細切れ item にせず、ここで一括管理する**（`repair-chain-successor-durability` と同じ扱い）。
+
+      **根本原因（横断監査 RC1〜RC6）**:
+
+      | | 根本原因 |
+      |---|---|
+      | RC1 | Authority を意味ではなく**表現**（Job kind・行の形・経路）で判定している |
+      | RC2 | 同じ意味（「承認待ち」「再開してよい」等）の述語が経路ごとに分岐している |
+      | RC3 | 「判定がまだ無い」と「否定的な判定」を区別していない |
+      | RC4 | Approval が個々の判断ではなく **command kind** に束縛されている |
+      | RC5 | 出口も可視性も無い停止がある（誰にも見えず、誰も進められない） |
+      | RC6 | Decision Authority（DA）の検出が不完全 |
+
+      **一括修復（W1〜W7）**:
+
+      | | 修復 | 対応する根本原因 |
+      |---|---|---|
+      | W1 | 復旧 Authority を意味で判定する（`approval_actor` による人間の承認 evidence を含む）。resume admission を1つの共有述語へ | RC1・RC2 |
+      | W2 | Design Review の判定 pipeline（未判定と否定判定の区別）と evidence supersession（同じ設計の最新判定が古い ALIGNED に優先） | RC3 |
+      | W3 | git_commit Approval への DA trigger 7（未解決の review 不一致）開示 | RC6 |
+      | W4 | Approval の identity を判断ごとに持たせ、「承認待ち」を canonical な1つの述語にする | RC2・RC4 |
+      | W5 | 停止の可視化・claim guard・inactive Project が保持する workspace の attention | RC5 |
+      | W6 | Mobile の resume / recover 表示を共有 admission 述語から導く | RC2 |
+      | W7 | ledger（本項目の登録と `independent-review-verdict-instability` の `deferred` 化） | — |
+
+      **触る範囲（allowedPaths の目安。これ以外へ広げない）**:
+      - `packages/shared/src/` … canonical な承認待ち述語・resume / recover admission 述語・Task occupancy
+      - `apps/api/src/designReview/`・`apps/api/src/designReviewEvidencePolicy.ts` … 判定 pipeline・evidence supersession・resume actor
+      - `apps/api/src/humanRecovery/` … 人間の復旧 Authority
+      - `apps/api/src/pl/` … PL tick の判定読み取り・停止の可視化・Technical Abort
+      - `apps/api/src/routes/`・`apps/api/src/state/`・`apps/api/src/storage/` … admission・attention・Approval identity
+      - `apps/worker/src/` … claim guard・workspace 排他
+      - `apps/mobile/lib/` … 共有述語からの表示
+      - `tasks/roadmap.md`・`docs/PROJECT_CURRENT_STATE.md` … ledger
+
+      **関連項目（重複実装しないこと。完了済み項目は何も置き換えない）**:
+      - `task-design-review-conflict-has-no-recovery-route`（deferred）— 復旧経路が無いこと自体の記録。本項目の W1・W2 が同じ根を扱う
+      - `independent-remediation-design-review-conflict`（in_progress）— CONFLICT からの再設計経路。W2 の判定 pipeline はその入力側であり、stage machine は変えない
+      - `consumed-stored-review-has-no-recovery-route`（done）— stored review の再駆動の正本。置き換えない
+      - `resumed-review-changes-requested-reaches-no-repair`（done）— resume した review の `changes_requested` の扱いの正本。置き換えない
+      - `independent-review-verdict-instability`（deferred）— verdict の揺れそのもの。本項目は W3 の開示までで、揺れの解消は扱わない
+
+      **作らないもの**: 新しい workflow / Gate / review 工程 / status / queue / daemon。
+      既存の述語・evidence・Approval を**1つの意味の owner へ寄せる**ことだけを行う（`canonical-domain-meaning`）。
+
+      **Acceptance Criteria**:
+      - `b8d0fc5d` と同じ形（initial-implement + `REVIEW_UNAVAILABLE` repair）の Task が、人間の承認 evidence により既存の復旧経路で admission を通る（テストで固定）
+      - 「承認待ち」「resume / recover してよい」の判定が API・Worker・Mobile で同じ共有述語から導かれる
+      - 未判定（requeue 中）の Design Review を否定判定として扱わず、同じ設計の最新判定が古い ALIGNED evidence に優先する
+      - 1つの判断に対する Approval が別の判断（他の action の APPROVED を含む）を上書きしない
+      - 出口の無い停止が残らない（進められない owner は attention として必ず見える）
+      - git_commit Approval で DA trigger 7 が開示される
+      - `typecheck` / `tests` / `roadmap:check` が PASS
 
 ---
 
