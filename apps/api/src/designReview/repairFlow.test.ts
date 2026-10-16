@@ -324,6 +324,45 @@ describe('review済みpromptがそのままrepair Jobへ渡る', () => {
   })
 })
 
+describe('repair Job は Implement の verification profile を引き継ぐ', () => {
+  const profiled = {
+    kind: 'test',
+    workingDir: '/workspace/target',
+    params: { verificationProfile: 'implement' },
+  }
+
+  it('runRepairFlow: source の safeCommand（profile 含む）がそのまま repair Job に入る', async () => {
+    const storage = createStorage()
+    const ids = seed(storage)
+    const failed = createFailedJob(storage, ids, {
+      workflowStepKey: 'task:' + ids.taskId + ':initial-implement',
+      safeCommand: profiled,
+    })
+
+    const outcome = await runRepairFlow(storage, { failedJob: failed }, deps())
+    expect(outcome.status).toBe('repair_job_created')
+    if (outcome.status !== 'repair_job_created') return
+    expect(storage.jobs.findById(outcome.jobId)!.safeCommand).toEqual(profiled)
+  })
+
+  it('executeQueuedRepair: queue 経路（所有権 handoff）でも profile を引き継ぐ', async () => {
+    const storage = createStorage()
+    const ids = seed(storage)
+    const failed = createFailedJob(storage, ids, { safeCommand: profiled })
+    storage.jobs.update(failed.id, { status: 'blocked' } as never)
+
+    const preparation = prepareRepairFlow(storage, { failedJob: failed })
+    if (preparation.action !== 'queue') throw new Error('fixture expected a queue preparation')
+    storage.designReviewRuns.create(preparation.run)
+    const run = storage.designReviewRuns.findQueued()[0]
+
+    const outcome = await executeQueuedRepair(storage, run, preparation.stepKey, deps())
+    expect(outcome.status).toBe('repair_job_created')
+    if (outcome.status !== 'repair_job_created') return
+    expect(storage.jobs.findById(outcome.jobId)!.safeCommand).toEqual(profiled)
+  })
+})
+
 describe('stepKey の一意制約 race は already_started（500 にしない）', () => {
   it('Design Review 中に同じ stepKey の Job が先に作られても already_started になる', async () => {
     const storage = createStorage()

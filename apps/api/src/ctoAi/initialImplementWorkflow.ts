@@ -89,7 +89,13 @@ export async function createInitialImplementWorkflow(
     workflowStepKey: stepKey,
     agentRole: 'developer_ai',
     status: 'queued',
-    safeCommand: { kind: 'test', workingDir: TARGET_WORKING_DIR },
+    // typecheck → test を Worker に実行させる。repair / retry / resume は safeCommand を
+    // そのまま引き継ぐので、この profile は派生 Job にも残る。
+    safeCommand: {
+      kind: 'test',
+      workingDir: TARGET_WORKING_DIR,
+      params: { verificationProfile: 'implement' },
+    },
     aiCliProvider: task.provider ?? 'claude_code',
     aiCliPrompt,
     aiCliMode: 'implement',

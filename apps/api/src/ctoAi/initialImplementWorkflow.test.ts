@@ -114,6 +114,12 @@ describe('initial implement workflow', () => {
       aiCliMode: 'implement',
       status: 'queued',
     })
+    // Worker に typecheck → test を実行させる固定 profile（kind は従来どおり test）。
+    expect(jobs[0].safeCommand).toEqual({
+      kind: 'test',
+      workingDir: '/workspace/target',
+      params: { verificationProfile: 'implement' },
+    })
     expect(jobs[0].aiCliPrompt).toContain('Implement T.')
     expect(jobs[0].aiCliPrompt).toContain('## Design Contract')
     expect(jobs[0].aiCliPrompt).toContain('current implementation is evidence, not specification')

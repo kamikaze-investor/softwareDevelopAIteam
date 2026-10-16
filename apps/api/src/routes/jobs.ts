@@ -62,6 +62,10 @@ const SafeCommandParamsSchema = z.object({
   revertCommit: z.string().optional(),
   testPattern: z.string().optional(),
   agentPrefix: z.string().optional(),
+  // `verificationProfile` は意図的に含めない（`.strict()` により 400）。
+  // profile はサーバー側の Implement producer（initialImplementWorkflow）だけが付け、
+  // 派生 Job は safeCommand ごと引き継ぐ。クライアントが付けられると、QA・手動 test Job の
+  // 実行内容をクライアントが変えられてしまう（独立レビュー指摘）。
 }).strict()
 
 /**

@@ -166,6 +166,7 @@ async function createTestWorkflowImplementJob(
   app: FastifyInstance,
   task: Task,
   prompt = 'Implement the approved requirement.',
+  safeCommand: Job['safeCommand'] = { kind: 'test', workingDir: '/workspace/target' },
 ): Promise<Job> {
   await createDesignReviewEvidence(app, task, prompt)
   const { getStorage } = await import('../storage/index.js')
@@ -175,7 +176,7 @@ async function createTestWorkflowImplementJob(
     workflowStepKey: `task:${task.id}:initial-implement`,
     agentRole: 'developer_ai',
     status: 'queued',
-    safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+    safeCommand,
     aiCliProvider: 'claude_code',
     aiCliPrompt: prompt,
     aiCliMode: 'implement',
@@ -221,6 +222,7 @@ async function createProducedTimeoutRetry(
   task: Task,
   prompt: string,
   workflowStepKey?: string,
+  safeCommand: Job['safeCommand'] = { kind: 'test', workingDir: '/workspace/target' },
 ): Promise<{ source: Job; retry: Job }> {
   await createDesignReviewEvidence(app, task, prompt)
   const { getStorage } = await import('../storage/index.js')
@@ -230,7 +232,7 @@ async function createProducedTimeoutRetry(
     ...(workflowStepKey === undefined ? {} : { workflowStepKey }),
     agentRole: 'developer_ai',
     status: 'running',
-    safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+    safeCommand,
     aiCliProvider: 'codex',
     aiCliPrompt: prompt,
     aiCliMode: 'implement',
@@ -418,6 +420,53 @@ describe('Job API', () => {
       // workingDir はクライアントから受け取らず、サーバー側の正規workingDirが設定される
       expect(body.safeCommand.workingDir).toBe('/workspace/target')
       expect(body.dryRun).toBe(true)
+    })
+  })
+
+  describe('safeCommand.params.verificationProfile', () => {
+    async function postSafeCommand(safeCommand: Record<string, unknown>) {
+      let response: { statusCode: number; body: string } | undefined
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id)
+        response = await app.inject({
+          method: 'POST',
+          url: '/api/jobs',
+          payload: {
+            taskId: task.id,
+            projectId: project.id,
+            agentRole: 'qa_ai',
+            safeCommand,
+            dryRun: true,
+          },
+        })
+      })
+      if (!response) throw new Error('POST /api/jobs did not respond')
+      return response
+    }
+
+    // profile はサーバー側 producer だけが付ける。既知の値でもクライアントからは受けない。
+    it.each([
+      ['the implement profile from a client (QA / manual test Job)', {
+        kind: 'test',
+        params: { verificationProfile: 'implement' },
+      }],
+      ['an unknown profile', { kind: 'test', params: { verificationProfile: 'full' } }],
+      ['a script-like profile', { kind: 'test', params: { verificationProfile: 'verify:implement; rm -rf /' } }],
+      ['the profile on a non-test kind', { kind: 'typecheck', params: { verificationProfile: 'implement' } }],
+      ['the profile combined with testPattern', {
+        kind: 'test',
+        params: { verificationProfile: 'implement', testPattern: 'apps/api' },
+      }],
+    ])('rejects %s with 400', async (_label, safeCommand) => {
+      const res = await postSafeCommand(safeCommand)
+      expect(res.statusCode).toBe(400)
+    })
+
+    it('keeps an ordinary test Job unchanged (no profile is added)', async () => {
+      const res = await postSafeCommand({ kind: 'test' })
+      expect(res.statusCode).toBe(201)
+      expect(parseBody<Job>(res.body).safeCommand).toEqual({ kind: 'test', workingDir: '/workspace/target' })
     })
   })
 
@@ -1838,6 +1887,75 @@ describe('Job API', () => {
         url: `/api/jobs?taskId=${task.id}`,
       })
       expect(parseBody<Job[]>(jobsResponse.body)).toHaveLength(1)
+    })
+  })
+
+  describe('verificationProfile=implement の Implement Job', () => {
+    const profiled: Job['safeCommand'] = {
+      kind: 'test',
+      workingDir: '/workspace/target',
+      params: { verificationProfile: 'implement' },
+    }
+
+    async function profiledImplement(app: FastifyInstance): Promise<{ task: Task; implement: Job }> {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id)
+      const implement = await createTestWorkflowImplementJob(app, task, undefined, profiled)
+      return { task, implement }
+    }
+
+    it.each([
+      ['typecheck or test failed (verify:implement exited non-zero)', { status: 'failed', exitCode: 1, changedFiles: ['src/a.ts'], guardResult: { permissionAllowed: true, fileChangeAllowed: true } }],
+      ['verify:implement timed out', { status: 'failed', exitCode: 1, stderr: 'command timed out after 120000ms and was terminated by containment', changedFiles: ['src/a.ts'], guardResult: { permissionAllowed: true, fileChangeAllowed: true } }],
+    ])('does not proceed to review or git_commit when %s', async (_label, resultPayload) => {
+      await withApp(async (app) => {
+        const { task, implement } = await profiledImplement(app)
+
+        const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${implement.id}`, payload: resultPayload })
+
+        expect(res.statusCode).toBe(200)
+        const { getStorage } = await import('../storage/index.js')
+        const jobs = getStorage().jobs.findByTaskId(task.id)
+        expect(jobs.some((job) => job.aiCliMode === 'review')).toBe(false)
+        expect(jobs.some((job) => job.safeCommand.kind === 'git_commit')).toBe(false)
+      })
+    })
+
+    it('creates the existing post-implement review only after verify:implement succeeds', async () => {
+      await withApp(async (app) => {
+        const { task, implement } = await profiledImplement(app)
+
+        const res = await app.inject({
+          method: 'PATCH',
+          url: `/api/jobs/${implement.id}`,
+          payload: successfulChangedImplementResult,
+        })
+
+        expect(res.statusCode).toBe(200)
+        const { getStorage } = await import('../storage/index.js')
+        const review = getStorage().jobs.findByTaskId(task.id)
+          .find((job) => job.workflowStepKey === `implement:${implement.id}:review`)
+        expect(review).toMatchObject({ aiCliMode: 'review', status: 'queued' })
+        // profile は review Job（git_status）へ伝播しない。
+        expect(review?.safeCommand).toEqual({ kind: 'git_status', workingDir: '/workspace/target' })
+      })
+    })
+
+    it('a produced retry keeps the verification profile', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app, { status: 'running' })
+        const task = await createTask(app, project.id, { status: 'in_progress' })
+        const { retry } = await createProducedTimeoutRetry(
+          app,
+          task,
+          'Retry the profiled implementation.',
+          `task:${task.id}:initial-implement`,
+          profiled,
+        )
+
+        expect(retry.workflowStepKey?.startsWith('retry:')).toBe(true)
+        expect(retry.safeCommand).toEqual(profiled)
+      })
     })
   })
 
