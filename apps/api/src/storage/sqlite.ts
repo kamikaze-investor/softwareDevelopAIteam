@@ -64,7 +64,7 @@ import { resolveLinkedGitCommitRejection } from '../linkedGitCommitRejection'
 import { blockedJobsReconcileRefusalReason, findBlockedJobsPreventingReconcile } from '../reconcile/externalCompletion'
 import { findBlockedRowsHoldingWorkspace } from '../state/blockedRowOwnership'
 import { classifyApprovedRunBlock, describeApprovedRunBlock } from '../approvedRunBlock'
-import { approvalActorAuditRecord, readApprovalActorClass, readJobsSupersededByHumanResume, resumeActorAuditRecord } from '../designReview/resumeActor'
+import { approvalActorAuditRecord, readApprovalActorClass, readJobsSupersededByHumanResume, resumeActorAuditRecord, withApprovalActorFacts } from '../designReview/resumeActor'
 
 /** resume transaction 内で authority evidence（`resume_actor`）が書けなかったことを表す（G-01）。 */
 class ResumeAuthorityEvidenceWriteError extends Error {
@@ -1300,6 +1300,27 @@ export function createSQLiteStorage(dbPath: string): IStorage {
    * APPROVED か / 失効していないか**。最後に既存の一回限り契約（APPROVED → CONSUMED）を
    * CAS で使い切る。新しい承認種別も新しい遷移も足していない。
    */
+  /**
+   * 人が決めた記録（approval_actor = human）の無い APPROVED を SUPERSEDED にする（supersede audit 付き）。
+   * **呼び出し側の transaction の中で呼ぶ。** authority を使う経路（consume / resume admission）が
+   * 主体の無い APPROVED に出会ったときの唯一の処理（reason=approval_actor_not_human）。
+   */
+  function supersedeNonHumanApproval(approvalRequestId: string): void {
+    const superseded = db.prepare(
+      "UPDATE approval_requests SET status = 'SUPERSEDED' WHERE id = ? AND status = 'APPROVED'",
+    ).run(approvalRequestId)
+    if (superseded.changes === 1) {
+      auditLog.record({
+        actor: 'api',
+        operation: 'supersede',
+        entityType: 'approval_request',
+        entityId: approvalRequestId,
+        result: 'success',
+        detail: 'reason=approval_actor_not_human',
+      })
+    }
+  }
+
   function verifyAndConsumeTaskApproval(
     taskId: string,
     approvalRequestId: string,
@@ -1339,19 +1360,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     // legacy 単一 token / actor 記録導入前の決定は行の状態だけでは人の判断と区別できない。使い切らずに
     // 同じ transaction で SUPERSEDED にし（supersede audit 付き）、改めて人の承認を求める。
     if (readApprovalActorClass(storage, approvalRequestId) !== 'human') {
-      const superseded = db.prepare(
-        "UPDATE approval_requests SET status = 'SUPERSEDED' WHERE id = ? AND status = 'APPROVED'",
-      ).run(approvalRequestId)
-      if (superseded.changes === 1) {
-        auditLog.record({
-          actor: 'api',
-          operation: 'supersede',
-          entityType: 'approval_request',
-          entityId: approvalRequestId,
-          result: 'success',
-          detail: 'reason=approval_actor_not_human',
-        })
-      }
+      supersedeNonHumanApproval(approvalRequestId)
       return {
         ok: false,
         code: 'APPROVAL_ACTOR_NOT_HUMAN',
@@ -3111,13 +3120,30 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         // **前提条件は共有の純関数 1 つで決める**（Mobile の Resume ボタンも同じ関数を使う）。
         // 以下の分岐の注記は、各前提がなぜ在るかの記録として残してある。判定はここでしか行わない。
         // done / Project 非 running の拒否もこの transaction の中で読み直した値で行う（b8d0fc5d 監査）。
+        // APPROVED の人が実行する Task 単位判断は、決定主体の事実（approval_actor）を付けて渡す。
+        // 主体が human でない live APPROVED は authority ではない: この authoritative な経路で出会ったら
+        // consume 側と同じ approval_actor_not_human で SUPERSEDED にし、人の判断として数えない（lifecycle repair C3）。
+        // 人の resume は completeResumeHandoff が生きた Task 単位の判断をすべて置き換える（superseded_by_resume）ので、
+        // ここで先に別の理由で書き換えない。
+        const resumeNowMs = Date.parse(now())
+        const admissionApprovals = withApprovalActorFacts(storage, approvalRows.map(deserializeApprovalRequest))
+        for (const approval of admissionApprovals) {
+          if (
+            resumedBy?.actorClass !== 'human'
+            && approval.approvalActor !== undefined
+            && approval.approvalActor !== 'human'
+            && isLiveApprovedApproval(approval, resumeNowMs)
+          ) {
+            supersedeNonHumanApproval(approval.id)
+          }
+        }
         const admission = evaluateResumeAdmission({
           taskStatus: taskRow.status,
           parked: isParkedTaskId(taskId),
           projectStatus: projectRow?.status,
           jobs: taskJobs,
-          approvals: approvalRows.map(deserializeApprovalRequest),
-          nowMs: Date.parse(now()),
+          approvals: admissionApprovals,
+          nowMs: resumeNowMs,
           // 人の resume は生きた Task 単位の判断を置き換える（completeResumeHandoff）。人でない resume は
           // それがある間 HUMAN_DECISION_PENDING（C-03）。規則は共有 admission の1箇所（Mobile と同じ）。
           resumedByHuman: resumedBy?.actorClass === 'human',

@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest'
 import type { IStorage } from './interface'
 import { createSQLiteStorage } from './sqlite'
 import { abortTask } from '../pl/abortTask'
-import { resumeActorClassFromAudit, RESUME_ACTOR_OPERATION } from '../designReview/resumeActor'
+import { recordApprovalActor, resumeActorClassFromAudit, RESUME_ACTOR_OPERATION } from '../designReview/resumeActor'
 
 /**
  * G-01: authority を変える遷移と、その authority evidence は一緒に commit する。
@@ -33,12 +33,16 @@ function taskApproval(
   taskId: string,
   requestedAction: string,
   status: 'APPROVED' | 'WAITING_FOR_USER' = 'APPROVED',
+  /** APPROVED を人（ADMIN）の決定として記録するか。記録の無い APPROVED は authority ではない（C3）。 */
+  decidedBy: 'admin' | 'none' = 'admin',
 ): string {
-  return storage.approvalRequests.create({
+  const id = storage.approvalRequests.create({
     taskId, requestedAction, riskLevel: 'HIGH', targetBranch: 'b', targetCommit: 'c', targetDiffHash: 'd',
     changedFiles: [], triggeredRules: [], invalidIf: [], status,
     expiresAt: new Date(Date.now() + HOUR).toISOString(),
   } as Parameters<IStorage['approvalRequests']['create']>[0]).id
+  if (status === 'APPROVED' && decidedBy === 'admin') recordApprovalActor(storage, id, 'admin')
+  return id
 }
 
 function resumeActorRows(storage: IStorage, jobId: string) {
@@ -97,7 +101,8 @@ describe('Task 単位の承認は新しい人の判断で置き換わる（C-03�
 
     expect(storage.approvalRequests.findById(abortApproval)?.status).toBe('SUPERSEDED')
     expect(storage.approvalRequests.findById(reconcileWaiting)?.status).toBe('SUPERSEDED')
-    expect(storage.auditLog.findByEntity('approval_request', abortApproval)).toEqual([
+    expect(storage.auditLog.findByEntity('approval_request', abortApproval)
+      .filter((entry) => entry.operation === 'supersede')).toEqual([
       expect.objectContaining({
         operation: 'supersede',
         detail: `reason=superseded_by_resume resume_job_id=${resumed.job.id}`,
@@ -142,6 +147,22 @@ describe('Task 単位の承認は新しい人の判断で置き換わる（C-03�
       .toMatchObject({ ok: false, code: 'HUMAN_DECISION_PENDING' })
   })
 
+  it('決定主体の記録が無い APPROVED abort_task は PL の resume を止めず、approval_actor_not_human で SUPERSEDED になる（C3）', () => {
+    // 実行側（verifyAndConsumeTaskApproval）が authority として使わない行を、HUMAN_DECISION_PENDING の
+    // 根拠にしない。authoritative な resume 経路で出会ったので、consume 側と同じ理由で置き換える。
+    const storage = createSQLiteStorage(':memory:')
+    const seeded = seedBlockedTask(storage)
+    const actorless = taskApproval(storage, seeded.taskId, 'abort_task', 'APPROVED', 'none')
+
+    const resumed = storage.jobs.resumeBlockedTask({ taskId: seeded.taskId, instructionPrompt: 'resume', resumedBy: PL })
+
+    expect(resumed.ok).toBe(true)
+    expect(storage.approvalRequests.findById(actorless)?.status).toBe('SUPERSEDED')
+    expect(storage.auditLog.findByEntity('approval_request', actorless)).toEqual([
+      expect.objectContaining({ operation: 'supersede', detail: 'reason=approval_actor_not_human' }),
+    ])
+  })
+
   it('期限切れの APPROVED や command kind の承認は PL の resume を止めない', () => {
     const storage = createSQLiteStorage(':memory:')
     const seeded = seedBlockedTask(storage)
@@ -162,7 +183,7 @@ describe('Task 単位の承認は新しい人の判断で置き換わる（C-03�
   it('command kind の承認（git_commit 以外も含む）には触れない', () => {
     const storage = createSQLiteStorage(':memory:')
     const seeded = seedBlockedTask(storage)
-    const commandApproval = taskApproval(storage, seeded.taskId, 'git_revert')
+    const commandApproval = taskApproval(storage, seeded.taskId, 'git_revert', 'APPROVED', 'none')
 
     const resumed = storage.jobs.resumeBlockedTask({ taskId: seeded.taskId, instructionPrompt: 'resume', resumedBy: HUMAN })
 
@@ -184,7 +205,8 @@ describe('Task 単位の承認は新しい人の判断で置き換わる（C-03�
 
     expect(recovered.ok).toBe(true)
     expect(storage.approvalRequests.findById(repairApproval)?.status).toBe('SUPERSEDED')
-    expect(storage.auditLog.findByEntity('approval_request', repairApproval)).toEqual([
+    expect(storage.auditLog.findByEntity('approval_request', repairApproval)
+      .filter((entry) => entry.operation === 'supersede')).toEqual([
       expect.objectContaining({
         operation: 'supersede',
         detail: `reason=superseded_by_recover recovered_task_id=${task.id}`,

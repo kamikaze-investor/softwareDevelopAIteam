@@ -33,7 +33,7 @@ import {
   type TaskFailureJob,
 } from '../taskFailureExplain/taskFailureAi'
 import type { CoordinatorDeps } from '../designReview/designReviewCoordinator'
-import { classifyResumeActorFromRequest } from '../designReview/resumeActor'
+import { classifyResumeActorFromRequest, humanTaskDecisionFacts } from '../designReview/resumeActor'
 import {
   RESUME_DESIGN_REVIEW_FAILED,
   RESUME_DESIGN_REVIEW_PENDING,
@@ -289,6 +289,9 @@ export async function taskRoutes(
       ...task,
       parked: storage.tasks.isParked(task.id),
       projectStatus: storage.projects.findById(task.projectId)?.status ?? null,
+      // 生きた Task 単位の人の判断（approval_actor を付けて shared `liveTaskDecisionState()` が決める）。
+      // Mobile は ApprovalRequest の生の status から authority を組み立て直さない（lifecycle repair C3）。
+      humanTaskDecisions: humanTaskDecisionFacts(storage, task.id),
     }
     return reply.send(detail)
   })

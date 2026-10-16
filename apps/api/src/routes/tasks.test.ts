@@ -952,6 +952,32 @@ describe('Task API', () => {
     })
   })
 
+  it('GET /api/tasks/:id exposes humanTaskDecisions: an actorless APPROVED is not a human decision (lifecycle repair C3)', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const created = await createTask(app, project.id, { title: 'T', status: 'blocked' })
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const make = (requestedAction: string) => storage.approvalRequests.create({
+        taskId: created.id, requestedAction, riskLevel: 'HIGH', targetBranch: 'b', targetCommit: 'c',
+        targetDiffHash: 'd', changedFiles: [], triggeredRules: [], invalidIf: [], status: 'APPROVED',
+        expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      } as Parameters<typeof storage.approvalRequests.create>[0])
+      // 主体記録の無い legacy APPROVED（authority ではない）と、ADMIN が決めた APPROVED。
+      const actorless = make('repair_from_stored_review:review-a')
+      const human = make('repair_from_stored_review:review-b')
+      recordApprovalActor(storage, human.id, 'admin')
+
+      const detail = parseBody<TaskDetail>((await app.inject({ method: 'GET', url: `/api/tasks/${created.id}` })).body)
+      expect(detail.humanTaskDecisions).toEqual([
+        { approvalRequestId: human.id, requestedAction: 'repair_from_stored_review:review-b', state: 'approved' },
+      ])
+      expect(detail.humanTaskDecisions.some((d) => d.approvalRequestId === actorless.id)).toBe(false)
+      // GET は read-only: 主体の無い行は数えないだけで、書き換えない。
+      expect(storage.approvalRequests.findById(actorless.id)?.status).toBe('APPROVED')
+    })
+  })
+
   it('GET /api/tasks/:id adds parked and projectStatus for the shared resume/recover admission', async () => {
     await withApp(async (app) => {
       const project = await createProject(app)

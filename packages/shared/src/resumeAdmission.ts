@@ -1,8 +1,12 @@
-import type { ApprovalRequest } from './types/approval_gate'
 import type { JobStatus } from './types/job'
 import type { ProjectStatus } from './types/project'
 import type { TaskStatus } from './types/task'
-import { isLiveTaskScopedDecision, isLiveWaitingApproval, isTaskScopedApprovalAction } from './approvalLiveness'
+import {
+  isLiveTaskScopedDecision,
+  isLiveWaitingApproval,
+  isTaskScopedApprovalAction,
+  type TaskDecisionApprovalInput,
+} from './approvalLiveness'
 
 /**
  * **Human Resume を受け付けてよいかの前提条件**（純関数・唯一の定義）。
@@ -33,7 +37,11 @@ export interface ResumeAdmissionInput {
    * Task の ApprovalRequest（順不同）。Job 束縛（command kind）の live な承認待ちが 1 件でもあれば断る。
    * Task 単位の判断（`isTaskScopedApprovalAction`）は `resumedByHuman` で扱いが分かれる。
    */
-  approvals: readonly (Pick<ApprovalRequest, 'status' | 'expiresAt'> & { requestedAction?: string })[]
+  /**
+   * `approvalActor` は API が `approval_actor` audit から計算した型付きの事実（`TaskDecisionApprovalInput`）。
+   * APPROVED の Task 単位判断は `approvalActor === 'human'` のときだけ人の判断として数える。
+   */
+  approvals: readonly TaskDecisionApprovalInput[]
   nowMs: number
   /**
    * 再開するのが人（ADMIN credential）か。人の resume は新しい人の判断として、生きた Task 単位の判断

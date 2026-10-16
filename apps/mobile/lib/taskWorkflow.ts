@@ -16,6 +16,7 @@ import type {
   Task,
   TaskDetail,
   TaskFailureClassification,
+  TaskHumanDecisionFact,
   TaskSummary,
   WatchdogEvent,
 } from '@ai-team/shared'
@@ -623,21 +624,16 @@ export type StoredReviewApprovalState = 'none' | 'waiting' | 'approved'
 
 export function storedReviewApprovalState(
   reviewJobId: string,
-  approvalRequests: ApprovalRequest[],
-  now: Date = new Date(),
+  humanTaskDecisions: readonly TaskHumanDecisionFact[] | undefined,
 ): StoredReviewApprovalState {
   const action = `repair_from_stored_review:${reviewJobId}`
-  // **期限切れは数えない。** backend は未失効のものしか使わないので、期限切れの APPROVED を
-  // 「承認済み」と出すと、押しても新しい承認待ちになって案内と食い違う（独立レビュー指摘）。
-  const unexpired = (request: ApprovalRequest): boolean => {
-    const expiresAt = Date.parse(request.expiresAt)
-    return Number.isNaN(expiresAt) ? false : expiresAt > now.getTime()
-  }
-  const related = approvalRequests.filter(
-    (request) => request.requestedAction === action && unexpired(request),
-  )
-  if (related.some((request) => request.status === 'APPROVED')) return 'approved'
-  if (related.some((request) => request.status === 'WAITING_FOR_USER')) return 'waiting'
+  // **authority を生の ApprovalRequest status から組み立て直さない**（lifecycle repair C3）。
+  // API の `TaskDetail.humanTaskDecisions` は期限切れ・決定主体（approval_actor=human）の無い APPROVED を
+  // 既に除いてある。backend は主体の無い APPROVED を consume せず SUPERSEDED にするので、それを
+  // 「承認済み」と出すと押しても新しい承認待ちになって案内と食い違う。事実が無い（古い API）なら 'none'。
+  const related = (humanTaskDecisions ?? []).filter((decision) => decision.requestedAction === action)
+  if (related.some((decision) => decision.state === 'approved')) return 'approved'
+  if (related.some((decision) => decision.state === 'waiting')) return 'waiting'
   return 'none'
 }
 
@@ -664,11 +660,10 @@ export type StoredReviewRecoveryView =
  * 動かず、**承認後にもう一度この操作を呼んで初めて** APPROVED を consume して queued にする。
  */
 export function storedReviewRecoveryView(
-  task: Task,
+  task: Task & Partial<Pick<TaskDetail, 'humanTaskDecisions'>>,
   jobs: Job[],
   reviews: ReviewResult[],
   qaResults: QAResult[] | null,
-  approvalRequests: ApprovalRequest[] = [],
 ): StoredReviewRecoveryView {
   const candidate = findStoredReviewRecoveryCandidate(task, jobs, reviews)
   if (!candidate) return { kind: 'hidden' }
@@ -676,7 +671,7 @@ export function storedReviewRecoveryView(
 
   const derived = deriveSafeCommandQaEvidence(candidate.implementJob)
   return {
-    approval: storedReviewApprovalState(candidate.reviewJob.id, approvalRequests),
+    approval: storedReviewApprovalState(candidate.reviewJob.id, task.humanTaskDecisions),
     candidate,
     derived,
     kind: 'ready',

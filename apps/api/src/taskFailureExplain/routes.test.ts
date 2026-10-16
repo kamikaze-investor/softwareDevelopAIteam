@@ -735,9 +735,11 @@ describe('Task failure explanation routes', () => {
       expect(taskResponse.statusCode).toBe(200)
       // GET /api/tasks/:id は Task に `parked` / `projectStatus` を足した TaskDetail を返す（lifecycle repair W6）。
       // ここで確かめたいのは「AI 生成の失敗が Task 本体を変えない」ことなので、追加欄は分けて見る。
-      const { parked, projectStatus, ...taskBody } = taskResponse.json<Task & { parked: boolean, projectStatus: string | null }>()
+      // humanTaskDecisions は lifecycle repair C3 で足した追加欄（人の判断の事実）。
+      const { parked, projectStatus, humanTaskDecisions, ...taskBody } = taskResponse.json<Task & { parked: boolean, projectStatus: string | null, humanTaskDecisions: unknown[] }>()
       expect(taskBody).toEqual(before)
       expect(parked).toBe(false)
+      expect(humanTaskDecisions).toEqual([])
       expect(projectStatus).toBe(storage.projects.findById(task.projectId)?.status ?? null)
 
       const instruction = 'Retry after reviewing the failure.'

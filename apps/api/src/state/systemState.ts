@@ -19,7 +19,7 @@ import { isLiveWorkspaceOwnerJob, occupiesProject } from '@ai-team/shared'
 import { findBlockedRowsHoldingWorkspace } from './blockedRowOwnership'
 import { summarizeAdoptionFailure } from '../pl/adoptionFailure'
 import { latestHumanRecoveryId } from '../humanRecovery/recoveryAudit'
-import { readJobsSupersededByHumanResume } from '../designReview/resumeActor'
+import { readJobsSupersededByHumanResume, withApprovalActorFacts } from '../designReview/resumeActor'
 import { isTechnicalRecoveryTargetExhausted } from '../pl/technicalResumePolicy'
 import type { IStorage } from '../storage/interface'
 import { isLiveApprovedApproval, isLiveTaskScopedDecision, isLiveWaitingApproval } from '@ai-team/shared'
@@ -58,7 +58,10 @@ function findLiveWaitingApproval(storage: IStorage, taskId: string, nowMs: numbe
  * 同じく人の判断待ちとして扱い、`job_blocked` を出さない（判断は `approval_waiting` が表す）。
  */
 function findLiveTaskScopedDecision(storage: IStorage, taskId: string, nowMs: number): ApprovalRequest | undefined {
-  const decisions = storage.approvalRequests.findByTaskId(taskId)
+  // APPROVED は決定主体が human の行だけを数える（`withApprovalActorFacts` が付ける型付きの事実。
+  // 主体の記録の無い APPROVED は authority ではないので、job_blocked を抑止しない。lifecycle repair C3）。
+  // GET の read-only 契約を守るため、ここでは SUPERSEDED にせず数えないだけにする。
+  const decisions = withApprovalActorFacts(storage, storage.approvalRequests.findByTaskId(taskId))
     .filter((request) => isLiveTaskScopedDecision(request, nowMs))
   // WAITING を優先（判断そのものを待っている）。無ければ APPROVED（実行を人が待っている）。
   return decisions.find((request) => isLiveWaitingApproval(request, nowMs))
@@ -572,7 +575,12 @@ export function buildSystemState(
       const stallingFailure = jobs.find((job) => (
         job.status === 'failed' && !isQuarantined(job) && !superseded.has(job.id)
       ))
-      if (task.status !== 'done' && !parentIsParked && !hasMovableJob && stallingFailure !== undefined) {
+      // 生きた Task 単位の人の判断（job_blocked と同じ actor-aware な事実）がある間は job_failed も出さない。
+      // 止めているのは人の判断で、それは approval_waiting が表す（重ねると CEO へ誤った二重通知。lifecycle repair C3）。
+      if (
+        task.status !== 'done' && !parentIsParked && !hasMovableJob && stallingFailure !== undefined
+        && findLiveTaskScopedDecision(storage, task.id, nowMs) === undefined
+      ) {
         attention.push({
           kind: 'job_failed',
           projectId: project.id,
