@@ -14,7 +14,7 @@ import type {
   TechnicalAbortCleanupSummary,
 } from '../pl/technicalAbortEvidence'
 import type { KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger } from '@ai-team/shared'
-import type { AiCliProvider, AiCliMode } from '@ai-team/shared'
+import type { AiCliProvider, AiCliMode, RecoverAdmissionCode } from '@ai-team/shared'
 import type { ResumeAdmissionCode } from '@ai-team/shared'
 import type { PrincipleApplication, PrincipleApplicationInput, PrincipleAggregateQuery, PrincipleAggregateRow, PrincipleDisagreementRow, PrincipleVersionAggregateRow } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
@@ -326,7 +326,7 @@ export interface IProjectStorage {
  */
 export type RecoverFromBlockedResult =
   | { ok: true; task: Task }
-  | { ok: false; code?: 'APPROVAL_WAITING' | 'PROJECT_NOT_RUNNING'; reason: string }
+  | { ok: false; code?: RecoverAdmissionCode; reason: string }
 
 export interface ITaskStorage {
   findByProjectId(projectId: string): Task[]
@@ -349,23 +349,17 @@ export interface ITaskStorage {
    * precheck と `tx.immediate()` の間に別 connection が Job を入れたり park したり
    * 承認要求を作ったりできるためで、**読み直す条件が判定に使った条件より少ない限り
    * IMMEDIATE で lock を取っても意味が無い**（独立レビュー round 6 指摘）。
-   * ここで確かめ直すのは:
+   * 確かめ直す条件（`status === 'blocked'`・Job 0 件・park されていない・有効な承認待ちが無い・
+   * Project が `running`）は precheck と**同じ共有の `evaluateRecoverAdmission()`** に、
+   * transaction の中で読み直した値を渡して判定する。条件をここへ書き写さない。
    *
-   *   1. `status === 'blocked'`
-   *   2. Job が0件
-   *   3. park されていない
-   *   4. 有効な承認待ちが無い（未期限の `WAITING_FOR_USER`。判定は
-   *      `humanRecovery/recoveryAudit` の `hasActiveApprovalWaiting()` で precheck と共有）
-   *   5. Project が `running`（precheck と同じ `PROJECT_NOT_RUNNING`）
-   *
-   * 呼び出し側が持つのは**ここに無い政策判定だけ**（Project が archived か、
-   * 自律ループから到達できるか、`nextDriver` は何か 等）。
+   * 呼び出し側が持つのは**ここに無い政策判定だけ**（自律ループから到達できるか、
+   * `nextDriver` は何か 等）。
    *
    * **`code` は race のときも precheck と同じ値を返すために在る。** 同じ原因なのに
    * 「precheck で気付いたか transaction で気付いたか」で machine-readable code が
    * 変わってはならない（独立レビュー round 7 指摘）。理由文字列を比較して code へ
-   * 戻すような実装はしないこと。いま分類しているのは承認待ちだけで、
-   * 他の precondition failure を網羅的に code 化する必要は無い。
+   * 戻すような実装はしないこと。
    */
   recoverFromBlocked(input: { taskId: string; detail: string }): RecoverFromBlockedResult
   findById(id: string): Task | undefined

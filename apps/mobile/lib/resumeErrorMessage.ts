@@ -1,6 +1,8 @@
 /**
- * `POST /api/tasks/:id/resume` の失敗を、CEO が次に何をすべきか分かる文言へ写す。
+ * `POST /api/tasks/:id/resume`（と `POST /api/tasks/:id/recover`）の失敗を、
+ * CEO が次に何をすべきか分かる文言へ写す。
  *
+ * code が無い・未知のときの fallback として:
  * API の `error` 文字列を部分一致で引く。**先に書いた方が優先される**ので、
  * 具体的な理由ほど上に置く。
  */
@@ -31,7 +33,41 @@ const RESUME_ERROR_MESSAGE_BY_REASON: ReadonlyArray<readonly [string, string]> =
   ['waiting for user review', '承認待ちの操作があるため、追加指示を送れませんでした。'],
 ]
 
-export function formatResumeErrorMessage(errorMessage: string | null): string {
+/**
+ * resume 拒否の `code` ごとの文言。code は共有 `ResumeAdmissionCode` と、API 固有の拒否 code
+ * （`apps/api/src/routes/tasks.ts` の `POST /:id/resume`）。
+ */
+const RESUME_ERROR_MESSAGE_BY_CODE: Readonly<Record<string, string>> = {
+  TASK_DONE: 'このTaskは完了しているため、再開できません。',
+  PROJECT_NOT_RUNNING: 'Projectが実行中ではないため、再開できませんでした。先にProjectを再開してください。',
+  NO_JOBS: 'このTaskには作業履歴が無いため、追加指示では再開できません。「復旧（再開待ちに戻す）」を使ってください。',
+  LATEST_JOB_NOT_BLOCKED: '現在は停止状態ではないため、追加指示を送れませんでした。',
+  TASK_PARKED: 'このTaskは中止（保留）されているため、再開できません。',
+  WORKSPACE_QUARANTINED: '安全のため停止しているため、追加指示では再開できません。AI開発チーム側で作業領域の復旧が必要です。',
+  LIVE_JOB_EXISTS: '既に実行中または待機中の作業があるため、追加指示を送れませんでした。',
+  APPROVAL_WAITING: '承認待ちの操作があるため、追加指示を送れませんでした。',
+  AI_CLI_MODE_MISSING: 'AI実行設定が不足しているため、再開できませんでした。',
+  AI_CLI_PROVIDER_MISSING: 'AI実行設定（使用するAI）が記録されていないため、再開できませんでした。AI開発チームに確認を依頼してください。',
+  RESUME_DESIGN_REVIEW_FAILED: RESUME_DESIGN_REVIEW_FAILED_MESSAGE,
+  REJECTED_COMMIT_SOURCE_UNRESOLVED:
+    '却下されたコミットの元の作業を特定できないため、再開できませんでした。AI開発チームに確認を依頼してください。',
+  GIT_COMMIT_RESUME_LINEAGE_INVALID:
+    '却下されたコミットの元の作業を特定できないため、再開できませんでした。AI開発チームに確認を依頼してください。',
+}
+
+function messageForCode(table: Readonly<Record<string, string>>, code: string | null): string | undefined {
+  if (code === null || !Object.prototype.hasOwnProperty.call(table, code)) return undefined
+  return table[code]
+}
+
+/**
+ * **stable な `code` を先に引く**（resume の 409 は必ず `{ error, code }` を返す）。
+ * code が無い・未知のときだけ、従来どおり `error` 文字列を部分一致で引く。
+ */
+export function formatResumeErrorMessage(errorMessage: string | null, code: string | null = null): string {
+  const byCode = messageForCode(RESUME_ERROR_MESSAGE_BY_CODE, code)
+  if (byCode !== undefined) return byCode
+
   if (errorMessage === null || errorMessage.length === 0) {
     return RESUME_ERROR_MESSAGE_FALLBACK
   }
@@ -42,4 +78,25 @@ export function formatResumeErrorMessage(errorMessage: string | null): string {
   )
 
   return matchingMessage?.[1] ?? RESUME_ERROR_MESSAGE_FALLBACK
+}
+
+export const RECOVER_ERROR_MESSAGE_FALLBACK =
+  '復旧に失敗しました。時間をおいて再度お試しください。'
+
+/** `POST /api/tasks/:id/recover` の拒否 `code`（`RecoverBlockedTaskResult`）ごとの文言。 */
+const RECOVER_ERROR_MESSAGE_BY_CODE: Readonly<Record<string, string>> = {
+  TASK_NOT_FOUND: '対象のTaskが見つかりませんでした。',
+  PROJECT_UNAVAILABLE: 'Projectが見つからないかアーカイブ済みのため、復旧できませんでした。',
+  PROJECT_NOT_RUNNING: 'Projectが実行中ではないため、復旧できませんでした。先にProjectを再開してください。',
+  TASK_NOT_BLOCKED: '現在は停止状態ではないため、復旧の必要はありません。',
+  TASK_HAS_JOBS: 'このTaskには作業履歴があるため、「追加指示を出す」から再開してください。',
+  TASK_PARKED: 'このTaskは中止（保留）されているため、復旧できません。',
+  APPROVAL_WAITING: '承認待ちの操作があるため、復旧できませんでした。先に承認画面で判断してください。',
+  // 403: 人（CEO）だけの操作で、API の認証構成が人と自動を区別できない（`HUMAN_ONLY_ROUTES`）。
+  HUMAN_ONLY_ROUTE_REQUIRES_SPLIT_CREDENTIALS:
+    'この操作はCEO専用です。現在のAPIの認証設定では実行できません。AI開発チームに確認を依頼してください。',
+}
+
+export function formatRecoverErrorMessage(code: string | null): string {
+  return messageForCode(RECOVER_ERROR_MESSAGE_BY_CODE, code) ?? RECOVER_ERROR_MESSAGE_FALLBACK
 }

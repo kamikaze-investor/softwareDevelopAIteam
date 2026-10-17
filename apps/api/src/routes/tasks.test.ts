@@ -1,7 +1,7 @@
 import cors from '@fastify/cors'
 import Fastify, { type FastifyInstance } from 'fastify'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { ApprovalRequest, Job, Project, SafeCommand, Task, TaskSummary } from '@ai-team/shared'
+import type { ApprovalRequest, Job, Project, SafeCommand, Task, TaskDetail, TaskSummary } from '@ai-team/shared'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { appendImplementContracts } from '../implementPrompt'
 import { buildSystemState } from '../state/systemState'
@@ -947,6 +947,27 @@ describe('Task API', () => {
 
       expect(res.statusCode).toBe(200)
       expect(parseBody<Task>(res.body).title).toBe('T')
+    })
+  })
+
+  it('GET /api/tasks/:id adds parked and projectStatus for the shared resume/recover admission', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const created = await createTask(app, project.id, { title: 'T' })
+
+      const before = parseBody<TaskDetail>((await app.inject({ method: 'GET', url: `/api/tasks/${created.id}` })).body)
+      expect(before.parked).toBe(false)
+      expect(before.projectStatus).toBe(project.status)
+
+      // park の正本は `task_aborted` audit 行（`ITaskStorage.isParked()`）。応答はそれを写すだけ。
+      const { getStorage } = await import('../storage/index.js')
+      getStorage().auditLog.record({
+        actor: 'api', operation: 'task_aborted', entityType: 'task', entityId: created.id,
+        result: 'success', detail: 'parked by CEO',
+      })
+      const after = parseBody<TaskDetail>((await app.inject({ method: 'GET', url: `/api/tasks/${created.id}` })).body)
+      expect(after.parked).toBe(true)
+      expect(after.title).toBe('T')
     })
   })
 
