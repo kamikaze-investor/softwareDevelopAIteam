@@ -582,6 +582,9 @@ describe('D2 review P2: skew already active at the FIRST git_commit gate', () =>
     expect(blockedItem?.detail).toContain('risk_rule_skew')
     expect(attention.some((item) => item.kind === 'approval_waiting')).toBe(false)
     const { triageBlocked } = await import('../pl/blockedTriage.js')
+    // The named exit is approving the existing approval (resume is not admitted while it is live WAITING).
+    expect(triageBlocked(env.storage, blockedItem!).summary).toContain(`承認 ${approval.id} を承認する`)
+    expect((await env.mobileAdmission(task.id)).resume.ok).toBe(false)
     expect(triageBlocked(env.storage, blockedItem!)).toMatchObject({
       rootCauseClass: 'unknown', recommendedLane: 'ceo_escalation', requiresAuthorityChange: false,
     })

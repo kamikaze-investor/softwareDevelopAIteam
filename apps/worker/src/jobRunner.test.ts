@@ -2005,7 +2005,7 @@ describe('runJob — Notifier / CEO通知 integration (Step 3D)', () => {
     expect(payload.title).toContain('Gate の技術的不整合')
     expect(payload.title).not.toContain('承認無効')
     expect(payload.body).toContain('承認の判断ではありません')
-    expect(payload.body).toContain('resume すると新しい承認が求められます')
+    expect(payload.body).toContain('承認待ちの承認があればそれを承認し、無ければ resume してください')
     expect(payload.sourceType).toBe('gate_technical_stop')
   })
 
