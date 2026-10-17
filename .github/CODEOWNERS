@@ -65,3 +65,59 @@ apps/api/src/auth/operatorGatewayAllowlist.ts @kamikaze-investor
 # Permission grant
 apps/api/src/routes/permissionGrants.ts @kamikaze-investor
 packages/shared/src/types/permission_grant.ts @kamikaze-investor
+
+# Authority / admission / recovery-budget / escalation-choice definitions (2026-10-17 lifecycle repair).
+# Mirrors GATE_CHANGE_EXACT_FILES in packages/shared/src/approvalGateLogic.ts (the Gate classifies these HIGH).
+# Meta Review requires Human Decision Authority for DA trigger (2) changes to them, and that can only be
+# satisfied through code-owner review when the file is listed here (autoReview resolveMetaReviewOutcome).
+apps/api/src/storage/sqlite.ts @kamikaze-investor
+apps/api/src/pl/abortTask.ts @kamikaze-investor
+apps/api/src/pl/executionLoop.ts @kamikaze-investor
+apps/api/src/state/systemState.ts @kamikaze-investor
+apps/api/src/gitCommitResumeLineage.ts @kamikaze-investor
+apps/api/src/linkedGitCommitRejection.ts @kamikaze-investor
+apps/worker/src/approvalLevel/commitGate.ts @kamikaze-investor
+packages/shared/src/approvalLiveness.ts @kamikaze-investor
+apps/api/src/designReview/resumeActor.ts @kamikaze-investor
+apps/api/src/designReview/repairRecoveryEpoch.ts @kamikaze-investor
+apps/api/src/designReview/repairFromStoredReview.ts @kamikaze-investor
+apps/api/src/designReview/resumeBlockedTask.ts @kamikaze-investor
+apps/api/src/designReview/terminalRepairSuccessorRecovery.ts @kamikaze-investor
+apps/api/src/designReview/terminalRepairEscalationRecovery.ts @kamikaze-investor
+apps/api/src/designReview/designReviewCoordinator.ts @kamikaze-investor
+apps/api/src/designReview/resultingCommitBinding.ts @kamikaze-investor
+apps/api/src/humanRecovery/recoverBlockedTask.ts @kamikaze-investor
+apps/api/src/humanRecovery/recoveryAudit.ts @kamikaze-investor
+apps/api/src/storage/interface.ts @kamikaze-investor
+packages/shared/src/resumeAdmission.ts @kamikaze-investor
+packages/shared/src/recoverAdmission.ts @kamikaze-investor
+packages/shared/src/taskOccupancy.ts @kamikaze-investor
+packages/shared/src/reviewSeparation.ts @kamikaze-investor
+apps/api/src/approvedRunBlock.ts @kamikaze-investor
+apps/api/src/state/blockedRowOwnership.ts @kamikaze-investor
+apps/api/src/reconcile/externalCompletion.ts @kamikaze-investor
+apps/api/src/pl/technicalResumePolicy.ts @kamikaze-investor
+apps/api/src/pl/technicalAbortEvidence.ts @kamikaze-investor
+apps/api/src/ctoAi/roadmapAdoption.ts @kamikaze-investor
+apps/api/src/pl/adoptionStep.ts @kamikaze-investor
+apps/api/src/ctoAi/initialImplementWorkflow.ts @kamikaze-investor
+apps/api/src/ctoAi/projectInitialization.ts @kamikaze-investor
+apps/api/src/pl/remediationStep.ts @kamikaze-investor
+apps/api/src/pl/conflictResolutionStep.ts @kamikaze-investor
+apps/api/src/pl/blockedTriage.ts @kamikaze-investor
+apps/api/src/pl/operatorRequestStep.ts @kamikaze-investor
+apps/worker/src/jobStateManager.ts @kamikaze-investor
+apps/worker/src/workspaceVerification.ts @kamikaze-investor
+apps/worker/src/index.ts @kamikaze-investor
+apps/api/src/jobResultApplicationPolicy.ts @kamikaze-investor
+apps/api/src/routes/jobs.ts @kamikaze-investor
+apps/api/src/routes/designReviewEvidence.ts @kamikaze-investor
+apps/api/src/routes/tasks.ts @kamikaze-investor
+apps/api/src/state/strandedTask.ts @kamikaze-investor
+apps/api/src/ctoAi/taskContinuation.ts @kamikaze-investor
+apps/api/src/designReview/retryCooldown.ts @kamikaze-investor
+apps/api/src/designReview/queuedRunDispatch.ts @kamikaze-investor
+apps/api/src/storage/roadmapTaskValidation.ts @kamikaze-investor
+apps/api/src/designReview/repairPromptBuilder.ts @kamikaze-investor
+apps/api/src/pl/adoptionFailure.ts @kamikaze-investor
+apps/api/src/storage/index.ts @kamikaze-investor
