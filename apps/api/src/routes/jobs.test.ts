@@ -1320,6 +1320,50 @@ describe('Job API', () => {
     })
   })
 
+  // **応答が失われた fingerprint 付き端末 PATCH の再送は deduplicated 200**（lifecycle repair C2）。
+  // write-once / running-only の検査が Outbox dedup より先に走っていたため、完全な再送が 409 になり、
+  // Worker の Outbox event は pending のまま残って intake が止まっていた。
+  it('PATCH /api/jobs/:id: fingerprint 付き端末 PATCH の完全な再送は 200 deduplicated で、状態を変えない', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const task = await createTask(app, project.id)
+      const created = await createJob(app, task)
+      await app.inject({ method: 'PATCH', url: `/api/jobs/${created.id}`, payload: { status: 'running' } })
+      const terminal = withOutbox({
+        status: 'failed',
+        exitCode: 1,
+        failureMetadata: { workspaceEndFingerprint: { mode: 'clean' as const, startCommitHash: '0805249b' } },
+      }, 'evt-fingerprint-terminal')
+
+      const first = await app.inject({ method: 'PATCH', url: `/api/jobs/${created.id}`, payload: terminal })
+      expect(first.statusCode).toBe(200)
+      expect(parseBody<OutboxJobResponse>(first.body).outbox).toEqual({ eventId: 'evt-fingerprint-terminal', deduplicated: false })
+      const { getStorage } = await import('../storage/index.js')
+      const before = getStorage().jobs.findById(created.id)
+
+      const replay = await app.inject({ method: 'PATCH', url: `/api/jobs/${created.id}`, payload: terminal })
+
+      expect(replay.statusCode).toBe(200)
+      expect(parseBody<OutboxJobResponse>(replay.body).outbox).toEqual({ eventId: 'evt-fingerprint-terminal', deduplicated: true })
+      expect(getStorage().jobs.findById(created.id)).toEqual(before)
+
+      // 同じ eventId で payload が違う再送は従来どおり拒否する。
+      const tampered = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${created.id}`,
+        payload: {
+          ...withOutbox({
+            status: 'failed',
+            exitCode: 2,
+            failureMetadata: { workspaceEndFingerprint: { mode: 'clean' as const, startCommitHash: 'other' } },
+          }, 'evt-fingerprint-terminal'),
+        },
+      })
+      expect(tampered.statusCode).toBe(409)
+      expect(getStorage().jobs.findById(created.id)).toEqual(before)
+    })
+  })
+
   describe('PATCH /api/jobs/:id implement requeue Design Review evidence gate', () => {
     it('rejects requeue when no evidence exists', async () => {
       await withApp(async (app) => {

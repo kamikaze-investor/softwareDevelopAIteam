@@ -18,7 +18,7 @@ import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IPrincipleApplicationStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReplaceActiveApprovalAndCreateResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult, RepairHandoffRefusalCode } from './interface'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IPrincipleApplicationStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReplaceActiveApprovalAndCreateResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, ConsumeApprovalForCommandJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult, RepairHandoffRefusalCode } from './interface'
 import { DesignReviewRunContentionError } from './interface'
 import { computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS, evaluateRecoverAdmission, evaluateResumeAdmission, isSupervisedRunKind, isLiveWaitingApproval } from '@ai-team/shared'
 import type { SupervisedRunKind } from '@ai-team/shared'
@@ -2082,6 +2082,9 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   }
 
   const jobs: IJobStorage = {
+    classifyOutboxEvent(jobId, outboxEvent) {
+      return checkOutboxEvent(db, jobId, outboxEvent).status
+    },
     findByTaskId(taskId) {
       const rows = db.prepare('SELECT * FROM jobs WHERE task_id = ? ORDER BY created_at DESC, rowid DESC').all(taskId) as any[]
       return rows.map(deserializeJob)
@@ -4693,6 +4696,109 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       })
 
       return approveTransaction()
+    },
+    supersedeUnwaitedSafeWorkRequests(taskId, requestedAction): string[] {
+      // 2026-10-16 Codex review round 3: 最新 1 行だけを畳むと、同じ action の古い legacy WAITING
+      // （b8d0fc5d のような git_status の行）が生き残り、resume / Mobile を塞ぎ続ける。
+      // HIGH の行を全部、audit と同じ transaction で畳む。CRITICAL の行は Worker が待っていた判断なので残す。
+      const supersedeTransaction = db.transaction((): string[] => {
+        const ids = (db.prepare(`
+          SELECT id FROM approval_requests
+          WHERE task_id = ? AND requested_action = ? AND status = 'WAITING_FOR_USER' AND risk_level = 'HIGH'
+          ORDER BY created_at ASC, rowid ASC
+        `).all(taskId, requestedAction) as Array<{ id: string }>).map((row) => row.id)
+        const supersede = db.prepare(`
+          UPDATE approval_requests SET status = 'SUPERSEDED'
+          WHERE id = ? AND status = 'WAITING_FOR_USER'
+        `)
+        for (const id of ids) {
+          if (supersede.run(id).changes !== 1) {
+            throw new Error(`Failed to supersede approval request ${id}`)
+          }
+          auditLog.record({
+            actor: 'api',
+            operation: 'supersede',
+            entityType: 'approval_request',
+            entityId: id,
+            result: 'success',
+            detail: `reason=safe_work_no_waiter requested_action=${requestedAction}`,
+          })
+        }
+        return ids
+      })
+      return supersedeTransaction()
+    },
+    consumeForCommandJob(input): ConsumeApprovalForCommandJobResult {
+      // 2026-10-16 監査（Codex review）: 非 git_commit の /consume は Task にも実在する Job にも
+      // 束縛されておらず、jobId 省略・存在しない Job・別 Task の Job でも使い切れた。
+      // 束縛の検証と CONSUMED への遷移を 1 transaction に閉じる（検証と書き込みの間に割り込ませない）。
+      const consumeTransaction = db.transaction((): ConsumeApprovalForCommandJobResult => {
+        const existing = approvalRequests.findById(input.id)
+        if (!existing) {
+          return { ok: false, code: 'NOT_FOUND', reason: 'Approval request not found' }
+        }
+        if (existing.requestedAction === 'git_commit') {
+          return {
+            ok: false,
+            code: 'GIT_COMMIT_NOT_ALLOWED',
+            reason: 'git_commit approvals are consumed through consumeForJob',
+            approvalRequest: existing,
+          }
+        }
+        const job = jobs.findById(input.jobId)
+        if (!job) {
+          return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Job not found', approvalRequest: existing }
+        }
+        if (job.taskId !== existing.taskId) {
+          return {
+            ok: false,
+            code: 'TASK_MISMATCH',
+            reason: 'Job belongs to a different task than the approval request',
+            approvalRequest: existing,
+          }
+        }
+        // Task 単位の操作（abort_task 等）の承認は、その名前の command kind を持つ Job が無いのでここで落ちる。
+        if (job.safeCommand.kind !== existing.requestedAction) {
+          return {
+            ok: false,
+            code: 'ACTION_MISMATCH',
+            reason: `Cannot consume: approval is for '${existing.requestedAction}', not '${job.safeCommand.kind}'`,
+            approvalRequest: existing,
+          }
+        }
+
+        // 以下は従来の非 git_commit consume と同じ順序・同じ遷移（reason / reviewedAt は保持）。
+        if (existing.status !== 'APPROVED') {
+          return {
+            ok: false,
+            code: 'STATUS_CONFLICT',
+            reason: `Cannot consume: current status is '${existing.status}' (must be APPROVED)`,
+            approvalRequest: existing,
+          }
+        }
+        if (new Date(existing.expiresAt) <= new Date()) {
+          const expired = approvalRequests.updateStatus(input.id, 'EXPIRED', undefined, true)
+          return { ok: false, code: 'EXPIRED', reason: 'Approval request has expired', approvalRequest: expired }
+        }
+        if (existing.targetCommit !== input.currentCommit || existing.targetDiffHash !== input.currentDiffHash) {
+          const stale = approvalRequests.updateStatus(input.id, 'STALE', undefined, true)
+          return {
+            ok: false,
+            code: 'STALE',
+            reason: 'Approval request is stale: commit or diff has changed',
+            approvalRequest: stale,
+          }
+        }
+        const consumed = db.prepare(`
+          UPDATE approval_requests SET status = 'CONSUMED'
+          WHERE id = ? AND status = 'APPROVED'
+        `).run(input.id)
+        if (consumed.changes !== 1) {
+          return { ok: false, code: 'STATUS_CONFLICT', reason: 'Approval request status changed concurrently' }
+        }
+        return { ok: true, approvalRequest: approvalRequests.findById(input.id)! }
+      })
+      return consumeTransaction()
     },
     consumeForJob(input): ConsumeApprovalForJobResult {
       const consumeTransaction = db.transaction((): ConsumeApprovalForJobResult => {

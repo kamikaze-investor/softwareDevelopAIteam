@@ -38,6 +38,8 @@ export {
   SAFE_ONLY_PATTERNS,
   ALWAYS_CRITICAL_RULES,
   APPROVAL_REQUEST_TTL_MINUTES,
+  SAFE_WORK_COMMAND_KINDS,
+  isSafeWorkCommandKind,
   runRiskReview,
   resolveEffectiveStatus,
   decideGateOutcome,

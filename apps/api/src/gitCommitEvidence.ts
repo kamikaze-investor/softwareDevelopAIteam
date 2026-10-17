@@ -45,6 +45,12 @@ import type { ChangeManifest, EntryType, FileChange } from '@ai-team/worker/src/
 import type { ChangeManifestEntry } from './approvalExplain/changeManifestIdentity'
 import { checkImplementJobDesignReviewEvidence } from './designReviewEvidencePolicy'
 import { resolveReviewedImplementation } from './designReview/repairFlow'
+import { parseResumeSource, resolveGitCommitResumeOrigin } from './designReview/repairPolicy'
+import {
+  classifyGitCommitResumeLineage,
+  isCanonicalGitCommitAnchor,
+  parseGitCommitResumeStepKey,
+} from './gitCommitResumeLineage'
 import type { IStorage } from './storage/interface'
 
 export type GitCommitHumanGateReason = 'human_decision_authority' | 'insufficient_safety_evidence'
@@ -283,4 +289,64 @@ export function evaluateGitCommitEvidence(
   if (!designReview.ok || designReview.evidence === undefined) fail('design_review_not_aligned')
 
   return result()
+}
+
+/**
+ * resume 済みを含む git_commit Job を、`review:<id>:git-commit` を持つ canonical anchor へ正規化する。
+ * 新方式は fixed anchor を exact id で1回だけ、旧形式（#348 以前の入れ子）は既存の
+ * `resolveGitCommitResumeOrigin()` で辿る（`storage/sqlite.ts` の REJECT 後 provenance と同じ規約）。
+ * 解けなければ undefined（呼び出し側は「不一致なし」とせず、開示を付けないだけ。判定自体は別途 fail closed 済み）。
+ */
+function canonicalGitCommitAnchorOf(storage: IStorage, gitCommitJob: Job): Job | undefined {
+  if (isCanonicalGitCommitAnchor(gitCommitJob)) return gitCommitJob
+  const parsed = parseGitCommitResumeStepKey(gitCommitJob.workflowStepKey)
+  const lineage = classifyGitCommitResumeLineage({
+    currentJob: gitCommitJob,
+    referencedJob: parsed !== undefined ? storage.jobs.findById(parsed.anchorJobId) : undefined,
+    taskJobs: storage.jobs.findByTaskId(gitCommitJob.taskId),
+    requireCurrentIsLatestGeneration: false,
+  })
+  if (lineage.kind === 'new_scheme') return lineage.lineage.anchorJob
+  if (lineage.kind !== 'legacy') return undefined
+  const origin = resolveGitCommitResumeOrigin(storage.jobs, gitCommitJob)
+  return origin.ok && isCanonicalGitCommitAnchor(origin.origin) ? origin.origin : undefined
+}
+
+/**
+ * **同じ実装に対する review の判定が割れたまま commit へ進んだか**（spec 22 §14-3 DA trigger (7)）。
+ *
+ * git_commit → canonical anchor → `review:<reviewJobId>:git-commit` → review の resume lineage を、
+ * 既存の walker（`resolveReviewedImplementation()`）で辿る。lineage 上の review はすべて同じ implement Job を
+ * レビューしているので「同一実装」である。その上で
+ * - commit の根拠になった最後の review が approved で、
+ * - それより前の review（resume で置き換えられた側）に changes_requested / rejected がある
+ * ときだけ true を返す（2026-10-09 b6d4097a: 517d0af7 の changes_requested が、同一 diff の resume 再実行
+ * 9dfffc41 で approved に変わり、そのまま git_commit の承認依頼になった）。
+ *
+ * 読み取りだけで、Evidence の合否は変えない（その経路は `review_resumed` / `review_lineage_unresolved` で
+ * 既に fail closed している）。用途は人間承認の依頼に「判定不一致」を開示することだけ。
+ */
+export function hasReviewVerdictDisagreement(storage: IStorage, gitCommitJob: Job): boolean {
+  if (gitCommitJob.safeCommand.kind !== 'git_commit') return false
+  const anchor = canonicalGitCommitAnchorOf(storage, gitCommitJob)
+  if (anchor === undefined) return false
+  const reviewRef = GIT_COMMIT_STEP_KEY.exec(anchor.workflowStepKey ?? '')
+  if (!reviewRef) return false
+  const reviewed = resolveReviewedImplementation(storage, reviewRef[1] as string)
+  if (!reviewed.ok || reviewed.resumeHops.length === 0) return false
+
+  // resumeHops は resume key を持つ review Job（最後の review 側から近い順）。各段の source が
+  // 置き換えられた側の review である。
+  const supersededReviewIds = new Set<string>()
+  for (const hop of reviewed.resumeHops) {
+    const sourceId = parseResumeSource(hop.workflowStepKey ?? '')
+    if (sourceId !== undefined) supersededReviewIds.add(sourceId)
+  }
+
+  const results = storage.reviewResults.findByTaskId(gitCommitJob.taskId)
+  const finalApproved = results.some((r) => r.jobId === reviewed.reviewJob.id && r.status === 'approved')
+  const earlierNegative = results.some((r) =>
+    supersededReviewIds.has(r.jobId)
+    && (r.status === 'changes_requested' || r.status === 'rejected'))
+  return finalApproved && earlierNegative
 }

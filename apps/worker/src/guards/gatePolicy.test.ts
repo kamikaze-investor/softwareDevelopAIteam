@@ -5,7 +5,7 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { resolvePolicy } from './gatePolicy.js'
+import { resolvePolicy, SAFE_WORK_ALLOWED_COMMAND_KINDS } from './gatePolicy.js'
 import type { ResolvePolicyResult } from './gatePolicy.js'
 import type { GateResult } from './gateProcessor.js'
 import type { GateCheckResponse } from './gateClient.js'
@@ -242,5 +242,52 @@ describe('resolvePolicy — API policy の採用', () => {
       }),
     )
     expect(result.policy).toBe('continue')
+  })
+})
+
+// ────────────────────────────────────────────────────────────
+// 2026-10-16 b8d0fc5d: API は SAFE_WORK の HIGH に承認依頼を作らない（requestId 無しの BLOCKED）
+// ────────────────────────────────────────────────────────────
+
+describe('resolvePolicy — 承認依頼の無い SAFE_WORK HIGH / 依頼のある CRITICAL', () => {
+  it('HIGH の BLOCKED で requestId が無くても continue_safe_work_only（safe work はそのまま続く）', () => {
+    const result = resolvePolicy(
+      makeGateResult({ finalRiskLevel: 'HIGH' }),
+      makeCheckResponse({
+        outcome: { decision: 'BLOCKED', riskLevel: 'HIGH' },
+        riskReview: { riskLevel: 'HIGH', triggeredRules: ['decision authority / safety policy doc'], requiresIndependentReview: true },
+        continuationPolicy: 'continue_safe_work_only',
+        nextAction: { action: 'wait_for_approval', message: 'safe work only' },
+      }),
+    )
+    expect(result.policy).toBe('continue_safe_work_only')
+    expect(SAFE_WORK_ALLOWED_COMMAND_KINDS).toContain('git_status')
+  })
+
+  it('ローカルが CRITICAL でも API の HIGH BLOCKED（依頼なし）は continue_safe_work_only のまま（API 判定を採る既存挙動）', () => {
+    const result = resolvePolicy(
+      makeGateResult({ finalRiskLevel: 'CRITICAL', gateDecision: 'BLOCK_CEO_REQUIRED' }),
+      makeCheckResponse({
+        outcome: { decision: 'BLOCKED', riskLevel: 'HIGH' },
+        riskReview: { riskLevel: 'HIGH', triggeredRules: [], requiresIndependentReview: true },
+        continuationPolicy: 'continue_safe_work_only',
+        nextAction: { action: 'wait_for_approval', message: 'safe work only' },
+      }),
+    )
+    expect(result.policy).toBe('continue_safe_work_only')
+  })
+
+  it('CRITICAL の BLOCKED（承認依頼あり）は block_until_approved で、requestId を理由に載せる', () => {
+    const result = resolvePolicy(
+      makeGateResult({ finalRiskLevel: 'CRITICAL' }),
+      makeCheckResponse({
+        outcome: { decision: 'BLOCKED', riskLevel: 'CRITICAL' },
+        riskReview: { riskLevel: 'CRITICAL', triggeredRules: ['AI instruction file'], requiresIndependentReview: true },
+        continuationPolicy: 'block_until_approved',
+        nextAction: { action: 'wait_for_approval', requestId: 'approval-critical-1', message: 'blocked' },
+      }),
+    )
+    expect(result.policy).toBe('block_until_approved')
+    expect(result.reason).toContain('approval-critical-1')
   })
 })

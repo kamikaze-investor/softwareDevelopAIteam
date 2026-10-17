@@ -90,3 +90,15 @@ export function hasPending(): boolean {
   const row = getDb().prepare('SELECT 1 FROM pending_outbox_events LIMIT 1').get()
   return row !== undefined
 }
+
+/**
+ * この Job の terminal update が未配送のまま Outbox に残っているか。
+ *
+ * startup recovery はこれが true の Job に競合する terminal 遷移（fail-if-running）を作らない。
+ * 作ると、後から届く replay（write-once の workspaceEndFingerprint を含む）が API で 409 になり、
+ * event が pending のまま残って queued Job intake が止まり続ける（lifecycle repair C2 / H-01）。
+ */
+export function hasPendingFor(jobId: string): boolean {
+  const row = getDb().prepare('SELECT 1 FROM pending_outbox_events WHERE job_id = ? LIMIT 1').get(jobId)
+  return row !== undefined
+}
