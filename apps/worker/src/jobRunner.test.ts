@@ -1454,6 +1454,127 @@ assertNoResidualChangesMock.mockImplementation(() => {})
 })
 
 // ────────────────────────────────────────────────────────────
+// lifecycle repair D2: 実際の jobRunner の Gate 分岐を、実際の resolvePolicy で通す。
+// ここだけは resolvePolicy をモックの戻り値で置き換えず、本物の実装へ委ねる
+// （ローカルリスクは本物の buildLocalGateResult → runRiskReview が manifest のパスから算出する）。
+// ────────────────────────────────────────────────────────────
+
+describe('runJob — real resolvePolicy through the jobRunner gate branch (D2)', () => {
+  const realResolvePolicy = async () =>
+    (await vi.importActual<typeof import('./guards/gatePolicy.js')>('./guards/gatePolicy.js')).resolvePolicy
+
+  function useFiles(paths: string[]): void {
+    buildWorktreeManifestMock.mockReturnValue({
+      changes: paths.map((path) => ({ path, kind: 'modified' as const, afterType: 'regular' as const, afterMode: '100644' })),
+      paths,
+    })
+    const state = new Map(paths.map((path) => [
+      path,
+      { absent: false, blobId: `blob-${path}`, type: 'regular' as const, mode: '100644' },
+    ]))
+    buildApprovedStateMapMock.mockReturnValue(new Map(state))
+    buildIndexStateMapMock.mockReturnValue(new Map(state))
+  }
+
+  function gateResponse(
+    risk: 'LOW' | 'HIGH' | 'CRITICAL',
+    next: { action: 'call_consume'; consumedRequestId?: string } | { action: 'proceed' },
+  ) {
+    return {
+      outcome: {
+        decision: 'ALLOW' as const,
+        riskLevel: risk,
+        ...(next.action === 'call_consume' && next.consumedRequestId ? { consumedRequestId: next.consumedRequestId } : {}),
+      },
+      riskReview: { riskLevel: risk, triggeredRules: [], requiresIndependentReview: risk !== 'LOW' },
+      sideEffects: [] as Array<{ type: string; requestId: string }>,
+      continuationPolicy: 'continue' as const,
+      nextAction: { ...next, message: next.action },
+    }
+  }
+
+  function gitCommitJob(): Job {
+    return createJob({
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', params: { commitMessage: 'test' } },
+    })
+  }
+
+  beforeEach(async () => {
+    resolvePolicyMock.mockImplementation(await realResolvePolicy())
+    assertIndexCleanMock.mockImplementation(() => {})
+    stageApprovedPathsMock.mockImplementation(() => {})
+    assertIndexMatchesApprovedMock.mockImplementation(() => {})
+    assertNoResidualChangesMock.mockImplementation(() => {})
+    detectGitOperationStateMock.mockReturnValue([])
+    callConsumeMock.mockResolvedValue({ ok: true })
+  })
+
+  it('approved HIGH git_commit (goal.md, ALLOW + call_consume) consumes the approval and commits', async () => {
+    useFiles(['docs/project_memory/goal.md'])
+    resolveCommandMock.mockReturnValue({ argv: ['git', 'commit', '-m', 'test'], description: 'git commit' })
+    mockGitCommitRun(BASE_COMMIT, 'aftercommit000000000000000000000000000000')
+    callGateCheckMock.mockResolvedValue(gateResponse('HIGH', { action: 'call_consume', consumedRequestId: 'req-high' }))
+
+    const result = await runJob(gitCommitJob(), createPolicy())
+
+    expect(callConsumeMock).toHaveBeenCalledWith('req-high', expect.anything())
+    expect(result.status).toBe('success')
+    expect(result.gatePolicy).toBeUndefined()
+  })
+
+  it('approved CRITICAL non-git_commit (AGENTS.md, ALLOW + call_consume) consumes and runs', async () => {
+    useFiles(['AGENTS.md'])
+    callGateCheckMock.mockResolvedValue(gateResponse('CRITICAL', { action: 'call_consume', consumedRequestId: 'req-crit' }))
+
+    const result = await runJob(createJob({ safeCommand: { kind: 'build', workingDir: '/workspace/target' } }), createPolicy())
+
+    expect(callConsumeMock).toHaveBeenCalledWith('req-crit', expect.anything())
+    expect(result.status).toBe('success')
+  })
+
+  it('local CRITICAL vs API HIGH (rule skew) → blocked, no consume, technical notification (not an approval wait)', async () => {
+    useFiles(['AGENTS.md'])
+    callGateCheckMock.mockResolvedValue(gateResponse('HIGH', { action: 'call_consume', consumedRequestId: 'req-skew' }))
+
+    const result = await runJob(createJob({ safeCommand: { kind: 'build', workingDir: '/workspace/target' } }), createPolicy())
+
+    expect(result.status).toBe('blocked')
+    expect(result.gatePolicy).toBe('re_check')
+    expect(result.stderr).toContain('risk_rule_skew')
+    expect(callConsumeMock).not.toHaveBeenCalled()
+    expect(resolveCommandMock).not.toHaveBeenCalled()
+    const titles = sendAlertMock.mock.calls.map((call) => JSON.stringify(call[0]))
+    expect(titles.some((t) => t.includes('Gate 判定の不一致'))).toBe(true)
+    expect(titles.some((t) => t.includes('承認待ち') || t.includes('承認無効'))).toBe(false)
+  })
+
+  it('API HIGH ALLOW + proceed (no approval consumed) → blocked as approval_contract_violation, no consume', async () => {
+    useFiles(['docs/project_memory/goal.md'])
+    callGateCheckMock.mockResolvedValue(gateResponse('HIGH', { action: 'proceed' }))
+
+    const result = await runJob(gitCommitJob(), createPolicy())
+
+    expect(result.status).toBe('blocked')
+    expect(result.gatePolicy).toBe('re_check')
+    expect(result.stderr).toContain('approval_contract_violation')
+    expect(callConsumeMock).not.toHaveBeenCalled()
+    expect(resolveCommandMock).not.toHaveBeenCalled()
+  })
+
+  it('local HIGH vs API LOW proceed (rule skew) → git_commit blocked by safe_work_only, no consume', async () => {
+    useFiles(['docs/project_memory/goal.md'])
+    callGateCheckMock.mockResolvedValue(gateResponse('LOW', { action: 'proceed' }))
+
+    const result = await runJob(gitCommitJob(), createPolicy())
+
+    expect(result.status).toBe('blocked')
+    expect(result.gatePolicy).toBe('continue_safe_work_only')
+    expect(result.stderr).toContain('risk_rule_skew')
+    expect(callConsumeMock).not.toHaveBeenCalled()
+  })
+})
+
+// ────────────────────────────────────────────────────────────
 // Gate check 統合テスト (Step 3A)
 // ────────────────────────────────────────────────────────────
 

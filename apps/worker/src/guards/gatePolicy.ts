@@ -7,7 +7,10 @@
  * 最終的な実行ポリシーを決定する純粋関数。
  *
  * 基本方針:
- *   - ローカルリスクが高い場合は API の判断より安全側へ escalate する
+ *   - 実行可否の正本は API の Gate 判断（承認状態を知っているのは API だけ）。ローカルの GateResult は
+ *     production では runRiskReview だけから作られる（processGate / AlignmentReport は通らない）
+ *   - API と食い違ったとき（ルールの版ずれ・承認契約違反・不正な riskLevel）だけ fail-closed で止める。
+ *     承認済み（ALLOW + call_consume）の HIGH / CRITICAL を一律に止めることはしない（lifecycle repair D2）
  *   - **有効な Gate レスポンスがあるときだけ呼ぶ**
  *
  * 【技術障害の扱い（2026-08-01 変更）】
@@ -43,6 +46,22 @@ export interface ResolvePolicyResult {
    * （API 不通時にローカルリスクだけで縮退判断する経路は 2026-08-01 に撤去した）。
    */
   apiAvailable: boolean
+  /**
+   * Worker と API の Gate 判断が食い違ったため fail-closed で止めたときの技術的な原因。
+   * 人の承認待ちではないので、呼び出し元は承認待ちとして通知しない。
+   */
+  technicalCause?: GateTechnicalCause
+}
+
+export type GateTechnicalCause = 'risk_rule_skew' | 'approval_contract_violation' | 'invalid_risk_level'
+
+const RISK_ORDER = { LOW: 0, MEDIUM: 1, HIGH: 2, CRITICAL: 3 } as const
+
+/** 既知の RiskLevel だけを順位に写す（prototype のキー等は undefined）。 */
+function riskOrder(level: unknown): number | undefined {
+  return typeof level === 'string' && Object.prototype.hasOwnProperty.call(RISK_ORDER, level)
+    ? RISK_ORDER[level as keyof typeof RISK_ORDER]
+    : undefined
 }
 
 // ────────────────────────────────────────────────────────────
@@ -123,30 +142,55 @@ export function resolvePolicy(
     }
   }
 
-  // ── ローカルリスクによる escalation ──
-  // API が continue でもローカルが HIGH/CRITICAL なら安全側へ上げる
-  if (apiPolicy === 'continue') {
-    if (localResult.finalRiskLevel === 'CRITICAL') {
-      return {
-        policy: 'block_until_approved',
-        reason: `Local analysis: CRITICAL risk (${localResult.reason ?? 'no reason'}). Escalating from API 'continue'.`,
-        apiAvailable: true,
-      }
+  // ── Worker 側に残す防御（lifecycle repair D2） ──
+  // ローカルリスクは API と同じ runRiskReview を同じ changedFiles に掛けた値なので、
+  // 「API が continue なのにローカルが HIGH 以上」は、人が承認して API が ALLOW + call_consume を
+  // 返したときにしか起きなかった。ここで一律に上げると、承認済みの HIGH / CRITICAL が consume まで
+  // 届かず永久に止まる（D2）。Worker に残すのは API の判断と食い違ったときの fail-closed だけである:
+  //   - API の riskLevel が不正           → re_check（invalid_risk_level）
+  //   - ローカル > API（ルールの版ずれ）  → CRITICAL は re_check、HIGH は continue_safe_work_only
+  //     （いずれも従来と同じ範囲を止める。承認待ちには見せない）
+  //   - API が HIGH 以上を、承認の consume を伴わずに continue させた（承認契約違反）→ re_check
+  // ローカルが未知の値なら CRITICAL とみなす（fail-closed）
+  const localOrder = riskOrder(localResult.finalRiskLevel) ?? RISK_ORDER.CRITICAL
+  const apiOrder = riskOrder(apiRisk)
+  if (apiOrder === undefined) {
+    return {
+      policy: 're_check',
+      reason: `invalid_risk_level: api=${apiRisk} decision=${checkResponse.outcome.decision}`,
+      apiAvailable: true,
+      technicalCause: 'invalid_risk_level',
     }
-    if (localResult.finalRiskLevel === 'HIGH') {
+  }
+
+  if (localOrder > apiOrder) {
+    const skewReason =
+      `risk_rule_skew: local=${localResult.finalRiskLevel} api=${apiRisk} decision=${checkResponse.outcome.decision}`
+      + ` (${localResult.reason ?? 'no reason'})`
+    if (localOrder >= RISK_ORDER.CRITICAL) {
+      return { policy: 're_check', reason: skewReason, apiAvailable: true, technicalCause: 'risk_rule_skew' }
+    }
+    if (localOrder >= RISK_ORDER.HIGH && apiPolicy === 'continue') {
       return {
         policy: 'continue_safe_work_only',
-        reason: `Local analysis: HIGH risk (${localResult.reason ?? 'no reason'}). Escalating from API 'continue'.`,
+        reason: skewReason,
         apiAvailable: true,
+        technicalCause: 'risk_rule_skew',
       }
     }
   }
 
-  if (apiPolicy === 'continue_safe_work_only' && localResult.finalRiskLevel === 'CRITICAL') {
+  const isApprovedConsume =
+    checkResponse.outcome.decision === 'ALLOW'
+    && checkResponse.nextAction.action === 'call_consume'
+    && typeof checkResponse.nextAction.consumedRequestId === 'string'
+    && checkResponse.nextAction.consumedRequestId.length > 0
+  if (apiPolicy === 'continue' && apiOrder >= RISK_ORDER.HIGH && !isApprovedConsume) {
     return {
-      policy: 'block_until_approved',
-      reason: `Local analysis: CRITICAL risk (${localResult.reason ?? 'no reason'}). Escalating from API 'continue_safe_work_only'.`,
+      policy: 're_check',
+      reason: `approval_contract_violation: api=${apiRisk} decision=${checkResponse.outcome.decision} action=${checkResponse.nextAction.action}`,
       apiAvailable: true,
+      technicalCause: 'approval_contract_violation',
     }
   }
 

@@ -175,30 +175,34 @@ describe('resolvePolicy — ローカルリスク escalation', () => {
     expect(result.policy).toBe('continue')
   })
 
-  it('localRisk HIGH + api continue → continue_safe_work_only (escalation)', () => {
+  // lifecycle repair D2: ローカル > API はルールの版ずれとして fail-closed。止める範囲は従来と同じで、
+  // CRITICAL は承認待ち（block_until_approved）ではなく技術停止（re_check + technicalCause）として返す。
+  it('localRisk HIGH + api LOW continue → continue_safe_work_only (risk_rule_skew)', () => {
     const result = resolvePolicy(
       makeGateResult({ finalRiskLevel: 'HIGH', gateDecision: 'DEEP_REVIEW', reason: 'dangerous file' }),
       makeCheckResponse({ continuationPolicy: 'continue' }),
     )
     expect(result.policy).toBe('continue_safe_work_only')
-    expect(result.reason).toContain('Escalating')
+    expect(result.technicalCause).toBe('risk_rule_skew')
+    expect(result.reason).toContain('risk_rule_skew')
   })
 
-  it('localRisk CRITICAL + api continue → block_until_approved (escalation)', () => {
+  it('localRisk CRITICAL + api LOW continue → re_check (risk_rule_skew), not an approval wait', () => {
     const result = resolvePolicy(
       makeGateResult({ finalRiskLevel: 'CRITICAL', gateDecision: 'BLOCK_CEO_REQUIRED', reason: 'payment file' }),
       makeCheckResponse({ continuationPolicy: 'continue' }),
     )
-    expect(result.policy).toBe('block_until_approved')
-    expect(result.reason).toContain('Escalating')
+    expect(result.policy).toBe('re_check')
+    expect(result.technicalCause).toBe('risk_rule_skew')
   })
 
-  it('localRisk CRITICAL + api continue_safe_work_only → block_until_approved (escalation)', () => {
+  it('localRisk CRITICAL + api continue_safe_work_only → re_check (risk_rule_skew)', () => {
     const result = resolvePolicy(
       makeGateResult({ finalRiskLevel: 'CRITICAL', gateDecision: 'BLOCK_CEO_REQUIRED' }),
       makeCheckResponse({ continuationPolicy: 'continue_safe_work_only' }),
     )
-    expect(result.policy).toBe('block_until_approved')
+    expect(result.policy).toBe('re_check')
+    expect(result.technicalCause).toBe('risk_rule_skew')
   })
 
   it('localRisk HIGH + api continue_safe_work_only → continue_safe_work_only (no further escalation)', () => {
@@ -289,5 +293,120 @@ describe('resolvePolicy — 承認依頼の無い SAFE_WORK HIGH / 依頼のあ�
     )
     expect(result.policy).toBe('block_until_approved')
     expect(result.reason).toContain('approval-critical-1')
+  })
+})
+
+// ────────────────────────────────────────────────────────────
+// lifecycle repair D2: 承認済み（ALLOW + call_consume）の HIGH / CRITICAL は consume まで進む。
+// Worker に残すのは API と食い違ったときの fail-closed（版ずれ・承認契約違反・不正な riskLevel）だけ。
+// ────────────────────────────────────────────────────────────
+
+describe('resolvePolicy — 承認済み HIGH / CRITICAL と Worker 側の fail-closed（D2）', () => {
+  // id に null を渡すと consumedRequestId 無し（undefined は既定値に置き換わるため使わない）
+  const consumeResponse = (risk: 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL', rawId: string | null = 'approval-1') => {
+    const id = rawId ?? undefined
+    return makeCheckResponse({
+      outcome: { decision: 'ALLOW', riskLevel: risk, consumedRequestId: id },
+      riskReview: { riskLevel: risk, triggeredRules: [], requiresIndependentReview: risk === 'HIGH' || risk === 'CRITICAL' },
+      continuationPolicy: 'continue',
+      nextAction: { action: 'call_consume', consumedRequestId: id, message: 'consume' },
+    } as Partial<GateCheckResponse>)
+  }
+
+  it.each(['HIGH', 'CRITICAL'] as const)('approved %s (local == api) → continue, so jobRunner consumes', (risk) => {
+    const result = resolvePolicy(makeGateResult({ finalRiskLevel: risk }), consumeResponse(risk))
+    expect(result.policy).toBe('continue')
+    expect(result.technicalCause).toBeUndefined()
+  })
+
+  it('approved HIGH but local CRITICAL (rules newer on the Worker) → re_check, approval left unused', () => {
+    const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'CRITICAL' }), consumeResponse('HIGH'))
+    expect(result.policy).toBe('re_check')
+    expect(result.technicalCause).toBe('risk_rule_skew')
+  })
+
+  it('approved MEDIUM-level request but local HIGH → continue_safe_work_only (risk_rule_skew)', () => {
+    const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'HIGH' }), consumeResponse('MEDIUM'))
+    expect(result.policy).toBe('continue_safe_work_only')
+    expect(result.technicalCause).toBe('risk_rule_skew')
+  })
+
+  it.each(['HIGH', 'CRITICAL'] as const)('api %s ALLOW + proceed (no approval consumed) → re_check (approval_contract_violation)', (risk) => {
+    const result = resolvePolicy(
+      makeGateResult({ finalRiskLevel: risk }),
+      makeCheckResponse({
+        outcome: { decision: 'ALLOW', riskLevel: risk },
+        riskReview: { riskLevel: risk, triggeredRules: [], requiresIndependentReview: true },
+        continuationPolicy: 'continue',
+        nextAction: { action: 'proceed', message: 'proceed' },
+      }),
+    )
+    expect(result.policy).toBe('re_check')
+    expect(result.technicalCause).toBe('approval_contract_violation')
+  })
+
+  it('api HIGH call_consume without a consumedRequestId → re_check (approval_contract_violation)', () => {
+    const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'HIGH' }), consumeResponse('HIGH', null))
+    expect(result.policy).toBe('re_check')
+    expect(result.technicalCause).toBe('approval_contract_violation')
+  })
+
+  it('api HIGH call_consume with an empty consumedRequestId → re_check (approval_contract_violation)', () => {
+    const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'HIGH' }), consumeResponse('HIGH', ''))
+    expect(result.policy).toBe('re_check')
+    expect(result.technicalCause).toBe('approval_contract_violation')
+  })
+
+  it.each(['SEVERE', 'toString', ''])('unknown api riskLevel %j → re_check (invalid_risk_level)', (risk) => {
+    const result = resolvePolicy(
+      makeGateResult({ finalRiskLevel: 'LOW' }),
+      makeCheckResponse({
+        riskReview: { riskLevel: risk as never, triggeredRules: [], requiresIndependentReview: false },
+      }),
+    )
+    expect(result.policy).toBe('re_check')
+    expect(result.technicalCause).toBe('invalid_risk_level')
+  })
+
+  it('unknown local riskLevel is treated as CRITICAL (fail-closed) → re_check (risk_rule_skew)', () => {
+    const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'toString' as never }), consumeResponse('HIGH'))
+    expect(result.policy).toBe('re_check')
+    expect(result.technicalCause).toBe('risk_rule_skew')
+  })
+
+  it('PENDING_APPROVAL / BLOCKED / STALE / REJECTED keep their existing policies (no technicalCause)', () => {
+    const pending = resolvePolicy(
+      makeGateResult({ finalRiskLevel: 'HIGH' }),
+      makeCheckResponse({
+        outcome: { decision: 'PENDING_APPROVAL', riskLevel: 'HIGH', requestId: 'r1' },
+        riskReview: { riskLevel: 'HIGH', triggeredRules: [], requiresIndependentReview: true },
+        continuationPolicy: 'continue_safe_work_only',
+        nextAction: { action: 'wait_for_approval', requestId: 'r1', message: 'wait' },
+      } as Partial<GateCheckResponse>),
+    )
+    expect(pending.policy).toBe('continue_safe_work_only')
+    expect(pending.technicalCause).toBeUndefined()
+
+    const stale = resolvePolicy(
+      makeGateResult({ finalRiskLevel: 'HIGH' }),
+      makeCheckResponse({
+        outcome: { decision: 'STALE', requestId: 'r2', reason: 'changed' },
+        nextAction: { action: 're_check', message: 're-check' },
+      } as Partial<GateCheckResponse>),
+    )
+    expect(stale.policy).toBe('re_check')
+    expect(stale.technicalCause).toBeUndefined()
+
+    const rejectedCritical = resolvePolicy(
+      makeGateResult({ finalRiskLevel: 'CRITICAL' }),
+      makeCheckResponse({
+        outcome: { decision: 'REJECTED', requestId: 'r3', riskLevel: 'CRITICAL', reason: 'no' },
+        riskReview: { riskLevel: 'CRITICAL', triggeredRules: [], requiresIndependentReview: true },
+        continuationPolicy: 'block_until_approved',
+        nextAction: { action: 'wait_for_approval', requestId: 'r3', message: 'rejected' },
+      } as Partial<GateCheckResponse>),
+    )
+    expect(rejectedCritical.policy).toBe('block_until_approved')
+    expect(rejectedCritical.technicalCause).toBeUndefined()
   })
 })

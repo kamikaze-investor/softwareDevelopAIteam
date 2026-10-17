@@ -605,7 +605,30 @@ export async function runJob(
     if (!dedupKey || !notifiedApprovalRequests.has(dedupKey)) {
       if (dedupKey) notifiedApprovalRequests.add(dedupKey)
 
-      if (gateResult.policy === 'block_until_approved') {
+      if (gateResult.technicalCause !== undefined) {
+        // Worker と API の Gate 判断の食い違い（lifecycle repair D2）。人の承認待ちではないので、
+        // 「承認待ち」「承認無効」として通知しない。承認の状態はここでは一切変えていない。
+        notifyGateEvent({
+          severity: 'warning',
+          title: `⚠️ Gate 判定の不一致（技術停止） — ${job.safeCommand.kind}`,
+          body: [
+            'Worker と API の Gate 判定が一致しないため、fail-closed で停止しました。',
+            '承認の状態は変更していません（APPROVED の承認があれば未使用のまま残ります）。',
+            '',
+            `原因: ${gateResult.technicalCause}`,
+            `コマンド: ${job.safeCommand.kind}`,
+            `タスク: ${job.taskId}`,
+            `Job: ${job.id}`,
+            `理由: ${gateResult.reason}`,
+            `対象リクエスト: ${approvalRequestId ?? 'なし'}`,
+            `コミット: ${targetCommit}`,
+            `DiffHash: ${targetDiffHash}`,
+            `検出時刻: ${new Date().toISOString()}`,
+          ].join('\n'),
+          sourceType: 'gate_technical_mismatch',
+          sourceId: approvalRequestId ?? job.id,
+        })
+      } else if (gateResult.policy === 'block_until_approved') {
         notifyGateEvent({
           severity: 'critical',
           title: `🚨 承認待ち — ${job.safeCommand.kind} が停止`,
@@ -664,6 +687,8 @@ export async function runJob(
       },
       gatePolicy: gateResult.policy,
       gateBlockReason: gateResult.reason,
+      // gatePolicy / gateBlockReason は API へ送られない。技術停止の原因は既存の stderr で残す。
+      ...(gateResult.technicalCause !== undefined ? { stderr: gateResult.reason } : {}),
       startedAt,
       completedAt: new Date().toISOString(),
     }
@@ -683,6 +708,9 @@ export async function runJob(
         },
         gatePolicy: gateResult.policy,
         gateBlockReason: `safe_work_only: ${kind} not permitted`,
+        ...(gateResult.technicalCause !== undefined
+          ? { stderr: `safe_work_only: ${kind} not permitted (${gateResult.reason})` }
+          : {}),
         startedAt,
         completedAt: new Date().toISOString(),
       }
