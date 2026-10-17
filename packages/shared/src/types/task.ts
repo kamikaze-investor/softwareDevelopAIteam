@@ -81,6 +81,25 @@ export interface TaskDetail extends Task {
   parked: boolean
   /** 所属 Project が見つからなければ null。 */
   projectStatus: ProjectStatus | null
+  /**
+   * この Task の**生きた Task 単位の人の判断**（API が shared `liveTaskDecisionState()` に
+   * `approval_actor` の事実を渡して計算したもの。lifecycle repair C3）。
+   * Mobile は ApprovalRequest の生の status から authority を組み立て直さず、これを使う
+   * （主体の記録の無い APPROVED は authority ではないので、ここには載らない）。
+   */
+  humanTaskDecisions: TaskHumanDecisionFact[]
+  /**
+   * queued / running の repair Design Review run があるか（`evaluateResumeAdmission()` の
+   * `repairDesignReviewInFlight`。lifecycle repair C3 / D3-1）。
+   */
+  repairDesignReviewInFlight: boolean
+}
+
+export interface TaskHumanDecisionFact {
+  approvalRequestId: string
+  requestedAction: string
+  /** waiting = 人の判断を待っている / approved = 人（ADMIN）が承認し、人の実行を待っている。 */
+  state: 'waiting' | 'approved'
 }
 
 export type TaskDisplayStatus =

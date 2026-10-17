@@ -709,6 +709,7 @@ export class LifecycleEnv {
         parked: task.parked,
         projectStatus: task.projectStatus ?? undefined,
         jobs: ordered,
+        repairDesignReviewInFlight: task.repairDesignReviewInFlight,
         approvals,
         nowMs,
       }),

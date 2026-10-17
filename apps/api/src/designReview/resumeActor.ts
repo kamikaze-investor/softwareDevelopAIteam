@@ -33,7 +33,15 @@
  */
 
 import type { FastifyRequest } from 'fastify'
-import type { AuditLogEntry, Job } from '@ai-team/shared'
+import {
+  isHumanExecutedTaskDecision,
+  liveTaskDecisionState,
+  type ApprovalActorFact,
+  type ApprovalRequest,
+  type AuditLogEntry,
+  type Job,
+  type TaskHumanDecisionFact,
+} from '@ai-team/shared'
 import { getCredentialClass, type CredentialClass } from '../auth/credentialClass'
 import type { IStorage } from '../storage/interface'
 import {
@@ -300,6 +308,42 @@ export function readApprovalActorClass(
     )
     return 'unknown'
   }
+}
+
+/**
+ * ApprovalRequest に**決定主体の型付きの事実**（`approvalActor`）を付ける（lifecycle repair C3）。
+ *
+ * shared の `liveTaskDecisionState()` / `evaluateResumeAdmission()` は storage を読まないので、
+ * 「APPROVED の人が実行する Task 単位判断が本当に人の決定か」はここで計算して渡す。
+ * 読むのは APPROVED の人が実行する Task 単位判断だけ（他の行の判定は主体に依存しない）。
+ */
+export function withApprovalActorFacts<T extends Pick<ApprovalRequest, 'id' | 'status' | 'requestedAction'>>(
+  storage: IStorage,
+  approvals: readonly T[],
+): Array<T & { approvalActor?: ApprovalActorFact }> {
+  return approvals.map((approval) => (
+    approval.status === 'APPROVED' && isHumanExecutedTaskDecision(approval.requestedAction)
+      ? { ...approval, approvalActor: readApprovalActorClass(storage, approval.id) }
+      : approval
+  ))
+}
+
+/**
+ * Task の**生きた Task 単位の人の判断**（`TaskDetail.humanTaskDecisions` の唯一の計算）。
+ * 新しい順（storage `findByTaskId()` の順）を保つ。
+ */
+export function humanTaskDecisionFacts(
+  storage: IStorage,
+  taskId: string,
+  nowMs: number = Date.now(),
+): TaskHumanDecisionFact[] {
+  const facts: TaskHumanDecisionFact[] = []
+  for (const approval of withApprovalActorFacts(storage, storage.approvalRequests.findByTaskId(taskId))) {
+    const state = liveTaskDecisionState(approval, nowMs)
+    if (state === undefined || approval.requestedAction === undefined) continue
+    facts.push({ approvalRequestId: approval.id, requestedAction: approval.requestedAction, state })
+  }
+  return facts
 }
 
 function authorityAuditTokens(authority: GenerationAuthority | undefined): string[] {
