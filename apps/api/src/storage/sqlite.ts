@@ -8,6 +8,7 @@
 
 import {
   holdsWorkspaceWhenBlocked,
+  isLiveWorkspaceOwnerJob,
   isStaleBlockedJobCandidate,
   LIVE_JOB_STATUSES,
   OCCUPIES_PROJECT_SQL,
@@ -58,6 +59,7 @@ import {
   type GitCommitResumeLineageClassification,
 } from '../gitCommitResumeLineage'
 import { resolveLinkedGitCommitRejection } from '../linkedGitCommitRejection'
+import { readJobsSupersededByHumanResume } from '../designReview/resumeActor'
 
 export class SingleRunningProjectError extends Error {
   constructor() {
@@ -66,10 +68,24 @@ export class SingleRunningProjectError extends Error {
   }
 }
 
-export class ArchiveBlockedByRunningJobError extends Error {
-  constructor() {
-    super('Cannot archive project while a Job is running')
-    this.name = 'ArchiveBlockedByRunningJobError'
+/** Project を放棄する（archive / draft へ戻す）と、その時点で lifecycle を持つ実体が見えなくなる種類。 */
+export type ProjectActiveLifecycleKind =
+  | 'queued_or_running_job'
+  | 'blocked_job'
+  | 'repair_design_review_run'
+
+/**
+ * archive / draft への遷移を拒否した理由。**status 変更と同じ transaction の中で**判定する。
+ *
+ * 以前は archive が running Job だけを見ており、queued Job・未解決の blocked Job・
+ * repair 用 Design Review run を持ったまま Project を放棄できた。放棄された Project は
+ * PL / attention / Worker の所有権判定から外れるため、それらの所有者が誰にも見えないまま残る
+ * （lifecycle repair W5）。pause は対象にしない（CEO の停止スイッチであり、Worker が所有権を見続ける）。
+ */
+export class ProjectHasActiveLifecycleError extends Error {
+  constructor(public readonly blockers: readonly ProjectActiveLifecycleKind[]) {
+    super(`Cannot archive project or return it to draft while it has an active lifecycle: ${blockers.join(', ')}`)
+    this.name = 'ProjectHasActiveLifecycleError'
   }
 }
 
@@ -647,6 +663,82 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   // `storage` 全体へアクセスする必要がある。クロージャ経由で late-assign する。
   let storage: IStorage
 
+  /**
+   * Project を放棄すると所有者が見えなくなる lifecycle の種類。
+   *
+   * blocked Job は Human Resume で後継が作られた旧行だけを superseded として除く
+   * （`readJobsSupersededByHumanResume`。attention と同じ reader を使い、ここで再実装しない）。
+   * done な Task に残る blocked 行も除かない。Worker はその行を、worktree が clean・git 操作なし・
+   * HEAD 解決可能と**観測できるまで**所有者として扱い（`isStaleBlockedJobCandidate` の契約）、
+   * その観測は API 側に永続化されていない。証明が無い以上、所有者として数える（fail-closed）。
+   * Project は Job の自己申告（`jobs.project_id`）ではなく Task の `project_id` から引く。
+   */
+  function activeLifecycleKindsOf(projectId: string): ProjectActiveLifecycleKind[] {
+    const kinds: ProjectActiveLifecycleKind[] = []
+    const movingJob = db.prepare(
+      "SELECT j.id FROM jobs j JOIN tasks t ON t.id = j.task_id "
+      + "WHERE t.project_id = ? AND j.status IN ('queued','running') LIMIT 1",
+    ).get(projectId)
+    if (movingJob) kinds.push('queued_or_running_job')
+
+    const blockedTaskIds = (db.prepare(
+      "SELECT DISTINCT j.task_id AS task_id FROM jobs j JOIN tasks t ON t.id = j.task_id "
+      + "WHERE t.project_id = ? AND j.status = 'blocked'",
+    ).all(projectId) as Array<{ task_id: string }>).map((row) => row.task_id)
+    const hasBlockedOwner = blockedTaskIds.some((taskId) => {
+      const taskJobs = jobs.findByTaskId(taskId)
+      const superseded = readJobsSupersededByHumanResume(storage, taskJobs)
+      return taskJobs.some((job) => job.status === 'blocked' && !superseded.has(job.id))
+    })
+    if (hasBlockedOwner) kinds.push('blocked_job')
+
+    const repairRun = db.prepare(
+      "SELECT r.id FROM design_review_runs r JOIN tasks t ON t.id = r.task_id "
+      + "WHERE t.project_id = ? AND r.status IN ('queued','running') "
+      + 'AND r.repair_source_job_id IS NOT NULL LIMIT 1',
+    ).get(projectId)
+    if (repairRun) kinds.push('repair_design_review_run')
+    return kinds
+  }
+
+  /**
+   * git_commit の完了が worktree の clean を証明したときだけ、同じ Task に残った blocked 行を終端化する。
+   *
+   * 残すと done な Task の blocked 行になり、Worker はそれを clean と観測するまで所有者として扱い、
+   * API の claim guard も解放の証明が無いため所有者として数える。done Task の行には自動の出口が
+   * 無いので（`abort_task` は done Task を拒否する）、**作らないことで防ぐ**（lifecycle repair W5）。
+   *
+   * 証明は committing Job が報告した `workspaceEndFingerprint` が committed HEAD で `clean` であること。
+   * 欠落・dirty・HEAD 不一致なら何もしない（fail-closed）。quarantine 行と Human Resume に
+   * superseded された行は対象外（前者は既存の clear-quarantine protocol の担当）。
+   */
+  function terminalizeBlockedJobsOnCleanCompletion(taskId: string, committing: Job): void {
+    const fingerprint = committing.failureMetadata?.workspaceEndFingerprint
+    if (
+      fingerprint?.mode !== 'clean'
+      || committing.commitHash === undefined
+      || fingerprint.startCommitHash !== committing.commitHash
+    ) return
+    const taskJobs = jobs.findByTaskId(taskId)
+    const superseded = readJobsSupersededByHumanResume(storage, taskJobs)
+    for (const job of taskJobs) {
+      if (job.id === committing.id || job.status !== 'blocked') continue
+      if (superseded.has(job.id) || job.failureMetadata?.quarantined === true) continue
+      const terminalized = db.prepare(
+        "UPDATE jobs SET status = 'failed' WHERE id = ? AND status = 'blocked'",
+      ).run(job.id)
+      if (terminalized.changes !== 1) continue
+      auditLog.record({
+        actor: 'api',
+        operation: 'completion_terminalized',
+        entityType: 'job',
+        entityId: job.id,
+        result: 'failed',
+        detail: `reason=clean_completion committing_job_id=${committing.id} commit=${committing.commitHash}`,
+      })
+    }
+  }
+
   const projects: IProjectStorage = {
     findAll() {
       const rows = db.prepare('SELECT * FROM projects ORDER BY created_at DESC').all() as any[]
@@ -686,42 +778,48 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       return project
     },
     update(id, data) {
-      const existing = projects.findById(id)
-      if (!existing) return undefined
+      // 判定と書き込みを1つの transaction にする。間に Job が作られて「確認したときは空だった」
+      // が成り立たなくなるのを防ぐ。
+      return db.transaction((): Project | undefined => {
+        const existing = projects.findById(id)
+        if (!existing) return undefined
 
-      if (data.status === 'archived') {
-        const runningJob = db.prepare(
-          `SELECT id FROM jobs WHERE project_id = ? AND status = 'running' LIMIT 1`
-        ).get(id)
-        if (runningJob) {
-          throw new ArchiveBlockedByRunningJobError()
+        // 止めるのは**放棄する遷移**だけ: archived への遷移と、running / paused → draft。
+        // pause は CEO の停止スイッチなので常に通す。paused Project の所有者は Worker が
+        // 引き続き workspace 所有権の判定に含めるので、pause しても見えなくはならない。
+        // archived → paused（復元）は止まった Project を見える側へ戻す操作なので対象にしない。
+        const abandonsProject = (data.status === 'archived' && existing.status !== 'archived')
+          || (data.status === 'draft' && (existing.status === 'running' || existing.status === 'paused'))
+        if (abandonsProject) {
+          const blockers = activeLifecycleKindsOf(id)
+          if (blockers.length > 0) throw new ProjectHasActiveLifecycleError(blockers)
         }
-      }
 
-      const updated = { ...existing, ...data, updatedAt: now() }
-      // startStageを同じUPDATEで書けるようにする。status='running'への遷移と開始stageの
-      // 永続化を別writeにすると、その間のcrashで「runningだがstageが無い」Projectが残り、
-      // recoveryがそれを推測で拾わざるを得なくなる。推測に頼ると、start_stage列導入前から
-      // 存在するlegacy runningまで巻き込んで再初期化しかねない（独立レビュー指摘、2026-09-07）。
-      const writesStage = Object.prototype.hasOwnProperty.call(data, 'startStage')
-      try {
-        db.prepare(`
-          UPDATE projects SET name=?, goal=?, design_philosophy=?, status=?, updated_at=?${
-            writesStage ? ', start_stage=?, start_stage_updated_at=?, start_blocked_reason=NULL' : ''
-          } WHERE id=?
-        `).run(
-          updated.name,
-          updated.goal,
-          JSON.stringify(updated.designPhilosophy),
-          updated.status,
-          updated.updatedAt,
-          ...(writesStage ? [updated.startStage ?? null, updated.updatedAt] : []),
-          id,
-        )
-      } catch (err: unknown) {
-        throwSingleRunningProjectError(err)
-      }
-      return updated
+        const updated = { ...existing, ...data, updatedAt: now() }
+        // startStageを同じUPDATEで書けるようにする。status='running'への遷移と開始stageの
+        // 永続化を別writeにすると、その間のcrashで「runningだがstageが無い」Projectが残り、
+        // recoveryがそれを推測で拾わざるを得なくなる。推測に頼ると、start_stage列導入前から
+        // 存在するlegacy runningまで巻き込んで再初期化しかねない（独立レビュー指摘、2026-09-07）。
+        const writesStage = Object.prototype.hasOwnProperty.call(data, 'startStage')
+        try {
+          db.prepare(`
+            UPDATE projects SET name=?, goal=?, design_philosophy=?, status=?, updated_at=?${
+              writesStage ? ', start_stage=?, start_stage_updated_at=?, start_blocked_reason=NULL' : ''
+            } WHERE id=?
+          `).run(
+            updated.name,
+            updated.goal,
+            JSON.stringify(updated.designPhilosophy),
+            updated.status,
+            updated.updatedAt,
+            ...(writesStage ? [updated.startStage ?? null, updated.updatedAt] : []),
+            id,
+          )
+        } catch (err: unknown) {
+          throwSingleRunningProjectError(err)
+        }
+        return updated
+      })()
     },
 
     updateStartStage(id, stage, blockedReason) {
@@ -2032,6 +2130,50 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           // 承認競合時（下記）と同じく、状態を変えずに現在値を返す。
           return existing
         }
+        // **pause は claim を原子的に止める**（lifecycle repair W5）。Worker の poll と claim の間に
+        // Project が running でなくなった場合、Job は queued のまま残す。Project は Job の
+        // 自己申告（project_id）ではなく Task から引く。
+        const claimingProject = db.prepare(
+          'SELECT p.status AS status FROM tasks t JOIN projects p ON p.id = t.project_id WHERE t.id = ?',
+        ).get(existing.taskId) as { status: string } | undefined
+        if (claimingProject?.status !== 'running') {
+          return existing
+        }
+        // **別 Task が live な所有者なら claim を書かない**（lifecycle repair W5）。
+        //
+        // Worker の所有権判定は複数リクエストで組んだ snapshot に基づくため、その間に別 Task
+        // （paused Project を含む）へ作られた非 initial-implement の queued Job を見落としうる。
+        // ここは claim の単一の choke point（IMMEDIATE transaction 内）なので、同じ意味
+        // （`isLiveWorkspaceOwnerJob`。Worker と共有）で archived 以外の全 Project を再確認する。
+        //
+        // **un-superseded な blocked 行も所有者として数える。** blocked は running からだけでなく
+        // queued からも起こる（`jobResultApplicationPolicy` は queued → blocked を許し、開始前の
+        // 拒否は blocked + quarantine へ変換される）ので、claim の直列化だけでは防げない。
+        // Human Resume で後継が作られた旧行は既存 reader（`readJobsSupersededByHumanResume`）で除く
+        // （resume が終端化した source は既に failed）。done な Task に残った blocked 行も除かない:
+        // 解放の証明は Worker の worktree 観測だけで、API 側には永続化されていない（fail-closed）。
+        const otherOwnerRows = db.prepare(
+          "SELECT j.task_id AS task_id, j.status AS status, j.workflow_step_key AS workflow_step_key "
+          + 'FROM jobs j JOIN tasks t ON t.id = j.task_id JOIN projects p ON p.id = t.project_id '
+          + "WHERE p.status != 'archived' AND j.task_id != ? AND j.status IN ('queued','running','blocked')",
+        ).all(existing.taskId) as Array<{ task_id: string; status: string; workflow_step_key: string | null }>
+        if (otherOwnerRows.some((row) => isLiveWorkspaceOwnerJob(row.task_id, {
+          status: row.status,
+          workflowStepKey: row.workflow_step_key,
+        }))) {
+          return existing
+        }
+        const blockedTaskIds = [...new Set(otherOwnerRows
+          .filter((row) => row.status === 'blocked')
+          .map((row) => row.task_id))]
+        const hasBlockedOwner = blockedTaskIds.some((taskId) => {
+          const taskJobs = jobs.findByTaskId(taskId)
+          const superseded = readJobsSupersededByHumanResume(storage, taskJobs)
+          return taskJobs.some((job) => job.status === 'blocked' && !superseded.has(job.id))
+        })
+        if (hasBlockedOwner) {
+          return existing
+        }
       }
       // Approval承認とWorkerのblocked結果保存が競合した場合、承認transactionがqueuedへ
       // 戻したJobを古いblocked結果で巻き戻さない。実行結果も再注入せず、現在値を返す。
@@ -2085,9 +2227,19 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           return { ok: true, job, deduplicated: true }
         }
 
+        const before = jobs.findById(id)
         const updated = jobs.update(id, data)
         if (!updated) {
           return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Job not found' }
+        }
+        // **拒否された claim は「適用済み」として記録しない**（lifecycle repair W5）。記録すると
+        // 同じ event の再送が deduplicated 200 + queued になり、Worker が拒否を成功と取り違えうる。
+        // 記録しなければ再送は毎回評価し直され、同じく拒否（409）される。
+        const claimRefused = data.status === 'running'
+          && before?.status === 'queued'
+          && updated.status !== 'running'
+        if (claimRefused) {
+          return { ok: true, job: updated, deduplicated: false }
         }
         recordOutboxEvent(db, id, outboxEvent)
 
@@ -2147,6 +2299,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         }
         recordOutboxEvent(db, input.jobId, input.outboxEvent)
 
+        terminalizeBlockedJobsOnCleanCompletion(sourceTask.id, updated)
         const continuation = completeTaskAndCreateContinuation(sourceTask, source.id)
 
         return { ok: true, job: updated, continuation, deduplicated: false }

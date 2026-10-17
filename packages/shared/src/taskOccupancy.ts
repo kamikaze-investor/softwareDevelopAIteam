@@ -88,3 +88,28 @@ export function holdsWorkspaceWhenBlocked(
  */
 export const OCCUPIES_PROJECT_SQL =
   "(status IN ('in_progress','blocked') OR (status = 'pending' AND roadmap_active = 1))"
+
+/**
+ * その Task の chain 先頭の initial-implement Job か（`task:<taskId>:initial-implement`）。
+ *
+ * queued のままの initial-implement は「その Task はまだ何も実行していない」ことを表し、
+ * workspace を所有しない。それ以外の queued Job（review / repair / git-commit / resume など）は
+ * 既に始まった chain の続きなので所有者として扱う。
+ */
+export function isInitialImplementStepKey(taskId: string, workflowStepKey: string | undefined): boolean {
+  return workflowStepKey === `task:${taskId}:initial-implement`
+}
+
+/**
+ * 観測なしで workspace 所有者と確定する **live（queued / running）な** Job か。
+ *
+ * Worker の所有権判定（`findWorkspaceOwningTaskIds()`）と API の claim guard が同じ意味を使う。
+ * blocked 行の判定（`holdsWorkspaceWhenBlocked()`）はここに含めない。
+ */
+export function isLiveWorkspaceOwnerJob(
+  taskId: string,
+  job: { status: string; workflowStepKey?: string | null },
+): boolean {
+  return job.status === 'running'
+    || (job.status === 'queued' && !isInitialImplementStepKey(taskId, job.workflowStepKey ?? undefined))
+}
