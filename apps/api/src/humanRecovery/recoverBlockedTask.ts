@@ -229,6 +229,7 @@ export type RecoverBlockedTaskResult =
     code:
       | 'TASK_NOT_FOUND'
       | 'PROJECT_UNAVAILABLE'
+      | 'PROJECT_NOT_RUNNING'
       | 'TASK_NOT_BLOCKED'
       | 'TASK_HAS_JOBS'
       | 'TASK_PARKED'
@@ -307,6 +308,17 @@ export function recoverBlockedTask(
     }
   }
 
+  // **running でない Project では再投入しない**（b8d0fc5d 監査）。paused / draft の Project では
+  // PL tick も attention 導出も Worker の claim も動かないので、`pending` へ戻しても誰も拾わず、
+  // blocked という「人が見るべき停止」の表示だけが消える。transaction の中でも読み直す。
+  if (project.status !== 'running') {
+    return {
+      ok: false,
+      code: 'PROJECT_NOT_RUNNING',
+      reason: `Task ${input.taskId} belongs to a project that is ${project.status}, not running; resume the project first`,
+    }
+  }
+
   // **`blocked` 以外は対象にしない。** `pending` は既に再投入済みか、そもそも止まっていない。
   if (task.status !== 'blocked') {
     return {
@@ -350,10 +362,9 @@ export function recoverBlockedTask(
   // 放置すると `approval_waiting` と `task_ready_without_job` が同時に立ち、PL は前者を
   // 先に処理するので、`nextDriver` と実際に進行を止めるものが食い違う。
   //
-  // `findByTaskId()` は `created_at DESC` で返すので `[0]` が最新 —— resume 側の
-  // `ORDER BY created_at DESC LIMIT 1` と同じ行を見ている。
+  // Task の全行を渡す（live な承認待ちが 1 行でもあれば断る。resume 側と同じ集約形）。
   if (hasActiveApprovalWaiting(
-    storage.approvalRequests.findByTaskId(task.id)[0],
+    storage.approvalRequests.findByTaskId(task.id),
     new Date().toISOString(),
   )) {
     return { ok: false, code: 'APPROVAL_WAITING', reason: APPROVAL_WAITING_REASON }

@@ -10,7 +10,7 @@
  * いるのと同じ形で、再投入の履歴も `audit_log` にだけ存在する。
  */
 
-import { occupiesProject, type ApprovalRequest, type Task } from '@ai-team/shared'
+import { isLiveWaitingApproval, occupiesProject, type ApprovalRequest, type Task } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
 
 /**
@@ -61,8 +61,10 @@ export function recoveryReleasesProjectSlot(task: Pick<Task, 'roadmapActive'>): 
  *
  * **既存 `resumeBlockedTask()` の不変条件をそのまま借りる。** 意味を広げも狭めもしない:
  *
- *   - 見るのは **`created_at` が最新の1行だけ**（`ORDER BY created_at DESC LIMIT 1`）
- *   - 拒否するのは `WAITING_FOR_USER` **かつ未期限**のときだけ
+ *   - Task の行のうち **live な承認待ちが 1 行でもあるか**を見る。Task あたり WAITING は高々 1 行
+ *     （W4 の不変条件）なので「最新の有効行が live WAITING」と同値で、より頑健な集約形にしてある
+ *   - live の判定は共有の `isLiveWaitingApproval()`（expiry 解釈の唯一の出どころ）。ここで
+ *     `WAITING_FOR_USER` **かつ未期限**を書き写さない
  *   - **`APPROVED` では拒否しない。** resume の現契約がそうであり、ここで拡張しない
  *   - **期限切れ `WAITING_FOR_USER` でも拒否しない。** 行を `EXPIRED` へ進める actor が
  *     居ないため、期限切れを承認待ちとして扱うと Task がどこからも復旧できなくなる
@@ -78,11 +80,11 @@ export function recoveryReleasesProjectSlot(task: Pick<Task, 'roadmapActive'>): 
  * 条件を2箇所へ書き写すと、片方だけ直したときに precheck と commit が食い違う。
  */
 export function hasActiveApprovalWaiting(
-  latestApproval: Pick<ApprovalRequest, 'status' | 'expiresAt'> | undefined,
+  approvals: readonly Pick<ApprovalRequest, 'status' | 'expiresAt'>[],
   nowIso: string,
 ): boolean {
-  if (latestApproval?.status !== 'WAITING_FOR_USER') return false
-  return new Date(latestApproval.expiresAt) > new Date(nowIso)
+  const nowMs = new Date(nowIso).getTime()
+  return approvals.some((approval) => isLiveWaitingApproval(approval, nowMs))
 }
 
 /** 承認待ちで Human Recovery を断るときの理由文。precheck と transaction で同じ文を使う。 */

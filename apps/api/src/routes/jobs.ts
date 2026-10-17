@@ -20,6 +20,7 @@ import {
   executeQueuedRepair,
   isWorkspaceQuarantined,
   prepareRepairFlow,
+  recordRepairAdmissionSkipped,
   resolveReviewedImplementation,
 } from '../designReview/repairFlow'
 import {
@@ -913,8 +914,15 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
                 reviewJobId: existing.id,
                 runId: reviewPreparation.runId,
               }, 'review requested changes but repair was not admitted; stage 2 skipped')
+              // log は流れて消える。blocked な Task では audit にも残す（状態は変えない。L4）。
+              recordRepairAdmissionSkipped(storage, {
+                taskId: existing.taskId,
+                reviewJobId: existing.id,
+                implementJobId: implementJob.id,
+                skip: reviewPreparation,
+              })
             } else if (reviewPreparation.action === 'escalate') {
-              escalateTaskToHuman(storage, existing.taskId)
+              escalateTaskToHuman(storage, existing.taskId, reviewPreparation.reason)
             } else if (reviewPreparation.action === 'queue') {
               const run = storage.designReviewRuns.create(reviewPreparation.run)
               kickQueuedDesignReview(storage, req.log, run, reviewPreparation.stepKey)
@@ -981,6 +989,14 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
           reviewJobId: existing.id,
           runId: refusalPreparation.runId,
         }, 'review refusal repair was not admitted; falling back to Human escalation')
+        if (reviewed?.ok === true) {
+          recordRepairAdmissionSkipped(storage, {
+            taskId: existing.taskId,
+            reviewJobId: existing.id,
+            implementJobId: reviewed.implementJob.id,
+            skip: refusalPreparation,
+          })
+        }
       } else if (refusalPreparation !== undefined) {
         const persisted = storage.jobs.updateWithOutboxEvent(
           existing.id,
@@ -995,7 +1011,7 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
           return reply.status(persisted.code === 'JOB_NOT_FOUND' ? 404 : 500).send({ error: persisted.reason })
         }
         if (refusalPreparation.action === 'escalate') {
-          escalateTaskToHuman(storage, existing.taskId)
+          escalateTaskToHuman(storage, existing.taskId, refusalPreparation.reason)
         } else if (persisted.queuedDesignReviewRun && refusalPreparation.action === 'queue') {
           kickQueuedDesignReview(storage, req.log, persisted.queuedDesignReviewRun, refusalPreparation.stepKey)
         }
@@ -1178,7 +1194,7 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       : undefined
 
     if (preparation?.action === 'escalate') {
-      escalateTaskToHuman(storage, existing.taskId)
+      escalateTaskToHuman(storage, existing.taskId, preparation.reason)
     }
 
     // outboxEventの有無にかかわらず同じatomic経路を使う。

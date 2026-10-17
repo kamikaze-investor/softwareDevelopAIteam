@@ -5,7 +5,7 @@ import type { Job, ReviewResult } from '@ai-team/shared'
 import { prepareRepairFlow } from './repairFlow'
 import { repairFromStoredReview } from './repairFromStoredReview'
 import { epochCoveredImplementationJobIds, repairRecoveryActionFor } from './repairRecoveryEpoch'
-import { recordResumeActor } from './resumeActor'
+import { recordApprovalActor, recordResumeActor } from './resumeActor'
 
 /**
  * **保存済み review を canonical repair へ戻す recovery action**の回帰テスト
@@ -118,8 +118,12 @@ function productionShape(storage: IStorage, taskOverrides: Record<string, unknow
   return { ids, implementJob: current, reviewJob, review }
 }
 
-/** 人が Mobile の承認 UI で押す操作に相当する。 */
+/**
+ * 人が Mobile の承認 UI で押す操作に相当する。ADMIN credential で決定したという
+ * `approval_actor` の記録も残す（epoch は human が決めた承認しか数えない）。
+ */
 function approve(storage: IStorage, approvalRequestId: string) {
+  recordApprovalActor(storage, approvalRequestId, 'admin')
   return storage.approvalRequests.recordDecision(approvalRequestId, 'APPROVED')
 }
 

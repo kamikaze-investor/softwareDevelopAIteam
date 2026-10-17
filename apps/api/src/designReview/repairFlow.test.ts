@@ -1,6 +1,7 @@
 import { describe, expect, it, beforeEach } from 'vitest'
 import { createSQLiteStorage } from '../storage/sqlite'
 import { repairRecoveryActionFor } from './repairRecoveryEpoch'
+import { recordApprovalActor } from './resumeActor'
 import type { IStorage } from '../storage/interface'
 import type { Job } from '@ai-team/shared'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
@@ -499,6 +500,8 @@ describe('repair generation を既存 audit へ残す', () => {
       expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
       invalidIf: [],
     } as never)
+    // CEO が ADMIN credential で承認した記録（epoch は human が決めた承認しか数えない）。
+    recordApprovalActor(storage, approval.id, 'admin')
     storage.approvalRequests.recordDecision(approval.id, 'APPROVED')
     expect(storage.approvalRequests.verifyAndConsumeForTaskAction({
       taskId: ids.taskId,

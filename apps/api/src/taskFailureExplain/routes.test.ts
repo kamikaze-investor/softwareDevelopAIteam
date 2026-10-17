@@ -743,6 +743,8 @@ describe('Task failure explanation routes', () => {
         decision: 'ALIGNED',
         independentReviewRequired: false,
       })
+      // resume は running Project でしか受け付けない（PROJECT_NOT_RUNNING）。
+      storage.projects.update(task.projectId, { status: 'running' })
       const resumeResponse = await app.inject({
         method: 'POST',
         url: `/api/tasks/${task.id}/resume`,

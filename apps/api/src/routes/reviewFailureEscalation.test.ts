@@ -431,6 +431,8 @@ describe('review-failure-escalation gap', () => {
       expect(storage.tasks.findById(task.id)?.status).toBe('blocked')
 
       // worktree は dirty のまま（implement の正当な成果を捨てない）。
+      // resume は running Project でしか受け付けない（PROJECT_NOT_RUNNING）。
+      storage.projects.update(project.id, { status: 'running' })
       const resumed = storage.jobs.resumeBlockedTask({
         taskId: task.id,
         instructionPrompt: 'レビューが失敗したので再実行する',

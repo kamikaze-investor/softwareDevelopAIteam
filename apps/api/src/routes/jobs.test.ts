@@ -792,7 +792,8 @@ describe('Job API', () => {
 
     it('rejects the resume path when no matching Design Review evidence exists', async () => {
       await withApp(async (app) => {
-        const project = await createProject(app)
+        // resume は running Project でしか受け付けない（PROJECT_NOT_RUNNING が先に効かないように）。
+        const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id)
         const { getStorage } = await import('../storage/index.js')
         const storage = getStorage()
