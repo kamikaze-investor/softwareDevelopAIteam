@@ -625,8 +625,11 @@ export async function runJob(
       checkResponse?.nextAction?.consumedRequestId
     const expiresAt = checkResponse?.approvalRequest?.expiresAt
 
-    // dedup: 同一 approvalRequestId への重複通知を抑制
-    const dedupKey = approvalRequestId
+    // dedup: 同一 approvalRequestId への重複通知を抑制。技術停止は通知の種類が違うので別キーにする
+    // （承認待ち通知の後に同じ承認 ID で技術停止が起きても抑止されないように。Codex review round 2）
+    const dedupKey = gateResult.technicalCause !== undefined
+      ? `${gateResult.technicalCause}:${approvalRequestId ?? job.id}`
+      : approvalRequestId
     if (!dedupKey || !notifiedApprovalRequests.has(dedupKey)) {
       if (dedupKey) notifiedApprovalRequests.add(dedupKey)
 

@@ -69,6 +69,12 @@ import {
 } from '../humanRecovery/recoverBlockedTask'
 import { isLiveApprovedApproval } from '@ai-team/shared'
 import type { AuditLogEntry, Job } from '@ai-team/shared'
+
+/**
+ * Worker の Gate 段階の技術停止の印（`apps/worker/src/guards/gatePolicy.ts` の `GateTechnicalCause`。
+ * Worker は理由を `<cause>: …` の形で stderr に載せる）。値の正本は Worker 側にあり、ここは読むだけ。
+ */
+const GATE_TECHNICAL_CAUSE_MARK = /\b(risk_rule_skew|approval_contract_violation|invalid_risk_level):/
 import type { DesignReviewRun, IStorage } from '../storage/interface'
 import { isUsableAlignedEvidence } from '../designReviewEvidencePolicy'
 import { retryStepKeyFor } from '../designReview/repairPolicy'
@@ -126,6 +132,11 @@ export const BLOCKED_ROOT_CAUSE_CLASSES = [
   'approval_waiting',
   /** 承認が STALE / EXPIRED / REJECTED で、その行では誰も進められない。 */
   'approval_not_actionable',
+  /**
+   * Worker と API の Gate 判断の食い違い（ルールの版ずれ・承認契約違反・不正な riskLevel）で、
+   * Worker が fail-closed で止めた。技術停止であり、方針判断ではない（lifecycle repair D2）。
+   */
+  'gate_policy_mismatch',
   /** ALIGNED evidence はあるのに実装 Job が作られていない。 */
   'task_ready_without_job',
   /** 機械的事実から原因を特定できなかった。**推測で retry してはならない。** */
@@ -953,6 +964,43 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
   // **Worker が送った証拠（guardResult / quarantine）が Gate 段階の拒否を示すときだけ**（Codex round 2）。
   // Permission 拒否・File Change Guard・quarantine は既存の rule（1〜3・7）がそれぞれ扱う。保存側
   // （`jobs.update` の停止理由）と同じ `classifyApprovedRunBlock()` で判定する。
+  //
+  // ── 6.8 Worker と API の Gate 判断の食い違い（lifecycle repair D2・Codex review round 2）──
+  // Worker は食い違い（ルールの版ずれ・承認契約違反・不正な riskLevel）で fail-closed したとき、原因を stderr に
+  // `risk_rule_skew:` 等の印で残す。版ずれが続いている間は、resume しても新しい Job が同じ理由で止まる。
+  // 下の rule 7 の auto_recovery に落とすと、試行 budget が Job 単位なので resume Job が際限なく作られる。
+  // よって自動 resume はせず、技術停止として人へ見せて止める（方針判断としては扱わない）。
+  // Gate 段階の拒否（guards passed）であることを、6.9 と同じ証拠で確かめたときだけ当てる。
+  const gateMismatch = facts.job?.status === 'blocked'
+    && classifyApprovedRunBlock(facts.job) === 'gate_refusal'
+    ? GATE_TECHNICAL_CAUSE_MARK.exec(facts.job.stderr ?? '')?.[1]
+    : undefined
+  if (facts.job?.status === 'blocked' && gateMismatch !== undefined && !hasLiveJob(facts)) {
+    return {
+      ...result,
+      rootCauseClass: 'gate_policy_mismatch',
+      blockingLayer: 'approval',
+      evidence: [
+        { fact: 'job.status', id: facts.job.id, value: 'blocked' },
+        { fact: 'job.gate_technical_cause', id: facts.job.id, value: gateMismatch },
+        { fact: 'job.stderr', id: facts.job.id, value: (facts.job.stderr ?? '').slice(0, 200) },
+        ...(facts.approvedLinkedGitCommitId !== undefined
+          ? [{ fact: 'approval_request.status (linked, unconsumed)', id: facts.approvedLinkedGitCommitId, value: 'APPROVED' }]
+          : []),
+      ],
+      recoverable: false,
+      existingRecoveryAvailable: true,
+      requiresAuthorityChange: false,
+      confidence: 'high',
+      // 自動実行してよい復旧が無い停止は人へ見せる（既存レーンでは ceo_escalation が唯一の人の窓口）。
+      recommendedLane: 'ceo_escalation',
+      summary:
+        `Worker と API の Gate 判定が食い違ったため Worker が fail-closed で止めた（${gateMismatch}）。`
+        + '技術停止であり、CEO の方針判断の対象ではない。承認の状態は変わっていない。'
+        + 'Worker と API が同じ版で動いていることを確かめてから resume する。',
+    }
+  }
+
   if (
     facts.job?.status === 'blocked'
     && facts.approvedLinkedGitCommitId !== undefined
@@ -1214,6 +1262,18 @@ function ceoDecisionAndOptions(
       return {
         decision: '待っている承認そのもの。',
         options: ['Mobile から承認する', '却下して別の設計へ回す'],
+      }
+    // rule 6.8（lifecycle repair D2）: Worker と API の Gate 判断の食い違いによる技術停止。
+    case 'gate_policy_mismatch':
+      return {
+        decision:
+          '技術停止（方針判断ではない）: Worker と API の Gate 判定が食い違ったため fail-closed で止まった。'
+          + '承認の状態は変わっていない。',
+        options: [
+          'Worker と API が同じ版で動いていることを確かめ、版ずれなら揃えてから Task を resume する',
+          'job.stderr の原因（risk_rule_skew / approval_contract_violation / invalid_risk_level）を技術調査に回す',
+          'この Task を park する（`abort_task`）',
+        ],
       }
     // rule 6.9（lifecycle repair D2）: 承認済みの git_commit が Worker の Gate 段階で技術的に止まった。
     // 方針判断ではないので、判断ではなく技術的な対処を並べる。却下（rule 7）の同じ分類は下の default のまま。

@@ -3542,6 +3542,56 @@ describe('approved-run blocked cause comes from the evidence the Worker sent', (
     expect(diagnosis.summary).not.toContain('CEO の判断が必要')
   })
 
+  // Codex review round 2: 版ずれが続く間は resume しても同じ理由で止まる。Job 単位の budget では止まらないので、
+  // Worker が stderr に残した技術停止の印があれば自動 resume しない（rule 6.8）。
+  it('a Worker gate mismatch (risk_rule_skew in stderr) on an approved git_commit is a technical stop with no auto-resume', () => {
+    const fx = approvedRunBlocked({ permissionAllowed: true, fileChangeAllowed: true, fileViolations: [] })
+    fx.storage.jobs.update(fx.jobId, { stderr: 'risk_rule_skew: local=CRITICAL api=HIGH decision=ALLOW (no reason)' } as never)
+    const item = buildSystemState(fx.storage, { now: () => NOW }).attention.find((a) => a.jobId === fx.jobId)!
+    const diagnosis = triageBlocked(fx.storage, item)
+    expect(diagnosis).toMatchObject({
+      rootCauseClass: 'gate_policy_mismatch',
+      requiresAuthorityChange: false,
+      recoverable: false,
+      recommendedLane: 'ceo_escalation',
+    })
+    expect(diagnosis.evidence).toContainEqual(
+      expect.objectContaining({ fact: 'job.gate_technical_cause', value: 'risk_rule_skew' }),
+    )
+    expect(diagnosis.summary).toContain('CEO の方針判断の対象ではない')
+  })
+
+  it('a non-approval Job stopped by a Worker gate mismatch is not sent to auto_recovery (no unbounded resume)', () => {
+    const { storage, taskId, projectId } = seed()
+    storage.tasks.update(taskId, { status: 'blocked' })
+    const job = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'build', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, {
+      guardResult: { permissionAllowed: true, fileChangeAllowed: true, fileViolations: [] },
+      stderr: 'safe_work_only: build not permitted (risk_rule_skew: local=HIGH api=LOW decision=ALLOW (no reason))',
+    } as never)
+    const item = buildSystemState(storage, { now: () => NOW }).attention.find((a) => a.jobId === job.id)!
+    const diagnosis = triageBlocked(storage, item)
+    expect(diagnosis.rootCauseClass).toBe('gate_policy_mismatch')
+    expect(diagnosis.recommendedLane).not.toBe('auto_recovery')
+  })
+
+  it('a gate-stage block without a technical-cause mark keeps the existing rules', () => {
+    const { storage, taskId, projectId } = seed()
+    storage.tasks.update(taskId, { status: 'blocked' })
+    const job = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'build', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, {
+      guardResult: { permissionAllowed: true, fileChangeAllowed: true, fileViolations: [] },
+    } as never)
+    const item = buildSystemState(storage, { now: () => NOW }).attention.find((a) => a.jobId === job.id)!
+    expect(triageBlocked(storage, item).rootCauseClass).not.toBe('gate_policy_mismatch')
+  })
+
   it('an expired APPROVED linked approval no longer matches rule 6.9', () => {
     const fx = approvedRunBlocked({ permissionAllowed: true, fileChangeAllowed: true, fileViolations: [] })
     const item = buildSystemState(fx.storage, { now: () => NOW }).attention.find((a) => a.jobId === fx.jobId)!

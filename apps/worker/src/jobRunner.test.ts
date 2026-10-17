@@ -1577,6 +1577,32 @@ describe('runJob — real resolvePolicy through the jobRunner gate branch (D2)',
     expect(titles.some((t) => t.includes('承認待ち') || t.includes('承認無効'))).toBe(false)
   })
 
+  // Codex review round 2: 承認待ち通知の dedup キーに技術停止が吸い込まれない
+  it('after an approval-wait notification for request X, a technical stop on X is still notified', async () => {
+    useFiles(['AGENTS.md'])
+    const job = createJob({ safeCommand: { kind: 'build', workingDir: '/workspace/target' } })
+    callGateCheckMock.mockResolvedValueOnce({
+      outcome: { decision: 'BLOCKED' as const, riskLevel: 'CRITICAL', requestId: 'req-dedup-d2' },
+      riskReview: { riskLevel: 'CRITICAL', triggeredRules: [], requiresIndependentReview: true },
+      sideEffects: [] as Array<{ type: string; requestId: string }>,
+      continuationPolicy: 'block_until_approved' as const,
+      nextAction: { action: 'wait_for_approval' as const, requestId: 'req-dedup-d2', message: 'wait' },
+    })
+    const first = await runJob(job, createPolicy())
+    expect(first.gatePolicy).toBe('block_until_approved')
+    const firstTitles = sendAlertMock.mock.calls.map((call) => JSON.stringify(call[0]))
+    expect(firstTitles.some((t) => t.includes('承認待ち'))).toBe(true)
+
+    sendAlertMock.mockClear()
+    // 承認後の再実行で、Worker のルールが API より新しく CRITICAL > HIGH の版ずれになった
+    callGateCheckMock.mockResolvedValueOnce(gateResponse('HIGH', { action: 'call_consume', consumedRequestId: 'req-dedup-d2' }))
+    const second = await runJob(job, createPolicy())
+    expect(second.gatePolicy).toBe('re_check')
+    const secondTitles = sendAlertMock.mock.calls.map((call) => JSON.stringify(call[0]))
+    expect(secondTitles.some((t) => t.includes('Gate 判定の不一致'))).toBe(true)
+    expect(callConsumeMock).not.toHaveBeenCalled()
+  })
+
   it('local CRITICAL vs API HIGH BLOCKED (rule skew) → even a safe-work kind (test) does not run', async () => {
     useFiles(['AGENTS.md'])
     callGateCheckMock.mockResolvedValue({
