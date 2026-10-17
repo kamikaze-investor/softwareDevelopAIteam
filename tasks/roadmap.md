@@ -6929,6 +6929,10 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
    - 効果検証可能性: safe_work_only 下で AI CLI を止めた件数が既存 `gate_evaluations` /
      `observationLog` から数えられること
 
+   **【2026-10-17 追記（独立監査 M7）】** 上記の safe-work 判定は、変更可能な AI CLI Job（implement Job は `kind:'test'`）の
+   実効行為と揃っていない。`REJECTED` の safe-work 対象 action が read-only で動き続けうる点も同じ決定点の話であり、
+   本項目で一緒に直す（新しい項目は作らない）。`state` は `planned` のまま。
+
 <!-- roadmap:id=review-gate-layers-implemented-but-unwired state=planned priority=high -->
 0. [ ] **実装済みと記録されているレビュー / Gate 層が Job 経路に配線されておらず、うち1つは gate 緩和の理由になった** — 2026-09-15 監査（Confirmed / P1）。個別の未配線ではなく **1 つの問題**として扱う。
 
@@ -11997,6 +12001,139 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       - 出口の無い停止が残らない（進められない owner は attention として必ず見える）
       - git_commit Approval で DA trigger 7 が開示される
       - `typecheck` / `tests` / `roadmap:check` が PASS
+
+<!-- roadmap:id=lifecycle-consume-commit-crash-recovery state=deferred -->
+12. [ ] **Approval の consume と `git commit` の間でクラッシュすると、復旧が repair（新しい Approval 要求）にしか無い** —
+      2026-10-17登録（Lifecycle 一括修復 `lifecycle-semantic-integrity-batch-repair` と独立監査
+      「Decision Authority・Approval Gate 独立設計監査」に基づく。`deferred`: PL は自動採用しない）。
+
+      **確認された事実**:
+      - (a) Approval を consume した後、`git commit` の前にクラッシュすると Job は failed になり、復旧は repair 経由のみで、
+        repair は**新しい Approval** を要求する（CEO が承認済みの同じ判断を再度求める）
+      - (b) `git commit` の後、結果を Outbox へ書く前にクラッシュすると、commit は存在するのに Job が quarantine される
+
+      **なぜ問題か**: (a) は承認済みの判断をやり直させ、(b) は成功した変更を失敗として扱う。どちらも誰かが手で突き合わせるまで進まない。
+
+      **着手時に確認すること**: 既存の不変条件（exact parent / `targetCommit`・`approvedContentHash`・resulting-commit binding）で
+      「commit が既にできているか」を照合して復旧できるか。**新しい Approval status は作らない。**
+
+      **やらないこと**: 新しい status / queue / daemon。Approval の再利用範囲を広げること（承認は元の判断にだけ効く）。
+
+<!-- roadmap:id=high-git-commit-pass-on-strengthened-safety-evidence state=deferred -->
+13. [ ] **M1: HIGH の技術的 git_commit を、強化した Safety Evidence（ベンダー分離の独立レビュー）で通す** —
+      2026-10-17登録（独立監査 M1。`deferred`）。
+
+      **方向**: HIGH でも技術判断だけの git_commit は、ベンダー分離の独立レビューによる強化 Safety Evidence で通す。
+      Decision Authority の対象（DA 表示付き）の変更は人間 Gate に残す。
+
+      **順序制約**: **M3（`da-triggers-345-deterministic-detectors`）の後にだけ着手する。** DA 検出の穴が残る間にこれを緩めると、
+      Authority 変更が LOW 経路を通る穴に加えて HIGH 経路も開く。
+      **実装前に最終設計を CEO へ報告する（P2-3）。**
+
+      **やらないこと**: M3 より前の着手。DA 表示付き変更の自動通過。
+
+<!-- roadmap:id=risk-rules-substring-false-positives state=deferred -->
+14. [ ] **M2: `RISK_RULES` の部分文字列一致が誤検知する（authorBadge / tokenizer / dropdown / guardian）** —
+      2026-10-17登録（独立監査 M2。`deferred`）。
+
+      **確認された事実**: path 内の部分文字列で risk を判定するため、`auth` / `token` / `drop` / `guard` を含むだけの無関係な
+      ファイル名が HIGH 側へ寄る。
+
+      **方向**: 部分文字列ではなく **path segment 単位**で照合する。
+
+      **やらないこと**: rule の追加・削除（照合方法だけを直す）。
+
+<!-- roadmap:id=da-triggers-345-deterministic-detectors state=deferred -->
+15. [ ] **M3: DA trigger 3/4/5 の決定論的検出（新規依存・外部サービス、新規 public route、不可逆 migration）** —
+      2026-10-17登録（独立監査 M3。`deferred`）。
+
+      **確認された事実**: Decision Authority の trigger 3（新規依存または外部サービス）・4（新規 public route）・
+      5（不可逆 migration）は diff 本文から決定論的に検出されない。Authority を変える変更が LOW のまま通る穴になる。
+
+      **方向**: diff 本文から検出する決定論的 detector を足す。
+
+      **順序制約**: **`high-git-commit-pass-on-strengthened-safety-evidence`（M1）より前に着手する。**
+
+      **やらないこと**: LLM による判定への置換。新しい Gate。
+
+<!-- roadmap:id=approval-consume-invariants state=deferred -->
+16. [ ] **M4: Approval consume の不変条件が足りない** —
+      2026-10-17登録（独立監査 M4。`deferred`）。
+
+      **確認された事実 / 方向**:
+      - 承認時と consume 時で `approval_actor`・対象 branch・risk を突き合わせない
+      - git 以外の Approval が Job に束縛されていない（束縛する、または action 単位であると文書化する）
+      - git 以外の同一 Job による idempotent な consume replay が無い
+      - Worker と API の間に policy version の handshake が無い
+
+      **やらないこと**: 新しい Approval status。
+
+<!-- roadmap:id=pre-commit-branch-recheck-and-binding-failure state=deferred -->
+17. [ ] **M5: commit 直前に branch を再確認し、resulting-commit binding が失敗したら Task を完了させない** —
+      2026-10-17登録（独立監査 M5。`deferred`）。
+
+      **確認された事実**: commit 直前に branch を再確認していない。resulting-commit binding が失敗しても Task が完了扱いになりうる。
+
+      **方向**: 直前の branch 再確認を足し、binding 失敗時は Task を完了させない。
+
+<!-- roadmap:id=blocked-triage-technical-lane state=deferred -->
+18. [ ] **M6: `blockedTriage` の残りの rule を技術制約 lane へ移し、「技術的・自動再開なし・CEO 判断なし」の PL lane を足す** —
+      2026-10-17登録（独立監査 M6。`deferred`）。
+
+      **確認された事実**: provider 汚染・原因不明・review attempt 枯渇の rule が CEO escalation になっている。
+      また「技術的だが自動再開せず、CEO 判断も要らない」状態を現在の lane model は表現できない。
+
+      **方向**: 上記 rule を技術制約 lane へ移す。併せて当該 lane を PL に足す。
+
+      **関連**: `blockedTriage` は `apps/api/src/pl/blockedTriage.ts`。M8 の CEO 判断（`review-disagreement-ceo-routing-decision`）と整合させる。
+
+<!-- roadmap:id=review-disagreement-ceo-routing-decision state=deferred -->
+19. [ ] **M8: レビュー不一致・安全方向の判定不能・Meta Review UNCERTAIN だけを理由に CEO へ回してよいか — 【CEO 判断待ち】** —
+      2026-10-17登録（独立監査 M8。`deferred`）。**CEO の決定を待っている。決定前に適用しない。**
+
+      **推奨案（折衷③）**: レビュー不一致と UNCERTAIN は技術 lane へ。Authority 定義の変更で方向が判定不能なものだけを CEO に残す。
+
+      **適用前に必要なこと**: `specs/22` §1-2 / §14-3 と CLAUDE.md §9 の差分を CEO に提示する（Authority 文書の変更のため）。
+
+      **関連**: `blocked-triage-technical-lane`（M6）。
+
+<!-- roadmap:id=reopened-promoted-id-stays-awaiting-promotion state=deferred -->
+20. [ ] **Promotion 済みの roadmap id を `planned` に戻すと、恒久的に「promotion 待ち」のままになる** —
+      2026-10-17登録（Lifecycle 一括修復。`deferred`）。
+
+      **確認された事実**: 述語がマスクされるだけで解除されない。現状は「id を reopen しない」という運用上の約束だけが防いでいる
+      （上記「Promotion 済み Tier A 項目の ID 運用」参照）。
+
+      **方向**: 約束ではなく述語側で扱う。
+
+<!-- roadmap:id=stale-waiting-git-commit-approval-detected-late state=deferred -->
+21. [ ] **Candidate HEAD が動いた後の WAITING git_commit Approval が、CEO の承認後にしか stale と分からない（1回のタップが3回になる）** —
+      2026-10-17登録（Lifecycle 一括修復。`deferred`）。
+
+      **方向**: 読み取り時に stale と印を付ける、または判断時点で HEAD を確認する。
+      **関連**: Candidate HEAD が進むと pending Approval が STALE になる既知の事象。
+
+<!-- roadmap:id=escalation-cleanup-leaves-earlier-repair-dirt state=deferred -->
+22. [ ] **Escalation の cleanup は escalate した Job 自身の manifest だけを戻し、以前の repair attempt の汚れは blocked owner に残る** —
+      2026-10-17登録（Lifecycle 一括修復。`deferred`）。
+
+      **確認された事実**: Task を resume せず abandon する場合は手動 cleanup が要る。
+
+      **やらないこと**: 他 Job の変更を黙って破棄する自動 cleanup（帰属できない変更を消さない）。
+
+<!-- roadmap:id=high-git-commit-block-raises-no-worker-alert state=deferred -->
+23. [ ] **HIGH の git_commit が block されても Worker 側の alert が出ない** —
+      2026-10-17登録（Lifecycle 一括修復。`deferred`）。
+
+      **確認された事実**: CEO は API の `approval_waiting` attention を通してしか知れない。
+
+<!-- roadmap:id=abort-blocked-dirty-baseline-cannot-complete state=deferred -->
+24. [ ] **dirty baseline を持つ blocked 行（例: reject された git_commit）の手動 abort が完了しない** —
+      2026-10-17登録（Lifecycle 一括修復。`deferred`）。
+
+      **確認された事実**: 出口は Human Resume（指示付き）だけである。
+
+      **やらないこと**: abort の自動化（Candidate の作業内容を捨ててしまうため）。
 
 ---
 

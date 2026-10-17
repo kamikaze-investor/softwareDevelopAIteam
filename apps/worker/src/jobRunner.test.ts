@@ -1986,6 +1986,42 @@ describe('runJob — Notifier / CEO通知 integration (Step 3D)', () => {
     )
   })
 
+  // D2: 技術的不整合の re_check は「承認無効」と通知しない。理由を stderr に残す（PL triage が自動 resume しない）
+  it.each([
+    'risk_rule_skew: local CRITICAL > API HIGH (worker/api rule skew); technical Gate inconsistency, not an approval decision',
+    'approval_contract_violation: decision=BLOCKED continuationPolicy=continue nextAction=wait_for_approval; technical Gate inconsistency, not an approval decision',
+  ])('技術的不整合の re_check（%s）→ 技術停止の通知・stderr に理由・コマンド未実行', async (reason) => {
+    callGateCheckMock.mockResolvedValue(makeBlockedResponse(`req-3d-tech-${reason.slice(0, 12)}`))
+    resolvePolicyMock.mockReturnValue({ policy: 're_check', reason, apiAvailable: true })
+
+    const result = await runJob(createJob(), createPolicy())
+
+    expect(result.status).toBe('blocked')
+    expect(result.gatePolicy).toBe('re_check')
+    expect(result.stderr).toBe(reason)
+    expect(resolveCommandMock).not.toHaveBeenCalled()
+    expect(callConsumeMock).not.toHaveBeenCalled()
+    const payload = sendAlertMock.mock.calls[0][0]
+    expect(payload.title).toContain('Gate の技術的不整合')
+    expect(payload.title).not.toContain('承認無効')
+    expect(payload.body).toContain('承認の判断ではありません')
+    expect(payload.body).toContain('承認待ちの承認があればそれを承認し、無ければ resume してください')
+    expect(payload.sourceType).toBe('gate_technical_stop')
+  })
+
+  it('STALE の re_check は従来どおり「承認無効」と通知し、stderr は付けない', async () => {
+    callGateCheckMock.mockResolvedValue(makeBlockedResponse('req-3d-stale'))
+    resolvePolicyMock.mockReturnValue({ policy: 're_check', reason: 'Approval is stale. Re-run gate/check to start a new approval flow.', apiAvailable: true })
+
+    const result = await runJob(createJob(), createPolicy())
+
+    expect(result.status).toBe('blocked')
+    expect(result.stderr).toBeUndefined()
+    const payload = sendAlertMock.mock.calls[0][0]
+    expect(payload.title).toContain('承認無効')
+    expect(payload.sourceType).toBe('gate_stale')
+  })
+
   // 2. block_until_approved の title に safeCommand.kind が含まれる
   it('block_until_approved の title に safeCommand.kind が含まれる', async () => {
     callGateCheckMock.mockResolvedValue(makeBlockedResponse('req-3d-002'))

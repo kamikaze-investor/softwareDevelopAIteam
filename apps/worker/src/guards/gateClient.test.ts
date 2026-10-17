@@ -92,6 +92,7 @@ describe('callGateCheck', () => {
       outcome: { decision: 'ALLOW', riskLevel: 'HIGH', consumedRequestId: 'req-001' },
       continuationPolicy: 'continue',
       nextAction: { action: 'call_consume', consumedRequestId: 'req-001', message: 'consume it' },
+      approvalRequest: { id: 'req-001', status: 'APPROVED', expiresAt: '2099-01-01T00:00:00.000Z', riskLevel: 'HIGH' },
     })
     mockFetch.mockResolvedValueOnce(makeJsonResponse(response))
 
@@ -560,5 +561,48 @@ describe('callConsume', () => {
     const err = await callConsume('req-001', makeConsumeParams()).catch(e => e)
     expect(err.message).not.toContain('LEAKED-SECRET')
     expect(err.message).not.toContain('<html>')
+  })
+})
+
+// ────────────────────────────────────────────────────────────
+// D2（2026-10-17）: call_consume の承認 id の一致（outcome / nextAction / approvalRequest）。
+// 食い違う id は technical failure。decision / policy の組の不整合は resolvePolicy が re_check にする（v4）。
+// ────────────────────────────────────────────────────────────
+
+describe('callGateCheck — call_consume tuple の整合（D2）', () => {
+  const coherent = (): GateCheckResponse => makeGateCheckResponse({
+    outcome: { decision: 'ALLOW', riskLevel: 'HIGH', consumedRequestId: 'req-d2' },
+    riskReview: { riskLevel: 'HIGH', triggeredRules: [], requiresIndependentReview: true },
+    continuationPolicy: 'continue',
+    nextAction: { action: 'call_consume', consumedRequestId: 'req-d2', message: 'consume it' },
+    approvalRequest: { id: 'req-d2', status: 'APPROVED', expiresAt: '2099-01-01T00:00:00.000Z', riskLevel: 'HIGH' },
+  })
+
+  it('整合した tuple は受理する', async () => {
+    mockFetch.mockResolvedValueOnce(makeJsonResponse(coherent()))
+    const result = await callGateCheck(makeGateCheckParams())
+    expect(result.nextAction.consumedRequestId).toBe('req-d2')
+  })
+
+  it.each<[string, (r: GateCheckResponse) => unknown]>([
+    ['outcome.consumedRequestId が無い', (r) => ({ ...r, outcome: { decision: 'ALLOW', riskLevel: 'HIGH' } })],
+    ['outcome.consumedRequestId が違う', (r) => ({ ...r, outcome: { ...r.outcome, consumedRequestId: 'req-other' } })],
+    ['approvalRequest が無い', (r) => { const { approvalRequest: _omit, ...rest } = r; return rest }],
+    ['approvalRequest.id が違う', (r) => ({ ...r, approvalRequest: { ...r.approvalRequest!, id: 'req-other' } })],
+  ])('%s → technical failure', async (_label, mutate) => {
+    mockFetch.mockResolvedValueOnce(makeJsonResponse(mutate(coherent())))
+    const err = await callGateCheck(makeGateCheckParams()).catch(e => e)
+    expect(err).toBeInstanceOf(GateClientError)
+    expect(err.technicalFailure).toBe(true)
+    expect(err.message).toContain('invalid response')
+  })
+
+  it.each<[string, (r: GateCheckResponse) => unknown]>([
+    ['decision が ALLOW でない', (r) => ({ ...r, outcome: { decision: 'PENDING_APPROVAL', requestId: 'req-d2', riskLevel: 'HIGH', consumedRequestId: 'req-d2' } })],
+    ['continuationPolicy が continue でない', (r) => ({ ...r, continuationPolicy: 'continue_safe_work_only' })],
+  ])('%s → 受理して resolvePolicy に渡す（そこで re_check approval_contract_violation。failed にしない）', async (_label, mutate) => {
+    mockFetch.mockResolvedValueOnce(makeJsonResponse(mutate(coherent())))
+    const result = await callGateCheck(makeGateCheckParams())
+    expect(result.nextAction.action).toBe('call_consume')
   })
 })

@@ -334,6 +334,8 @@ export type ConsumeApprovalForJobResult =
         | 'JOB_NOT_FOUND'
         | 'JOB_NOT_UNIQUE'
         | 'JOB_MISMATCH'
+        | 'JOB_NOT_RUNNING'
+        | 'APPROVAL_ACTOR_NOT_HUMAN'
       reason: string
       approvalRequest?: ApprovalRequest
       linkedJobId?: string
@@ -353,9 +355,11 @@ export type ConsumeApprovalForCommandJobResult =
         | 'JOB_NOT_FOUND'
         | 'TASK_MISMATCH'
         | 'ACTION_MISMATCH'
+        | 'JOB_NOT_RUNNING'
         | 'STATUS_CONFLICT'
         | 'EXPIRED'
         | 'STALE'
+        | 'APPROVAL_ACTOR_NOT_HUMAN'
       reason: string
       approvalRequest?: ApprovalRequest
     }
