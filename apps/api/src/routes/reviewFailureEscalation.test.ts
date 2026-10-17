@@ -291,7 +291,7 @@ describe('review-failure-escalation gap', () => {
 
       const res = await app.inject({
         method: 'PATCH', url: `/api/jobs/${review.id}`,
-        payload: { status: 'success', exitCode: 0 },
+        payload: withOutbox({ status: 'success', exitCode: 0 }, 'event-review-success-without-result'),
       })
 
       expect(res.statusCode).toBe(200)
@@ -369,11 +369,11 @@ describe('review-failure-escalation gap', () => {
 
       const res = await app.inject({
         method: 'PATCH', url: `/api/jobs/${review.id}`,
-        payload: {
+        payload: withOutbox({
           status: 'success',
           exitCode: 0,
           reviewResult: { status: 'approved', summary: 'ok', findings: [] },
-        },
+        }, 'event-review-approved'),
       })
 
       expect(res.statusCode).toBe(200)
@@ -396,14 +396,14 @@ describe('review-failure-escalation gap', () => {
 
       const res = await app.inject({
         method: 'PATCH', url: `/api/jobs/${review.id}`,
-        payload: {
+        payload: withOutbox({
           status: 'success',
           exitCode: 0,
           reviewResult: {
             status: 'changes_requested', summary: 'fix the format',
             findings: [{ severity: 'high', file: 'test.js', line: 1, message: 'wrong format', rule: 'acceptanceCriteria[0]' }],
           },
-        },
+        }, 'event-review-changes-requested'),
       })
 
       expect(res.statusCode).toBe(200)

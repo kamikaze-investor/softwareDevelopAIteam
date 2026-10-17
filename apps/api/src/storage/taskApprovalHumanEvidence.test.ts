@@ -110,6 +110,39 @@ describe('Task 単位の承認は approval_actor = human でだけ authority に
     expect(() => storage.approvalRequests.recordDecision(id, 'APPROVED', undefined, undefined as never)).toThrow(/decidedBy/)
     expect(storage.approvalRequests.findById(id)?.status).toBe('WAITING_FOR_USER')
   })
+
+  // lifecycle repair final（P3）: 期限切れの WAITING を transaction の中で読み直して決定しない。
+  it.each(['APPROVED', 'REJECTED'] as const)('期限切れの WAITING を %s にしない（EXPIRED へ進め、actor 証拠も書かない）', (decision) => {
+    const storage = createSQLiteStorage(':memory:')
+    const { taskId } = seedTask(storage, false)
+    const id = storage.approvalRequests.create({
+      taskId, requestedAction: 'abort_task', riskLevel: 'HIGH', targetBranch: 'b', targetCommit: 'c', targetDiffHash: 'd',
+      changedFiles: [], triggeredRules: [], invalidIf: [], status: 'WAITING_FOR_USER',
+      expiresAt: new Date(Date.now() - 1000).toISOString(),
+    } as Parameters<IStorage['approvalRequests']['create']>[0]).id
+
+    const result = storage.approvalRequests.recordDecision(id, decision, undefined, { credentialClass: 'admin' })
+
+    expect(result).toMatchObject({ ok: false, code: 'EXPIRED', approvalRequest: { status: 'EXPIRED' } })
+    expect(storage.approvalRequests.findById(id)?.status).toBe('EXPIRED')
+    expect(storage.auditLog.findByEntity('approval_request', id)
+      .some((entry) => entry.operation === 'approval_actor')).toBe(false)
+    expect(storage.approvalRequests.verifyAndConsumeForTaskAction({
+      taskId, approvalRequestId: id, expectedAction: 'abort_task',
+    })).toMatchObject({ ok: false })
+  })
+
+  it('決定済みの行は決定し直さない（STATUS_CONFLICT・行は変わらない）', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const { taskId } = seedTask(storage, false)
+    const id = request(storage, taskId, 'abort_task')
+    expect(storage.approvalRequests.recordDecision(id, 'REJECTED', undefined, { credentialClass: 'admin' }))
+      .toMatchObject({ ok: true, approvalRequest: { status: 'REJECTED' } })
+
+    expect(storage.approvalRequests.recordDecision(id, 'APPROVED', undefined, { credentialClass: 'admin' }))
+      .toMatchObject({ ok: false, code: 'STATUS_CONFLICT' })
+    expect(storage.approvalRequests.findById(id)?.status).toBe('REJECTED')
+  })
 })
 
 describe('live WAITING の Task 単位 request も resume / recover の規則に乗る', () => {
