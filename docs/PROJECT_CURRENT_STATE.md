@@ -367,6 +367,19 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Remediation の試行受付が原子的でない（複数 API プロセス前提でのみ問題になる）**（state: planned）
 - **System One Decision Layer の一般化（Principle 以外の Question category / 外部 Decision Engine 評価）**（state: deferred）
 - **Lifecycle 横断監査（RC1〜RC6）と一括修復 W1〜W7: 同じ意味を経路ごとに別の表現・述語で判定していた**（state: in_progress）
+- **Approval の consume と `git commit` の間でクラッシュすると、復旧が repair（新しい Approval 要求）にしか無い**（state: deferred）
+- **M1: HIGH の技術的 git_commit を、強化した Safety Evidence（ベンダー分離の独立レビュー）で通す**（state: deferred）
+- **M2: `RISK_RULES` の部分文字列一致が誤検知する（authorBadge / tokenizer / dropdown / guardian）**（state: deferred）
+- **M3: DA trigger 3/4/5 の決定論的検出（新規依存・外部サービス、新規 public route、不可逆 migration）**（state: deferred）
+- **M4: Approval consume の不変条件が足りない**（state: deferred）
+- **M5: commit 直前に branch を再確認し、resulting-commit binding が失敗したら Task を完了させない**（state: deferred）
+- **M6: `blockedTriage` の残りの rule を技術制約 lane へ移し、「技術的・自動再開なし・CEO 判断なし」の PL lane を足す**（state: deferred）
+- **M8: レビュー不一致・安全方向の判定不能・Meta Review UNCERTAIN だけを理由に CEO へ回してよいか（state: deferred）
+- **Promotion 済みの roadmap id を `planned` に戻すと、恒久的に「promotion 待ち」のままになる**（state: deferred）
+- **Candidate HEAD が動いた後の WAITING git_commit Approval が、CEO の承認後にしか stale と分からない（1回のタップが3回になる）**（state: deferred）
+- **Escalation の cleanup は escalate した Job 自身の manifest だけを戻し、以前の repair attempt の汚れは blocked owner に残る**（state: deferred）
+- **HIGH の git_commit が block されても Worker 側の alert が出ない**（state: deferred）
+- **dirty baseline を持つ blocked 行（例: reject された git_commit）の手動 abort が完了しない**（state: deferred）
 
 詳細は `tasks/roadmap.md`「スマホ操作MVP残タスク」を参照。
 <!-- AUTO-GENERATED:ROADMAP_CURRENT_STATE:END -->
