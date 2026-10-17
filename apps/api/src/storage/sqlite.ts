@@ -62,6 +62,8 @@ import {
 } from '../gitCommitResumeLineage'
 import { resolveLinkedGitCommitRejection } from '../linkedGitCommitRejection'
 import { readJobsSupersededByHumanResume } from '../designReview/resumeActor'
+import { blockedJobsReconcileRefusalReason, findBlockedJobsPreventingReconcile } from '../reconcile/externalCompletion'
+import { findBlockedRowsHoldingWorkspace } from '../state/blockedRowOwnership'
 
 export class SingleRunningProjectError extends Error {
   constructor() {
@@ -666,13 +668,32 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   let storage: IStorage
 
   /**
+   * その Task の blocked 行が、観測なしで workspace 所有者と確定するか。
+   *
+   * **claim guard（`jobs.update` queued→running）・`activeLifecycleKindsOf`・systemState の
+   * `workspace_held_by_stalled_owner` はすべてこの意味を使う**（ownership を自前で書き直さない）。
+   * 実体は `findBlockedRowsHoldingWorkspace()`（`state/blockedRowOwnership.ts`）: shared の
+   * `holdsWorkspaceWhenBlocked()` に park 状態を渡し、Human Resume で後継が作られた旧行を
+   * quarantine でない場合だけ除く（quarantine が優先。Worker と同じ）。
+   *
+   * done / park された Task に残った非 quarantine の blocked 行（`isStaleBlockedJobCandidate`）は
+   * ここでは所有者にしない。それは「所有していない」ではなく「観測しないと決められない」であり、
+   * 観測は Worker（clean worktree・HEAD 解決可能・git 操作なしを確認して初めて解放）と、
+   * 次の initial implement の `computeWorkspaceBaseline` admission（dirty なら fail-closed）が担う。
+   * API がここで所有者と数えると、Worker が解放した後も claim が永久に止まり、出口が無い
+   * （done Task は abort / resume / archive のどれも通らない）。2026-09-17 の abort 事故と同じ構図。
+   */
+  function taskHoldsWorkspaceViaBlockedRow(taskId: string): boolean {
+    const task = tasks.findById(taskId)
+    if (!task) return false
+    return findBlockedRowsHoldingWorkspace(storage, task, jobs.findByTaskId(taskId)).length > 0
+  }
+
+  /**
    * Project を放棄すると所有者が見えなくなる lifecycle の種類。
    *
-   * blocked Job は Human Resume で後継が作られた旧行だけを superseded として除く
-   * （`readJobsSupersededByHumanResume`。attention と同じ reader を使い、ここで再実装しない）。
-   * done な Task に残る blocked 行も除かない。Worker はその行を、worktree が clean・git 操作なし・
-   * HEAD 解決可能と**観測できるまで**所有者として扱い（`isStaleBlockedJobCandidate` の契約）、
-   * その観測は API 側に永続化されていない。証明が無い以上、所有者として数える（fail-closed）。
+   * blocked Job が所有者かは claim guard・systemState と同じ `taskHoldsWorkspaceViaBlockedRow()`
+   * （shared の `holdsWorkspaceWhenBlocked` + Human Resume superseded 除外）で決める。
    * Project は Job の自己申告（`jobs.project_id`）ではなく Task の `project_id` から引く。
    */
   function activeLifecycleKindsOf(projectId: string): ProjectActiveLifecycleKind[] {
@@ -687,12 +708,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       "SELECT DISTINCT j.task_id AS task_id FROM jobs j JOIN tasks t ON t.id = j.task_id "
       + "WHERE t.project_id = ? AND j.status = 'blocked'",
     ).all(projectId) as Array<{ task_id: string }>).map((row) => row.task_id)
-    const hasBlockedOwner = blockedTaskIds.some((taskId) => {
-      const taskJobs = jobs.findByTaskId(taskId)
-      const superseded = readJobsSupersededByHumanResume(storage, taskJobs)
-      return taskJobs.some((job) => job.status === 'blocked' && !superseded.has(job.id))
-    })
-    if (hasBlockedOwner) kinds.push('blocked_job')
+    if (blockedTaskIds.some(taskHoldsWorkspaceViaBlockedRow)) kinds.push('blocked_job')
 
     const repairRun = db.prepare(
       "SELECT r.id FROM design_review_runs r JOIN tasks t ON t.id = r.task_id "
@@ -706,9 +722,10 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   /**
    * git_commit の完了が worktree の clean を証明したときだけ、同じ Task に残った blocked 行を終端化する。
    *
-   * 残すと done な Task の blocked 行になり、Worker はそれを clean と観測するまで所有者として扱い、
-   * API の claim guard も解放の証明が無いため所有者として数える。done Task の行には自動の出口が
-   * 無いので（`abort_task` は done Task を拒否する）、**作らないことで防ぐ**（lifecycle repair W5）。
+   * 残すと done な Task の blocked 行になり、Worker はそれを clean と観測するまで所有者として扱う。
+   * done Task の行には人が解く出口が無いので（`abort_task` も resume も done Task を拒否する）、
+   * **作らないことで防ぐ**（lifecycle repair W5）。終端化した Job に紐づく actionable な承認
+   * （WAITING_FOR_USER / APPROVED）は同じ transaction で SUPERSEDED にする（resume の終端化と同じ）。
    *
    * 証明は committing Job が報告した `workspaceEndFingerprint` が committed HEAD で `clean` であること。
    * 欠落・dirty・HEAD 不一致なら何もしない（fail-closed）。quarantine 行と Human Resume に
@@ -738,6 +755,16 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         result: 'failed',
         detail: `reason=clean_completion committing_job_id=${committing.id} commit=${committing.commitHash}`,
       })
+      if (job.approvalId !== undefined && supersedeApprovalOfTerminalJob(db, job.approvalId, job.taskId)) {
+        auditLog.record({
+          actor: 'api',
+          operation: 'supersede',
+          entityType: 'approval_request',
+          entityId: job.approvalId,
+          result: 'success',
+          detail: `reason=linked_job_terminal source_job_id=${job.id} mode=clean_completion committing_job_id=${committing.id}`,
+        })
+      }
     }
   }
 
@@ -890,7 +917,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       const taskRow = db.prepare('SELECT * FROM tasks WHERE id = ?').get(job.taskId) as any
       if (!taskRow) continue
       const task = deserializeTask(taskRow)
-      if (holdsWorkspaceWhenBlocked(task, job)) return { job, task }
+      if (holdsWorkspaceWhenBlocked({ status: task.status, parked: isParkedTaskId(task.id) }, job)) return { job, task }
       // ここへ来るのは stale 候補だけ。証明の及ぶ workspace のものだけを見逃す。
       //
       // **どちらかの workingDir が読めなければ「同じ workspace だ」と言えない。**
@@ -995,7 +1022,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       if (
         job.status === 'queued'
         || job.status === 'running'
-        || holdsWorkspaceWhenBlocked(task, job)
+        || holdsWorkspaceWhenBlocked({ status: task.status, parked: isParkedTaskId(task.id) }, job)
         || occupiesProject(task)
       ) return { job, task }
     }
@@ -2191,12 +2218,12 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         // ここは claim の単一の choke point（IMMEDIATE transaction 内）なので、同じ意味
         // （`isLiveWorkspaceOwnerJob`。Worker と共有）で archived 以外の全 Project を再確認する。
         //
-        // **un-superseded な blocked 行も所有者として数える。** blocked は running からだけでなく
+        // **workspace を所有する blocked 行も所有者として数える。** blocked は running からだけでなく
         // queued からも起こる（`jobResultApplicationPolicy` は queued → blocked を許し、開始前の
         // 拒否は blocked + quarantine へ変換される）ので、claim の直列化だけでは防げない。
-        // Human Resume で後継が作られた旧行は既存 reader（`readJobsSupersededByHumanResume`）で除く
-        // （resume が終端化した source は既に failed）。done な Task に残った blocked 行も除かない:
-        // 解放の証明は Worker の worktree 観測だけで、API 側には永続化されていない（fail-closed）。
+        // 判定は `taskHoldsWorkspaceViaBlockedRow()`（shared `holdsWorkspaceWhenBlocked` +
+        // Human Resume superseded 除外）。done な Task の stale 候補は Worker の worktree 観測と
+        // baseline admission に任せる（ここで数えると Worker の解放後も claim が永久に止まる）。
         const otherOwnerRows = db.prepare(
           "SELECT j.task_id AS task_id, j.status AS status, j.workflow_step_key AS workflow_step_key "
           + 'FROM jobs j JOIN tasks t ON t.id = j.task_id JOIN projects p ON p.id = t.project_id '
@@ -2211,12 +2238,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         const blockedTaskIds = [...new Set(otherOwnerRows
           .filter((row) => row.status === 'blocked')
           .map((row) => row.task_id))]
-        const hasBlockedOwner = blockedTaskIds.some((taskId) => {
-          const taskJobs = jobs.findByTaskId(taskId)
-          const superseded = readJobsSupersededByHumanResume(storage, taskJobs)
-          return taskJobs.some((job) => job.status === 'blocked' && !superseded.has(job.id))
-        })
-        if (hasBlockedOwner) {
+        if (blockedTaskIds.some(taskHoldsWorkspaceViaBlockedRow)) {
           return existing
         }
       }
@@ -2376,6 +2398,12 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         const source = jobs.findById(input.sourceJobId)
         if (!source || source.taskId !== task.id) {
           return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Source Job not found for this Task' }
+        }
+        // **blocked Job が残る Task は done にしない。** done Task の blocked 行には出口が無く、
+        // 取り込みには clean worktree の証拠も無いので終端化もしない（先に resume / abort_task）。
+        const blocked = findBlockedJobsPreventingReconcile(storage, task.id)
+        if (blocked.length > 0) {
+          return { ok: false, code: 'TASK_HAS_BLOCKED_JOBS', reason: blockedJobsReconcileRefusalReason(blocked) }
         }
 
         // **Candidate commit と同じ遷移を共有する。** ここに別の完了ロジックは無い。

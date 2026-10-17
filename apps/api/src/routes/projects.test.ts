@@ -612,12 +612,26 @@ describe('Project API', () => {
       })
     })
 
-    it('a blocked row left on a done Task still blocks archive: release is only proven by a Worker observation', async () => {
-      // Worker はこの行を、worktree clean / git 操作なし / HEAD 解決可能と観測するまで所有者として扱う。
-      // その観測は API 側に永続化されていないので、done を理由に履歴とはみなさない（fail-closed）。
+    // lifecycle repair C2: 所有者の判定は claim guard と同じ shared `holdsWorkspaceWhenBlocked`。
+    // done な Task の非 quarantine blocked 行は stale 候補で、解放は Worker の worktree 観測、
+    // dirty の保護は次の initial implement の baseline admission が担う。ここで拒否し続けると
+    // done Task は abort / resume もできないので、Project を畳む出口が無くなる。
+    it('a legacy (non-quarantined) blocked row on a done Task does not block archive', async () => {
       await withApp(async (app) => {
         const project = await createProject(app, { status: 'paused' })
         await createProjectJob(project.id, 'blocked', 'done')
+
+        const res = await patchStatus(app, project.id, 'archived')
+
+        expect(res.statusCode).toBe(200)
+      })
+    })
+
+    it('a quarantined blocked row on a done Task still blocks archive', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app, { status: 'paused' })
+        const { jobId } = await createProjectJob(project.id, 'blocked', 'done')
+        ;(await storageOf()).jobs.update(jobId, { failureMetadata: { quarantined: true, quarantineReason: 'unverified' } })
 
         const res = await patchStatus(app, project.id, 'archived')
 

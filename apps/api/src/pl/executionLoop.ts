@@ -174,6 +174,10 @@ const ACTIONABLE_ATTENTION_KINDS: readonly AttentionItem['kind'][] = [
   // 共有 workspace を握り、running Project の claim が止まっている。**通知だけ**する。
   // 解消（Project の再開・放棄、既存 abort_task の観測による解放）は CEO の判断（lifecycle repair W5）。
   'workspace_held_by_stalled_owner',
+  // running Project の queued Job が閾値を過ぎても claim されず、他の attention も説明していない。
+  // **通知だけ**する（Worker の停止・所有権 ambiguous を PL は直せない）。referenceId = Job id なので
+  // 同じ Job は1回だけ届く（lifecycle repair C2 / RC5）。
+  'job_queued_long',
   // blocked は notify-only にしない。blocked reason を読んで sanctioned な復旧を選ばせる
   // （CEO 指示・2026-09-15）。executor が無い・判断不能なら fail-closed で Escalation へ倒れる。
   'job_blocked',
@@ -202,6 +206,7 @@ const ATTENTION_PRIORITY: readonly AttentionItem['kind'][] = [
   // quarantine も人の判断（観測と再受け入れ）だけが解く。1回だけ CEO へ届ける。
   'workspace_quarantined',
   'workspace_held_by_stalled_owner',
+  'job_queued_long',
   // blocked は workflow を止めているので早く見る。
   // **`ACTIONABLE_ATTENTION_KINDS` に入れてもここに無ければ永久に選ばれない**（selectTarget が
   // この順序を走査するため）。両方に入れること。
@@ -391,6 +396,8 @@ const NOTIFY_ONLY_ATTENTION_KINDS: readonly AttentionItem['kind'][] = [
   'workspace_quarantined',
   // 進まない所有者が workspace を握っている。PL には Project の再開・放棄も stale 行の解放もできない。
   'workspace_held_by_stalled_owner',
+  // claim されない queued Job。PL には Worker の再起動も所有権の観測もできない。
+  'job_queued_long',
 ]
 
 /**
@@ -1753,6 +1760,7 @@ async function handleTarget(
     && item.taskId !== undefined
     && item.kind !== 'workspace_quarantined'
     && item.kind !== 'workspace_held_by_stalled_owner'
+    && item.kind !== 'job_queued_long'
   ) {
     const abort = requestTechnicalAbort(storage, {
       taskId: item.taskId,
