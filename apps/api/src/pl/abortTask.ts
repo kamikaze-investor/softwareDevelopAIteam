@@ -1116,6 +1116,12 @@ function hasTaskEscalation(storage: IStorage, taskId: string, taskJobs: readonly
   for (const approval of storage.approvalRequests.findByTaskId(taskId)) {
     targetKeys.add(`approval_waiting:${approval.id}`)
   }
+  // Design Review の attention は run 単位の referenceId を持つ（同じ Task の2回目の episode を
+  // 別対象にするため）。上の `${kind}:${taskId}` は referenceId 導入前に書かれた audit 用に残す。
+  for (const run of storage.designReviewRuns.findByTaskId(taskId)) {
+    targetKeys.add(`design_review_failed:${run.id}`)
+    targetKeys.add(`design_review_idle:${run.id}`)
+  }
 
   const recoveryIds = storage.auditLog
     .findByEntity('task', taskId)

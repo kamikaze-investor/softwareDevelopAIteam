@@ -146,12 +146,39 @@ export function technicalRecoveryTargetKey(item: TechnicalRecoveryTarget): strin
   return `${item.kind}:${subject}`
 }
 
+/** 同一性キーを Task 単位から run 単位（referenceId = run.id）へ移した attention kind。 */
+const RUN_SCOPED_DESIGN_REVIEW_KINDS = ['design_review_failed', 'design_review_idle'] as const
+
+/**
+ * PL ループ対象キーの audit 行（新しい順）。**exact-key の lookup はすべてここを通す。**
+ *
+ * `design_review_failed` / `design_review_idle` のキーは `<kind>:<taskId>` から
+ * `<kind>:<runId>` へ移った。移行前に `<kind>:<taskId>` で書かれた escalation・試行・
+ * exhaustion を捨てると、既に CEO へ上げた / budget を使い切った run が再び動き出す。
+ * そこで legacy 行は、**その行が書かれた時点で run が既に存在していた**
+ * （`run.createdAt <= row.createdAt`）ときだけ、その run の履歴として数える。
+ * それより後に作られた run（同じ Task の新しい episode）は新しい同一性から始まる。
+ */
+export function findPlTargetAuditEntries(storage: IStorage, targetKey: string): AuditLogEntry[] {
+  const entries = storage.auditLog.findByEntity('pl_loop_target', targetKey)
+  const separator = targetKey.indexOf(':')
+  const kind = targetKey.slice(0, separator)
+  if (separator < 0 || !(RUN_SCOPED_DESIGN_REVIEW_KINDS as readonly string[]).includes(kind)) return entries
+
+  const run = storage.designReviewRuns.findById(targetKey.slice(separator + 1))
+  if (run?.taskId === undefined) return entries
+  const legacy = storage.auditLog
+    .findByEntity('pl_loop_target', `${kind}:${run.taskId}`)
+    .filter((entry) => run.createdAt <= entry.createdAt)
+  if (legacy.length === 0) return entries
+  return [...entries, ...legacy].sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+}
+
 /** Only target-wide exhaustion is projected here; the per-Task cap removes resume_task alone. */
 export function isTechnicalRecoveryTargetExhausted(
   storage: IStorage,
   item: TechnicalRecoveryTarget,
 ): boolean {
-  return storage.auditLog
-    .findByEntity('pl_loop_target', technicalRecoveryTargetKey(item))
+  return findPlTargetAuditEntries(storage, technicalRecoveryTargetKey(item))
     .some((entry) => entry.operation === 'pl_loop' && entry.result === 'technical_exhausted')
 }

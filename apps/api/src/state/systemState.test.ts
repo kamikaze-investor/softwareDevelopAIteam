@@ -3,6 +3,7 @@ import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import { buildSystemState } from './systemState'
 import { triageBlocked } from '../pl/blockedTriage'
+import { technicalRecoveryTargetKey } from '../pl/technicalResumePolicy'
 
 const NOW = '2026-09-14T10:00:00.000Z'
 const now = () => NOW
@@ -442,6 +443,46 @@ describe('buildSystemState — 終端した Design Review も観測できる（p
     expect(state.attention.some((a) => a.kind === 'design_review_failed')).toBe(false)
     expect(state.attention.some((a) => a.kind === 'design_review_idle')).toBe(false)
     expect(state.projects[0].designReview?.status).toBe('succeeded')
+  })
+
+  // 同じ Task の2回目の Design Review episode を1回目と同一視すると、1回目の escalation 済み・
+  // budget 消費済みの記録が2回目を黙らせる（2026-10-16 production・Task `b8d0fc5d`）。
+  it('同じ Task の2つの Design Review 失敗 episode は別の dedup key になる', () => {
+    const { storage, projectId } = seed()
+    const task = addTask(storage, projectId)
+    const createRun = (): string => storage.designReviewRuns.create({
+      reviewKind: 'task',
+      subjectId: task.id,
+      taskId: task.id,
+      designText: 'd',
+      designTextHash: 'h',
+      taskTitle: 'T',
+      changedFiles: [],
+    }).id
+    const failRun = (): string => {
+      const runId = createRun()
+      const claimed = storage.designReviewRuns.claim(runId, 3)
+      storage.designReviewRuns.complete(runId, claimed.run!.claimToken!, 'failed', undefined, 'boom')
+      return runId
+    }
+    const keyOf = (kind: string): string => {
+      const item = buildSystemState(storage, { now }).attention.find((a) => a.kind === kind)
+      if (item === undefined) throw new Error(`no ${kind} attention`)
+      return technicalRecoveryTargetKey(item)
+    }
+
+    const firstRunId = failRun()
+    const firstKey = keyOf('design_review_failed')
+    const secondRunId = failRun()
+    const secondKey = keyOf('design_review_failed')
+
+    expect(firstKey).toBe(`design_review_failed:${firstRunId}`)
+    expect(secondKey).toBe(`design_review_failed:${secondRunId}`)
+    expect(secondKey).not.toBe(firstKey)
+
+    // idle も run 単位。
+    const queuedRunId = createRun()
+    expect(keyOf('design_review_idle')).toBe(`design_review_idle:${queuedRunId}`)
   })
 })
 

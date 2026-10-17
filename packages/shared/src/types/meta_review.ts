@@ -204,4 +204,9 @@ export interface DesignReviewEvidence {
   independentReviewRequired: boolean
   independentReviewVerdict?: DesignReviewIndependentVerdict
   createdAt: string
+  /**
+   * この evidence を生んだ Design Review run（`completeWithEvidence` が設定する）。
+   * 手動登録や列追加前の行では undefined で、その場合の失効順序は timestamp 規則になる。
+   */
+  runId?: string
 }

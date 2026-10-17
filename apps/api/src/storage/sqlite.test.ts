@@ -2265,6 +2265,11 @@ describe('SQLiteStorage', () => {
       })
 
       describe('createRepairJobWithHandoff', () => {
+        // handoff は running な Project でしか Job を作らない（transaction 内の再確認）。
+        beforeEach(() => {
+          storage.projects.update(projectId, { status: 'running' })
+        })
+
         function createBlockedSourceJob(): { id: string; previous: Job } {
           const source = storage.jobs.create({
             taskId,
@@ -2316,6 +2321,76 @@ describe('SQLiteStorage', () => {
           expect(repairJob.aiCliPrompt).toBe('reviewed repair prompt')
           // source Job は所有権を持たない状態（failed）へ解放されている
           expect(storage.jobs.findById(sourceJobId)?.status).toBe('failed')
+        })
+
+        // Task / Project 状態の再確認は Job を作る transaction の中で行う（TOCTOU 回避）。
+        // 断るときは Job を作らず、source Job の所有権（blocked）にも触らない。
+        it('refuses inside the transaction when the Project is not running: no Job, source stays blocked', () => {
+          const source = createBlockedSourceJob()
+          storage.projects.update(projectId, { status: 'paused' })
+
+          const result = storage.jobs.createRepairJobWithHandoff(repairJobInput(source.id))
+
+          expect(result).toMatchObject({ ok: false, code: 'PROJECT_NOT_RUNNING' })
+          expect(storage.jobs.findByTaskId(taskId).some((job) => job.workflowStepKey === `repair:${source.id}:1`)).toBe(false)
+          expect(storage.jobs.findById(source.id)?.status).toBe('blocked')
+        })
+
+        it('refuses inside the transaction when the Task is done, but not merely because it is blocked', () => {
+          const source = createBlockedSourceJob()
+          storage.tasks.update(taskId, { status: 'done' })
+          expect(storage.jobs.createRepairJobWithHandoff(repairJobInput(source.id)))
+            .toMatchObject({ ok: false, code: 'TASK_DONE' })
+          expect(storage.jobs.findById(source.id)?.status).toBe('blocked')
+
+          storage.tasks.update(taskId, { status: 'blocked' })
+          expect(storage.jobs.createRepairJobWithHandoff(repairJobInput(source.id)).ok).toBe(true)
+        })
+
+        it('refuses with LINEAGE_MISMATCH when the source Job belongs to another Task of the same Project', () => {
+          const taskB = storage.tasks.create({
+            projectId, title: 'B', description: '', status: 'pending', assignee: 'developer_ai', dependencies: [],
+          })
+          const sourceOfB = storage.jobs.create({
+            taskId: taskB.id,
+            projectId,
+            agentRole: 'developer_ai',
+            status: 'blocked',
+            safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+            aiCliMode: 'implement',
+          })
+
+          // repair 先は Task A（repairJobInput の taskId）、source は Task B の Job。
+          expect(storage.jobs.createRepairJobWithHandoff(repairJobInput(sourceOfB.id)))
+            .toMatchObject({ ok: false, code: 'LINEAGE_MISMATCH' })
+          expect(storage.jobs.findById(sourceOfB.id)?.status).toBe('blocked')
+          expect(storage.jobs.findByTaskId(taskId).some((job) => job.workflowStepKey === `repair:${sourceOfB.id}:1`)).toBe(false)
+        })
+
+        it('refuses with PROJECT_MISMATCH when the repair or source Job names another Project, keeping source ownership', () => {
+          // Task の Project は止まっていて、別 Project が running。呼び出し側の projectId を信じると通ってしまう形。
+          storage.projects.update(projectId, { status: 'paused' })
+          const other = storage.projects.create({ name: 'Other', goal: 'g', designPhilosophy: [], status: 'running' })
+          const source = createBlockedSourceJob()
+          const input = repairJobInput(source.id)
+
+          expect(storage.jobs.createRepairJobWithHandoff({ ...input, repairJob: { ...input.repairJob, projectId: other.id } }))
+            .toMatchObject({ ok: false, code: 'PROJECT_MISMATCH' })
+          expect(storage.jobs.findById(source.id)?.status).toBe('blocked')
+
+          // source Job が別 Project を名指す場合も同じ。
+          const foreignSource = storage.jobs.create({
+            taskId,
+            projectId: other.id,
+            agentRole: 'developer_ai',
+            status: 'blocked',
+            safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+            aiCliMode: 'implement',
+          })
+          expect(storage.jobs.createRepairJobWithHandoff(repairJobInput(foreignSource.id)))
+            .toMatchObject({ ok: false, code: 'PROJECT_MISMATCH' })
+          expect(storage.jobs.findById(foreignSource.id)?.status).toBe('blocked')
+          expect(storage.jobs.findByTaskId(taskId).some((job) => job.workflowStepKey?.startsWith('repair:'))).toBe(false)
         })
 
         it('transaction rolls back on successor creation failure, source Job REMAINS blocked (ownership retained)', () => {
@@ -2960,6 +3035,66 @@ describe('SQLiteStorage', () => {
         db.pragma("index_info('ux_design_review_runs_subject_active')") as Array<{ name: string }>
       )).map((column) => column.name)
       expect(indexedColumns).toEqual(['review_kind', 'subject_id'])
+    })
+  })
+
+  describe('design_review_evidence.run_id migration', () => {
+    const runIdColumn = (dbPath: string): { name: string; notnull: number; dflt_value: unknown } | undefined =>
+      readDatabase(dbPath, (db) => (
+        db.pragma('table_info(design_review_evidence)') as Array<{ name: string; notnull: number; dflt_value: unknown }>
+      )).find((column) => column.name === 'run_id')
+
+    it('pre-subject legacy DB: rebuild keeps run_id, legacy rows stay NULL, new evidence is run-bound', () => {
+      const dbPath = path.join(os.tmpdir(), `ai-team-evidence-run-id-legacy-${randomUUID()}.db`)
+      const before = createLegacyDesignReviewDatabase(dbPath)
+      const storage = createSQLiteStorage(dbPath)
+
+      expect(runIdColumn(dbPath)).toMatchObject({ notnull: 0, dflt_value: null })
+      for (const row of before.evidenceRows) {
+        expect(storage.designReviewEvidence.findById(row.id)?.runId).toBeUndefined()
+      }
+
+      // legacy fixture の Task には active run があるので、別の Task で新しい evidence を作る。
+      const taskId = storage.tasks.create({
+        projectId: 'project-legacy', title: 'after migration', description: '', status: 'pending',
+        assignee: 'developer_ai', dependencies: [],
+      } as Parameters<IStorage['tasks']['create']>[0]).id
+      const run = storage.designReviewRuns.create({
+        taskId, taskTitle: 't', designText: 'migrated design', designTextHash: 'hash-migrated', changedFiles: [],
+      })
+      const claimed = storage.designReviewRuns.claim(run.id, 3)
+      const evidence = storage.designReviewRuns.completeWithEvidence(run.id, claimed.claimToken!, '{}', {
+        reviewKind: 'task', subjectId: taskId, taskId, designTextHash: 'hash-migrated',
+        reviewLoad: 'low', decision: 'ALIGNED', independentReviewRequired: false,
+      } as never)
+      expect(evidence?.runId).toBe(run.id)
+      expect(storage.designReviewEvidence.findById(evidence!.id)?.runId).toBe(run.id)
+    })
+
+    it('post-subject DB without run_id: the column is added idempotently and existing rows stay NULL', () => {
+      const dbPath = path.join(os.tmpdir(), `ai-team-evidence-run-id-existing-${randomUUID()}.db`)
+      createSQLiteStorage(dbPath)
+      // 列追加前の schema を再現する（列を落とし、既存行を1件置く）。
+      const db = new Database(dbPath)
+      try {
+        db.exec('ALTER TABLE design_review_evidence DROP COLUMN run_id')
+        db.prepare(`
+          INSERT INTO design_review_evidence
+            (id, review_kind, subject_id, task_id, design_text_hash, review_load, decision,
+             independent_review_required, independent_review_verdict, created_at)
+          VALUES ('evidence-before-run-id', 'roadmap', 'project-x', NULL, 'h', 'critical', 'ALIGNED', 0, NULL,
+                  '2026-10-16T09:00:00.000Z')
+        `).run()
+      } finally {
+        db.close()
+      }
+      expect(runIdColumn(dbPath)).toBeUndefined()
+
+      const storage = createSQLiteStorage(dbPath)
+      createSQLiteStorage(dbPath)
+
+      expect(runIdColumn(dbPath)).toMatchObject({ notnull: 0 })
+      expect(storage.designReviewEvidence.findById('evidence-before-run-id')?.runId).toBeUndefined()
     })
   })
 
