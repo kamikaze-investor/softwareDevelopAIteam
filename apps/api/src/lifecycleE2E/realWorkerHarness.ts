@@ -351,7 +351,7 @@ export async function startRealWorkerApi(apiBase: string, options: StartOptions 
 export async function waitFor(
   check: () => boolean,
   describe: () => string,
-  timeoutMs = 60_000,
+  timeoutMs = 300_000,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {

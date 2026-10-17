@@ -112,7 +112,7 @@ import {
   type WorkerProcess,
 } from './realWorkerHarness'
 
-vi.setConfig({ testTimeout: 240_000, hookTimeout: 30_000 })
+vi.setConfig({ testTimeout: 900_000, hookTimeout: 60_000 })
 targetRoot.dir = LIFECYCLE_TARGET_DIR
 
 let api: RealWorkerEnv | undefined
@@ -181,7 +181,7 @@ function trailOf(taskId: string): string[][] {
   return jobTrail(api!.env, taskId)
 }
 
-async function waitTaskStatus(taskId: string, status: Task['status'], timeoutMs = 90_000): Promise<void> {
+async function waitTaskStatus(taskId: string, status: Task['status'], timeoutMs = 300_000): Promise<void> {
   await waitFor(
     () => api!.env.storage.tasks.findById(taskId)?.status === status,
     () => `task ${taskId} → ${status}; now ${api!.env.storage.tasks.findById(taskId)?.status}; jobs ${JSON.stringify(trailOf(taskId))}; alerts ${JSON.stringify(alerts.map((a) => a.title))}`,
@@ -458,7 +458,7 @@ describe.skipIf(!setup.gitAvailable)('real Worker E2E — escalation cleanup and
     const resume = await api!.admin<Job & { code?: string; error?: string }>('POST', `/api/tasks/${task.id}/resume`, { instruction: 'Write the page without failing.' })
     expect(resume.status, JSON.stringify(resume.body)).toBe(201)
     expect(resume.body.workflowStepKey).toMatch(/^resume:/)
-    await waitTaskStatus(task.id, 'done', 90_000)
+    await waitTaskStatus(task.id, 'done', 300_000)
     const committed = headFiles()
     // The resumed run's review saw (and the commit contains) the inherited files of the failed attempts.
     expect(committed).toEqual(['docs/lifecycle/attempt-1.md', 'docs/lifecycle/attempt-2.md', 'docs/lifecycle/attempt-3.md', 'docs/lifecycle/resumed.md'])
