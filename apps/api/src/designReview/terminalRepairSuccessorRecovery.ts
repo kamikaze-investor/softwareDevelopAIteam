@@ -45,6 +45,7 @@ import {
 } from './repairFlow'
 import { repairStepKeyFor } from './repairPolicy'
 import type { DesignReviewRun, IStorage } from '../storage/interface'
+import { isUsableAlignedEvidence } from '../designReviewEvidencePolicy'
 
 export interface TerminalRepairSuccessorRecoverySummary {
   /** 走査した候補 run の件数（`findTerminalRepairPurposeRuns()` の返り値）。 */
@@ -93,10 +94,13 @@ function runItselfAligned(run: DesignReviewRun): boolean {
  */
 function hasMatchingAlignedEvidence(storage: IStorage, run: DesignReviewRun): boolean {
   if (run.taskId === undefined) return false
+  // ALIGNED であるだけでは足りない。同じ設計の新しい run（active / CONFLICT・UNCERTAIN）に
+  // 覆された evidence は使えない（designReviewEvidencePolicy の単一の規則・独立レビュー round 9）。
   return storage.designReviewEvidence
     .findByTaskId(run.taskId)
     .some((evidence) =>
-      evidence.decision === 'ALIGNED' && evidence.designTextHash === run.designTextHash)
+      evidence.designTextHash === run.designTextHash
+      && isUsableAlignedEvidence(evidence, storage.designReviewEvidence))
 }
 
 /**

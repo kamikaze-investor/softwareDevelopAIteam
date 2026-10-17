@@ -30,9 +30,9 @@ import {
   type DesignReviewKind,
 } from '@ai-team/shared'
 import { resolveDefaultControlContextDir } from '@ai-team/shared/src/constitutionPrinciples.js'
-import type { IStorage, DesignReviewRun } from '../storage/interface'
+import { DesignReviewRunContentionError, type IStorage, type DesignReviewRun } from '../storage/interface'
 import type { AppliedPrinciple } from '@ai-team/shared'
-import { computeDesignTextHash } from '../designReviewEvidencePolicy'
+import { computeDesignTextHash, type StoredRunJudgment } from '../designReviewEvidencePolicy'
 import { recordPrincipleApplications } from '../principles/ledger'
 
 /** bounded attempt。超過したrunはrequeueせずfailedで終端する。 */
@@ -200,6 +200,133 @@ export interface RecomputeOutcome {
   rejectedReason?: string
 }
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * runner の出力が判定材料として読める形（null でも配列でも primitive でもない object）か。
+ * 読めない出力は「判定」ではなく「使える出力が無い」なので、呼び出し側は runner crash と同じく
+ * finalizeFailure で終端する。
+ */
+export function isUsableRunnerOutput(value: unknown): value is RawStrategicResult {
+  return isPlainRecord(value)
+}
+
+/**
+ * payload に有効な CONFLICT 判定が1件でもあるか（構造が崩れていても拾う）。
+ *
+ * 数えるのは integration の CONFLICT と、**要求した focus（expectedFocuses）**の CONFLICT だけ。
+ * 要求していない focus 名の CONFLICT は誰に何を問うた結果か特定できず（旧 runner の架空 focus 等）、
+ * 書き直しても答えようがないので判定として採用しない（従来の構造検証の意図を保つ）。
+ */
+function payloadHasValidConflict(raw: RawStrategicResult, expectedFocuses: readonly string[]): boolean {
+  const isConflict = (value: unknown): boolean => isPlainRecord(value) && value.decision === 'CONFLICT'
+  const isRequestedFocusConflict = (value: unknown): boolean =>
+    isConflict(value) && typeof (value as { focus?: unknown }).focus === 'string'
+      && expectedFocuses.includes((value as { focus: string }).focus)
+  return (Array.isArray(raw.focusedReviewResults) && raw.focusedReviewResults.some(isRequestedFocusConflict))
+    || isConflict(raw.integrationReviewResult)
+}
+
+/** 構造検証で見つかった問題（空なら妥当）。見つかった順に並ぶ。 */
+function structuralProblems(
+  raw: RawStrategicResult,
+  expectedFocuses: readonly string[],
+  integrationReviewRequired: boolean,
+  independentReviewRequired: boolean,
+): string[] {
+  const problems: string[] = []
+
+  if (!isFocusResultArray(raw.focusedReviewResults)) {
+    problems.push('focusedReviewResults has invalid shape')
+  } else {
+    const reportedFocuses = raw.focusedReviewResults.map((item) => item.focus)
+    // low load でも selectFocuses は [] を返すため、例外を設けず常に集合一致を要求する。
+    const focusSetMatches =
+      reportedFocuses.length === expectedFocuses.length &&
+      expectedFocuses.every((focus) => reportedFocuses.includes(focus))
+    if (!focusSetMatches) {
+      problems.push(
+        `focus set mismatch: expected [${expectedFocuses.join(',')}] but runner reported [${reportedFocuses.join(',')}]`,
+      )
+    }
+    // decision 値も enum に対して明示的に検証する。素通りさせると `resolveFinalDecision` は未知値を
+    // UNCERTAIN へ丸めるだけで、「runner が何を返したのか」が evidence から失われる。
+    const invalidDecisions = raw.focusedReviewResults
+      .map((item) => item.decision)
+      .filter((decision) => !isStrategicDecision(decision))
+    if (invalidDecisions.length > 0) {
+      problems.push(`unknown focused review decision(s): ${invalidDecisions.join(', ')}`)
+    }
+  }
+
+  // verdict は reviewerAdapter の定義値のみ受理する。未知の文字列を evidence へ保存すると、
+  // decision は ALIGNED なのに Job Gate（independentReviewVerdict === 'approved'）が恒久的に落ちる。
+  // critical で verdict が無いものは「欠落」であって語彙違いではない（unavailable 側で扱う）。
+  const independent = raw.independentReviewResult
+  if (independent !== undefined && independent !== null) {
+    const verdict = isPlainRecord(independent) ? independent.verdict : undefined
+    const missing = typeof verdict !== 'string'
+    if (!(independentReviewRequired && missing) && !INDEPENDENT_REVIEW_VERDICTS.includes(verdict as never)) {
+      problems.push(`unknown independent review verdict: ${String(verdict)}`)
+    }
+  }
+
+  // roadmap kind では integration review の存在そのものを必須にする（fail-closed）。
+  // `null` は `undefined` と同じく「integration 無し」として扱う（task kind では任意）。
+  const integration = raw.integrationReviewResult
+  const integrationDecision = isPlainRecord(integration) ? integration.decision : undefined
+  if (integrationReviewRequired && typeof integrationDecision !== 'string') {
+    problems.push('roadmap review requires an integration review result')
+  } else if (integration !== undefined && integration !== null && !isStrategicDecision(integrationDecision)) {
+    problems.push(`unknown integration review decision: ${String(integrationDecision)}`)
+  }
+
+  return problems
+}
+
+/**
+ * runner が「review を（一部でも）実行できなかった」ことを示す事実の一覧（空なら無し）。
+ *
+ * `finalDecision: 'REVIEW_UNAVAILABLE'`、focused / integration / independent の `unavailable: true`、
+ * および critical で必須の independent が欠落していること。判定を厳しくする向きにしか使わない。
+ * 先頭が rejectedReason の主文になる（runner の理由 → 各結果の印 → independent の状態の順）。
+ */
+function unavailabilityNotes(raw: RawStrategicResult, independentReviewRequired: boolean): string[] {
+  const notes: string[] = []
+  const marked = (value: unknown): boolean => isPlainRecord(value) && value.unavailable === true
+  const runnerReason = typeof raw.unavailableReason === 'string' && raw.unavailableReason.trim() !== ''
+    ? raw.unavailableReason.trim().slice(0, 500)
+    : undefined
+
+  if (raw.finalDecision === 'REVIEW_UNAVAILABLE') {
+    notes.push(`review unavailable: ${runnerReason ?? 'runner reported REVIEW_UNAVAILABLE without a reason'}`)
+  }
+  if (Array.isArray(raw.focusedReviewResults) && raw.focusedReviewResults.some(marked)) {
+    notes.push('a focused review reported it was unavailable')
+  }
+  if (marked(raw.integrationReviewResult)) {
+    notes.push('the integration review reported it was unavailable')
+  }
+
+  const independent = raw.independentReviewResult
+  const independentMissing = !isPlainRecord(independent) || typeof independent.verdict !== 'string'
+  if (independentReviewRequired && independentMissing) {
+    notes.push('critical review load requires an independent review result')
+  } else if (marked(independent)) {
+    notes.push(independentReviewRequired
+      ? 'critical review load requires an independent review result, but it was unavailable'
+      : 'the independent review reported it was unavailable')
+  }
+
+  // 印が1つでも付いた場合だけ runner の理由を添える（理由の欄だけでは unavailable としない）。
+  if (notes.length > 0 && runnerReason !== undefined && raw.finalDecision !== 'REVIEW_UNAVAILABLE') {
+    notes.unshift(`review unavailable: ${runnerReason}`)
+  }
+  return notes
+}
+
 function isFocusResultArray(value: unknown): value is Array<{ focus: string; decision: string }> {
   return (
     Array.isArray(value) &&
@@ -277,9 +404,17 @@ function buildRoadmapRejectedReason(
  *   - selectedFocuses    … reviewLoad + changedFiles から selectFocuses で再計算
  *   - finalDecision      … resolveFinalDecision + applyIndependentReviewOverride で再計算
  *
- * 構造検証で不採用にするもの:
- *   - 再計算した focus 集合と runner の focusedReviewResults が一致しない場合
- *   - critical なのに independentReviewResult が欠落している場合
+ * **判定は1本の順序付き pipeline で決める（task / roadmap 両 kind・全 load 共通）。**
+ * 分岐ごとに継ぎ足すと「ある load・ある kind だけ CONFLICT が隠れる / unavailable が ALIGNED に
+ * なる」が繰り返し漏れた（独立レビュー round 1〜4・2026-10-16）。不変条件は順序で保証する:
+ *
+ *   A. object でない出力は判定材料にしない（呼び出し側が finalizeFailure へ送る）。
+ *   B. 有効な CONFLICT（integration・要求した focus）があれば CONFLICT（構造の問題・unavailable より先）。
+ *   C. unavailable = finalDecision REVIEW_UNAVAILABLE / 各結果の `unavailable: true` /
+ *      critical で必須の independent の欠落。
+ *   D. 構造検証に落ちたら、unavailable なら REVIEW_UNAVAILABLE、そうでなければ従来どおり UNCERTAIN。
+ *   E. 組み直した判定 + critical の independent override。unavailable で CONFLICT でなければ
+ *      REVIEW_UNAVAILABLE。ALIGNED は上のどれも起きなかったときだけ。
  *
  * 残存リスク（本実装で解消したと主張しないもの）:
  *   各focusのdecision・integrationのdecision・independent reviewのverdict自体は
@@ -304,125 +439,77 @@ export function recomputeDecision(
   // ここで Codex independent を要求し続けると、Worker が作らないものをAPIが求める
   // 恒久的な不整合になり、新topologyは一度も成立しない。
   const independentReviewRequired = reviewKind !== 'roadmap' && reviewLoad === 'critical'
-
   // roadmap kind では integration review の存在そのものを必須にする（fail-closed）。
   // 「Claudeが落ちたので統合を省いて続行」を許すと、単独のGemini群だけで承認が通る。
   const integrationReviewRequired = reviewKind === 'roadmap'
 
-  const reject = (rejectedReason: string): RecomputeOutcome => ({
-    decision: 'UNCERTAIN',
-    reviewLoad,
-    independentReviewRequired,
-    rejectedReason,
-  })
+  // A. 読めない出力（null・配列・primitive）。実行経路は事前に弾いて finalizeFailure へ送るが、
+  //    保存済み結果を読み直す他の呼び出し側のために、ここでも例外にせず不採用で返す。
+  if (!isPlainRecord(raw)) {
+    return { decision: 'UNCERTAIN', reviewLoad, independentReviewRequired, rejectedReason: 'runner output is not an object' }
+  }
 
-  // **review が実行できなかったと runner が明示したら、その authority をそのまま返す。**
-  //
-  // finalDecision は自己申告なので、通常この関数は読まずに判定を組み直す。だが
-  // `REVIEW_UNAVAILABLE` は ALIGNED から**遠ざける向きにしか**働かない（fail-closed）ので、
-  // 受け取ってよい。受け取らずに下の集合一致検査へ流すと、実行されなかった review の
-  // focus 集合が期待と合わず `focus set mismatch` になり、**「実行できなかった」という本当の
-  // 原因が review ロジックの不整合に置き換わる**（2026-09-28 production・run `d0af140a`:
-  // prompt.md の ENOENT が focus set mismatch として escalation された）。
-  //
-  // **期待 focus が空（= low load）の task kind に限る。**
-  //
-  // - focus を選ぶ load（medium 以上）では runner が実在する focus の結果を必ず返すので、
-  //   従来どおり下で組み直す。runner は focus が1件落ちても残りを実行し続けるため、
-  //   「ある focus は CONFLICT・別の focus は unavailable」が起こり得る。ここで早期 return すると
-  //   組み直せば CONFLICT になるはずの結果が REVIEW_UNAVAILABLE に置き換わり、CONFLICT だけを
-  //   対象にする remediation が動かなくなる（medium / high の regression）。
-  // - roadmap kind は integration review の必須性と専用の rejectedReason を持っており、
-  //   本修正の対象外である（挙動を変えない）。
-  if (reviewKind === 'task' && expectedFocuses.length === 0 && raw.finalDecision === 'REVIEW_UNAVAILABLE') {
-    const reason = typeof raw.unavailableReason === 'string' && raw.unavailableReason.trim() !== ''
-      ? raw.unavailableReason.trim().slice(0, 500)
-      : 'runner reported REVIEW_UNAVAILABLE without a reason'
+  const independent = isPlainRecord(raw.independentReviewResult) ? raw.independentReviewResult : undefined
+  const independentVerdict = typeof independent?.verdict === 'string' ? independent.verdict : undefined
+  const problems = structuralProblems(raw, expectedFocuses, integrationReviewRequired, independentReviewRequired)
+  const unavailable = unavailabilityNotes(raw, independentReviewRequired)
+
+  // B. **有効な CONFLICT は何より先に返す。** CONFLICT は ALIGNED から遠ざける向きにしか
+  //    働かないので、構造が崩れていても・review の一部が実行できなくても判定として採用してよい。
+  //    以前は欠落・構造不一致を先に見ていたため、critical の independent 欠落（Task `b8d0fc5d`
+  //    の run `c11357e8`）や unavailable 申告で、本物の CONFLICT が「レビューできなかった」に
+  //    置き換わり、CONFLICT だけを対象にする remediation が動かなかった。
+  if (payloadHasValidConflict(raw, expectedFocuses)) {
+    const notes = [...problems, ...unavailable]
+    const roadmapReason = reviewKind === 'roadmap' ? buildRoadmapRejectedReason(raw, 'CONFLICT') : undefined
     return {
-      decision: 'REVIEW_UNAVAILABLE',
+      decision: 'CONFLICT',
       reviewLoad,
       independentReviewRequired,
-      rejectedReason: `review unavailable: ${reason}`,
+      independentReviewVerdict: independentVerdict,
+      rejectedReason: notes.length === 0
+        ? roadmapReason
+        : `${roadmapReason ?? 'review found a CONFLICT'}; ${notes.join('; ')}`,
     }
   }
 
-  if (!isFocusResultArray(raw.focusedReviewResults)) {
-    return reject('focusedReviewResults has invalid shape')
+  // C/D. 判定無し（unavailable）と構造の不採用。unavailable を先に見るのは、実行されなかった
+  //    review の構造は期待と合わないことがあり、そのまま reject すると本当の原因が
+  //    `focus set mismatch` に置き換わるため（2026-09-28 production・run `d0af140a`:
+  //    prompt.md の ENOENT が focus set mismatch として escalation された）。
+  const unavailableOutcome = (): RecomputeOutcome => ({
+    decision: 'REVIEW_UNAVAILABLE',
+    reviewLoad,
+    independentReviewRequired,
+    independentReviewVerdict: independentVerdict,
+    rejectedReason: unavailable.join('; '),
+  })
+  if (problems.length > 0) {
+    return unavailable.length > 0
+      ? unavailableOutcome()
+      : { decision: 'UNCERTAIN', reviewLoad, independentReviewRequired, rejectedReason: problems.join('; ') }
   }
 
-  const reportedFocuses = raw.focusedReviewResults.map((item) => item.focus)
-  const focusSetMatches =
-    reportedFocuses.length === expectedFocuses.length &&
-    expectedFocuses.every((focus) => reportedFocuses.includes(focus))
-
-  // low load でも selectFocuses は [] を返すため、例外を設けず常に集合一致を要求する。
-  if (!focusSetMatches) {
-    return reject(
-      `focus set mismatch: expected [${expectedFocuses.join(',')}] but runner reported [${reportedFocuses.join(',')}]`,
-    )
-  }
-
-  // decision 値も enum に対して明示的に検証する。ここを素通りさせると
-  // `resolveFinalDecision` は未知値を（fail-closed 化後も）UNCERTAIN へ丸めるだけで、
-  // 「runner が何を返したのか」が evidence から失われる。independent review verdict と
-  // 同じく、受理できない語彙は理由付きで reject する（下の verdict チェックと対称）。
-  const invalidDecisions = raw.focusedReviewResults
-    .map((item) => item.decision)
-    .filter((decision) => !isStrategicDecision(decision))
-  if (invalidDecisions.length > 0) {
-    return reject(`unknown focused review decision(s): ${invalidDecisions.join(', ')}`)
-  }
-
-  const independent = raw.independentReviewResult as
-    | { verdict?: string; unavailable?: boolean }
-    | undefined
-
-  if (independentReviewRequired && (!independent || typeof independent.verdict !== 'string')) {
-    return reject('critical review load requires an independent review result')
-  }
-
-  // verdict は reviewerAdapter の定義値のみ受理する。未知の文字列をそのまま evidence へ
-  // 保存すると、decisionはALIGNEDなのにJob Gate（independentReviewVerdict === 'approved'）が
-  // 恒久的に落ちる不整合状態になるため、ここで弾く。
-  if (independent && !INDEPENDENT_REVIEW_VERDICTS.includes(independent.verdict as never)) {
-    return reject(`unknown independent review verdict: ${String(independent.verdict)}`)
-  }
-
-  const integration = raw.integrationReviewResult as { decision?: string } | undefined
-
-  if (integrationReviewRequired && (!integration || typeof integration.decision !== 'string')) {
-    return reject('roadmap review requires an integration review result')
-  }
-
-  // integration 側も同様に enum 検証する。integration review は roadmap kind では必須で、
-  // かつ focused が全件 ALIGNED でもここ1件で最終判定を動かせるため、未知値を
-  // 黙って UNCERTAIN へ丸めず reject して理由を残す。
-  //
-  // `null` は `undefined` と同じく「integration 無し」として扱う（独立レビュー指摘）。
-  // task kind では integration review は任意であり、runner が JSON で
-  // `"integrationReviewResult": null` を返すことがある。`!== undefined` だけで判定すると
-  // そこで `integration.decision` が TypeError を投げ、この関数の呼び出し元は
-  // 既存の失敗確定 catch の外にあるため、**claim した run が running のまま残り**
-  // 既存の reject 経路で終端できなくなる。roadmap kind の `null` は上の
-  // `integrationReviewRequired` チェック（`!integration`）が先に reject する。
-  if (integration !== undefined && integration !== null && !isStrategicDecision(integration.decision)) {
-    return reject(`unknown integration review decision: ${String(integration.decision)}`)
-  }
-
+  // E. 組み直した判定 + critical の independent override（従来どおり安全側にのみ倒す）。
   let decision: RecomputedDecision = resolveFinalDecision(
     raw.focusedReviewResults as never,
-    integration as never,
+    (raw.integrationReviewResult ?? undefined) as never,
   )
-
-  if (independentReviewRequired && independent) {
+  if (independentReviewRequired && independent !== undefined && independentVerdict !== undefined) {
     decision = applyIndependentReviewOverride(decision, independent as never) as RecomputedDecision
+  }
+
+  // **申告された unavailable は ALIGNED にしない。** 自己申告を信じないのは ALIGNED への格上げを
+  // 防ぐためであって、unavailable を ALIGNED へ格上げしてよい理由にはならない。
+  if (unavailable.length > 0 && decision !== 'CONFLICT') {
+    return unavailableOutcome()
   }
 
   return {
     decision,
     reviewLoad,
     independentReviewRequired,
-    independentReviewVerdict: independent?.verdict,
+    independentReviewVerdict: independentVerdict,
     rejectedReason: reviewKind === 'roadmap' && decision !== 'ALIGNED'
       ? buildRoadmapRejectedReason(raw, decision)
       : undefined,
@@ -591,7 +678,10 @@ export function executeRunner(deps: CoordinatorDeps, input: string): Promise<Run
 }
 
 export interface ExecuteDesignReviewResult {
-  status: 'evidence_registered' | 'not_aligned' | 'requeued' | 'failed' | 'not_claimable' | 'stale'
+  /**
+   * `contended`: 同じ subject に別の同一性の active run が居て、この review を始められない（判定待ち）。
+   */
+  status: 'evidence_registered' | 'not_aligned' | 'requeued' | 'failed' | 'not_claimable' | 'stale' | 'contended'
   decision?: RecomputedDecision
   evidence?: DesignReviewEvidence
   error?: string
@@ -686,14 +776,28 @@ export async function executeDesignReviewRun(
     )
   }
 
-  let raw: RawStrategicResult
+  let parsed: unknown
   try {
-    raw = JSON.parse(execution.stdout) as RawStrategicResult
+    parsed = JSON.parse(execution.stdout)
   } catch {
     return finalizeFailure(storage, claimed.run, claimToken, 'runner returned unparsable output')
   }
+  // `null`・配列・primitive は「使える出力が無い」であって判定ではない。runner crash と同じく
+  // finalizeFailure で終端する（以前は `null` で recomputeDecision が投げ、claim した run が
+  // running のまま残った。独立レビュー指摘・2026-10-16）。
+  if (!isUsableRunnerOutput(parsed)) {
+    return finalizeFailure(storage, claimed.run, claimToken, 'runner returned no usable output (not a JSON object)')
+  }
+  const raw = parsed
 
-  const outcome = recomputeDecision(raw, run.reviewKind, changedFiles)
+  // 再計算で何が投げても run を running のまま残さない。
+  let outcome: RecomputeOutcome
+  try {
+    outcome = recomputeDecision(raw, run.reviewKind, changedFiles)
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err)
+    return finalizeFailure(storage, claimed.run, claimToken, `design review recompute failed: ${reason}`)
+  }
 
   // **記録は fence を通った後にだけ行う。**
   //
@@ -702,6 +806,23 @@ export async function executeDesignReviewRun(
   // （同じ run.id なので unique index が後勝ちを許さない）。
   // 結果として **Review が採用しなかった判定が ledger に残る**（独立レビュー指摘 2026-09-17 第2回）。
   // ALIGNED でない結果も記録したいので、両方の分岐の fence 直後に置く。
+
+  // **task kind の REVIEW_UNAVAILABLE は判定ではない。** runner が使える判定を返さなかった
+  // のと同じなので、runner crash と同じ `finalizeFailure()`（attempt 残があれば requeue、
+  // 上限で failed）で終端する。以前は `succeeded` / not_aligned として確定させていたため、
+  // Codex logout のような一時的な欠落でも retry されず escalation された（Task `b8d0fc5d`）。
+  // 判定が無いので principle ledger にも記録しない（finalizeFailure 経路と同じ扱い）。
+  // roadmap kind はこの関数の挙動を変えない。
+  if (run.reviewKind === 'task' && outcome.decision === 'REVIEW_UNAVAILABLE') {
+    const failure = finalizeFailure(
+      storage,
+      claimed.run,
+      claimToken,
+      appendRunnerStderr(outcome.rejectedReason ?? 'review unavailable', execution.stderr),
+    )
+    // 呼び出し側の escalation 理由に「なぜ判定が無いか」を残すため decision を添える。
+    return failure.status === 'stale' ? failure : { ...failure, decision: 'REVIEW_UNAVAILABLE' }
+  }
 
   if (outcome.decision !== 'ALIGNED') {
     if (execution.stderr) {
@@ -759,11 +880,105 @@ export async function createAndExecuteDesignReview(
   // これにより design_text → design_text_hash → evidence.designTextHash →
   // Job Gate が計算する computeDesignTextHash(job.aiCliPrompt) が同一内容でのみ一致し、
   // review後にpromptを書き換えた実行を通せない。
-  const run = storage.designReviewRuns.create({
+  return createAndExecute(storage, () => storage.designReviewRuns.create({
     ...input,
     designTextHash: computeDesignTextHash(input.designText),
-  })
-  return executeDesignReviewRun(storage, run, deps)
+  }), deps)
+}
+
+/**
+ * run の作成（または同一性の一致する active run の再利用）→ 実行 → 終端しなかった場合の読み直し。
+ *
+ * - 別の同一性の active run が居る（`DesignReviewRunContentionError`）→ `contended`。
+ *   subject ごとに active は1本なので、相手が終わるまで判定は得られない（否定ではない）。
+ * - 別の executor が同じ run を握っていた（`not_claimable` / `stale`）→ **保存済み状態を読み直す**。
+ *   queued / running なら `requeued`（判定待ち）、ALIGNED evidence があれば `evidence_registered`、
+ *   本当に終端した否定・失敗だけを `not_aligned` / `failed` にする。読み直さずに返すと、
+ *   同じ要求が重なっただけで（2本目の resume 等）レビュー失敗として扱われる。
+ */
+async function createAndExecute(
+  storage: IStorage,
+  createRun: () => DesignReviewRun,
+  deps: CoordinatorDeps,
+): Promise<ExecuteDesignReviewResult> {
+  let run: DesignReviewRun
+  try {
+    run = createRun()
+  } catch (err) {
+    if (err instanceof DesignReviewRunContentionError) {
+      return { status: 'contended', error: err.message }
+    }
+    throw err
+  }
+  const result = await executeDesignReviewRun(storage, run, deps)
+  if (result.status !== 'not_claimable' && result.status !== 'stale') return result
+  return readDurableRunOutcome(storage, run.id) ?? result
+}
+
+/**
+ * 終端した run の判定を、API と同じ再計算で分類する（evidence 失効規則の入力）。
+ * succeeded 以外・結果なし・読めない結果・REVIEW_UNAVAILABLE は「判定なし」。
+ */
+export function classifyStoredRunJudgment(run: DesignReviewRun): StoredRunJudgment {
+  if (run.status !== 'succeeded' || run.resultJson === undefined) return 'none'
+  try {
+    const parsed: unknown = JSON.parse(run.resultJson)
+    if (!isUsableRunnerOutput(parsed)) return 'none'
+    const decision = recomputeDecision(parsed, run.reviewKind, run.changedFiles).decision
+    if (decision === 'ALIGNED') return 'aligned'
+    return decision === 'CONFLICT' || decision === 'UNCERTAIN' ? 'negative' : 'none'
+  } catch {
+    return 'none'
+  }
+}
+
+/** 他の executor が扱った run の、保存済みの結果。読めなければ undefined（呼び出し側は元の結果を返す）。 */
+function readDurableRunOutcome(storage: IStorage, runId: string): ExecuteDesignReviewResult | undefined {
+  const run = storage.designReviewRuns.findById(runId)
+  if (run === undefined) return undefined
+  if (run.status === 'queued' || run.status === 'running') {
+    return { status: 'requeued', error: `design review run ${run.id} is ${run.status} in another executor` }
+  }
+  if (run.status === 'failed') {
+    return { status: 'failed', error: run.error }
+  }
+  // **この run 自身の保存済み結果を先に組み直す。** 同じ design hash の古い ALIGNED evidence が
+  // 残っていても、この run が CONFLICT で終わったなら CONFLICT である。evidence を先に見ると、
+  // 古い承認がこの run の否定判定を上書きしてしまう（独立レビュー round 7・2026-10-16）。
+  if (run.resultJson === undefined) return undefined
+  let decision: RecomputedDecision
+  let rejectedReason: string | undefined
+  try {
+    const parsed: unknown = JSON.parse(run.resultJson)
+    if (!isUsableRunnerOutput(parsed)) return undefined
+    const outcome = recomputeDecision(parsed, run.reviewKind, run.changedFiles)
+    decision = outcome.decision
+    rejectedReason = outcome.rejectedReason
+  } catch {
+    return undefined
+  }
+  if (decision !== 'ALIGNED') {
+    return { status: 'not_aligned', decision, error: run.error ?? rejectedReason }
+  }
+  // この run が ALIGNED のときだけ、それが登録した（同じ hash の）evidence を採用する。
+  const evidence = run.reviewKind === 'task' && run.taskId !== undefined
+    ? storage.designReviewEvidence.findByTaskId(run.taskId)
+      .find((item) => item.designTextHash === run.designTextHash && item.decision === 'ALIGNED')
+    : storage.designReviewEvidence.findLatestBySubjectId(run.reviewKind, run.subjectId)
+  if (evidence === undefined || evidence.designTextHash !== run.designTextHash || evidence.decision !== 'ALIGNED') {
+    return undefined
+  }
+  // **evidence も単一の失効規則を通す。** 読み直すまでの間に、同じ設計の新しい run が始まっている・
+  // CONFLICT で終わっていることがある。その evidence を返すと最新の判定を上書きする（独立レビュー round 9）。
+  const superseding = storage.designReviewEvidence.findSupersedingRun(evidence)
+  if (superseding === undefined) {
+    return { status: 'evidence_registered', decision: 'ALIGNED', evidence }
+  }
+  if (superseding.status === 'queued' || superseding.status === 'running') {
+    return { status: 'requeued', error: `a newer design review run ${superseding.id} for the same design is ${superseding.status}` }
+  }
+  return readDurableRunOutcome(storage, superseding.id)
+    ?? { status: 'not_aligned', error: `a newer design review run ${superseding.id} for the same design did not align` }
 }
 
 export interface CreateAndExecuteRoadmapReviewInput {
@@ -780,15 +995,14 @@ export async function createAndExecuteRoadmapReview(
   input: CreateAndExecuteRoadmapReviewInput,
   deps: CoordinatorDeps,
 ): Promise<ExecuteDesignReviewResult> {
-  const run = storage.designReviewRuns.create({
+  return createAndExecute(storage, () => storage.designReviewRuns.create({
     reviewKind: 'roadmap',
     subjectId: input.projectId,
     taskTitle: input.taskTitle ?? 'Whole-Roadmap Review',
     designText: input.reviewMaterial,
     designTextHash: computeDesignTextHash(input.reviewMaterial),
     changedFiles: [],
-  })
-  return executeDesignReviewRun(storage, run, deps)
+  }), deps)
 }
 
 /**

@@ -226,7 +226,9 @@ describe('claim 4: only the attempt that won the claim fence is recorded', () =>
       },
     )
 
-    expect(result.status).toBe('stale')
+    // fence に負けた結果は保存済み状態から読み直す。勝った側がまだ終端していない（running）ので
+    // 判定待ち（requeued）として返り、レビュー失敗にはならない（独立レビュー round 6）。
+    expect(result.status).toBe('requeued')
     // fence が拒否した attempt の判定は ledger に残らない。
     expect(storage.principleApplications.findAll()).toEqual([])
   })
