@@ -1362,6 +1362,18 @@ function ceoDecisionAndOptions(
   }
 }
 
+/**
+ * 人へ見せるが**方針判断ではない**技術停止か（lifecycle repair D2: rule 6.8 / 6.9）。
+ * 既存レーンでは人の窓口が `ceo_escalation` しか無いので、本文と理由の文言だけをこれで分ける。
+ */
+export function isTechnicalStopDiagnosis(diagnosis: BlockedDiagnosis): boolean {
+  return diagnosis.requiresAuthorityChange === false
+    && (
+      diagnosis.rootCauseClass === 'gate_policy_mismatch'
+      || diagnosis.evidence.some((fact) => fact.fact === 'approval_request.status (linked, unconsumed)')
+    )
+}
+
 export interface TriageEscalationInput {
   diagnosis: BlockedDiagnosis
   item: AttentionItem
@@ -1401,7 +1413,9 @@ export function buildTriageEscalationBody(input: TriageEscalationInput): string 
       : ['  - （この対象に対する実行は無い）']),
     `なぜ AI だけで解決できないか: ${input.blockedReason}`,
     `選ばれたレーン: ${diagnosis.recommendedLane}`,
-    `必要な CEO 判断: ${decision}`,
+    isTechnicalStopDiagnosis(diagnosis)
+      ? `必要な対応（技術停止・CEO の方針判断ではない）: ${decision}`
+      : `必要な CEO 判断: ${decision}`,
     '安全な選択肢:',
     ...options.map((option, index) => `  ${index + 1}. ${option}`),
     'PL は BLOCK を覆せません。上の選択肢はいずれも既存の Gate をそのまま通ります。',

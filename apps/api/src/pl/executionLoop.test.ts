@@ -3578,6 +3578,29 @@ describe('approved-run blocked cause comes from the evidence the Worker sent', (
     expect(diagnosis.recommendedLane).not.toBe('auto_recovery')
   })
 
+  // Codex review round 3: 技術停止は「必要な CEO 判断」「CEO の判断を要する」と説明しない
+  it('the escalation body for a Worker gate mismatch reads as a technical stop, not a CEO decision', async () => {
+    const { storage, taskId, projectId } = seed()
+    storage.tasks.update(taskId, { status: 'blocked' })
+    const job = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'build', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, {
+      guardResult: { permissionAllowed: true, fileChangeAllowed: true, fileViolations: [] },
+      stderr: 're_check: risk_rule_skew: local=CRITICAL api=HIGH decision=ALLOW (no reason)',
+    } as never)
+    const escalations: string[] = []
+
+    const result = await runPlTick(storage, deps({ escalate: async (p) => { escalations.push(p.body) } }))
+
+    expect(result.status).toBe('escalated')
+    expect(result.triage?.rootCauseClass).toBe('gate_policy_mismatch')
+    expect(escalations[0]).toContain('技術停止')
+    expect(escalations[0]).not.toContain('必要な CEO 判断:')
+    expect(escalations[0]).not.toContain('CEO の判断を要する')
+  })
+
   it('a gate-stage block without a technical-cause mark keeps the existing rules', () => {
     const { storage, taskId, projectId } = seed()
     storage.tasks.update(taskId, { status: 'blocked' })

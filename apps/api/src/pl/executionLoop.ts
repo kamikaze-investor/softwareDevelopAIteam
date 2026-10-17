@@ -66,6 +66,7 @@ import { buildResumeAiCliPrompt } from '../implementPrompt'
 import {
   buildTriageEscalationBody,
   formatTriageAuditDetail,
+  isTechnicalStopDiagnosis,
   needsProviderDiagnosis,
   protectedViolations,
   readLatestDesignReview,
@@ -714,6 +715,13 @@ function selfResolutionBlockedReason(diagnosis: BlockedDiagnosis): string {
           + '（Independent Remediation は pending の Task を、resume は既存 Job を要求します）。'
           + 'Remediation を試して失敗したのではなく、**一度も実行できていません**。'
           + '再投入は CEO の明示操作にのみ認められています。'
+        )
+      }
+      // lifecycle repair D2: 技術停止（rule 6.8 / 6.9）は人へ見せるが、方針判断として説明しない
+      if (isTechnicalStopDiagnosis(diagnosis)) {
+        return (
+          '技術停止です（CEO の方針判断ではありません）。自動で実行してよい既存の復旧経路が無いため、'
+          + '人の確認（Worker と API の版の整合を確かめてからの resume 等）を待ちます。'
         )
       }
       return diagnosis.confidence === 'low'
