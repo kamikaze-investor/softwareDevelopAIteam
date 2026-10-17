@@ -2948,7 +2948,9 @@ describe('abortTask — directly linked rejected git_commit observation-only rel
   it('refuses when the linked git_commit approval is no longer REJECTED during observation', () => {
     const fx = seedRejectedGitCommit()
     const abortApprovalId = requestRejectedGitCommitAbort(fx)
-    fx.storage.approvalRequests.recordDecision(fx.rejectedApprovalId, 'APPROVED', undefined, { credentialClass: 'admin' })
+    // 観測中に行が REJECTED でなくなった、という外部変更を作る。recordDecision は決定済みの行を
+    // もう決定し直さない（WAITING 以外は STATUS_CONFLICT）ので、行の状態を直接書き換える。
+    fx.storage.approvalRequests.updateStatus(fx.rejectedApprovalId, 'APPROVED')
 
     expect(completeAbortCleanup(fx.storage, {
       jobId: fx.latestJobId, observation: BASELINE, knownGood: KNOWN_GOOD,

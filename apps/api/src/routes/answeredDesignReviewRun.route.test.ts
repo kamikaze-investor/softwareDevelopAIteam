@@ -1,7 +1,8 @@
 import Fastify, { type FastifyInstance } from 'fastify'
 import { Writable } from 'node:stream'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { Job } from '@ai-team/shared'
+import { createHash } from 'node:crypto'
+import { canonicalizeJobUpdate, type Job } from '@ai-team/shared'
 
 // **kick だけを止める。** 判定（prepareRepairFlow / admission）は本物を使う。
 vi.mock('../designReview/repairFlow', async (importOriginal) => {
@@ -121,7 +122,9 @@ async function shape() {
   return { s, taskId: task.id, i1, unavailableRun, conflictRun, humanResumedReview }
 }
 
-const changesRequested = {
+// A review verdict reaches the API only as the Worker's Outbox delivery; a direct `success` write is refused
+// (R-FINAL-OPPATCH), so the fixture carries an eventId + payloadHash like `persistTerminalUpdate()` does.
+const changesRequestedResult = {
   status: 'success',
   exitCode: 0,
   changedFiles: [DOC],
@@ -131,6 +134,11 @@ const changesRequested = {
     summary: 'second review',
     findings: [{ severity: 'medium', file: DOC, message: 'secret boundary claim is wrong' }],
   },
+}
+const changesRequested = {
+  ...changesRequestedResult,
+  eventId: 'answered-run-review-delivery',
+  payloadHash: createHash('sha256').update(canonicalizeJobUpdate(changesRequestedResult)).digest('hex'),
 }
 
 describe('D3: PATCH の review 分岐と Human Resume で回答済みの Design Review run', () => {

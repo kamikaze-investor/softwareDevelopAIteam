@@ -1,4 +1,5 @@
 import type { JobWorkspaceBaseline } from '@ai-team/shared'
+import { getCredentialClass } from '../auth/credentialClass'
 import { completeAbortCleanup } from '../pl/abortTask'
 import { TECHNICAL_ABORT_WORKER_REFUSAL_CODES } from '../pl/technicalAbortEvidence'
 import type { FastifyInstance } from 'fastify'
@@ -767,10 +768,16 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
     // の 2 つが起きた。適用できないと分かった配送は event を記録（Worker が捨てられる）して payload を
     // 1 つも適用せず、下流の処理（review / repair / continuation）も走らせずに 200 + 現在の Job を返す。
     // claim（→ running）は対象外: 拒否された claim は記録しない既存契約（W5）を保つ。
+    //
+    // **同じ status への配送も含める**（lifecycle repair final）。Worker の Outbox は Job ごとに
+    // terminal event を 1 つしか持たない（`recordPending`）ので、eventId の違う同 status 配送は
+    // 「別の経路（operator PATCH 等）が先にその status にした」ことを意味する。例: operator が running を
+    // failed にした後、Worker の `failed` + workspaceEndFingerprint が届く。以前は同 status を除外していた
+    // ため下の running-only 検査で 409 になり、再送が永久に 409 → Worker の intake 全体が止まった。
+    // 同じ eventId の完全な再送は `isExactReplay` で先に dedup される。
     const isNonApplicableOutboxDelivery = (job: Job): boolean => (
       jobUpdate.status !== undefined
       && jobUpdate.status !== 'running'
-      && jobUpdate.status !== job.status
       && !canApplyJobResultStatus(job.status, jobUpdate.status)
     )
     if (outboxEvent !== undefined && !isExactReplay && isNonApplicableOutboxDelivery(existing)) {
@@ -793,6 +800,37 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
         return reply.status(404).send({ error: 'Job not found' })
       }
       // NOW_APPLICABLE: 読み直した時点で適用先の状態にある。通常の経路で評価する。
+    }
+
+    // **`success` は Worker 自身の結果配送（Outbox event 付き）だけが書ける**（lifecycle repair residual
+    // R-FINAL-OPPATCH）。汎用 Task CRUD が lifecycle の所有する status を書けないのと同じ扱いである。
+    //
+    // success の下流（post-implement review の作成・git_commit の Task 完了 + continuation・resulting commit の
+    // bind）は Worker の結果欄（changedFiles / guardResult / exitCode / commitHash / end fingerprint）を前提にする。
+    // eventId の無い直接の `success`（operator の ADMIN / legacy credential）はそれを持たないので、
+    //   - implement: review が作られず、後から届く Worker の本物の success は「適用先の状態に無い配送」として
+    //     何も適用されずに ack される。Task は pending・最新 Job = success・worktree は dirty のまま、
+    //     attention も PL の駆動も無い**黙った停止**になる（residuals.lifecycle.test.ts で実測）
+    //   - git_commit: commit していないのに Task が done になり continuation が走る
+    // Worker は terminal 結果を必ず `persistTerminalUpdate()`（eventId 付き）で送り、eventId 無しで送るのは
+    // claim（→ running）だけなので、この拒否は Worker の配送を何も変えない。止まった running Job の出口は
+    // 従来どおり `PATCH /:id/fail-if-running`・eventId 無しの failed / blocked・requeue（→ queued）である。
+    // **Outbox event の由来も確かめる**（Codex review r5）: eventId と payloadHash は呼び出し側が計算できるので、
+    // split credential では Worker credential の配送だけを Worker の結果として受ける。ADMIN が event 欄を付けても
+    // success は書けない。legacy（単一 token）と未認証のテスト構成は由来を区別できないため従来どおり。
+    const credentialClass = getCredentialClass(req)
+    const workerProvenance = credentialClass === undefined || credentialClass === 'worker' || credentialClass === 'legacy'
+    if (
+      (outboxEvent === undefined || !workerProvenance)
+      && jobUpdate.status === 'success'
+      && existing.status !== 'success'
+    ) {
+      return reply.status(409).send({
+        error: 'success can only be recorded by the Worker\'s own result delivery (an Outbox event); '
+          + 'a direct status write cannot carry the result fields the workflow needs. '
+          + 'To stop a stuck job, use PATCH /api/jobs/:id/fail-if-running or set it to failed / blocked',
+        code: 'JOB_SUCCESS_REQUIRES_WORKER_RESULT',
+      })
     }
 
     const workspaceEndFingerprint = jobUpdate.failureMetadata?.workspaceEndFingerprint
@@ -870,6 +908,7 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
     // Worker側のexecution FSMとは責務が異なるため同一化しない。
     // 同一statusの再送（from === to）はDB stateを変えないが、statusを削ると下流の
     // 判定（review approved等）まで変わってしまうため、そのまま通す。
+    // （eventId の違う同 status の Outbox 配送は、上の acknowledge で既に返っているのでここへ来ない。）
     //
     // **200 + no-op は Outbox 配送（eventId 付き）にだけ使う。** at-least-once の遅延・重複 result は
     // Worker の Outbox からしか来ない（`persistTerminalUpdate`）。eventId の無い要求は配送の再送では

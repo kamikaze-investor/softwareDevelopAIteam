@@ -105,7 +105,18 @@ export const GATE_CHANGE_EXACT_FILES: readonly string[] = [
   // 2026-10-17 Codex review round 2（c3-b）
   'apps/api/src/jobResultApplicationPolicy',                    // Job result の状態遷移 admission（正本）
   'apps/api/src/routes/jobs',                                   // 直接遷移 / claim の拒否と Outbox 受理の境界
+  'apps/api/src/routes/designReviewEvidence',                   // Design Review evidence を発行する route（implement Job の admission 根拠）
   'apps/api/src/routes/tasks',                                  // generic route で無許可の done を止める唯一の場所・lifecycle 所有状態の拒否
+  // 2026-10-17 最終監査（lifecycle repair final）
+  'apps/api/src/state/strandedTask',                            // lifecycle 所有状態（in_progress / review）から出してよいかの stranded 判定
+  'apps/api/src/ctoAi/taskContinuation',                        // Task continuation と CEO escalation の選択
+  'apps/api/src/designReview/retryCooldown',                    // 判定の出ない Design Review の再試行 budget の時間配分
+  // 2026-10-17 Codex review r5（RC6-LIST の authority coverage guard で非 authority 扱いにしていたもの）
+  'apps/api/src/designReview/queuedRunDispatch',                // queued run を review / repair のどちらの経路へ送るかを決める唯一の dispatcher
+  'apps/api/src/storage/roadmapTaskValidation',                 // Roadmap Task の admission / scope 検証（path traversal・allowedPaths・control_plane_operation）
+  'apps/api/src/designReview/repairPromptBuilder',              // repair prompt の untrusted data fence と無害化（信頼境界）
+  'apps/api/src/pl/adoptionFailure',                            // 採用失敗の incident 指紋（CEO へ通知するかの判定材料）
+  'apps/api/src/storage/index',                                 // 全 authority 判定が読む storage の選択と production DB_PATH の fail-closed 検査
 ]
 for (const file of GATE_CHANGE_EXACT_FILES) {
   if (!/^[A-Za-z0-9/]+$/.test(file)) {

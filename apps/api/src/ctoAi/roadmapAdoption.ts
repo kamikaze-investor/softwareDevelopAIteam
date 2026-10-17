@@ -159,7 +159,7 @@ export function awaitingPromotionAuditKey(
  * git_commit の ALLOW はより厳しくなる方向にしか変わっていない。よって v3 の ALLOW も同じ証明になる。
  * Production の既存 evidence は v2 なので両方を受け付ける。
  */
-const CANDIDATE_COMMIT_EVIDENCE_POLICY_VERSIONS: ReadonlySet<string> = new Set(['gate-policy-v2', 'gate-policy-v3'])
+export const CANDIDATE_COMMIT_EVIDENCE_POLICY_VERSIONS: ReadonlySet<string> = new Set(['gate-policy-v2', 'gate-policy-v3'])
 
 /** Human Approval path: source Job の linked approval が Candidate への CONSUMED な git_commit。 */
 function hasConsumedCandidateApproval(storage: IStorage, taskId: string, sourceJob: Job): boolean {

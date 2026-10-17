@@ -1,5 +1,5 @@
 import Fastify, { type FastifyInstance } from 'fastify'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 import { canonicalizeJobUpdate, type Job, type Task } from '@ai-team/shared'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
@@ -119,7 +119,8 @@ async function gitCommitsOf(taskId: string): Promise<Job[]> {
   return (await storage()).jobs.findByTaskId(taskId).filter((job) => job.safeCommand.kind === 'git_commit')
 }
 
-async function approve(app: FastifyInstance, review: Job, payload: Record<string, unknown> = approved) {
+// The Worker delivers `success` only as an Outbox event; a direct write is refused (R-FINAL-OPPATCH).
+async function approve(app: FastifyInstance, review: Job, payload: Record<string, unknown> = withOutbox(approved, randomUUID())) {
   const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${review.id}`, payload })
   expect(res.statusCode).toBe(200)
 }

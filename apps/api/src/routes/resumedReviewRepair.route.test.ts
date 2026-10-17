@@ -1,5 +1,5 @@
 import Fastify, { type FastifyInstance } from 'fastify'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { canonicalizeJobUpdate, type Job } from '@ai-team/shared'
 
@@ -255,7 +255,7 @@ describe('PATCH の review 分岐: Human Resume で再実行された review', (
       expect(resumed.workflowStepKey).toBe(`resume:${shape.r0.id}:1`)
       expect(resumed.aiCliMode).toBe('review')
 
-      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${resumed.id}`, payload: reviewPatch('changes_requested') })
+      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${resumed.id}`, payload: withOutbox(reviewPatch('changes_requested'), randomUUID()) })
 
       expect(res.statusCode).toBe(200)
       const runs = await repairRuns(shape.taskId)
@@ -273,7 +273,7 @@ describe('PATCH の review 分岐: Human Resume で再実行された review', (
       const shape = await blockedAfterFailedReview()
       const resumed = await resume(app, shape.taskId)
 
-      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${resumed.id}`, payload: reviewPatch('approved') })
+      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${resumed.id}`, payload: withOutbox(reviewPatch('approved'), randomUUID()) })
 
       expect(res.statusCode).toBe(200)
       expect(await repairRuns(shape.taskId)).toHaveLength(0)
@@ -313,7 +313,7 @@ describe('PATCH の review 分岐: Human Resume で再実行された review', (
       const resumed = await resume(app, shape.taskId)
       expect(resumed.workflowStepKey).toBe(`resume:${manual.id}:1`)
 
-      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${resumed.id}`, payload: reviewPatch('changes_requested') })
+      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${resumed.id}`, payload: withOutbox(reviewPatch('changes_requested'), randomUUID()) })
 
       expect(res.statusCode).toBe(200)
       expect(await repairRuns(shape.taskId)).toHaveLength(0)
@@ -331,7 +331,7 @@ describe('PATCH の review 分岐: 既存の implement:<id>:review（regression�
     await withApp(async (app) => {
       const shape = await blockedAfterFailedReview({ firstReviewTerminal: false })
 
-      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${shape.r0.id}`, payload: reviewPatch('changes_requested', 'first review') })
+      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${shape.r0.id}`, payload: withOutbox(reviewPatch('changes_requested', 'first review'), randomUUID()) })
 
       expect(res.statusCode).toBe(200)
       const runs = await repairRuns(shape.taskId)
@@ -349,7 +349,7 @@ describe('PATCH の review 分岐: 既存の implement:<id>:review（regression�
       const res = await app.inject({
         method: 'PATCH',
         url: `/api/jobs/${shape.repairReview.id}`,
-        payload: reviewPatch('changes_requested', '517d0af7-like review'),
+        payload: withOutbox(reviewPatch('changes_requested', '517d0af7-like review'), randomUUID()),
       })
 
       expect(res.statusCode).toBe(200)
