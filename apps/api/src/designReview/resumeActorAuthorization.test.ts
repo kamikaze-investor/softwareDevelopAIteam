@@ -14,7 +14,7 @@
 
 import { createHash } from 'node:crypto'
 import Fastify, { type FastifyInstance } from 'fastify'
-import { afterEach, describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { Job, Task } from '@ai-team/shared'
 import { apiTokenAuth } from '../auth/apiToken.js'
 import { isWorkerRouteAllowed } from '../auth/workerAllowlist.js'
@@ -140,6 +140,36 @@ describe('[20] split credential mode — ADMIN だけが human resume になる'
       expect(recorded[0].result).toBe('human')
       expect(recorded[0].detail).toContain('authorization_evidence=admin_credential')
       expect(recorded[0].detail).toContain(`task_id=${task.id}`)
+    } finally {
+      await app.close()
+    }
+  })
+
+  // G-01: resume_actor が書けなければ resume ごと rollback し、503 retryable で返す（resume Job は残らない）。
+  it('resume_actor の書き込みが失敗すると 503 retryable、resume Job も actor 行も残らず、再送で通る', async () => {
+    const app = await buildApp({ kind: 'split' })
+    try {
+      const { task } = await seedResumableTask()
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const jobsBefore = storage.jobs.findByTaskId(task.id).map((job) => job.id)
+
+      const original = storage.auditLog.record.bind(storage.auditLog)
+      const spy = vi.spyOn(storage.auditLog, 'record').mockImplementation((entry) => {
+        if (entry.operation === RESUME_ACTOR_OPERATION) throw new Error('disk is full')
+        return original(entry)
+      })
+      const failed = await resumeAs(app, task.id, ADMIN_TOKEN)
+      spy.mockRestore()
+
+      expect(failed.statusCode).toBe(503)
+      expect(JSON.parse(failed.body)).toMatchObject({ code: 'RESUME_COMMIT_FAILED', retryable: true })
+      expect(storage.jobs.findByTaskId(task.id).map((job) => job.id)).toEqual(jobsBefore)
+
+      const retried = await resumeAs(app, task.id, ADMIN_TOKEN)
+      expect(retried.statusCode).toBe(201)
+      const recorded = await recordedActorFor((JSON.parse(retried.body) as Job).id)
+      expect(recorded.map((row) => row.result)).toEqual(['human'])
     } finally {
       await app.close()
     }

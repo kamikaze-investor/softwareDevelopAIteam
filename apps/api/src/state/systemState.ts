@@ -22,7 +22,7 @@ import { latestHumanRecoveryId } from '../humanRecovery/recoveryAudit'
 import { readJobsSupersededByHumanResume } from '../designReview/resumeActor'
 import { isTechnicalRecoveryTargetExhausted } from '../pl/technicalResumePolicy'
 import type { IStorage } from '../storage/interface'
-import { isLiveWaitingApproval } from '@ai-team/shared'
+import { isLiveApprovedApproval, isLiveTaskScopedDecision, isLiveWaitingApproval } from '@ai-team/shared'
 import type { ApprovalRequest, Job, Task, Project } from '@ai-team/shared'
 
 /**
@@ -47,6 +47,22 @@ import type { ApprovalRequest, Job, Task, Project } from '@ai-team/shared'
 function findLiveWaitingApproval(storage: IStorage, taskId: string, nowMs: number): ApprovalRequest | undefined {
   return storage.approvalRequests.findByTaskId(taskId)
     .find((request) => isLiveWaitingApproval(request, nowMs))
+}
+
+/**
+ * Task に生きた **Task 単位の人の判断**（abort_task / reconcile_external_completion /
+ * repair_from_stored_review:* 等の未期限 WAITING / APPROVED。Job には結び付かない）があるか（Codex round 2）。
+ *
+ * それがある間、人でない resume は `HUMAN_DECISION_PENDING` で断られる（C-03）。その Task の blocked Job を
+ * `job_blocked` として PL に見せると、毎 tick 診断 → resume → 拒否 を繰り返す。Job に結び付いた live WAITING と
+ * 同じく人の判断待ちとして扱い、`job_blocked` を出さない（判断は `approval_waiting` が表す）。
+ */
+function findLiveTaskScopedDecision(storage: IStorage, taskId: string, nowMs: number): ApprovalRequest | undefined {
+  const decisions = storage.approvalRequests.findByTaskId(taskId)
+    .filter((request) => isLiveTaskScopedDecision(request, nowMs))
+  // WAITING を優先（判断そのものを待っている）。無ければ APPROVED（実行を人が待っている）。
+  return decisions.find((request) => isLiveWaitingApproval(request, nowMs))
+    ?? decisions.find((request) => isLiveApprovedApproval(request, nowMs))
 }
 
 function isWaitingOnLiveApproval(storage: IStorage, job: Job, nowMs: number): boolean {
@@ -586,6 +602,7 @@ export function buildSystemState(
           && task.status !== 'done'
           && !parentIsParked
           && !isWaitingOnLiveApproval(storage, job, nowMs)
+          && findLiveTaskScopedDecision(storage, task.id, nowMs) === undefined
         ) {
           // **done な Task の blocked Job は attention にしない。**
           // Task が終端に達している以上その Job は履歴であり、誰も解消できない
@@ -702,6 +719,25 @@ export function buildSystemState(
             + 'is waiting for a human decision',
           stuckForMs: elapsedMs(approval.createdAt, nowMs),
         })
+      } else {
+        // **APPROVED のまま実行されていない Task 単位の判断**（例: CEO が承認した abort_task を CEO が
+        // /abort でまだ実行していない）も人の判断待ちである。新しい attention kind は作らず、同じ
+        // notify-only の `approval_waiting`（referenceId = その承認。1件につき1回だけ通知）で見せる。
+        // ここで出さないと、上で `job_blocked` を抑止した Task が誰にも見えないまま止まる。
+        const decided = findLiveTaskScopedDecision(storage, task.id, nowMs)
+        if (decided !== undefined && decided.status === 'APPROVED' && task.status !== 'done' && !parentIsParked) {
+          attention.push({
+            kind: 'approval_waiting',
+            projectId: project.id,
+            projectName: project.name,
+            taskId: task.id,
+            referenceId: decided.id,
+            detail:
+              `approval request ${decided.id} (${decided.requestedAction}, risk ${decided.riskLevel}) `
+              + 'is APPROVED but not yet executed; the task waits for a human to carry out or replace that decision',
+            stuckForMs: elapsedMs(decided.reviewedAt ?? decided.createdAt, nowMs),
+          })
+        }
       }
     }
 

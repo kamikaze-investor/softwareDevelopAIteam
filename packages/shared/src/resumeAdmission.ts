@@ -2,7 +2,7 @@ import type { ApprovalRequest } from './types/approval_gate'
 import type { JobStatus } from './types/job'
 import type { ProjectStatus } from './types/project'
 import type { TaskStatus } from './types/task'
-import { isLiveWaitingApproval } from './approvalLiveness'
+import { isLiveTaskScopedDecision, isLiveWaitingApproval, isTaskScopedApprovalAction } from './approvalLiveness'
 
 /**
  * **Human Resume を受け付けてよいかの前提条件**（純関数・唯一の定義）。
@@ -29,9 +29,19 @@ export interface ResumeAdmissionInput {
   projectStatus: ProjectStatus | string | undefined
   /** Task の Job。**新しい順**（先頭が最新）。 */
   jobs: readonly ResumeAdmissionJob[]
-  /** Task の ApprovalRequest（順不同）。live な承認待ちが 1 件でもあれば断る。 */
-  approvals: readonly Pick<ApprovalRequest, 'status' | 'expiresAt'>[]
+  /**
+   * Task の ApprovalRequest（順不同）。Job 束縛（command kind）の live な承認待ちが 1 件でもあれば断る。
+   * Task 単位の判断（`isTaskScopedApprovalAction`）は `resumedByHuman` で扱いが分かれる。
+   */
+  approvals: readonly (Pick<ApprovalRequest, 'status' | 'expiresAt'> & { requestedAction?: string })[]
   nowMs: number
+  /**
+   * 再開するのが人（ADMIN credential）か。人の resume は新しい人の判断として、生きた Task 単位の判断
+   * （WAITING / APPROVED）を置き換える（storage が同じ transaction で SUPERSEDED にする）。
+   * 人でない resume（PL / AI / 主体不明）は、それがある間は `HUMAN_DECISION_PENDING` で再開しない。
+   * 既定は false（主体を証明できないものを人扱いしない）。Mobile は CEO の操作なので true を渡す。
+   */
+  resumedByHuman?: boolean
 }
 
 export type ResumeAdmissionCode =
@@ -43,6 +53,8 @@ export type ResumeAdmissionCode =
   | 'WORKSPACE_QUARANTINED'
   | 'LIVE_JOB_EXISTS'
   | 'APPROVAL_WAITING'
+  /** 生きた Task 単位の人の判断がある。人の resume だけがそれを置き換えられる。 */
+  | 'HUMAN_DECISION_PENDING'
   | 'AI_CLI_MODE_MISSING'
   | 'AI_CLI_PROVIDER_MISSING'
 
@@ -73,8 +85,16 @@ export function evaluateResumeAdmission(input: ResumeAdmissionInput): ResumeAdmi
   }
   // 期限切れの WAITING は誰も待っていない（`isLiveWaitingApproval()`）。それで resume を
   // 恒久拒否すると Task はどこからも復旧できなくなる（2026-09-12 Production）。
-  if (input.approvals.some((approval) => isLiveWaitingApproval(approval, input.nowMs))) {
+  // Task 単位の判断はここでは数えない（下で人 / 人でないで分ける）。Job 束縛の承認待ちは従来どおり断る。
+  if (input.approvals.some((approval) =>
+    !isTaskScopedApprovalAction(approval.requestedAction) && isLiveWaitingApproval(approval, input.nowMs))) {
     return { ok: false, code: 'APPROVAL_WAITING' }
+  }
+  if (
+    input.resumedByHuman !== true
+    && input.approvals.some((approval) => isLiveTaskScopedDecision(approval, input.nowMs))
+  ) {
+    return { ok: false, code: 'HUMAN_DECISION_PENDING' }
   }
   // AI CLI Job の resume は provider と mode をそのまま引き継ぐので、どちらかが欠けると作れない。
   // storage 側に同じ検査を二重に持たない（API と Mobile の判定を一致させる）。

@@ -18,6 +18,17 @@ import type { AiCliProvider, AiCliMode, RecoverAdmissionCode } from '@ai-team/sh
 import type { ResumeAdmissionCode } from '@ai-team/shared'
 import type { PrincipleApplication, PrincipleApplicationInput, PrincipleAggregateQuery, PrincipleAggregateRow, PrincipleDisagreementRow, PrincipleVersionAggregateRow } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
+import type { CredentialClass } from '../auth/credentialClass'
+import type { ResumeActorEvidence } from '../designReview/resumeActor'
+
+/**
+ * 承認の決定を下した主体（`apiTokenAuth()` が決めた credential 種別だけ）。
+ * storage はこれを `approval_actor` audit 行として**状態変更と同じ transaction で**書く（H-03）。
+ * 行の形は `designReview/resumeActor.ts` の `approvalActorAuditRecord()` が唯一の出どころ。
+ */
+export interface ApprovalDecisionActor {
+  credentialClass: CredentialClass | undefined
+}
 
 export type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
 
@@ -41,6 +52,16 @@ export type ResumeBlockedTaskResult =
         | 'GIT_COMMIT_RESUME_LINEAGE_INVALID'
         /** 共有 `evaluateResumeAdmission()` の前提条件による拒否（Mobile と同じ code）。 */
         | ResumeAdmissionCode
+        /**
+         * resume と同じ transaction で書く authority evidence（`resume_actor`）が書けなかった（G-01）。
+         * transaction ごと rollback 済みで何も変わっていないので、同じ resume を再試行してよい。
+         */
+        | 'RESUME_COMMIT_FAILED'
+        /**
+         * 人でない resume（PL / AI / 主体不明）を、Task に生きた Task 単位の人の判断（未期限の APPROVED /
+         * WAITING の abort_task 等）がある間は行わない。否定ではなく正当な人の判断待ち。
+         */
+        | 'HUMAN_DECISION_PENDING'
       reason: string
     }
 
@@ -560,6 +581,12 @@ export interface IJobStorage {
   resumeBlockedTask(input: {
     taskId: string
     instructionPrompt: string
+    /**
+     * 誰が再開したか。渡すと resume Job の作成と**同じ transaction で** `resume_actor` 行を書き、
+     * 書けなければ resume ごと rollback して `RESUME_COMMIT_FAILED` を返す（G-01）。
+     * `human` の resume は新しい人の判断として、その Task の Task 単位の承認を置き換える（C-03）。
+     */
+    resumedBy?: ResumeActorEvidence
   }): ResumeBlockedTaskResult
   /**
    * PR-C finding 14 修復 (BLOCKER B): quarantine を解除する（単一transaction・冪等）。
@@ -741,7 +768,12 @@ export interface IApprovalRequestStorage {
     taskId: string
     approvalRequestId: string
     expectedAction: string
-  }): { ok: true } | { ok: false; reason: string }
+  }): { ok: true } | {
+    ok: false
+    /** 人が決めた記録の無い APPROVED。SUPERSEDED にされ、改めて人の承認が要る。 */
+    code?: 'APPROVAL_ACTOR_NOT_HUMAN'
+    reason: string
+  }
   findByTaskId(taskId: string): ApprovalRequest[]
   findById(id: string): ApprovalRequest | undefined
   /** task_id で WAITING_FOR_USER / APPROVED 状態のものを返す（CONSUMED は除外） */
@@ -761,8 +793,11 @@ export interface IApprovalRequestStorage {
     data: Omit<ApprovalRequest, 'id' | 'createdAt'>,
     jobId: string,
   ): CreateApprovalForJobResult
-  /** WAITING_FOR_USER の git_commit Approval をCAS更新し、同一Jobをqueuedへ戻す。 */
-  approveAndResumeJob(id: string, reason?: string): ReviewApprovalAndResumeJobResult
+  /**
+   * WAITING_FOR_USER の git_commit Approval をCAS更新し、同一Jobをqueuedへ戻す。
+   * 承認・Job 再 queue と同じ transaction で `decidedBy` の `approval_actor` 行を書く（必須）。
+   */
+  approveAndResumeJob(id: string, reason: string | undefined, decidedBy: ApprovalDecisionActor): ReviewApprovalAndResumeJobResult
   /** Job/Task/Action/baselineを検証して git_commit Approval を一度だけconsumeする。 */
   consumeForJob(input: {
     id: string
@@ -791,8 +826,16 @@ export interface IApprovalRequestStorage {
   }): ConsumeApprovalForCommandJobResult
   /** preserveReviewMeta=true のとき reason/reviewedAt を上書きしない（consume 用） */
   updateStatus(id: string, status: ApprovalGateStatus, reason?: string, preserveReviewMeta?: boolean): ApprovalRequest | undefined
-  /** 人間による APPROVED/REJECTED 決定を更新し、同一transactionでaudit_logへ記録する（PATCH /status 用） */
-  recordDecision(id: string, status: 'APPROVED' | 'REJECTED', reason?: string): ApprovalRequest | undefined
+  /**
+   * 人間による APPROVED/REJECTED 決定を更新し、同一transactionでaudit_logへ記録する（PATCH /status 用）。
+   * 決定と同じ transaction で `decidedBy` の `approval_actor` 行も書く（必須。片方だけ残らない）。
+   */
+  recordDecision(
+    id: string,
+    status: 'APPROVED' | 'REJECTED',
+    reason: string | undefined,
+    decidedBy: ApprovalDecisionActor,
+  ): ApprovalRequest | undefined
 }
 
 export interface IDesignReviewEvidenceStorage {

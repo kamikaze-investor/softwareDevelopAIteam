@@ -19,7 +19,7 @@ import type {
   TaskSummary,
   WatchdogEvent,
 } from '@ai-team/shared'
-import { evaluateRecoverAdmission, evaluateResumeAdmission } from '@ai-team/shared'
+import { evaluateRecoverAdmission, evaluateResumeAdmission, isLiveWaitingApproval } from '@ai-team/shared'
 
 export function parseDateTime(value: string): number {
   const time = Date.parse(value)
@@ -118,7 +118,8 @@ export function deriveJobDisplayState(
     return isWatchdogConfirmedStalled(job, watchdogEvents) ? 'running_stalled' : 'running_healthy'
   }
   if (job.status === 'blocked') {
-    return findLinkedApproval(job, approvalRequests)?.status === 'WAITING_FOR_USER'
+    // 期限切れ WAITING は誰も待っていない（shared `isLiveWaitingApproval`。監査 A-02）。
+    return isLiveWaitingApproval(findLinkedApproval(job, approvalRequests))
       ? 'approval_waiting'
       : 'blocked'
   }
@@ -254,7 +255,8 @@ export function hasWaitingLinkedApproval(
   approvalRequests: ApprovalRequest[],
 ): boolean {
   const latestJob = sortJobsByNewestFirst(jobs)[0]
-  return findLinkedApproval(latestJob, approvalRequests)?.status === 'WAITING_FOR_USER'
+  // 期限切れ WAITING で手動操作を恒久ロックしない（承認も resume 拒否もされない行。監査 A-02）。
+  return isLiveWaitingApproval(findLinkedApproval(latestJob, approvalRequests))
 }
 
 /**
@@ -342,6 +344,8 @@ export function canShowResumeUI(
     parked: task.parked,
     projectStatus: task.projectStatus ?? undefined,
     jobs: jobsInAdmissionOrder(jobs),
+    // Mobile の操作は CEO（ADMIN credential）なので人の resume として判定する（API と同じ規則）。
+    resumedByHuman: true,
     approvals: approvalRequests,
     nowMs,
   }).ok

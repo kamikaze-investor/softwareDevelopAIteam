@@ -3,11 +3,11 @@ import { createHash } from 'node:crypto'
 import { mkdtempSync, rmSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { afterEach, beforeEach, describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { OperatorRequestKind } from '@ai-team/shared'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
-import { resetPlLoopInFlightForTest, runPlTick, type PlDiagnosisInput, type PlLoopDeps } from './executionLoop'
+import { PL_MAX_ATTEMPTS_PER_TARGET, resetPlLoopInFlightForTest, runPlTick, type PlDiagnosisInput, type PlLoopDeps } from './executionLoop'
 import { readResumeActorClasses } from '../designReview/resumeActor'
 import {
   OPERATOR_ANSWER_SYSTEM,
@@ -365,6 +365,32 @@ describe('runPlTick — Operator Request', () => {
     expect(storage.operatorRequests.findById(request.id)).toMatchObject({
       disposition: 'declined', plAction: { attempted: false, status: 'no_matching_target' },
     })
+  })
+
+  // Codex round 4: Operator Request 経由の handleTarget も、自律 tick と同じ有界ラッパーを通る。
+  // audit の書き込みが全部失敗する（DB 書き込み障害）間に依頼が届き続けても、同じ対象を無限に試さない。
+  it('audit の書き込みが全部失敗しても、依頼経由の同じ対象は試行上限で止まり、ログは1回だけ', async () => {
+    const jobId = blockedCommitJob()
+    alignedEvidence()
+    vi.spyOn(storage.auditLog, 'record').mockImplementation(() => { throw new Error('SQLITE_IOERR: disk I/O error') })
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+    const diagnoses: PlDiagnosisInput[] = []
+    for (let tick = 0; tick < 8; tick += 1) {
+      // 毎 tick 新しい依頼を出す（依頼は1件ずつ処理され、処理済みの依頼は再実行されない）。
+      ask('request', '再開して', { targetKey: `job_blocked:${jobId}`, taskId })
+      resetPlLoopInFlightForTest()
+      try {
+        await runPlTick(storage, deps({ answerOperatorRequest: failIfCalled, diagnose: diagnoseProposing('resume_task', diagnoses) }))
+      } catch {
+        // 書き込み障害の例外は呼び出し側へ返る（従来どおり）。ここでは回数だけを見る。
+      }
+    }
+    const fallbackLogs = errors.mock.calls.filter((call) => String(call[0]).includes('in-process attempt counter'))
+    vi.restoreAllMocks()
+
+    expect(diagnoses.length).toBeGreaterThan(0)
+    expect(diagnoses.length).toBeLessThanOrEqual(PL_MAX_ATTEMPTS_PER_TARGET)
+    expect(fallbackLogs).toHaveLength(1)
   })
 
   it('technical budget が尽きた対象は依頼があっても扱わない（選択条件を緩めない）', async () => {

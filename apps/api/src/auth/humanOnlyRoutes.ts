@@ -48,6 +48,11 @@ export const HUMAN_ONLY_ROUTES: readonly HumanOnlyRouteEntry[] = [
   // up-front の Approval Gate を課さない代わりに、**呼び出し主体が人であること**が
   // authorization の実体なので、主体を区別できない構成では実行させない。
   { method: 'POST', url: '/api/tasks/:id/recover' },
+  // CEO の承認 / 却下そのもの（C-02）。APPROVED は git_commit の再 queue・Task 単位操作（abort_task 等）・
+  // stored-review recovery の repair budget 再発行の authority になる。split mode では WORKER allowlist に
+  // 載っていないので既に ADMIN だけだが、legacy 単一 token / 認証なしの構成では token を持つ誰でも
+  // （Worker を含む）承認できてしまっていた。承認の authority を deployment mode に依存させない。
+  { method: 'PATCH', url: '/api/approval-requests/:id/status' },
 ]
 
 /**

@@ -55,6 +55,7 @@ import {
 } from '@ai-team/shared'
 import type { ApprovalType } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
+import { readApprovalActorClass } from '../designReview/resumeActor'
 
 /** 監査記録で使う語彙。`audit_log` の既存スキーマをそのまま使う。 */
 const AUDIT_OPERATION = 'pl_action_authorize'
@@ -360,6 +361,17 @@ function checkApprovalGate(
   }
   if (expiresAtMs <= Date.now()) {
     return { satisfied: false, rejection: `approval request ${approvalRequestId} has expired` }
+  }
+  // **Task 単位の人の判断は、人が決めた記録（approval_actor = human）があって初めて authority になる**
+  // （Codex review 361c19a・stored-review recovery と同じ正本の規則）。APPROVED の行の状態だけでは
+  // legacy 単一 token / actor 記録導入前の決定と区別できない。証明できない承認は通さず、改めて人の承認を求める。
+  if (readApprovalActorClass(storage, approvalRequestId) !== 'human') {
+    return {
+      satisfied: false,
+      rejection:
+        `approval request ${approvalRequestId} has no record that a human (ADMIN credential) decided it`
+        + ' (APPROVAL_ACTOR_NOT_HUMAN); a fresh human approval is required',
+    }
   }
   return { satisfied: true }
 }

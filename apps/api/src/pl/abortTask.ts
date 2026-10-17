@@ -51,6 +51,7 @@ import {
   getBaseRoadmapId,
   holdsWorkspaceWhenBlocked,
   isLiveJob,
+  isLiveApprovedApproval,
   isLiveWaitingApproval,
   isStaleBlockedJobCandidate,
   occupiesProject,
@@ -807,10 +808,12 @@ export function requestTechnicalAbort(
   // 止めるのは「人の判断が生きている」request だけ: 期限内の WAITING（判断待ち）と APPROVED
   // （下された人の判断。技術的 cleanup で上書きしない）。期限切れ WAITING は誰も待っておらず
   // 承認もできないので、ここで拒否すると Technical Abort が恒久的に塞がる（2026-10-16 監査 A2）。
-  // 期限解釈は shared `isLiveWaitingApproval` に一本化する。最新1件ではなく全行を見るのは、
-  // 新しい期限切れ WAITING の陰に古い APPROVED が残る legacy 状態でも人の判断を見落とさないため。
+  // 期限解釈は shared `isLiveWaitingApproval` / `isLiveApprovedApproval` に一本化する。最新1件ではなく
+  // 全行を見るのは、新しい期限切れ WAITING の陰に古い APPROVED が残る legacy 状態でも人の判断を見落とさないため。
+  // 期限切れの APPROVED は consume できない（gate と同じ遅延判定）ので、もう誰の authority でもない。
+  // それを数えると、期限切れ未消費の承認 1 行で Technical Abort が恒久的に拒否される（2026-10-16 監査 B-2）。
   const activeApproval = storage.approvalRequests.findByTaskId(task.id)
-    .find((request) => request.status === 'APPROVED' || isLiveWaitingApproval(request))
+    .find((request) => isLiveApprovedApproval(request) || isLiveWaitingApproval(request))
   if (activeApproval !== undefined) {
     recordTechnicalAbortRefusal(storage, {
       taskId: task.id,
