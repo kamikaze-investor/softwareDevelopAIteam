@@ -59,6 +59,9 @@ import {
   persistJobResult,
   processQueuedWork,
   reportAbortCleanupObservations,
+  clearPendingAbortCleanupSubmissions,
+  pendingAbortCleanupSubmissionJobIds,
+  hasPendingAbortCleanupSubmissions,
   start,
 } from './index.js'
 
@@ -440,6 +443,455 @@ describe('abort cleanup observation reporting', () => {
         headValid: true, blindSpotsAbsent: true,
       },
     })
+  })
+})
+
+describe('dirty Technical Abort cleanup — identical resubmission after a retryable refusal', () => {
+  // 同じ carrier + generation の保留があれば、観測も cleanup もやり直さず同じ payload を再送する
+  // （Codex review ba0cdae: 観測し直すと clean な workspace が dirty な fingerprint と食い違い quarantine になる）。
+  const dirtyEnd = {
+    mode: 'dirty' as const,
+    startCommitHash: 'end-head',
+    entries: [{ path: 'apps/worker/src/index.ts', kind: 'modified' as const, xyStatus: '.M', worktreeHash: 'sha256:owned' }],
+  }
+  const cleanEnd = { mode: 'clean' as const, startCommitHash: 'end-head' }
+  const knownGoodClean = {
+    gitOperationMarkers: [], worktreeClean: true, indexClean: true, headValid: true, blindSpotsAbsent: true,
+  }
+  const knownGoodDirty = { ...knownGoodClean, worktreeClean: false }
+
+  beforeEach(() => {
+    clearPendingAbortCleanupSubmissions()
+  })
+
+  function arrange(responses: Array<() => Response>, markerGoneAfterCall?: number): {
+    reports: () => string[]
+  } {
+    const project = {
+      id: 'project-1', name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+      createdAt: NOW, updatedAt: NOW,
+    }
+    const requestedTask: Task = { ...task, status: 'blocked', roadmapActive: true }
+    const markedJob: Job = {
+      ...job,
+      id: 'job-dirty',
+      status: 'failed',
+      failureMetadata: {
+        workspaceEndFingerprint: dirtyEnd,
+        abortCleanupRequestedAt: NOW,
+        abortTechnicalEvidenceId: 'evidence-1',
+        abortTechnicalStateFingerprint: 'fp-1',
+      },
+    }
+    const cancelledJob: Job = { ...markedJob, failureMetadata: { workspaceEndFingerprint: dirtyEnd } }
+    // 1回目の観測は dirty（cleanup 前）、cleanup 後は clean。以後の観測も clean のまま。
+    workspaceVerificationMocks.observeWorkspace
+      .mockReturnValueOnce({ observation: dirtyEnd, knownGood: knownGoodDirty })
+      .mockReturnValue({ observation: cleanEnd, knownGood: knownGoodClean })
+    let reportCount = 0
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const value = String(url)
+      if (value.endsWith('/api/projects')) return new Response(JSON.stringify([project]), { status: 200 })
+      if (value.includes('/api/tasks?projectId=')) return new Response(JSON.stringify([requestedTask]), { status: 200 })
+      if (value.includes('/api/jobs?taskId=')) {
+        const gone = markerGoneAfterCall !== undefined && reportCount >= markerGoneAfterCall
+        return new Response(JSON.stringify([gone ? cancelledJob : markedJob]), { status: 200 })
+      }
+      if (value.includes('/abort-cleanup-result')) {
+        const respond = responses[reportCount] ?? responses[responses.length - 1]!
+        reportCount += 1
+        return respond()
+      }
+      throw new Error(`unexpected fetch ${value}`)
+    })
+    vi.stubGlobal('fetch', fetchMock)
+    return {
+      reports: () => fetchMock.mock.calls
+        .filter(([url]) => String(url).includes('/abort-cleanup-result'))
+        .map(([, init]) => String(init?.body)),
+    }
+  }
+
+  const busy = (): Response => new Response(JSON.stringify({ error: 'busy', code: 'STORAGE_BUSY' }), { status: 409 })
+
+  it('STORAGE_BUSY → the next poll resends the identical evidence without re-observing or re-cleaning → success', async () => {
+    const { reports } = arrange([busy, () => new Response(null, { status: 200 })])
+
+    await expect(reportAbortCleanupObservations()).resolves.toBe(false)
+    expect(jobRunnerMocks.revertBlockedJobChanges).toHaveBeenCalledTimes(1)
+    const observationsAfterFirstPoll = workspaceVerificationMocks.observeWorkspace.mock.calls.length
+
+    await expect(reportAbortCleanupObservations()).resolves.toBe(true)
+
+    // 2回目の poll では観測も cleanup もやり直さない。
+    expect(workspaceVerificationMocks.observeWorkspace.mock.calls.length).toBe(observationsAfterFirstPoll)
+    expect(jobRunnerMocks.revertBlockedJobChanges).toHaveBeenCalledTimes(1)
+    const [first, second] = reports()
+    expect(second).toBe(first)
+    expect(JSON.parse(first!)).toMatchObject({
+      observation: cleanEnd,
+      preCleanupObservation: dirtyEnd,
+      cleanupSummary: { changedPathCount: 1 },
+      // 証拠がどの cleanup generation のものかを名指す（API が現在の marker と照合する）。
+      cleanupGeneration: {
+        abortCleanupRequestedAt: NOW,
+        abortTechnicalEvidenceId: 'evidence-1',
+        abortTechnicalStateFingerprint: 'fp-1',
+      },
+    })
+    // refusal（quarantine につながる）は一度も送らない。
+    expect(reports().some((body) => body.includes('refusalCode'))).toBe(false)
+  })
+
+  it('a resubmission refused as GENERATION_MISMATCH is definitive: the entry is cleared and not resent', async () => {
+    const mismatch = (): Response =>
+      new Response(JSON.stringify({ error: 'mismatch', code: 'GENERATION_MISMATCH' }), { status: 409 })
+    const { reports } = arrange([busy, mismatch])
+
+    await expect(reportAbortCleanupObservations()).resolves.toBe(false)
+    expect(pendingAbortCleanupSubmissionJobIds()).toEqual(['job-dirty'])
+    await expect(reportAbortCleanupObservations()).resolves.toBe(false)
+
+    expect(pendingAbortCleanupSubmissionJobIds()).toEqual([])
+    expect(reports()).toHaveLength(2)
+    expect(reports()[1]).toBe(reports()[0])
+    expect(reports().some((body) => body.includes('refusalCode'))).toBe(false)
+  })
+
+  it('a resubmission refused by a human decision stops resending; the cancelled generation is not re-observed', async () => {
+    const conflict = (): Response =>
+      new Response(JSON.stringify({ error: 'conflict', code: 'HUMAN_DECISION_CONFLICT' }), { status: 409 })
+    const { reports } = arrange([busy, conflict], 2)
+
+    await expect(reportAbortCleanupObservations()).resolves.toBe(false)
+    await expect(reportAbortCleanupObservations()).resolves.toBe(false)
+    // API が generation を取り消した後の poll では、何も観測せず何も送らない。
+    const observations = workspaceVerificationMocks.observeWorkspace.mock.calls.length
+    await expect(reportAbortCleanupObservations()).resolves.toBe(false)
+
+    expect(workspaceVerificationMocks.observeWorkspace.mock.calls.length).toBe(observations)
+    expect(reports()).toHaveLength(2)
+    expect(reports()[1]).toBe(reports()[0])
+    expect(reports().some((body) => body.includes('refusalCode'))).toBe(false)
+  })
+})
+
+describe('pending Technical Abort cleanup delivery gates intake and is swept when its generation disappears', () => {
+  // Codex review cf8a33e: 配送待ちの間は queued Job を取らない / generation が消えた保留は掃除する。
+  const dirtyEnd = {
+    mode: 'dirty' as const,
+    startCommitHash: 'end-head',
+    entries: [{ path: 'apps/worker/src/index.ts', kind: 'modified' as const, xyStatus: '.M', worktreeHash: 'sha256:owned' }],
+  }
+  const cleanEnd = { mode: 'clean' as const, startCommitHash: 'end-head' }
+  const knownGoodClean = {
+    gitOperationMarkers: [], worktreeClean: true, indexClean: true, headValid: true, blindSpotsAbsent: true,
+  }
+  const project = {
+    id: 'project-1', name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+    createdAt: NOW, updatedAt: NOW,
+  }
+  const carrierTask: Task = { ...task, id: 'task-a', status: 'blocked', roadmapActive: true }
+  const carrier: Job = {
+    ...job,
+    id: 'job-carrier',
+    taskId: 'task-a',
+    status: 'failed',
+    failureMetadata: {
+      workspaceEndFingerprint: dirtyEnd,
+      abortCleanupRequestedAt: NOW,
+      abortTechnicalEvidenceId: 'evidence-1',
+      abortTechnicalStateFingerprint: 'fp-1',
+    },
+  }
+  const busy = (): Response => new Response(JSON.stringify({ error: 'busy', code: 'STORAGE_BUSY' }), { status: 409 })
+
+  interface ApiState {
+    projectStatus: string
+    projectsFail: boolean
+    carrierTask: Task
+    carrierJobs: Job[]
+    extraTasks: Task[]
+    extraJobs: Record<string, Job[]>
+    /** discovery の fetch を reject（throw）させる対象。 */
+    throwOn?: 'projects' | 'tasks' | 'jobs'
+    cleanupResponses: Array<() => Response>
+    onAccepted?: (state: ApiState) => void
+  }
+
+  function stubApi(state: ApiState): void {
+    workspaceVerificationMocks.observeWorkspace
+      .mockReturnValueOnce({ observation: dirtyEnd, knownGood: { ...knownGoodClean, worktreeClean: false } })
+      .mockReturnValue({ observation: cleanEnd, knownGood: knownGoodClean })
+    let reports = 0
+    fetchMock.mockImplementation(async (url: string | URL | Request, init?: RequestInit) => {
+      const value = String(url)
+      if (state.throwOn === 'projects' && value.endsWith('/api/projects')) throw new TypeError('fetch failed')
+      if (state.throwOn === 'tasks' && value.includes('/api/tasks?projectId=')) throw new TypeError('fetch failed')
+      if (state.throwOn === 'jobs' && value.includes('/api/jobs?taskId=')) throw new TypeError('fetch failed')
+      if (value.endsWith('/api/projects')) {
+        if (state.projectsFail) return new Response(null, { status: 503 })
+        return new Response(JSON.stringify([{ ...project, status: state.projectStatus }]), { status: 200 })
+      }
+      if (value.includes('/api/tasks?projectId=')) {
+        return new Response(JSON.stringify([state.carrierTask, ...state.extraTasks]), { status: 200 })
+      }
+      if (value.includes('/api/jobs?taskId=task-a')) return new Response(JSON.stringify(state.carrierJobs), { status: 200 })
+      const extra = /\/api\/jobs\?taskId=([^&]+)/.exec(value)
+      if (extra) return new Response(JSON.stringify(state.extraJobs[decodeURIComponent(extra[1]!)] ?? []), { status: 200 })
+      if (value.includes('/abort-cleanup-result')) {
+        const respond = state.cleanupResponses[reports] ?? state.cleanupResponses[state.cleanupResponses.length - 1]!
+        reports += 1
+        const response = respond()
+        if (response.ok) state.onAccepted?.(state)
+        return response
+      }
+      // queued Job の claim（running への PATCH）は 409 で止める。呼ばれたこと自体が claim の証拠。
+      if (value.includes('/api/jobs/job-queued') && init?.method === 'PATCH') {
+        return new Response(JSON.stringify({ error: 'stop here' }), { status: 409 })
+      }
+      return new Response(JSON.stringify([]), { status: 200 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+  }
+
+  const claimed = (): boolean => fetchMock.mock.calls.some(
+    ([url, init]) => String(url).includes('/api/jobs/job-queued') && init?.method === 'PATCH',
+  )
+
+  beforeEach(() => {
+    clearPendingAbortCleanupSubmissions()
+  })
+
+  it('a queued Job is not claimed while the cleanup delivery is pending, and is claimed after acceptance', async () => {
+    vi.useFakeTimers()
+    const queuedTask: Task = { ...task, id: 'task-b', status: 'pending', roadmapActive: true }
+    const queuedJob: Job = { ...job, id: 'job-queued', taskId: 'task-b', status: 'queued' }
+    const state: ApiState = {
+      projectStatus: 'running',
+      projectsFail: false,
+      carrierTask,
+      carrierJobs: [carrier],
+      extraTasks: [queuedTask],
+      extraJobs: { 'task-b': [queuedJob] },
+      cleanupResponses: [busy, () => new Response(null, { status: 200 })],
+      // 受理後の API: Task は park され、carrier から cleanup marker が消える。
+      onAccepted: (current) => {
+        current.carrierTask = { ...carrierTask, status: 'pending', roadmapActive: false }
+        current.carrierJobs = [{ ...carrier, failureMetadata: { workspaceEndFingerprint: dirtyEnd } }]
+      },
+    }
+    stubApi(state)
+
+    void pollJobs()
+    await flushPollCycle()
+    // poll 1: STORAGE_BUSY で配送待ち → intake しない。
+    expect(pendingAbortCleanupSubmissionJobIds()).toEqual(['job-carrier'])
+    expect(claimed()).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST)
+    // poll 2: 同じ証拠を再送して受理。この poll は従来どおり intake を飛ばす。
+    expect(pendingAbortCleanupSubmissionJobIds()).toEqual([])
+    expect(claimed()).toBe(false)
+
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST)
+    // poll 3: 配送待ちが無いので queued Job を claim しにいく。
+    expect(claimed()).toBe(true)
+  })
+
+  it('sweeps the pending entry when the API shows the generation was cancelled', async () => {
+    const state: ApiState = {
+      projectStatus: 'running', projectsFail: false, carrierTask, carrierJobs: [carrier],
+      extraTasks: [], extraJobs: {}, cleanupResponses: [busy],
+    }
+    stubApi(state)
+    await reportAbortCleanupObservations()
+    expect(pendingAbortCleanupSubmissionJobIds()).toEqual(['job-carrier'])
+
+    // marker が消えた（generation 取り消し / commit 済みで応答だけ失われた）。
+    state.carrierJobs = [{ ...carrier, failureMetadata: { workspaceEndFingerprint: dirtyEnd } }]
+    await reportAbortCleanupObservations()
+    expect(pendingAbortCleanupSubmissionJobIds()).toEqual([])
+  })
+
+  it('sweeps the pending entry when its project is no longer running', async () => {
+    const state: ApiState = {
+      projectStatus: 'running', projectsFail: false, carrierTask, carrierJobs: [carrier],
+      extraTasks: [], extraJobs: {}, cleanupResponses: [busy],
+    }
+    stubApi(state)
+    await reportAbortCleanupObservations()
+    state.projectStatus = 'paused'
+    await reportAbortCleanupObservations()
+    expect(pendingAbortCleanupSubmissionJobIds()).toEqual([])
+  })
+
+  it('keeps the pending entry (and keeps intake paused) when the API enumeration fails', async () => {
+    const state: ApiState = {
+      projectStatus: 'running', projectsFail: false, carrierTask, carrierJobs: [carrier],
+      extraTasks: [], extraJobs: {}, cleanupResponses: [busy],
+    }
+    stubApi(state)
+    await reportAbortCleanupObservations()
+    state.projectsFail = true
+    await reportAbortCleanupObservations()
+    expect(pendingAbortCleanupSubmissionJobIds()).toEqual(['job-carrier'])
+  })
+
+  // Codex review 44ddd0f: 列挙が失敗し続けても、保留は毎回列挙と独立に再送され、上限で必ず（通知付きで）解ける。
+  it('with discovery failing every poll, the pending report is still resent each poll and released at the bound with one alert', async () => {
+    const state: ApiState = {
+      projectStatus: 'running', projectsFail: false, carrierTask, carrierJobs: [carrier],
+      extraTasks: [], extraJobs: {}, cleanupResponses: [busy],
+    }
+    stubApi(state)
+    await reportAbortCleanupObservations()
+    const cleanupPosts = (): number => fetchMock.mock.calls
+      .filter(([url]) => String(url).includes('/abort-cleanup-result')).length
+    expect(cleanupPosts()).toBe(1)
+
+    state.projectsFail = true
+    let polls = 0
+    while (hasPendingAbortCleanupSubmissions() && polls < 50) {
+      const before = cleanupPosts()
+      await reportAbortCleanupObservations()
+      polls += 1
+      // 列挙が失敗しても、各 poll で必ず1回再送する（上限が進む）。
+      expect(cleanupPosts()).toBe(before + 1)
+    }
+
+    // 初回を含めて 20 回で解け、黙らずに一度だけ通知する。
+    expect(hasPendingAbortCleanupSubmissions()).toBe(false)
+    expect(cleanupPosts()).toBe(20)
+    expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(1)
+    expect(notifierMocks.sendAlert).toHaveBeenCalledWith(expect.objectContaining({
+      severity: 'critical',
+      sourceId: 'abort_cleanup:job-carrier',
+    }))
+    // 全ての再送は同じ証拠。
+    const bodies = new Set(fetchMock.mock.calls
+      .filter(([url]) => String(url).includes('/abort-cleanup-result'))
+      .map(([, init]) => String(init?.body)))
+    expect(bodies.size).toBe(1)
+  })
+
+  // Codex review 57f2cf6: fetchJson() は reject で throw する。列挙が throw しても保留は残り、毎 poll 独立に再送され、
+  // 上限で通知付きで解ける（poll ごと外側の catch へ抜けて黙って止まらない）。
+  it.each(['projects', 'tasks', 'jobs'] as const)(
+    'with discovery throwing at /api/%s every poll, the pending report is still resent and released at the bound',
+    async (throwOn) => {
+      const state: ApiState = {
+        projectStatus: 'running', projectsFail: false, carrierTask, carrierJobs: [carrier],
+        extraTasks: [], extraJobs: {}, cleanupResponses: [busy],
+      }
+      stubApi(state)
+      await reportAbortCleanupObservations()
+      expect(pendingAbortCleanupSubmissionJobIds()).toEqual(['job-carrier'])
+      const cleanupPosts = (): number => fetchMock.mock.calls
+        .filter(([url]) => String(url).includes('/abort-cleanup-result')).length
+
+      state.throwOn = throwOn
+      // throw した列挙は authoritative ではない: sweep で消さず、再送は続ける。
+      await expect(reportAbortCleanupObservations()).resolves.toBe(false)
+      expect(pendingAbortCleanupSubmissionJobIds()).toEqual(['job-carrier'])
+      expect(cleanupPosts()).toBe(2)
+
+      let polls = 0
+      while (hasPendingAbortCleanupSubmissions() && polls < 50) {
+        await reportAbortCleanupObservations()
+        polls += 1
+      }
+      expect(hasPendingAbortCleanupSubmissions()).toBe(false)
+      expect(cleanupPosts()).toBe(20)
+      expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(1)
+    },
+  )
+
+  // Codex review 35a1784: 同じ poll で新しい cleanup が受理されても、別の保留の再送を飛ばさない。
+  it('a newly accepted cleanup does not starve a separate pending submission in the same poll', async () => {
+    const cleanEndOnly = { mode: 'clean' as const, startCommitHash: 'end-head' }
+    workspaceVerificationMocks.observeWorkspace.mockReturnValue({ observation: cleanEndOnly, knownGood: knownGoodClean })
+    const marked = (id: string, taskId: string, evidence: string): Job => ({
+      ...job,
+      id,
+      taskId,
+      status: 'failed',
+      failureMetadata: {
+        workspaceEndFingerprint: cleanEndOnly,
+        abortCleanupRequestedAt: NOW,
+        abortTechnicalEvidenceId: evidence,
+        abortTechnicalStateFingerprint: `fp-${evidence}`,
+      },
+    })
+    const taskA: Task = { ...task, id: 'task-a', status: 'blocked', roadmapActive: true }
+    const taskB: Task = { ...task, id: 'task-b', status: 'blocked', roadmapActive: true }
+    const jobA = marked('job-a', 'task-a', 'evidence-a')
+    const jobB = marked('job-b', 'task-b', 'evidence-b')
+    let bMarked = false
+    let aAttempts = 0
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const value = String(url)
+      if (value.endsWith('/api/projects')) return new Response(JSON.stringify([project]), { status: 200 })
+      // B を先に列挙する: B の受理で列挙が早期に終わり、A には列挙経路では届かない。
+      if (value.includes('/api/tasks?projectId=')) {
+        return new Response(JSON.stringify(bMarked ? [taskB, taskA] : [taskA]), { status: 200 })
+      }
+      if (value.includes('/api/jobs?taskId=task-a')) return new Response(JSON.stringify([jobA]), { status: 200 })
+      if (value.includes('/api/jobs?taskId=task-b')) return new Response(JSON.stringify([jobB]), { status: 200 })
+      if (value.includes('/api/jobs/job-a/abort-cleanup-result')) {
+        aAttempts += 1
+        return aAttempts === 1 ? busy() : new Response(null, { status: 200 })
+      }
+      if (value.includes('/api/jobs/job-b/abort-cleanup-result')) return new Response(null, { status: 200 })
+      return new Response(JSON.stringify([]), { status: 200 })
+    })
+    vi.stubGlobal('fetch', fetchMock)
+
+    // poll 1: A が STORAGE_BUSY で保留になる。
+    await reportAbortCleanupObservations()
+    expect(pendingAbortCleanupSubmissionJobIds()).toEqual(['job-a'])
+
+    // poll 2: 新しく B の cleanup が要求され受理される。同じ poll で A の保留も再送されて解ける。
+    bMarked = true
+    await expect(reportAbortCleanupObservations()).resolves.toBe(true)
+    const posted = fetchMock.mock.calls.map(([url]) => String(url)).filter((url) => url.includes('/abort-cleanup-result'))
+    expect(posted.filter((url) => url.includes('job-b'))).toHaveLength(1)
+    expect(posted.filter((url) => url.includes('job-a'))).toHaveLength(2)
+    expect(pendingAbortCleanupSubmissionJobIds()).toEqual([])
+  })
+
+  it('a technical refusal report names the carrier generation', async () => {
+    workspaceVerificationMocks.verifyWorkspaceAgainstBaseline.mockReturnValue({ verified: false })
+    const state: ApiState = {
+      projectStatus: 'running', projectsFail: false, carrierTask, carrierJobs: [carrier],
+      extraTasks: [], extraJobs: {}, cleanupResponses: [() => new Response(null, { status: 409 })],
+    }
+    stubApi(state)
+    await reportAbortCleanupObservations()
+
+    const refusal = fetchMock.mock.calls.find(([url]) => String(url).includes('/abort-cleanup-result'))
+    expect(JSON.parse(String(refusal?.[1]?.body))).toEqual({
+      refusalCode: 'PRE_CLEANUP_BASELINE_MISMATCH',
+      cleanupGeneration: {
+        abortCleanupRequestedAt: NOW,
+        abortTechnicalEvidenceId: 'evidence-1',
+        abortTechnicalStateFingerprint: 'fp-1',
+      },
+    })
+  })
+
+  it('with discovery failing, an accepted resubmission clears the entry and releases the gate', async () => {
+    const state: ApiState = {
+      projectStatus: 'running', projectsFail: false, carrierTask, carrierJobs: [carrier],
+      extraTasks: [], extraJobs: {}, cleanupResponses: [busy, () => new Response(null, { status: 200 })],
+    }
+    stubApi(state)
+    await reportAbortCleanupObservations()
+    state.projectsFail = true
+
+    await expect(reportAbortCleanupObservations()).resolves.toBe(true)
+    expect(hasPendingAbortCleanupSubmissions()).toBe(false)
+    expect(notifierMocks.sendAlert).not.toHaveBeenCalled()
   })
 })
 
