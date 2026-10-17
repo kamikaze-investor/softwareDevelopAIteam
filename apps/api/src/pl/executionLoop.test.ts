@@ -3734,3 +3734,53 @@ describe('triage rule 6.8: only an unspoofable, pre-execution technical stop; a 
     expect(triage.summary).not.toContain('新しい承認が求められる')
   })
 })
+
+describe('triage rule 6.8: the exit it names matches what is actually admitted', () => {
+  const SKEW = 'risk_rule_skew: local CRITICAL > API HIGH (worker/api rule skew); technical Gate inconsistency, not an approval decision'
+
+  function commitJobStoppedBySkew(approvalStatus: 'WAITING_FOR_USER' | 'none', expiresInMs = 60 * 60 * 1000) {
+    const { storage, taskId, projectId } = seed()
+    storage.tasks.update(taskId, { status: 'in_progress' })
+    const job = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, dryRun: false,
+      workflowStepKey: 'review:skew-review-job:git-commit',
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, { status: 'running', startedAt: new Date().toISOString() })
+    let approvalId: string | undefined
+    if (approvalStatus === 'WAITING_FOR_USER') {
+      const linked = storage.approvalRequests.createForJob({
+        taskId, requestedAction: 'git_commit', riskLevel: 'HIGH', targetBranch: 'main', targetCommit: 'c',
+        targetDiffHash: 'd', changedFiles: [], triggeredRules: [], invalidIf: [],
+        status: 'WAITING_FOR_USER', expiresAt: new Date(Date.now() + expiresInMs).toISOString(),
+      } as Parameters<IStorage['approvalRequests']['create']>[0], job.id)
+      if (!linked.ok) throw new Error(linked.reason)
+      approvalId = linked.approvalRequest.id
+    }
+    storage.jobs.update(job.id, {
+      status: 'blocked', completedAt: new Date().toISOString(), stderr: SKEW,
+      guardResult: { permissionAllowed: true, fileChangeAllowed: true, fileViolations: [] },
+    } as never)
+    const item = buildSystemState(storage, { now: () => new Date().toISOString() }).attention.find((a) => a.jobId === job.id)!
+    return { triage: triageBlocked(storage, item), approvalId }
+  }
+
+  it('a live WAITING linked approval → the summary names approving that approval (resume is not admitted while it waits)', () => {
+    const { triage, approvalId } = commitJobStoppedBySkew('WAITING_FOR_USER')
+    expect(triage.recommendedLane).toBe('ceo_escalation')
+    expect(triage.summary).toContain(`承認 ${approvalId} を承認する`)
+    expect(triage.summary).toContain('承認待ちの間は resume できない')
+    expect(triage.summary).not.toContain('新しい承認が求められる')
+  })
+
+  it('no linked waiting approval → the summary names resume (a new approval will be requested)', () => {
+    const { triage } = commitJobStoppedBySkew('none')
+    expect(triage.summary).toContain('resume すれば再開でき')
+    expect(triage.summary).toContain('新しい承認が求められる')
+  })
+
+  it('an expired WAITING linked approval is not live → the summary names resume', () => {
+    const { triage } = commitJobStoppedBySkew('WAITING_FOR_USER', -60 * 1000)
+    expect(triage.summary).toContain('resume すれば再開でき')
+  })
+})

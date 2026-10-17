@@ -650,7 +650,7 @@ export async function runJob(
             `検出時刻: ${new Date().toISOString()}`,
             '',
             '次のアクション:',
-            '原因（Worker / API の版ずれ等）を直した後に resume してください。resume すると新しい承認が求められます。',
+            '原因（Worker / API の版ずれ等）を直した後、承認待ちの承認があればそれを承認し、無ければ resume してください（resume では新しい承認が求められます）。',
           ].join('\n'),
           sourceType: 'gate_technical_stop',
           sourceId: approvalRequestId ?? job.id,

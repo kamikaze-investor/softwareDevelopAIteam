@@ -288,3 +288,21 @@ describe('resolvePolicy — 組の整合（全 decision × continuationPolicy ×
     expect(findGateTechnicalStopCode(result.reason)).toBe('approval_contract_violation')
   })
 })
+
+describe('resolvePolicy — outcome.riskLevel と riskReview.riskLevel の食い違いは契約外', () => {
+  it.each([
+    ['ALLOW + call_consume', { ...approvedConsume('HIGH'), outcome: { decision: 'ALLOW', riskLevel: 'CRITICAL', consumedRequestId: 'approval-d2' } }],
+    ['ALLOW + proceed', { ...allowProceed('LOW'), outcome: { decision: 'ALLOW', riskLevel: 'HIGH' } }],
+    ['BLOCKED', { ...waiting('BLOCKED', 'HIGH', 'continue_safe_work_only', 'r'), outcome: { decision: 'BLOCKED', riskLevel: 'LOW', requestId: 'r' } }],
+  ] as const)('%s with a differing outcome.riskLevel → re_check approval_contract_violation', (_label, response) => {
+    const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'LOW' }), response as GateCheckResponse)
+    expect(result.policy).toBe('re_check')
+    expect(findGateTechnicalStopCode(result.reason)).toBe('approval_contract_violation')
+  })
+
+  it('outcome.riskLevel が無い（STALE 等）のは食い違いにしない / 一致していれば通常どおり', () => {
+    expect(resolvePolicy(makeGateResult({ finalRiskLevel: 'HIGH' }), approvedConsume('HIGH')).policy).toBe('continue')
+    const noOutcomeRisk = { ...approvedConsume('HIGH'), outcome: { decision: 'ALLOW', consumedRequestId: 'approval-d2' } } as GateCheckResponse
+    expect(resolvePolicy(makeGateResult({ finalRiskLevel: 'HIGH' }), noOutcomeRisk).policy).toBe('continue')
+  })
+})

@@ -68,7 +68,7 @@ import {
   type HumanRecoveryNextDriver,
 } from '../humanRecovery/recoverBlockedTask'
 import type { AuditLogEntry, Job } from '@ai-team/shared'
-import { gateTechnicalStopCodeOfJob, isLiveApprovedApproval } from '@ai-team/shared'
+import { gateTechnicalStopCodeOfJob, isLiveApprovedApproval, isLiveWaitingApproval } from '@ai-team/shared'
 import type { DesignReviewRun, IStorage } from '../storage/interface'
 import { isUsableAlignedEvidence } from '../designReviewEvidencePolicy'
 import { retryStepKeyFor } from '../designReview/repairPolicy'
@@ -370,6 +370,11 @@ interface Facts {
    * 人は承認し Gate も ALLOW したのに、Worker 側の policy が実行を拒んだ形（integrated E2E・P1）。
    */
   approvedLinkedGitCommitId?: string
+  /**
+   * blocked Job 自身の linked Approval が **live な WAITING_FOR_USER**。その間 resume は admit されないので、
+   * 出口はその承認を承認すること（または期限切れ後の resume）になる（D2 rule 6.8 の案内文に使う）。
+   */
+  liveWaitingLinkedApprovalId?: string
   review?: LatestDesignReviewVerdict
   alignedEvidenceId?: string
 }
@@ -442,6 +447,12 @@ function gatherFacts(storage: IStorage, item: AttentionItem): Facts {
     // 期限切れ・読めない期限の APPROVED はもう誰の authority にもならない（consume が使わせない）。
     return isLiveApprovedApproval(linked) ? linked.id : undefined
   })()
+  const liveWaitingLinkedApprovalId = (() => {
+    if (!job || !job.approvalId) return undefined
+    const linked = storage.approvalRequests.findById(job.approvalId)
+    if (!linked || linked.taskId !== job.taskId) return undefined
+    return isLiveWaitingApproval(linked) ? linked.id : undefined
+  })()
   const review = item.taskId !== undefined ? readLatestDesignReview(storage, item.taskId) : undefined
   const evidence =
     item.taskId !== undefined
@@ -460,6 +471,7 @@ function gatherFacts(storage: IStorage, item: AttentionItem): Facts {
       ? { gitCommitResumeLineageInvalidReason: linkedGitCommit.invalidReason }
       : {}),
     ...(approvedLinkedGitCommitId !== undefined ? { approvedLinkedGitCommitId } : {}),
+    ...(liveWaitingLinkedApprovalId !== undefined ? { liveWaitingLinkedApprovalId } : {}),
     ...(review !== undefined ? { review } : {}),
     // 新しい同じ設計の判定に覆された ALIGNED は根拠にしない（isUsableAlignedEvidence）。
     ...(evidence?.reviewKind === 'task' && isUsableAlignedEvidence(evidence, storage.designReviewEvidence)
@@ -975,8 +987,11 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
       summary:
         `Gate の技術的な不整合（${technicalStopCode}）で ${facts.job.safeCommand.kind} が停止した。`
         + '承認の判断ではなく、未解決の技術的制約（Authority の境界ではない）。'
-        + '自動 resume は同じ不整合で再停止するだけなので行わない。原因を直した後に resume すれば再開でき、'
-        + 'git_commit なら新しい承認が求められる。',
+        + '自動 resume は同じ不整合で再停止するだけなので行わない。'
+        + (facts.liveWaitingLinkedApprovalId !== undefined
+          // live な WAITING の間 resume は admit されない。出口は既存の承認を承認すること。
+          ? `原因を直した後、承認一覧で承認 ${facts.liveWaitingLinkedApprovalId} を承認する（承認待ちの間は resume できない）。`
+          : '原因を直した後に resume すれば再開でき、git_commit なら新しい承認が求められる。'),
     }
   }
 

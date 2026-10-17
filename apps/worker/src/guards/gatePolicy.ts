@@ -197,12 +197,16 @@ function technicalStop(code: GateTechnicalStopCode, detail: string): ResolvePoli
  *   - PENDING_APPROVAL / BLOCKED  → wait_for_approval + (continue_safe_work_only | block_until_approved)
  *   - REJECTED                    → wait_for_approval + (continue_safe_work_only | block_until_approved)
  *   - STALE                       → re_check
+ *   - outcome.riskLevel があれば riskReview.riskLevel と一致すること
  * call_consume の id 一致・RiskLevel の妥当性は gateClient が応答検証で保証する。
  */
 function isCoherentGateResponse(checkResponse: GateCheckResponse): boolean {
   const decision = checkResponse.outcome.decision
   const policy = checkResponse.continuationPolicy
   const action = checkResponse.nextAction.action
+  // API は outcome.riskLevel を riskReview.riskLevel と同じ値で返す（decideGateOutcome）。両方あって食い違うなら契約外。
+  const outcomeRisk = checkResponse.outcome.riskLevel
+  if (outcomeRisk !== undefined && outcomeRisk !== checkResponse.riskReview.riskLevel) return false
   switch (decision) {
     case 'ALLOW': {
       if (policy !== 'continue') return false
