@@ -319,7 +319,8 @@ describe('resume API to worker integration', () => {
         name: 'Resume integration',
         goal: 'Verify resume handoff to Worker',
         designPhilosophy: [],
-        status: 'draft',
+        // resume は running Project でしか受け付けない（PROJECT_NOT_RUNNING）。
+        status: 'running',
       })
       const task = storage.tasks.create({
         projectId: project.id,
