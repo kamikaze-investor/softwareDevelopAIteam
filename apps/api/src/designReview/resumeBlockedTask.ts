@@ -1,5 +1,6 @@
 import type { Task } from '@ai-team/shared'
 import type { IStorage, ResumeBlockedTaskResult } from '../storage/interface'
+import type { ResumeActorEvidence } from './resumeActor'
 import {
   buildDefaultCoordinatorDeps,
   createAndExecuteDesignReview,
@@ -29,21 +30,24 @@ export type ResumeBlockedTaskWithDesignReviewResult =
  * that the new instruction has no matching Design Review evidence, review exactly that prompt
  * before retrying once.
  *
- * This is the single recovery path used by both HTTP and the in-process PL. Actor attribution is
- * deliberately left to the callers because the HTTP route derives it from credentials while the
- * PL derives it from the in-process execution boundary.
+ * This is the single recovery path used by both HTTP and the in-process PL. The actor is decided by
+ * the callers (the HTTP route from credentials, the PL from the in-process execution boundary) and
+ * passed through as `resumedBy`; storage writes the `resume_actor` row in the same transaction that
+ * creates the resume Job (G-01), so a resume never commits without its authority evidence.
  */
 export async function resumeBlockedTaskWithDesignReview(
   storage: IStorage,
   input: {
     task: Pick<Task, 'id' | 'title'>
     instructionPrompt: string
+    resumedBy: ResumeActorEvidence
     coordinatorDeps?: CoordinatorDeps
   },
 ): Promise<ResumeBlockedTaskWithDesignReviewResult> {
   let resumed = storage.jobs.resumeBlockedTask({
     taskId: input.task.id,
     instructionPrompt: input.instructionPrompt,
+    resumedBy: input.resumedBy,
   })
 
   if (!resumed.ok && resumed.code === 'DESIGN_REVIEW_PRECONDITION_FAILED') {
@@ -80,6 +84,7 @@ export async function resumeBlockedTaskWithDesignReview(
     resumed = storage.jobs.resumeBlockedTask({
       taskId: input.task.id,
       instructionPrompt: input.instructionPrompt,
+      resumedBy: input.resumedBy,
     })
   }
 

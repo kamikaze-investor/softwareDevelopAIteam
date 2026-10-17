@@ -106,7 +106,7 @@ describe('park された Task は repair chain へ入らない', () => {
       changedFiles: [], triggeredRules: [], invalidIf: ['commit changes'],
       status: 'WAITING_FOR_USER', expiresAt: new Date(Date.now() + 3600_000).toISOString(),
     } as never)
-    storage.approvalRequests.updateStatus(request.id, 'APPROVED')
+    storage.approvalRequests.recordDecision(request.id, 'APPROVED', undefined, { credentialClass: 'admin' })
     const parked = abortTask(storage, { taskId, approvalRequestId: request.id, reason: 'parked' })
     if (!parked.ok || parked.status !== 'parked') throw new Error('fixture failed to park')
   }
@@ -501,8 +501,7 @@ describe('repair generation を既存 audit へ残す', () => {
       invalidIf: [],
     } as never)
     // CEO が ADMIN credential で承認した記録（epoch は human が決めた承認しか数えない）。
-    recordApprovalActor(storage, approval.id, 'admin')
-    storage.approvalRequests.recordDecision(approval.id, 'APPROVED')
+    storage.approvalRequests.recordDecision(approval.id, 'APPROVED', undefined, { credentialClass: 'admin' })
     expect(storage.approvalRequests.verifyAndConsumeForTaskAction({
       taskId: ids.taskId,
       approvalRequestId: approval.id,

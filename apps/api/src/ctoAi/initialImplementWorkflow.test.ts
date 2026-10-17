@@ -85,7 +85,7 @@ describe('initial implement workflow', () => {
           changedFiles: [], triggeredRules: [], invalidIf: ['commit changes'],
           status: 'WAITING_FOR_USER', expiresAt: new Date(Date.now() + 3600_000).toISOString(),
         } as Parameters<IStorage['approvalRequests']['create']>[0])
-        storage.approvalRequests.updateStatus(request.id, 'APPROVED')
+        storage.approvalRequests.recordDecision(request.id, 'APPROVED', undefined, { credentialClass: 'admin' })
         const parked = abortTask(storage, {
           taskId, approvalRequestId: request.id, reason: 'CEO parked it while the review ran',
         })

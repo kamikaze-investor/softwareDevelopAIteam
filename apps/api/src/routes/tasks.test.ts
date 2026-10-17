@@ -5,6 +5,7 @@ import type { ApprovalRequest, Job, Project, SafeCommand, Task, TaskDetail, Task
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { appendImplementContracts } from '../implementPrompt'
 import { buildSystemState } from '../state/systemState'
+import { recordApprovalActor } from '../designReview/resumeActor'
 import { buildResumeAiCliPrompt, type TaskRouteOptions } from './tasks'
 
 /**
@@ -249,7 +250,7 @@ describe('Task API', () => {
       })
       expect(hiddenTechnicalPath.statusCode).toBe(400)
 
-      storage.approvalRequests.updateStatus(request.id, 'APPROVED')
+      storage.approvalRequests.recordDecision(request.id, 'APPROVED', undefined, { credentialClass: 'admin' })
       const approved = await app.inject({
         method: 'POST',
         url: `/api/tasks/${task.id}/abort`,
@@ -295,6 +296,7 @@ describe('Task API', () => {
         changedFiles: [], triggeredRules: [], invalidIf: [], status: 'APPROVED',
         expiresAt: new Date(Date.now() + 3600_000).toISOString(),
       } as never)
+      recordApprovalActor(storage, abortApproval.id, 'admin')
 
       const response = await app.inject({
         method: 'POST',
@@ -335,7 +337,7 @@ describe('Task API', () => {
         changedFiles: [], triggeredRules: [], invalidIf: ['commit changes'],
         status: 'WAITING_FOR_USER', expiresAt: new Date(Date.now() + 3600_000).toISOString(),
       } as never)
-      storage.approvalRequests.updateStatus(request.id, 'APPROVED')
+      storage.approvalRequests.recordDecision(request.id, 'APPROVED', undefined, { credentialClass: 'admin' })
       const { abortTask } = await import('../pl/abortTask.js')
       expect(abortTask(storage, {
         taskId: task.id, approvalRequestId: request.id, reason: 'parked',
@@ -1280,7 +1282,7 @@ describe('Task API', () => {
         const project = await createProject(app, { status: 'running' })
         const task = await createTask(app, project.id)
         await createBlockedAiCliJob(app, task)
-        await createApprovalRequest(task.id, { status: 'WAITING_FOR_USER' })
+        await createApprovalRequest(task.id, { status: 'WAITING_FOR_USER', requestedAction: 'git_commit' })
 
         const res = await app.inject({
           method: 'POST',

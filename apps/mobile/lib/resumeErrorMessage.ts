@@ -46,6 +46,7 @@ const RESUME_ERROR_MESSAGE_BY_CODE: Readonly<Record<string, string>> = {
   WORKSPACE_QUARANTINED: '安全のため停止しているため、追加指示では再開できません。AI開発チーム側で作業領域の復旧が必要です。',
   LIVE_JOB_EXISTS: '既に実行中または待機中の作業があるため、追加指示を送れませんでした。',
   APPROVAL_WAITING: '承認待ちの操作があるため、追加指示を送れませんでした。',
+  HUMAN_DECISION_PENDING: '承認画面で判断待ち・判断済みの操作（中止など）があるため、この操作では再開できませんでした。CEOの操作として再開してください。',
   AI_CLI_MODE_MISSING: 'AI実行設定が不足しているため、再開できませんでした。',
   AI_CLI_PROVIDER_MISSING: 'AI実行設定（使用するAI）が記録されていないため、再開できませんでした。AI開発チームに確認を依頼してください。',
   RESUME_DESIGN_REVIEW_FAILED: RESUME_DESIGN_REVIEW_FAILED_MESSAGE,
@@ -99,4 +100,19 @@ const RECOVER_ERROR_MESSAGE_BY_CODE: Readonly<Record<string, string>> = {
 
 export function formatRecoverErrorMessage(code: string | null): string {
   return messageForCode(RECOVER_ERROR_MESSAGE_BY_CODE, code) ?? RECOVER_ERROR_MESSAGE_FALLBACK
+}
+
+export const APPROVAL_DECISION_ERROR_MESSAGE_FALLBACK = '操作に失敗しました'
+
+/**
+ * `PATCH /api/approval-requests/:id/status` の拒否 `code` ごとの文言。
+ * この route も `HUMAN_ONLY_ROUTES`（C-02）なので、API の認証構成が人と自動を区別できないと 403 になる。
+ */
+const APPROVAL_DECISION_ERROR_MESSAGE_BY_CODE: Readonly<Record<string, string>> = {
+  HUMAN_ONLY_ROUTE_REQUIRES_SPLIT_CREDENTIALS:
+    '承認・却下はCEO専用の操作です。現在のAPIの認証設定では実行できません。AI開発チームに確認を依頼してください。',
+}
+
+export function formatApprovalDecisionErrorMessage(code: string | null): string {
+  return messageForCode(APPROVAL_DECISION_ERROR_MESSAGE_BY_CODE, code) ?? APPROVAL_DECISION_ERROR_MESSAGE_FALLBACK
 }

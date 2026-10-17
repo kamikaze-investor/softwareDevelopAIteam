@@ -26,7 +26,7 @@ import {
   type PlLoopDeps,
 } from './executionLoop'
 import { findProposalDiagnostics, PL_MAX_ADOPTION_ATTEMPTS } from './adoptionStep'
-import { parseTriageAuditDetail } from './blockedTriage'
+import { parseTriageAuditDetail, triageBlocked } from './blockedTriage'
 import { readResumeActorClasses } from '../designReview/resumeActor'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { prepareRepairFlow } from '../designReview/repairFlow'
@@ -1681,7 +1681,7 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
       // CEO が Job 作成から閾値を大きく過ぎてから承認する。
       const decidedAt = 3 * PAST
       vi.setSystemTime(T0 + decidedAt)
-      const resumed = storage.approvalRequests.approveAndResumeJob(approvalId)
+      const resumed = storage.approvalRequests.approveAndResumeJob(approvalId, undefined, { credentialClass: 'admin' })
       expect(resumed.ok).toBe(true)
       expect(storage.jobs.findById(job.id)).toMatchObject({ status: 'queued' })
 
@@ -2622,6 +2622,107 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     expect(readResumeActorClasses(storage, storage.jobs.findByTaskId(taskId)).get(resumeJob!.id)).toBe('pl')
   })
 
+  // C-03 の残り + Codex round 2: 生きた人の判断（APPROVED abort_task）がある Task を PL は resume しない。
+  // job_blocked ではなく approval_waiting（notify-only）として1回だけ人へ届け、診断も試行もしない。
+  it('a live APPROVED abort_task is a human wait: notified once as approval_waiting, no resume, no attempt', async () => {
+    const { storage, taskId, projectId } = seed()
+    const sourceJobId = blockedAiCliJob(storage, taskId, projectId)
+    const abortApproval = storage.approvalRequests.create({
+      taskId, requestedAction: 'abort_task', riskLevel: 'HIGH', targetBranch: 'b', targetCommit: 'c',
+      targetDiffHash: 'd', changedFiles: [], triggeredRules: [], invalidIf: [], status: 'APPROVED',
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    } as Parameters<IStorage['approvalRequests']['create']>[0])
+    const escalations: string[] = []
+
+    const result = await runPlTick(storage, deps({
+      diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: 'technical recovery', riskLevel: 'LOW' }),
+      escalate: async (p) => { escalations.push(p.title); return DELIVERED },
+      coordinatorDeps: alignedCoordinatorDeps,
+    }))
+
+    expect(result.status).toBe('escalated')
+    expect(result.target?.kind).toBe('approval_waiting')
+    expect(escalations).toHaveLength(1)
+    expect(countPriorAttempts(storage, `job_blocked:${sourceJobId}`)).toBe(0)
+    expect(storage.approvalRequests.findById(abortApproval.id)?.status).toBe('APPROVED')
+    expect(storage.jobs.findByTaskId(taskId).some((j) => j.workflowStepKey === `resume:${sourceJobId}:1`)).toBe(false)
+  })
+
+  // Codex round 2: RESUME_COMMIT_FAILED は技術的失敗の試行として数え、technical budget で止める。
+  it('a persistent resume_actor write failure burns attempts and stops instead of retrying silently', async () => {
+    const { storage, taskId, projectId } = seed()
+    const sourceJobId = blockedAiCliJob(storage, taskId, projectId)
+    const original = storage.auditLog.record.bind(storage.auditLog)
+    vi.spyOn(storage.auditLog, 'record').mockImplementation((entry) => {
+      if (entry.operation === 'resume_actor') throw new Error('disk is full')
+      return original(entry)
+    })
+    const escalations: string[] = []
+    let diagnoses = 0
+    const tickDeps = deps({
+      diagnose: async () => {
+        diagnoses += 1
+        return JSON.stringify({ actionKind: 'resume_task', rationale: 'technical recovery', riskLevel: 'LOW' })
+      },
+      escalate: async (payload) => { escalations.push(payload.title); return DELIVERED },
+      coordinatorDeps: alignedCoordinatorDeps,
+    })
+    const results: string[] = []
+    for (let tick = 0; tick < PL_MAX_ATTEMPTS_PER_TARGET + 4; tick += 1) {
+      resetPlLoopInFlightForTest()
+      results.push((await runPlTick(storage, tickDeps)).status)
+    }
+    vi.restoreAllMocks()
+
+    const key = `job_blocked:${sourceJobId}`
+    expect(countPriorAttempts(storage, key)).toBeGreaterThan(0)
+    expect(countPriorAttempts(storage, key)).toBeLessThanOrEqual(PL_MAX_ATTEMPTS_PER_TARGET)
+    expect(diagnoses).toBeLessThanOrEqual(PL_MAX_ATTEMPTS_PER_TARGET)
+    expect(storage.jobs.findByTaskId(taskId).some((j) => j.workflowStepKey === `resume:${sourceJobId}:1`)).toBe(false)
+    // 予算が尽きた後は試行しない（後半の tick は idle）。尽きた事実は既存の technical_exhausted として残り、
+    // attention の detail にも投影されて人に見える（試行回数だけで CEO decision にはしない既存方針）。
+    expect(results.slice(-3)).toEqual(['idle', 'idle', 'idle'])
+    expect(storage.auditLog.findByEntity('pl_loop_target', key)
+      .filter((entry) => entry.result === 'technical_exhausted')).toHaveLength(1)
+    const visible = buildSystemState(storage, { now: () => NOW }).attention.find((a) => a.jobId === sourceJobId)
+    expect(visible?.detail).toContain('technical recovery budget is exhausted')
+  })
+
+  // Codex round 3: audit の書き込み自体が全部失敗する（DB 書き込み障害）と、試行回数も technical_exhausted も
+  // 残せない。プロセス内の対象別カウンタで同じ上限まで数え、それ以上その対象を試さない。
+  it('when every audit write fails, the PL still stops retrying the target after the attempt bound', async () => {
+    const { storage, taskId, projectId } = seed()
+    const sourceJobId = blockedAiCliJob(storage, taskId, projectId)
+    vi.spyOn(storage.auditLog, 'record').mockImplementation(() => { throw new Error('SQLITE_IOERR: disk I/O error') })
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+    let diagnoses = 0
+    const tickDeps = deps({
+      diagnose: async () => {
+        diagnoses += 1
+        return JSON.stringify({ actionKind: 'resume_task', rationale: 'technical recovery', riskLevel: 'LOW' })
+      },
+      escalate: async () => DELIVERED,
+      coordinatorDeps: alignedCoordinatorDeps,
+    })
+    const results: string[] = []
+    for (let tick = 0; tick < PL_MAX_ATTEMPTS_PER_TARGET + 5; tick += 1) {
+      resetPlLoopInFlightForTest()
+      try {
+        results.push((await runPlTick(storage, tickDeps)).status)
+      } catch (error: unknown) {
+        results.push(`threw:${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    const fallbackErrors = errors.mock.calls.filter((call) => String(call[0]).includes('in-process attempt counter'))
+    vi.restoreAllMocks()
+
+    expect(diagnoses).toBeLessThanOrEqual(PL_MAX_ATTEMPTS_PER_TARGET)
+    expect(results.slice(-3).every((r) => r === 'idle')).toBe(true)
+    expect(storage.jobs.findByTaskId(taskId).some((j) => j.workflowStepKey === `resume:${sourceJobId}:1`)).toBe(false)
+    // 対象ごとに1回だけ記録する（毎 tick ログを流さない）。
+    expect(fallbackErrors).toHaveLength(1)
+  })
+
   // **判定が出ていない resume の Design Review は否定ではない**（独立レビュー round 5・2026-10-16）。
   // 試行を消費せず attention を残し、次の tick で同じ instruction を再送すると active-run dedup で
   // **同じ run** が再開され、ALIGNED なら resume Job が1回だけ作られる。
@@ -2987,7 +3088,7 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
       requestedAction, status: 'WAITING_FOR_USER',
       expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(), invalidIf: [],
     } as Parameters<IStorage['approvalRequests']['create']>[0])
-    storage.approvalRequests.recordDecision(created.id, 'APPROVED', 'seeded')
+    storage.approvalRequests.recordDecision(created.id, 'APPROVED', 'seeded', { credentialClass: 'admin' })
     return created.id
   }
 
@@ -3124,3 +3225,199 @@ describe('rekick_design_review は attention が名指した run だけを動か
     expect(storage.designReviewRuns.findById(replacementId)?.status).toBe('queued')
   })
 })
+
+// integrated E2E・P1: ADMIN が HIGH の git_commit を承認 → gate/check は ALLOW + call_consume →
+// Worker の gate policy（AI 編集禁止）が continue_safe_work_only へ倒して blocked を報告する。
+// 以前は API がこの blocked を「承認と競合した古い結果」として捨て、Job は running のまま無音停止した。
+describe('approved git_commit blocked by the Worker gate policy', () => {
+  function approvedThenWorkerBlocked(): { storage: IStorage; taskId: string; jobId: string; approvalId: string } {
+    const { storage, taskId, projectId } = seed()
+    storage.tasks.update(taskId, { status: 'in_progress' })
+    const job = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, dryRun: false,
+      workflowStepKey: 'review:some-review-job:git-commit',
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, { status: 'running', startedAt: new Date().toISOString() })
+    const linked = storage.approvalRequests.createForJob({
+      taskId, requestedAction: 'git_commit', riskLevel: 'HIGH', targetBranch: 'main', targetCommit: 'c0ffee',
+      targetDiffHash: 'd1ff', changedFiles: ['src/a.ts'], triggeredRules: [], invalidIf: [],
+      status: 'WAITING_FOR_USER', expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    } as Parameters<IStorage['approvalRequests']['create']>[0], job.id)
+    if (!linked.ok) throw new Error(linked.reason)
+    // 最初の実行は承認待ちで blocked。
+    storage.jobs.update(job.id, { status: 'blocked' })
+    const approved = storage.approvalRequests.approveAndResumeJob(
+      linked.approvalRequest.id, undefined, { credentialClass: 'admin' },
+    )
+    if (!approved.ok) throw new Error(approved.reason)
+    // 承認後の実行: claim → Worker が safe_work_only で blocked を報告（stderr 無し）。
+    const claimed = storage.jobs.update(job.id, { status: 'running', startedAt: new Date().toISOString() })
+    expect(claimed?.status).toBe('running')
+    storage.jobs.update(job.id, {
+      status: 'blocked',
+      completedAt: new Date().toISOString(),
+      guardResult: { permissionAllowed: true, fileChangeAllowed: true, fileViolations: [] },
+    })
+    return { storage, taskId, jobId: job.id, approvalId: linked.approvalRequest.id }
+  }
+
+  it('persists the blocked result, keeps the approval APPROVED, and surfaces job_blocked with the cause', () => {
+    const fx = approvedThenWorkerBlocked()
+
+    expect(fx.storage.jobs.findById(fx.jobId)?.status).toBe('blocked')
+    expect(fx.storage.approvalRequests.findById(fx.approvalId)?.status).toBe('APPROVED')
+    const attention = buildSystemState(fx.storage, { now: () => NOW }).attention
+      .filter((item) => item.taskId === fx.taskId && item.kind === 'job_blocked')
+    expect(attention).toHaveLength(1)
+    expect(attention[0].detail).toContain('approved_but_worker_blocked')
+    expect(attention[0].detail).toContain(fx.approvalId)
+    expect(attention[0].detail).toContain('guards passed but the Worker gate step blocked git_commit')
+  })
+
+  it('a stale blocked result for a requeued (queued) Job is still ignored', () => {
+    const { storage, taskId, projectId } = seed()
+    const job = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, dryRun: false,
+      workflowStepKey: 'review:other-review-job:git-commit',
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, { status: 'running', startedAt: new Date().toISOString() })
+    const linked = storage.approvalRequests.createForJob({
+      taskId, requestedAction: 'git_commit', riskLevel: 'HIGH', targetBranch: 'main', targetCommit: 'c',
+      targetDiffHash: 'd', changedFiles: [], triggeredRules: [], invalidIf: [],
+      status: 'WAITING_FOR_USER', expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    } as Parameters<IStorage['approvalRequests']['create']>[0], job.id)
+    if (!linked.ok) throw new Error(linked.reason)
+    const approved = storage.approvalRequests.approveAndResumeJob(linked.approvalRequest.id, undefined, { credentialClass: 'admin' })
+    if (!approved.ok) throw new Error(approved.reason)
+
+    storage.jobs.update(job.id, { status: 'blocked' })
+    expect(storage.jobs.findById(job.id)?.status).toBe('queued')
+  })
+
+  it('the PL escalates it once to the CEO (not auto-resume) and does not churn on later ticks', async () => {
+    const fx = approvedThenWorkerBlocked()
+    const escalations: string[] = []
+    const tickDeps = deps({
+      diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: 'retry', riskLevel: 'LOW' }),
+      escalate: async (payload) => { escalations.push(payload.title); return DELIVERED },
+    })
+
+    const first = await runPlTick(fx.storage, tickDeps)
+    expect(first.status).toBe('escalated')
+    expect(first.triage?.lane).toBe('ceo_escalation')
+    expect(escalations).toHaveLength(1)
+
+    for (let tick = 0; tick < 3; tick += 1) {
+      resetPlLoopInFlightForTest()
+      await runPlTick(fx.storage, tickDeps)
+    }
+    expect(escalations).toHaveLength(1)
+    // 自動 resume していない: 後継 Job も新しい承認も作られず、承認は APPROVED のまま。
+    expect(fx.storage.jobs.findByTaskId(fx.taskId)).toHaveLength(1)
+    expect(fx.storage.approvalRequests.findById(fx.approvalId)?.status).toBe('APPROVED')
+  })
+
+  it('a Human Resume starts a new generation and supersedes the unused approval', () => {
+    const fx = approvedThenWorkerBlocked()
+    fx.storage.tasks.update(fx.taskId, { status: 'blocked' })
+
+    const resumed = fx.storage.jobs.resumeBlockedTask({
+      taskId: fx.taskId,
+      instructionPrompt: 'resume',
+      resumedBy: { actorClass: 'human', evidence: 'admin_credential' },
+    })
+
+    expect(resumed.ok).toBe(true)
+    if (!resumed.ok) return
+    expect(resumed.job.approvalId).toBeUndefined()
+    expect(fx.storage.jobs.findById(fx.jobId)?.status).toBe('failed')
+    expect(fx.storage.approvalRequests.findById(fx.approvalId)?.status).toBe('SUPERSEDED')
+  })
+})
+
+// Codex round 2 (34fb1d8)
+describe('approved-run blocked cause comes from the evidence the Worker sent', () => {
+  function approvedRunBlocked(guardResult: Record<string, unknown>): { storage: IStorage; jobId: string } {
+    const { storage, taskId, projectId } = seed()
+    storage.tasks.update(taskId, { status: 'in_progress' })
+    const job = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, dryRun: false,
+      workflowStepKey: 'review:perm-review-job:git-commit',
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, { status: 'running', startedAt: new Date().toISOString() })
+    const linked = storage.approvalRequests.createForJob({
+      taskId, requestedAction: 'git_commit', riskLevel: 'HIGH', targetBranch: 'main', targetCommit: 'c',
+      targetDiffHash: 'd', changedFiles: [], triggeredRules: [], invalidIf: [],
+      status: 'WAITING_FOR_USER', expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    } as Parameters<IStorage['approvalRequests']['create']>[0], job.id)
+    if (!linked.ok) throw new Error(linked.reason)
+    storage.jobs.update(job.id, { status: 'blocked' })
+    const approved = storage.approvalRequests.approveAndResumeJob(linked.approvalRequest.id, undefined, { credentialClass: 'admin' })
+    if (!approved.ok) throw new Error(approved.reason)
+    storage.jobs.update(job.id, { status: 'running', startedAt: new Date().toISOString() })
+    storage.jobs.update(job.id, { status: 'blocked', completedAt: new Date().toISOString(), guardResult } as never)
+    return { storage, jobId: job.id }
+  }
+
+  it('a permission denial on the approved rerun is persisted with the real guard reason, not a gate-policy story', () => {
+    const fx = approvedRunBlocked({
+      permissionAllowed: false, permissionReason: 'once grant already used', fileChangeAllowed: true, fileViolations: [],
+    })
+    const job = fx.storage.jobs.findById(fx.jobId)!
+    expect(job.status).toBe('blocked')
+    expect(job.stderr).toContain('approved_run_permission_denied: once grant already used')
+    expect(job.stderr).not.toContain('gate step')
+    const item = buildSystemState(fx.storage, { now: () => NOW }).attention.find((a) => a.jobId === fx.jobId)!
+    expect(triageBlocked(fx.storage, item).rootCauseClass).not.toBe('safety_or_authority_boundary')
+  })
+
+  it('guards passed (gate-step refusal) is the only evidence that triage rule 6.9 escalates', () => {
+    const fx = approvedRunBlocked({ permissionAllowed: true, fileChangeAllowed: true, fileViolations: [] })
+    const item = buildSystemState(fx.storage, { now: () => NOW }).attention.find((a) => a.jobId === fx.jobId)!
+    expect(triageBlocked(fx.storage, item)).toMatchObject({
+      rootCauseClass: 'safety_or_authority_boundary', recommendedLane: 'ceo_escalation',
+    })
+  })
+})
+
+describe('a live task-scoped human decision is a human wait, not a blocked-job recovery target', () => {
+  it('APPROVED abort_task + blocked Job: no job_blocked, one approval_waiting notification, no per-tick diagnosis', async () => {
+    const { storage, taskId, projectId } = seed()
+    storage.tasks.update(taskId, { status: 'blocked' })
+    storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+      aiCliMode: 'implement', aiCliProvider: 'codex',
+    } as Parameters<IStorage['jobs']['create']>[0])
+    const abort = storage.approvalRequests.create({
+      taskId, requestedAction: 'abort_task', riskLevel: 'HIGH', targetBranch: 'b', targetCommit: 'c',
+      targetDiffHash: 'd', changedFiles: [], triggeredRules: [], invalidIf: [], status: 'WAITING_FOR_USER',
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    } as Parameters<IStorage['approvalRequests']['create']>[0])
+    storage.approvalRequests.recordDecision(abort.id, 'APPROVED', undefined, { credentialClass: 'admin' })
+
+    const attention = buildSystemState(storage, { now: () => NOW }).attention.filter((a) => a.taskId === taskId)
+    expect(attention.map((a) => a.kind)).toEqual(['approval_waiting'])
+    expect(attention[0].referenceId).toBe(abort.id)
+    expect(attention[0].detail).toContain('APPROVED but not yet executed')
+
+    let diagnoses = 0
+    const escalations: string[] = []
+    const tickDeps = deps({
+      diagnose: async () => { diagnoses += 1; return JSON.stringify({ actionKind: 'resume_task', rationale: 'r', riskLevel: 'LOW' }) },
+      escalate: async (payload) => { escalations.push(payload.title); return DELIVERED },
+    })
+    for (let tick = 0; tick < 4; tick += 1) {
+      resetPlLoopInFlightForTest()
+      await runPlTick(storage, tickDeps)
+    }
+    expect(diagnoses).toBe(0)
+    expect(escalations).toHaveLength(1)
+    expect(storage.approvalRequests.findById(abort.id)?.status).toBe('APPROVED')
+    expect(storage.jobs.findByTaskId(taskId)).toHaveLength(1)
+  })
+})
+

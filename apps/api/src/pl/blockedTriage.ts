@@ -72,6 +72,7 @@ import type { DesignReviewRun, IStorage } from '../storage/interface'
 import { isUsableAlignedEvidence } from '../designReviewEvidencePolicy'
 import { retryStepKeyFor } from '../designReview/repairPolicy'
 import { isTerminalJobStatus } from '../jobResultApplicationPolicy'
+import { classifyApprovedRunBlock } from '../approvedRunBlock'
 import {
   classifyGitCommitResumeLineage,
   parseGitCommitResumeStepKey,
@@ -363,6 +364,11 @@ interface Facts {
   rejectedApprovalId?: string
   /** fixed-anchor generation が壊れており、自動 resume へ倒してはならない。 */
   gitCommitResumeLineageInvalidReason?: string
+  /**
+   * blocked git_commit Job 自身の linked Approval が **APPROVED（未 consume）** のまま。
+   * 人は承認し Gate も ALLOW したのに、Worker 側の policy が実行を拒んだ形（integrated E2E・P1）。
+   */
+  approvedLinkedGitCommitId?: string
   review?: LatestDesignReviewVerdict
   alignedEvidenceId?: string
 }
@@ -428,6 +434,12 @@ function gatherFacts(storage: IStorage, item: AttentionItem): Facts {
     return { rejection: rejectionOf(source, source.approvalId) }
   })()
   const linkedRejection = linkedGitCommit.rejection
+  const approvedLinkedGitCommitId = (() => {
+    if (!job || job.safeCommand.kind !== 'git_commit' || !job.approvalId) return undefined
+    const linked = storage.approvalRequests.findById(job.approvalId)
+    if (!linked || linked.taskId !== job.taskId || linked.requestedAction !== 'git_commit') return undefined
+    return linked.status === 'APPROVED' ? linked.id : undefined
+  })()
   const review = item.taskId !== undefined ? readLatestDesignReview(storage, item.taskId) : undefined
   const evidence =
     item.taskId !== undefined
@@ -445,6 +457,7 @@ function gatherFacts(storage: IStorage, item: AttentionItem): Facts {
     ...(linkedGitCommit.invalidReason !== undefined
       ? { gitCommitResumeLineageInvalidReason: linkedGitCommit.invalidReason }
       : {}),
+    ...(approvedLinkedGitCommitId !== undefined ? { approvedLinkedGitCommitId } : {}),
     ...(review !== undefined ? { review } : {}),
     // 新しい同じ設計の判定に覆された ALIGNED は根拠にしない（isUsableAlignedEvidence）。
     ...(evidence?.reviewKind === 'task' && isUsableAlignedEvidence(evidence, storage.designReviewEvidence)
@@ -927,6 +940,42 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
   // （2026-09-23 production で、人の REJECT が同一 diff の承認待ちへ戻った）。
   // `rootCauseClass` は増やさず、既存 schema の値だけで
   // 「既存 resume は在るが、AI が自動実行してよい復旧ではない」を表現する。
+  // ── 6.9 承認済みなのに Worker が実行を拒んだ git_commit ─────────────────────
+  //
+  // linked Approval は APPROVED（未 consume）で、Gate は ALLOW + call_consume を返したが、Worker 側の
+  // gate policy（AI 編集禁止の Control 領域）が実行を拒んで blocked を報告した。下の 7 へ落とすと
+  // auto_recovery → PL resume → 新しい承認 → CEO 承認 → また Worker が拒否、の無限往復になる。
+  // AI が解ける停止ではない（policy の変更は CEO の判断）ので、CEO に一度だけ見せて止める。
+  // **Worker が送った証拠（guardResult / quarantine）が Gate 段階の拒否を示すときだけ**（Codex round 2）。
+  // Permission 拒否・File Change Guard・quarantine は既存の rule（1〜3・7）がそれぞれ扱う。保存側
+  // （`jobs.update` の停止理由）と同じ `classifyApprovedRunBlock()` で判定する。
+  if (
+    facts.job?.status === 'blocked'
+    && facts.approvedLinkedGitCommitId !== undefined
+    && classifyApprovedRunBlock(facts.job) === 'gate_refusal'
+    && !hasLiveJob(facts)
+  ) {
+    return {
+      ...result,
+      rootCauseClass: 'safety_or_authority_boundary',
+      blockingLayer: 'approval',
+      evidence: [
+        { fact: 'approval_request.status (linked, unconsumed)', id: facts.approvedLinkedGitCommitId, value: 'APPROVED' },
+        { fact: 'job.status', id: facts.job.id, value: 'blocked' },
+        { fact: 'job.stderr', id: facts.job.id, value: (facts.job.stderr ?? '').slice(0, 200) },
+      ],
+      recoverable: false,
+      existingRecoveryAvailable: true,
+      requiresAuthorityChange: true,
+      confidence: 'high',
+      recommendedLane: 'ceo_escalation',
+      summary:
+        'CEO が承認し Gate も許可した git_commit を、Worker 側の gate policy が実行しなかった'
+        + '（承認は APPROVED のまま未使用）。自動 resume しても同じ拒否を繰り返すだけで、'
+        + 'Worker の policy は AI が変更できない。CEO の判断が必要。',
+    }
+  }
+
   if (facts.job?.status === 'blocked' && !hasLiveJob(facts)) {
     const ceoRejected = facts.ceoRejectedGitCommit === true
     return {
