@@ -123,12 +123,23 @@ function requestTechnical(fx: ReturnType<typeof seedTechnicalAbort>): void {
   }
 }
 
+/** Worker と同じく、報告する時点の carrier の marker から cleanup generation を名指す。 */
+function currentCleanupGeneration(storage: IStorage, jobId: string) {
+  const metadata = storage.jobs.findById(jobId)?.failureMetadata
+  return {
+    abortCleanupRequestedAt: metadata?.abortCleanupRequestedAt ?? '',
+    abortTechnicalEvidenceId: metadata?.abortTechnicalEvidenceId ?? '',
+    abortTechnicalStateFingerprint: metadata?.abortTechnicalStateFingerprint ?? '',
+  }
+}
+
 function finishTechnical(
   fx: ReturnType<typeof seedTechnicalAbort>,
   input: Partial<Parameters<typeof completeAbortCleanup>[1]> = {},
 ): ReturnType<typeof completeAbortCleanup> {
   return completeAbortCleanup(fx.storage, {
     jobId: fx.latestJobId,
+    cleanupGeneration: currentCleanupGeneration(fx.storage, fx.latestJobId),
     preCleanupObservation: BASELINE,
     observation: BASELINE,
     knownGood: KNOWN_GOOD,
@@ -848,6 +859,58 @@ describe('abortTask — blocked Job を1本残さない', () => {
   })
 })
 
+describe('abortTask — 認可された park は Task の active request を action を問わず STALE にする', () => {
+  function waitingRequest(storage: IStorage, taskId: string, action: string): string {
+    return storage.approvalRequests.create({
+      taskId, requestedAction: action, riskLevel: 'HIGH',
+      targetBranch: 'ai/park', targetCommit: 'c', targetDiffHash: 'd',
+      changedFiles: [], triggeredRules: [], invalidIf: [],
+      status: 'WAITING_FOR_USER', expiresAt: FUTURE,
+    } as Parameters<IStorage['approvalRequests']['create']>[0]).id
+  }
+
+  it('Job 付きの manual park は git_commit 以外の active request も STALE にし、abort 承認は CONSUMED のまま', () => {
+    const fx = seed()
+    const approvalRequestId = approve(fx.storage, fx.taskId)
+    const other = waitingRequest(fx.storage, fx.taskId, 'deploy')
+    const requested = abortTask(fx.storage, { taskId: fx.taskId, approvalRequestId, reason: 'r' })
+    if (!requested.ok || requested.status !== 'cleanup_requested') throw new Error('expected cleanup_requested')
+    // 認可 guard を通る前（cleanup 要求の段階）では何も変えない。
+    expect(fx.storage.approvalRequests.findById(other)?.status).toBe('WAITING_FOR_USER')
+
+    const done = completeAbortCleanup(fx.storage, { jobId: fx.jobId, observation: BASELINE, knownGood: KNOWN_GOOD })
+    expect(done).toMatchObject({ ok: true })
+
+    expect(fx.storage.approvalRequests.findById(other)?.status).toBe('STALE')
+    expect(fx.storage.approvalRequests.findById(approvalRequestId)?.status).toBe('CONSUMED')
+    const aborted = fx.storage.auditLog.findByEntity('task', fx.taskId)
+      .find((entry) => entry.operation === 'task_aborted' && entry.result === 'success')
+    expect(aborted?.detail).toContain('1 active approval(s) staled')
+  })
+
+  it('Job の無い直接 park も git_commit 以外の active request を STALE にする', () => {
+    const fx = seed()
+    fx.storage.jobs.update(fx.jobId, { status: 'failed' })
+    const approvalRequestId = approve(fx.storage, fx.taskId)
+    const other = waitingRequest(fx.storage, fx.taskId, 'deploy')
+
+    expect(abortTask(fx.storage, { taskId: fx.taskId, approvalRequestId, reason: 'r' }))
+      .toMatchObject({ ok: true, status: 'parked' })
+    expect(fx.storage.approvalRequests.findById(other)?.status).toBe('STALE')
+  })
+
+  it('認可に失敗した park は active request を変えない', () => {
+    const fx = seed()
+    fx.storage.jobs.update(fx.jobId, { status: 'failed' })
+    const other = waitingRequest(fx.storage, fx.taskId, 'deploy')
+
+    expect(abortTask(fx.storage, { taskId: fx.taskId, approvalRequestId: other, reason: 'r' }))
+      .toMatchObject({ ok: false })
+    expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(true)
+    expect(fx.storage.approvalRequests.findById(other)?.status).toBe('WAITING_FOR_USER')
+  })
+})
+
 describe('abortTask — park した Task を別経路で再武装させない', () => {
   it('resume は park された Task を進めない', () => {
     const fx = seed()
@@ -1282,6 +1345,316 @@ describe('P2-2 Automatic Technical Abort', () => {
         .toBeUndefined()
     },
   )
+
+  // 期限解釈は shared isLiveWaitingApproval に一本化（2026-10-16 監査 A2）。期限切れ WAITING は
+  // 誰も待っておらず承認もできないので、Technical Abort を恒久的に塞がない。
+  it('an expired WAITING approval does not block Technical Abort, and the park stales it', () => {
+    const fx = seedTechnicalAbort()
+    const expired = fx.storage.approvalRequests.create({
+      taskId: fx.taskId,
+      requestedAction: 'deploy',
+      riskLevel: 'HIGH',
+      targetBranch: 'ai/technical',
+      targetCommit: 'c2',
+      targetDiffHash: 'd2',
+      changedFiles: [],
+      triggeredRules: [],
+      invalidIf: [],
+      status: 'WAITING_FOR_USER',
+      expiresAt: new Date(Date.now() - 60_000).toISOString(),
+    } as Parameters<IStorage['approvalRequests']['create']>[0])
+
+    requestTechnical(fx)
+    expect(finishTechnical(fx)).toMatchObject({ ok: true })
+
+    expect(fx.storage.tasks.findById(fx.taskId)).toMatchObject({ status: 'pending', roadmapActive: false })
+    // changedPathCount=0 でも、action を問わず残った active request を STALE にする。
+    expect(fx.storage.approvalRequests.findById(expired.id)?.status).toBe('STALE')
+    const aborted = fx.storage.auditLog.findByEntity('task', fx.taskId)
+      .find((entry) => entry.operation === 'task_aborted' && entry.result === 'success')
+    expect(JSON.parse(aborted?.detail ?? '{}')).toMatchObject({ staleApprovalCount: 1 })
+  })
+
+  // precheck 後に作られた人の判断を、park の STALE 化で黙って消さない。同じ条件を最終 transaction で
+  // atomic に再確認する（新しい gate ではない）。拒否は typed で、Task / request は変えない。
+  it.each(['WAITING_FOR_USER', 'APPROVED'] as const)(
+    'a %s approval created after the precheck makes the final park transaction refuse',
+    (status) => {
+      const fx = seedTechnicalAbort()
+      requestTechnical(fx)
+      const carrierBefore = fx.storage.jobs.findById(fx.latestJobId)
+      const late = fx.storage.approvalRequests.create({
+        taskId: fx.taskId,
+        requestedAction: 'deploy',
+        riskLevel: 'HIGH',
+        targetBranch: 'ai/technical',
+        targetCommit: 'c4',
+        targetDiffHash: 'd4',
+        changedFiles: [],
+        triggeredRules: [],
+        invalidIf: [],
+        status,
+        expiresAt: FUTURE,
+      } as Parameters<IStorage['approvalRequests']['create']>[0])
+
+      expect(finishTechnical(fx)).toMatchObject({ ok: false, code: 'HUMAN_DECISION_CONFLICT' })
+      expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(true)
+      expect(fx.storage.approvalRequests.findById(late.id)?.status).toBe(status)
+      // cleanup の失敗ではないので carrier を quarantine しない。ただしこの cleanup generation は
+      // 同じ transaction で取り消す（Codex review cb1f2db / 84fe348）。
+      const carrierAfter = fx.storage.jobs.findById(fx.latestJobId)
+      expect(carrierAfter?.status).toBe(carrierBefore?.status)
+      expect(carrierAfter?.failureMetadata?.quarantined).toBeUndefined()
+      expect(carrierAfter?.failureMetadata?.abortCleanupRequestedAt).toBeUndefined()
+      expect(carrierAfter?.failureMetadata?.abortTechnicalEvidenceId).toBeUndefined()
+      expect(carrierAfter?.failureMetadata?.workspaceEndFingerprint)
+        .toEqual(carrierBefore?.failureMetadata?.workspaceEndFingerprint)
+      expect(fx.storage.auditLog.findByEntity('task', fx.taskId).some(
+        (entry) => entry.operation === 'technical_abort_refused'
+          && entry.detail?.includes('HUMAN_DECISION_CONFLICT') === true,
+      )).toBe(true)
+      expect(fx.storage.auditLog.findByEntity('task', fx.taskId).some(
+        (entry) => entry.operation === 'task_aborted' && entry.result === 'success',
+      )).toBe(false)
+    },
+  )
+
+  function lateRequest(fx: ReturnType<typeof seedTechnicalAbort>, status: 'WAITING_FOR_USER' | 'APPROVED'): string {
+    return fx.storage.approvalRequests.create({
+      taskId: fx.taskId,
+      requestedAction: 'repair_from_stored_review:review-1',
+      riskLevel: 'HIGH',
+      targetBranch: 'ai/technical',
+      targetCommit: 'c5',
+      targetDiffHash: 'd5',
+      changedFiles: [],
+      triggeredRules: [],
+      invalidIf: [],
+      status,
+      expiresAt: FUTURE,
+    } as Parameters<IStorage['approvalRequests']['create']>[0]).id
+  }
+
+  function expectNotParkedNorQuarantined(fx: ReturnType<typeof seedTechnicalAbort>): void {
+    expect(fx.storage.tasks.findById(fx.taskId)).toMatchObject({ status: 'blocked', roadmapActive: true })
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata?.quarantined).toBeUndefined()
+    expect(fx.storage.auditLog.findByEntity('task', fx.taskId).some(
+      (entry) => entry.operation === 'task_aborted' && entry.result === 'success',
+    )).toBe(false)
+  }
+
+  it('after a HUMAN_DECISION_CONFLICT, a Worker retry once the decision is CONSUMED (review queued) is refused', () => {
+    const fx = seedTechnicalAbort()
+    requestTechnical(fx)
+    const late = lateRequest(fx, 'WAITING_FOR_USER')
+    expect(finishTechnical(fx)).toMatchObject({ ok: false, code: 'HUMAN_DECISION_CONFLICT' })
+
+    // 人が承認し、stored-review recovery が消費して repair 用 Design Review が queued になった。
+    fx.storage.approvalRequests.updateStatus(late, 'APPROVED')
+    fx.storage.approvalRequests.updateStatus(late, 'CONSUMED', undefined, true)
+    fx.storage.designReviewRuns.create({
+      taskId: fx.taskId, taskTitle: 'repair', designText: 'd', designTextHash: 'h', changedFiles: [],
+    })
+
+    // 取り消し済みの generation の再送は認可されていない。
+    expect(finishTechnical(fx)).toMatchObject({ ok: false, code: 'NOT_REQUESTED' })
+    expectNotParkedNorQuarantined(fx)
+    expect(fx.storage.designReviewRuns.findActiveByTaskId(fx.taskId)?.status).toBe('queued')
+  })
+
+  it('a request approved and CONSUMED after the cleanup request refuses the first report too', () => {
+    const fx = seedTechnicalAbort()
+    requestTechnical(fx)
+    const late = lateRequest(fx, 'APPROVED')
+    fx.storage.approvalRequests.updateStatus(late, 'CONSUMED', undefined, true)
+
+    expect(finishTechnical(fx)).toMatchObject({ ok: false, code: 'HUMAN_DECISION_CONFLICT' })
+    expectNotParkedNorQuarantined(fx)
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata?.abortCleanupRequestedAt).toBeUndefined()
+    expect(finishTechnical(fx)).toMatchObject({ ok: false, code: 'NOT_REQUESTED' })
+  })
+
+  it('a late cleanup after a repair Job was created is refused as superseded without quarantining the old carrier', () => {
+    const fx = seedTechnicalAbort()
+    requestTechnical(fx)
+    const repair = fx.storage.jobs.create({
+      taskId: fx.taskId, projectId: fx.projectId, agentRole: 'developer_ai', status: 'queued',
+      workflowStepKey: `repair:${fx.latestJobId}:1`,
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      workspaceBaseline: BASELINE,
+    } as Parameters<IStorage['jobs']['create']>[0])
+
+    expect(finishTechnical(fx)).toMatchObject({ ok: false, code: 'CLEANUP_SUPERSEDED' })
+    expectNotParkedNorQuarantined(fx)
+    // 古い carrier の cleanup generation は取り消され、再送は認可されない。
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata?.abortCleanupRequestedAt).toBeUndefined()
+    expect(finishTechnical(fx)).toMatchObject({ ok: false, code: 'NOT_REQUESTED' })
+    // repair は quarantine に塞がれず、そのまま実行できる状態のまま。
+    expect(fx.storage.jobs.findById(repair.id)?.status).toBe('queued')
+    expect(fx.storage.jobs.findByTaskId(fx.taskId)
+      .some((job) => job.failureMetadata?.quarantined === true)).toBe(false)
+  })
+
+  // Codex review / PL 2026-10-16: 取り消された generation の証拠を、同じ carrier の新しい generation として受理しない。
+  it('after a cancelled generation and a fresh technical request, a resend of the old evidence is GENERATION_MISMATCH', () => {
+    const fx = seedTechnicalAbort()
+    requestTechnical(fx)
+    const oldGeneration = currentCleanupGeneration(fx.storage, fx.latestJobId)
+    const late = lateRequest(fx, 'WAITING_FOR_USER')
+    // 人の判断で generation 1 を取り消す。
+    expect(finishTechnical(fx)).toMatchObject({ ok: false, code: 'HUMAN_DECISION_CONFLICT' })
+    // その判断は却下され、同じ carrier に新しい technical request（generation 2）が出る。
+    fx.storage.approvalRequests.updateStatus(late, 'REJECTED')
+    requestTechnical(fx)
+    const newGeneration = currentCleanupGeneration(fx.storage, fx.latestJobId)
+    expect(newGeneration.abortTechnicalEvidenceId).not.toBe(oldGeneration.abortTechnicalEvidenceId)
+
+    // Worker が generation 1 の証拠を再送する。
+    expect(finishTechnical(fx, { cleanupGeneration: oldGeneration }))
+      .toMatchObject({ ok: false, code: 'GENERATION_MISMATCH' })
+    expectNotParkedNorQuarantined(fx)
+    expect(currentCleanupGeneration(fx.storage, fx.latestJobId)).toEqual(newGeneration)
+    // generation を名指さない technical 報告も受理しない。
+    expect(finishTechnical(fx, { cleanupGeneration: undefined }))
+      .toMatchObject({ ok: false, code: 'GENERATION_MISMATCH' })
+    expectNotParkedNorQuarantined(fx)
+
+    // 現在の generation を名指す報告は受理する。
+    expect(finishTechnical(fx)).toMatchObject({ ok: true })
+    expect(fx.storage.tasks.findById(fx.taskId)).toMatchObject({ status: 'pending', roadmapActive: false })
+  })
+
+  // Codex review 57f2cf6: 遅れて届いた generation 1 の Worker 拒否が generation 2 を退役・quarantine させない。
+  it('a delayed refusal of generation 1 after generation 2 was requested is GENERATION_MISMATCH; a matching refusal retires', () => {
+    const fx = seedTechnicalAbort()
+    requestTechnical(fx)
+    const oldGeneration = currentCleanupGeneration(fx.storage, fx.latestJobId)
+    const late = lateRequest(fx, 'WAITING_FOR_USER')
+    expect(finishTechnical(fx)).toMatchObject({ ok: false, code: 'HUMAN_DECISION_CONFLICT' })
+    fx.storage.approvalRequests.updateStatus(late, 'REJECTED')
+    requestTechnical(fx)
+    const metadataGen2 = fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata
+    const refusalsBefore = fx.storage.auditLog.findByEntity('task', fx.taskId)
+      .filter((entry) => entry.operation === 'technical_abort_refused').length
+
+    for (const cleanupGeneration of [oldGeneration, undefined]) {
+      expect(completeAbortCleanup(fx.storage, {
+        jobId: fx.latestJobId,
+        knownGood: KNOWN_GOOD,
+        refusalCode: 'CLEANUP_EXECUTION_FAILED',
+        ...(cleanupGeneration !== undefined ? { cleanupGeneration } : {}),
+      })).toMatchObject({ ok: false, code: 'GENERATION_MISMATCH' })
+    }
+    // generation 2 はそのまま、quarantine も refusal 記録も無い。
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata).toEqual(metadataGen2)
+    expect(fx.storage.auditLog.findByEntity('task', fx.taskId)
+      .filter((entry) => entry.operation === 'technical_abort_refused').length).toBe(refusalsBefore)
+
+    // 現在の generation を名指す拒否は従来どおり退役・quarantine する。
+    expect(completeAbortCleanup(fx.storage, {
+      jobId: fx.latestJobId,
+      knownGood: KNOWN_GOOD,
+      refusalCode: 'CLEANUP_EXECUTION_FAILED',
+      cleanupGeneration: currentCleanupGeneration(fx.storage, fx.latestJobId),
+    })).toMatchObject({ ok: false, code: 'VERIFICATION_FAILED' })
+    const retired = fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata
+    expect(retired).toMatchObject({
+      quarantined: true,
+      quarantineReason: 'technical abort cleanup refused (CLEANUP_EXECUTION_FAILED)',
+    })
+    expect(retired?.abortCleanupRequestedAt).toBeUndefined()
+  })
+
+  it('the storage retire write re-checks the generation atomically', () => {
+    const fx = seedTechnicalAbort()
+    requestTechnical(fx)
+    const before = fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata
+    const current = currentCleanupGeneration(fx.storage, fx.latestJobId)
+
+    expect(fx.storage.jobs.retireTechnicalAbortCleanupForGeneration({
+      jobId: fx.latestJobId,
+      generation: { ...current, abortTechnicalEvidenceId: 'evidence-other' },
+      quarantineReason: 'r',
+    })).toBe(false)
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata).toEqual(before)
+    expect(fx.storage.jobs.retireTechnicalAbortCleanupForGeneration({
+      jobId: fx.latestJobId, generation: current, quarantineReason: 'r',
+    })).toBe(true)
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata).toMatchObject({ quarantined: true })
+  })
+
+  it('the storage final transaction re-checks the generation (GENERATION_MISMATCH, no change)', () => {
+    const fx = seedTechnicalAbort()
+    requestTechnical(fx)
+    const metadataBefore = fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata
+    const current = currentCleanupGeneration(fx.storage, fx.latestJobId)
+
+    const result = fx.storage.jobs.parkBlockedTaskWithTerminalJobs({
+      jobId: fx.latestJobId,
+      taskId: fx.taskId,
+      observation: BASELINE,
+      knownGood: KNOWN_GOOD,
+      reason: 'r',
+      authorization: {
+        kind: 'technical_evidence',
+        evidenceId: current.abortTechnicalEvidenceId,
+        stateFingerprint: current.abortTechnicalStateFingerprint,
+        rootCauseClass: 'protected_path',
+        attentionKind: metadataBefore?.abortTechnicalAttentionKind as never,
+      },
+      preCleanupObservation: BASELINE,
+      cleanupSummary: { changedPathCount: 0, restoredPathCount: 0, removedPathCount: 0 },
+      cleanupGeneration: { ...current, abortCleanupRequestedAt: '2000-01-01T00:00:00.000Z' },
+    })
+
+    expect(result).toMatchObject({ ok: false, code: 'GENERATION_MISMATCH' })
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata).toEqual(metadataBefore)
+    expectNotParkedNorQuarantined(fx)
+  })
+
+  it('an expired APPROVED approval still blocks Technical Abort (a human decision is not overridden)', () => {
+    const fx = seedTechnicalAbort()
+    approvedRequest(fx.storage, fx.taskId, {
+      action: 'git_commit',
+      expiresAt: new Date(Date.now() - 60_000).toISOString(),
+    })
+    const attention = buildSystemState(fx.storage).attention.find((item) => item.taskId === fx.taskId)
+    if (attention === undefined) throw new Error('attention missing')
+
+    expect(requestTechnicalAbort(fx.storage, {
+      taskId: fx.taskId,
+      attention,
+      readLedger: () => TECHNICAL_LEDGER,
+    })).toMatchObject({ ok: false, code: 'TECHNICAL_EVIDENCE_INELIGIBLE' })
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata?.abortCleanupRequestedAt)
+      .toBeUndefined()
+  })
+
+  it('an APPROVED approval hidden behind a newer expired WAITING still blocks Technical Abort', () => {
+    const fx = seedTechnicalAbort()
+    approvedRequest(fx.storage, fx.taskId, { action: 'git_commit' })
+    fx.storage.approvalRequests.create({
+      taskId: fx.taskId,
+      requestedAction: 'deploy',
+      riskLevel: 'HIGH',
+      targetBranch: 'ai/technical',
+      targetCommit: 'c3',
+      targetDiffHash: 'd3',
+      changedFiles: [],
+      triggeredRules: [],
+      invalidIf: [],
+      status: 'WAITING_FOR_USER',
+      expiresAt: new Date(Date.now() - 60_000).toISOString(),
+    } as Parameters<IStorage['approvalRequests']['create']>[0])
+    const attention = buildSystemState(fx.storage).attention.find((item) => item.taskId === fx.taskId)
+    if (attention === undefined) throw new Error('attention missing')
+
+    expect(requestTechnicalAbort(fx.storage, {
+      taskId: fx.taskId,
+      attention,
+      readLedger: () => TECHNICAL_LEDGER,
+    })).toMatchObject({ ok: false, code: 'TECHNICAL_EVIDENCE_INELIGIBLE' })
+  })
 
   it('refuses a subject that already has a CEO escalation', () => {
     const fx = seedTechnicalAbort()

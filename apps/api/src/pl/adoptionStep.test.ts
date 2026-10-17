@@ -313,8 +313,12 @@ describe('follow-up 候補の検出・skip・boost（CEO 判断 2026-09-17）', 
         && approvalInput.taskId === sourceJob.taskId
         && approvalInput.requestedAction === 'git_commit'
       ) {
+        // createForJob は running / blocked の Job にしか結び付けない。承認は Job 実行中に発行されるので、
+        // その時点の状態で結び付けてから fixture の最終 status へ戻す。
+        storage.jobs.update(sourceJob.id, { status: 'running' })
         const created = storage.approvalRequests.createForJob(approvalInput, sourceJob.id)
         if (!created.ok) throw new Error(`failed to bind approval: ${created.reason}`)
+        storage.jobs.update(sourceJob.id, { status: sourceJob.status })
       } else {
         // Corrupt/legacy evidence is seeded deliberately: the predicate must fail open toward ordinary follow-up.
         const approval = storage.approvalRequests.create(approvalInput)
