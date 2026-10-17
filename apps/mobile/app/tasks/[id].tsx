@@ -13,6 +13,7 @@ import type {
   ReviewResult,
   RiskLevel,
   Task,
+  TaskDetail,
   TaskFailureClassification,
   TaskFailureExplanationResponse,
   TaskFailureFacts,
@@ -42,6 +43,7 @@ import {
   canRunReview,
   allowsProgressActions,
   visibleTaskActions,
+  canShowRecoverUI,
   canShowResumeUI,
   invalidateQaEvidence,
   deriveJobDisplayState,
@@ -58,6 +60,7 @@ import {
   storedReviewRecoveryView,
 } from '../../lib/taskWorkflow'
 import { formatResumeErrorMessage, RESUME_ERROR_MESSAGE_FALLBACK } from '../../lib/resumeErrorMessage'
+import { readApiRejection, submitTaskRecovery } from '../../lib/taskRecovery'
 import { POLLING_INTERVAL_MS, usePolling } from '../../lib/usePolling'
 
 const RESUME_INSTRUCTION_MAX_LENGTH = 2000
@@ -187,7 +190,8 @@ const TASK_FAILURE_CLASSIFICATION_LABEL: Record<
 }
 
 interface TaskDetailData {
-  task: Task
+  /** `GET /api/tasks/:id` は Resume / Recover の前提判定用に parked・projectStatus を足して返す */
+  task: TaskDetail
   jobs: Job[]
   approvalRequests: ApprovalRequest[]
   /** MOB-001: stall を「検出しただけ」と「確認済み」に分けて表示するため */
@@ -198,7 +202,7 @@ interface TaskDetailData {
   qaResults: QAResult[] | null
 }
 
-async function fetchTask(taskId: string): Promise<Task | null> {
+async function fetchTask(taskId: string): Promise<TaskDetail | null> {
   const response = await apiFetch(
     `/api/tasks/${encodeURIComponent(taskId)}`,
   )
@@ -211,7 +215,7 @@ async function fetchTask(taskId: string): Promise<Task | null> {
     throw new Error(`Failed to fetch task: ${response.status}`)
   }
 
-  return (await response.json()) as Task
+  return (await response.json()) as TaskDetail
 }
 
 async function fetchJobs(taskId: string): Promise<Job[]> {
@@ -429,15 +433,6 @@ async function createTaskJob(
   }
 }
 
-async function readResumeApiError(response: Response): Promise<string | null> {
-  try {
-    const body = (await response.json()) as { error?: unknown }
-    return typeof body.error === 'string' ? body.error : null
-  } catch {
-    return null
-  }
-}
-
 async function postResumeInstruction(
   taskId: string,
   instruction: string,
@@ -456,8 +451,8 @@ async function postResumeInstruction(
       return { ok: true }
     }
 
-    const errorMessage = await readResumeApiError(response)
-    return { message: formatResumeErrorMessage(errorMessage), ok: false }
+    const { code, error } = await readApiRejection(response)
+    return { message: formatResumeErrorMessage(error, code), ok: false }
   } catch {
     return { message: RESUME_ERROR_MESSAGE_FALLBACK, ok: false }
   }
@@ -997,7 +992,55 @@ interface ResumeInstructionSectionProps {
   onChangeInstruction: (instruction: string) => void
   onOpen: () => void
   onSubmit: () => void
-  task: Task
+  task: TaskDetail
+}
+
+const RECOVER_HELP_TEXT =
+  'このTaskは作業が1件も作られないまま停止しています（設計レビューで止まった場合など）。'
+  + '復旧すると「再開待ち」に戻り、AI開発チームが設計レビューからやり直します。'
+  + '承認や安全確認は省略されません。'
+
+interface RecoverSectionProps {
+  approvalRequests: ApprovalRequest[]
+  isSubmitting: boolean
+  jobs: Job[]
+  onSubmit: () => void
+  task: TaskDetail
+}
+
+/** Job 0 件の blocked Task だけに出る「復旧（再開待ちに戻す）」。表示条件は `canShowRecoverUI()`。 */
+function RecoverSection({
+  approvalRequests,
+  isSubmitting,
+  jobs,
+  onSubmit,
+  task,
+}: RecoverSectionProps): ReactElement | null {
+  if (!canShowRecoverUI(task, jobs, approvalRequests)) {
+    return null
+  }
+
+  return (
+    <View style={styles.section}>
+      <View style={styles.resumeBox}>
+        <Text style={styles.resumeHelpText}>{RECOVER_HELP_TEXT}</Text>
+        <TouchableOpacity
+          disabled={isSubmitting}
+          onPress={onSubmit}
+          style={[
+            styles.resumeSubmitButton,
+            styles.recoverButton,
+            isSubmitting && styles.resumeSubmitButtonDisabled,
+          ]}
+        >
+          {isSubmitting && (
+            <ActivityIndicator color="#fff" size="small" />
+          )}
+          <Text style={styles.resumeSubmitButtonText}>復旧（再開待ちに戻す）</Text>
+        </TouchableOpacity>
+      </View>
+    </View>
+  )
 }
 
 function ResumeInstructionSection({
@@ -1392,6 +1435,7 @@ export default function TaskDetailScreen(): ReactElement {
   const [isResumeEditorOpen, setIsResumeEditorOpen] = useState(false)
   const [isSubmittingResumeInstruction, setIsSubmittingResumeInstruction] =
     useState(false)
+  const [isSubmittingRecovery, setIsSubmittingRecovery] = useState(false)
 
   const loadTaskDetail = useCallback(async (): Promise<void> => {
     if (taskId === null || taskId.length === 0) {
@@ -1535,6 +1579,37 @@ export default function TaskDetailScreen(): ReactElement {
     [isSubmittingStoredReviewRecovery, submitStoredReviewRecoveryAction],
   )
 
+  const submitRecovery = useCallback(async (): Promise<void> => {
+    if (taskId === null || taskId.length === 0) return
+    setIsSubmittingRecovery(true)
+    try {
+      const result = await submitTaskRecovery(taskId)
+      if (!result.ok) {
+        Alert.alert('復旧失敗', result.message)
+        return
+      }
+      Alert.alert(
+        '復旧（再開待ちに戻す）',
+        'Taskを再開待ちに戻しました。AI開発チームが設計レビューからやり直します。',
+      )
+      await loadTaskDetail()
+    } finally {
+      setIsSubmittingRecovery(false)
+    }
+  }, [loadTaskDetail, taskId])
+
+  const handleRecover = useCallback((): void => {
+    if (isSubmittingRecovery) return
+    Alert.alert(
+      '復旧（再開待ちに戻す）',
+      'このTaskを再開待ちに戻しますか？',
+      [
+        { style: 'cancel', text: 'キャンセル' },
+        { onPress: () => { void submitRecovery() }, text: '復旧' },
+      ],
+    )
+  }, [isSubmittingRecovery, submitRecovery])
+
   const handleSubmitResumeInstruction = useCallback((): void => {
     const trimmedInstruction = resumeInstruction.trim()
 
@@ -1621,6 +1696,13 @@ export default function TaskDetailScreen(): ReactElement {
             onChangeInstruction={setResumeInstruction}
             onOpen={() => setIsResumeEditorOpen(true)}
             onSubmit={handleSubmitResumeInstruction}
+            task={data.task}
+          />
+          <RecoverSection
+            approvalRequests={data.approvalRequests}
+            isSubmitting={isSubmittingRecovery}
+            jobs={data.jobs}
+            onSubmit={handleRecover}
             task={data.task}
           />
           <StoredReviewRecoverySection
@@ -1998,6 +2080,10 @@ const styles = StyleSheet.create({
     fontSize: 12,
     lineHeight: 18,
     marginTop: 8,
+  },
+  recoverButton: {
+    justifyContent: 'center',
+    marginTop: 12,
   },
   resumeBox: {
     backgroundColor: '#141414',

@@ -178,6 +178,11 @@ function formatApprovalGateStatus(status: string): string {
       return 'ステータス: 反映済み'
     case 'EXPIRED':
       return 'ステータス: 期限切れ'
+    // Task 詳細の APPROVAL_STATUS_LABEL と同じ語を使う（同じ状態を画面ごとに別の名前で呼ばない）。
+    case 'STALE':
+      return 'ステータス: 無効化'
+    case 'SUPERSEDED':
+      return 'ステータス: 置き換え済み'
     default:
       return `ステータス: ${status}`
   }

@@ -4,6 +4,7 @@ import type { AgentRole } from './agent'
 import type { AiCliProvider } from './ai_cli'
 import type { ApprovalGateStatus } from './approval_gate'
 import type { JobStatus } from './job'
+import type { ProjectStatus } from './project'
 import type { RiskLevel } from './safety_guard'
 
 export type TaskStatus = 'pending' | 'in_progress' | 'review' | 'done' | 'blocked'
@@ -67,6 +68,18 @@ export interface Task {
 
   createdAt: string
   updatedAt: string
+}
+
+/**
+ * `GET /api/tasks/:id` の応答。Task に、Resume / Recover の前提判定
+ * （`evaluateResumeAdmission()` / `evaluateRecoverAdmission()`）が要る保存済みの事実を足したもの。
+ * Mobile がこの 2 つを API と同じ入力で判定するために返す。新しい状態ではない
+ * （`parked` は `ITaskStorage.isParked()`、`projectStatus` は所属 Project の status）。
+ */
+export interface TaskDetail extends Task {
+  parked: boolean
+  /** 所属 Project が見つからなければ null。 */
+  projectStatus: ProjectStatus | null
 }
 
 export type TaskDisplayStatus =
