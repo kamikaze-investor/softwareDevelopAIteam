@@ -3521,15 +3521,39 @@ describe('approved-run blocked cause comes from the evidence the Worker sent', (
     expect(job.stderr).toContain('approved_run_permission_denied: once grant already used')
     expect(job.stderr).not.toContain('gate step')
     const item = buildSystemState(fx.storage, { now: () => NOW }).attention.find((a) => a.jobId === fx.jobId)!
-    expect(triageBlocked(fx.storage, item).rootCauseClass).not.toBe('safety_or_authority_boundary')
+    const diagnosis = triageBlocked(fx.storage, item)
+    expect(diagnosis.rootCauseClass).not.toBe('safety_or_authority_boundary')
+    // rule 6.9（Gate 段階の拒否）には当たらない
+    expect(diagnosis.evidence.some((e) => e.fact === 'approval_request.status (linked, unconsumed)')).toBe(false)
   })
 
-  it('guards passed (gate-step refusal) is the only evidence that triage rule 6.9 escalates', () => {
+  // lifecycle repair D2: rule 6.9 は技術停止として分類する。CEO の方針判断（Authority）にしない。
+  it('guards passed (gate-step refusal) is the only evidence for triage rule 6.9, classified as a technical stop', () => {
     const fx = approvedRunBlocked({ permissionAllowed: true, fileChangeAllowed: true, fileViolations: [] })
     const item = buildSystemState(fx.storage, { now: () => NOW }).attention.find((a) => a.jobId === fx.jobId)!
-    expect(triageBlocked(fx.storage, item)).toMatchObject({
-      rootCauseClass: 'safety_or_authority_boundary', recommendedLane: 'ceo_escalation',
+    const diagnosis = triageBlocked(fx.storage, item)
+    expect(diagnosis).toMatchObject({
+      rootCauseClass: 'approval_not_actionable',
+      requiresAuthorityChange: false,
+      recommendedLane: 'ceo_escalation',
+      recoverable: false,
     })
+    expect(diagnosis.summary).toContain('CEO の方針判断の対象ではない')
+    expect(diagnosis.summary).not.toContain('CEO の判断が必要')
+  })
+
+  it('an expired APPROVED linked approval no longer matches rule 6.9', () => {
+    const fx = approvedRunBlocked({ permissionAllowed: true, fileChangeAllowed: true, fileViolations: [] })
+    const item = buildSystemState(fx.storage, { now: () => NOW }).attention.find((a) => a.jobId === fx.jobId)!
+    // 期限（1 時間後）を過ぎた時点で判定する。consume できない APPROVED は 6.9 の「承認済みで未使用」ではない
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(new Date(Date.now() + 2 * 60 * 60 * 1000))
+      const diagnosis = triageBlocked(fx.storage, item)
+      expect(diagnosis.evidence.some((e) => e.fact === 'approval_request.status (linked, unconsumed)')).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 

@@ -67,6 +67,7 @@ import {
   predictHumanRecoveryDriver,
   type HumanRecoveryNextDriver,
 } from '../humanRecovery/recoverBlockedTask'
+import { isLiveApprovedApproval } from '@ai-team/shared'
 import type { AuditLogEntry, Job } from '@ai-team/shared'
 import type { DesignReviewRun, IStorage } from '../storage/interface'
 import { isUsableAlignedEvidence } from '../designReviewEvidencePolicy'
@@ -438,7 +439,8 @@ function gatherFacts(storage: IStorage, item: AttentionItem): Facts {
     if (!job || job.safeCommand.kind !== 'git_commit' || !job.approvalId) return undefined
     const linked = storage.approvalRequests.findById(job.approvalId)
     if (!linked || linked.taskId !== job.taskId || linked.requestedAction !== 'git_commit') return undefined
-    return linked.status === 'APPROVED' ? linked.id : undefined
+    // 期限切れの APPROVED は consume できないので 6.9 の対象にしない（下の rule 7 が扱う）
+    return isLiveApprovedApproval(linked) ? linked.id : undefined
   })()
   const review = item.taskId !== undefined ? readLatestDesignReview(storage, item.taskId) : undefined
   const evidence =
@@ -942,10 +944,12 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
   // 「既存 resume は在るが、AI が自動実行してよい復旧ではない」を表現する。
   // ── 6.9 承認済みなのに Worker が実行を拒んだ git_commit ─────────────────────
   //
-  // linked Approval は APPROVED（未 consume）で、Gate は ALLOW + call_consume を返したが、Worker 側の
-  // gate policy（AI 編集禁止の Control 領域）が実行を拒んで blocked を報告した。下の 7 へ落とすと
-  // auto_recovery → PL resume → 新しい承認 → CEO 承認 → また Worker が拒否、の無限往復になる。
-  // AI が解ける停止ではない（policy の変更は CEO の判断）ので、CEO に一度だけ見せて止める。
+  // linked Approval は APPROVED（未 consume・期限内）で、Gate は ALLOW + call_consume を返したが、Worker が
+  // Gate 段階で blocked を報告した。lifecycle repair D2 の修正後、この形で残る原因は**技術的なもの**だけである
+  // （Worker と API のリスクルールの版ずれ・consume の失敗・consume id の欠落。Worker は原因を stderr に載せる）。
+  // **CEO の方針判断ではない**ので Authority の問題として分類しない（specs/22 §1-3）。
+  // ただし自動 resume はしない: resume は APPROVED の人の承認を SUPERSEDED にして、同じ diff の承認を
+  // もう一度人へ求めることになる。人に見せて止め、Worker と API の版が揃ってから resume する。
   // **Worker が送った証拠（guardResult / quarantine）が Gate 段階の拒否を示すときだけ**（Codex round 2）。
   // Permission 拒否・File Change Guard・quarantine は既存の rule（1〜3・7）がそれぞれ扱う。保存側
   // （`jobs.update` の停止理由）と同じ `classifyApprovedRunBlock()` で判定する。
@@ -957,7 +961,8 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
   ) {
     return {
       ...result,
-      rootCauseClass: 'safety_or_authority_boundary',
+      // 「承認行がこの Job では使えない」技術停止。Authority 境界（safety_or_authority_boundary）ではない。
+      rootCauseClass: 'approval_not_actionable',
       blockingLayer: 'approval',
       evidence: [
         { fact: 'approval_request.status (linked, unconsumed)', id: facts.approvedLinkedGitCommitId, value: 'APPROVED' },
@@ -966,13 +971,16 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
       ],
       recoverable: false,
       existingRecoveryAvailable: true,
-      requiresAuthorityChange: true,
+      requiresAuthorityChange: false,
       confidence: 'high',
+      // 自動実行してよい復旧が無い停止は人へ見せる（既存レーンでは ceo_escalation が唯一の人の窓口）。
+      // 見せるのは技術停止としてであり、方針判断の依頼ではない（ceoDecisionAndOptions が文言を分ける）。
       recommendedLane: 'ceo_escalation',
       summary:
-        'CEO が承認し Gate も許可した git_commit を、Worker 側の gate policy が実行しなかった'
-        + '（承認は APPROVED のまま未使用）。自動 resume しても同じ拒否を繰り返すだけで、'
-        + 'Worker の policy は AI が変更できない。CEO の判断が必要。',
+        '承認済み（APPROVED・未使用）の git_commit が、Worker の Gate 段階で技術的に止まった'
+        + '（Worker と API のリスクルールの版ずれ、または consume の失敗。原因は job.stderr）。'
+        + 'CEO の方針判断の対象ではない。Worker と API が同じ版で動いていることを確かめてから resume する'
+        + '（resume は同じ diff の新しい Job と承認依頼を作る）。',
     }
   }
 
@@ -1206,6 +1214,30 @@ function ceoDecisionAndOptions(
       return {
         decision: '待っている承認そのもの。',
         options: ['Mobile から承認する', '却下して別の設計へ回す'],
+      }
+    // rule 6.9（lifecycle repair D2）: 承認済みの git_commit が Worker の Gate 段階で技術的に止まった。
+    // 方針判断ではないので、判断ではなく技術的な対処を並べる。却下（rule 7）の同じ分類は下の default のまま。
+    case 'approval_not_actionable':
+      if (diagnosis.evidence.some((e) => e.fact === 'approval_request.status (linked, unconsumed)')) {
+        return {
+          decision:
+            '技術停止（方針判断ではない）: 承認済みの git_commit が Worker の Gate 段階で止まった。'
+            + '承認は APPROVED のまま未使用。',
+          options: [
+            'Worker と API が同じ版で動いていることを確かめ、版ずれなら揃えてから Task を resume する'
+            + '（resume は同じ diff の新しい Job と承認依頼を作る）',
+            'job.stderr の原因（risk_rule_skew / approval_contract_violation / consume 失敗）を技術調査に回す',
+            'この Task を park する（`abort_task`）',
+          ],
+        }
+      }
+      return {
+        decision: '原因を機械的事実から特定できなかった。次にどこへ進めるか。',
+        options: [
+          '追加の read-only 調査を指示する',
+          '独立した診断者へ回す',
+          'この Task を park して別項目へ進む',
+        ],
       }
     // `independent_remediation` レーンは上で早期 return するので、ここへ来る CONFLICT は
     // **Remediation が構造的に届かないもの**（blocked かつ Job 0 件）だけである。
