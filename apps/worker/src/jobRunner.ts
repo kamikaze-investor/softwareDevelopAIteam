@@ -591,6 +591,31 @@ export async function runJob(
 
   const gateResult = resolvePolicy(localGateResult, checkResponse)
 
+  // Worker と API の Gate 判断の食い違い（lifecycle repair D2）。人の承認待ちではないので、
+  // 「承認待ち」「承認無効」として通知しない。承認の状態はここでは一切変えていない。
+  const notifyTechnicalGateStop = (cause: string, approvalRequestId: string | undefined): void => {
+    notifyGateEvent({
+      severity: 'warning',
+      title: `⚠️ Gate 判定の不一致（技術停止） — ${job.safeCommand.kind}`,
+      body: [
+        'Worker と API の Gate 判定が一致しないため、fail-closed で停止しました。',
+        '承認の状態は変更していません（APPROVED の承認があれば未使用のまま残ります）。',
+        '',
+        `原因: ${cause}`,
+        `コマンド: ${job.safeCommand.kind}`,
+        `タスク: ${job.taskId}`,
+        `Job: ${job.id}`,
+        `理由: ${gateResult.reason}`,
+        `対象リクエスト: ${approvalRequestId ?? 'なし'}`,
+        `コミット: ${targetCommit}`,
+        `DiffHash: ${targetDiffHash}`,
+        `検出時刻: ${new Date().toISOString()}`,
+      ].join('\n'),
+      sourceType: 'gate_technical_mismatch',
+      sourceId: approvalRequestId ?? job.id,
+    })
+  }
+
   if (gateResult.policy === 'block_until_approved' || gateResult.policy === 're_check') {
     console.warn(`[gate] ${gateResult.policy}: taskId=${job.taskId} reason="${gateResult.reason}"`)
 
@@ -606,28 +631,7 @@ export async function runJob(
       if (dedupKey) notifiedApprovalRequests.add(dedupKey)
 
       if (gateResult.technicalCause !== undefined) {
-        // Worker と API の Gate 判断の食い違い（lifecycle repair D2）。人の承認待ちではないので、
-        // 「承認待ち」「承認無効」として通知しない。承認の状態はここでは一切変えていない。
-        notifyGateEvent({
-          severity: 'warning',
-          title: `⚠️ Gate 判定の不一致（技術停止） — ${job.safeCommand.kind}`,
-          body: [
-            'Worker と API の Gate 判定が一致しないため、fail-closed で停止しました。',
-            '承認の状態は変更していません（APPROVED の承認があれば未使用のまま残ります）。',
-            '',
-            `原因: ${gateResult.technicalCause}`,
-            `コマンド: ${job.safeCommand.kind}`,
-            `タスク: ${job.taskId}`,
-            `Job: ${job.id}`,
-            `理由: ${gateResult.reason}`,
-            `対象リクエスト: ${approvalRequestId ?? 'なし'}`,
-            `コミット: ${targetCommit}`,
-            `DiffHash: ${targetDiffHash}`,
-            `検出時刻: ${new Date().toISOString()}`,
-          ].join('\n'),
-          sourceType: 'gate_technical_mismatch',
-          sourceId: approvalRequestId ?? job.id,
-        })
+        notifyTechnicalGateStop(gateResult.technicalCause, approvalRequestId)
       } else if (gateResult.policy === 'block_until_approved') {
         notifyGateEvent({
           severity: 'critical',
@@ -698,6 +702,12 @@ export async function runJob(
     const kind = job.safeCommand.kind
     if (!(SAFE_WORK_ALLOWED_COMMAND_KINDS as readonly string[]).includes(kind)) {
       console.warn(`[gate] safe_work_only: ${kind} is not permitted. taskId=${job.taskId}`)
+      if (gateResult.technicalCause !== undefined) {
+        notifyTechnicalGateStop(
+          gateResult.technicalCause,
+          checkResponse?.approvalRequest?.id ?? checkResponse?.nextAction?.consumedRequestId,
+        )
+      }
       return {
         status: 'blocked',
         guardResult: {

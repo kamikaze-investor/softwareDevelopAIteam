@@ -1571,6 +1571,28 @@ describe('runJob — real resolvePolicy through the jobRunner gate branch (D2)',
     expect(result.gatePolicy).toBe('continue_safe_work_only')
     expect(result.stderr).toContain('risk_rule_skew')
     expect(callConsumeMock).not.toHaveBeenCalled()
+    // safe work 経路で止めた技術停止も、承認待ちではなく技術停止として通知する（Codex review round 1）
+    const titles = sendAlertMock.mock.calls.map((call) => JSON.stringify(call[0]))
+    expect(titles.some((t) => t.includes('Gate 判定の不一致'))).toBe(true)
+    expect(titles.some((t) => t.includes('承認待ち') || t.includes('承認無効'))).toBe(false)
+  })
+
+  it('local CRITICAL vs API HIGH BLOCKED (rule skew) → even a safe-work kind (test) does not run', async () => {
+    useFiles(['AGENTS.md'])
+    callGateCheckMock.mockResolvedValue({
+      outcome: { decision: 'BLOCKED' as const, riskLevel: 'HIGH' },
+      riskReview: { riskLevel: 'HIGH', triggeredRules: [], requiresIndependentReview: true },
+      sideEffects: [] as Array<{ type: string; requestId: string }>,
+      continuationPolicy: 'continue_safe_work_only' as const,
+      nextAction: { action: 'wait_for_approval' as const, message: 'safe work only' },
+    })
+
+    const result = await runJob(createJob({ safeCommand: { kind: 'test', workingDir: '/workspace/target' } }), createPolicy())
+
+    expect(result.status).toBe('blocked')
+    expect(result.gatePolicy).toBe('re_check')
+    expect(result.stderr).toContain('risk_rule_skew')
+    expect(resolveCommandMock).not.toHaveBeenCalled()
   })
 })
 

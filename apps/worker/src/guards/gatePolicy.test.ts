@@ -268,7 +268,9 @@ describe('resolvePolicy — 承認依頼の無い SAFE_WORK HIGH / 依頼のあ�
     expect(SAFE_WORK_ALLOWED_COMMAND_KINDS).toContain('git_status')
   })
 
-  it('ローカルが CRITICAL でも API の HIGH BLOCKED（依頼なし）は continue_safe_work_only のまま（API 判定を採る既存挙動）', () => {
+  // lifecycle repair D2（Codex review round 1）: 以前は API の HIGH BLOCKED を採り safe work を続けていた。
+  // ローカル CRITICAL > API はルールの版ずれなので、どの decision でも全 kind を止める（承認待ちには見せない）。
+  it('ローカルが CRITICAL で API が HIGH BLOCKED（依頼なし）なら re_check（risk_rule_skew）で全 kind を止める', () => {
     const result = resolvePolicy(
       makeGateResult({ finalRiskLevel: 'CRITICAL', gateDecision: 'BLOCK_CEO_REQUIRED' }),
       makeCheckResponse({
@@ -278,7 +280,8 @@ describe('resolvePolicy — 承認依頼の無い SAFE_WORK HIGH / 依頼のあ�
         nextAction: { action: 'wait_for_approval', message: 'safe work only' },
       }),
     )
-    expect(result.policy).toBe('continue_safe_work_only')
+    expect(result.policy).toBe('re_check')
+    expect(result.technicalCause).toBe('risk_rule_skew')
   })
 
   it('CRITICAL の BLOCKED（承認依頼あり）は block_until_approved で、requestId を理由に載せる', () => {
@@ -340,6 +343,27 @@ describe('resolvePolicy — 承認済み HIGH / CRITICAL と Worker 側の fail-
         continuationPolicy: 'continue',
         nextAction: { action: 'proceed', message: 'proceed' },
       }),
+    )
+    expect(result.policy).toBe('re_check')
+    expect(result.technicalCause).toBe('approval_contract_violation')
+  })
+
+  // Codex review round 1: CRITICAL は API の契約上 block_until_approved か承認済み consume しか無い。
+  // 整合しない応答（continue_safe_work_only・proceed）で safe work を走らせない。
+  it.each([
+    { decision: 'ALLOW' as const, policy: 'continue_safe_work_only' as const, action: 'proceed' as const },
+    { decision: 'ALLOW' as const, policy: 'continue' as const, action: 'proceed' as const },
+    { decision: 'PENDING_APPROVAL' as const, policy: 'continue_safe_work_only' as const, action: 'wait_for_approval' as const },
+    { decision: 'BLOCKED' as const, policy: 'continue' as const, action: 'wait_for_approval' as const },
+  ])('api CRITICAL with $decision / $policy / $action (local CRITICAL) → re_check (approval_contract_violation)', ({ decision, policy, action }) => {
+    const result = resolvePolicy(
+      makeGateResult({ finalRiskLevel: 'CRITICAL' }),
+      makeCheckResponse({
+        outcome: { decision, riskLevel: 'CRITICAL' },
+        riskReview: { riskLevel: 'CRITICAL', triggeredRules: [], requiresIndependentReview: true },
+        continuationPolicy: policy,
+        nextAction: { action, message: 'm' },
+      } as Partial<GateCheckResponse>),
     )
     expect(result.policy).toBe('re_check')
     expect(result.technicalCause).toBe('approval_contract_violation')

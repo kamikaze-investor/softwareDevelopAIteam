@@ -122,6 +122,60 @@ export function resolvePolicy(
   const apiPolicy = checkResponse.continuationPolicy
   const apiRisk = checkResponse.riskReview.riskLevel as string
 
+  // ── Worker 側に残す防御（lifecycle repair D2） ──
+  // ローカルリスクは API と同じ runRiskReview を同じ changedFiles に掛けた値なので、
+  // 「API が continue なのにローカルが HIGH 以上」は、人が承認して API が ALLOW + call_consume を
+  // 返したときにしか起きなかった。ここで一律に上げると、承認済みの HIGH / CRITICAL が consume まで
+  // 届かず永久に止まる（D2）。Worker に残すのは API の判断と食い違ったときの fail-closed だけである。
+  // **どの decision でも**（PENDING_APPROVAL / BLOCKED を含む）先に評価する:
+  //   - API の riskLevel が不正                          → re_check（invalid_risk_level）
+  //   - ローカル CRITICAL > API（ルールの版ずれ）        → re_check（risk_rule_skew）
+  //   - API CRITICAL を承認の consume なしに続行させる    → re_check（approval_contract_violation）
+  //     （API の契約上 CRITICAL は block_until_approved か、承認済み ALLOW + call_consume しか無い）
+  //   - API HIGH を承認の consume なしに continue させる → re_check（approval_contract_violation）
+  //   - ローカル HIGH > API で API が continue           → continue_safe_work_only（risk_rule_skew）
+  // 止める範囲は従来以上で、承認待ち（block_until_approved）には見せない。
+  // ローカルが未知の値なら CRITICAL とみなす（fail-closed）
+  const localOrder = riskOrder(localResult.finalRiskLevel) ?? RISK_ORDER.CRITICAL
+  const apiOrder = riskOrder(apiRisk)
+  if (apiOrder === undefined) {
+    return {
+      policy: 're_check',
+      reason: `invalid_risk_level: api=${apiRisk} decision=${checkResponse.outcome.decision}`,
+      apiAvailable: true,
+      technicalCause: 'invalid_risk_level',
+    }
+  }
+
+  const skewReason =
+    `risk_rule_skew: local=${localResult.finalRiskLevel} api=${apiRisk} decision=${checkResponse.outcome.decision}`
+    + ` (${localResult.reason ?? 'no reason'})`
+  if (localOrder > apiOrder && localOrder >= RISK_ORDER.CRITICAL) {
+    return { policy: 're_check', reason: skewReason, apiAvailable: true, technicalCause: 'risk_rule_skew' }
+  }
+
+  const isApprovedConsume =
+    checkResponse.outcome.decision === 'ALLOW'
+    && checkResponse.nextAction.action === 'call_consume'
+    && typeof checkResponse.nextAction.consumedRequestId === 'string'
+    && checkResponse.nextAction.consumedRequestId.length > 0
+  const contractViolation =
+    !isApprovedConsume
+    && (
+      (apiOrder >= RISK_ORDER.CRITICAL && apiPolicy !== 'block_until_approved')
+      || (apiOrder >= RISK_ORDER.HIGH && apiPolicy === 'continue')
+    )
+  if (contractViolation) {
+    return {
+      policy: 're_check',
+      reason:
+        `approval_contract_violation: api=${apiRisk} policy=${apiPolicy}`
+        + ` decision=${checkResponse.outcome.decision} action=${checkResponse.nextAction.action}`,
+      apiAvailable: true,
+      technicalCause: 'approval_contract_violation',
+    }
+  }
+
   // PENDING_APPROVAL の場合はリスクレベルで分岐
   if (
     checkResponse.outcome.decision === 'PENDING_APPROVAL' ||
@@ -142,55 +196,13 @@ export function resolvePolicy(
     }
   }
 
-  // ── Worker 側に残す防御（lifecycle repair D2） ──
-  // ローカルリスクは API と同じ runRiskReview を同じ changedFiles に掛けた値なので、
-  // 「API が continue なのにローカルが HIGH 以上」は、人が承認して API が ALLOW + call_consume を
-  // 返したときにしか起きなかった。ここで一律に上げると、承認済みの HIGH / CRITICAL が consume まで
-  // 届かず永久に止まる（D2）。Worker に残すのは API の判断と食い違ったときの fail-closed だけである:
-  //   - API の riskLevel が不正           → re_check（invalid_risk_level）
-  //   - ローカル > API（ルールの版ずれ）  → CRITICAL は re_check、HIGH は continue_safe_work_only
-  //     （いずれも従来と同じ範囲を止める。承認待ちには見せない）
-  //   - API が HIGH 以上を、承認の consume を伴わずに continue させた（承認契約違反）→ re_check
-  // ローカルが未知の値なら CRITICAL とみなす（fail-closed）
-  const localOrder = riskOrder(localResult.finalRiskLevel) ?? RISK_ORDER.CRITICAL
-  const apiOrder = riskOrder(apiRisk)
-  if (apiOrder === undefined) {
+  // ローカル HIGH > API で API が continue（ルールの版ずれ）→ 従来どおり safe work だけに絞る
+  if (localOrder > apiOrder && localOrder >= RISK_ORDER.HIGH && apiPolicy === 'continue') {
     return {
-      policy: 're_check',
-      reason: `invalid_risk_level: api=${apiRisk} decision=${checkResponse.outcome.decision}`,
+      policy: 'continue_safe_work_only',
+      reason: skewReason,
       apiAvailable: true,
-      technicalCause: 'invalid_risk_level',
-    }
-  }
-
-  if (localOrder > apiOrder) {
-    const skewReason =
-      `risk_rule_skew: local=${localResult.finalRiskLevel} api=${apiRisk} decision=${checkResponse.outcome.decision}`
-      + ` (${localResult.reason ?? 'no reason'})`
-    if (localOrder >= RISK_ORDER.CRITICAL) {
-      return { policy: 're_check', reason: skewReason, apiAvailable: true, technicalCause: 'risk_rule_skew' }
-    }
-    if (localOrder >= RISK_ORDER.HIGH && apiPolicy === 'continue') {
-      return {
-        policy: 'continue_safe_work_only',
-        reason: skewReason,
-        apiAvailable: true,
-        technicalCause: 'risk_rule_skew',
-      }
-    }
-  }
-
-  const isApprovedConsume =
-    checkResponse.outcome.decision === 'ALLOW'
-    && checkResponse.nextAction.action === 'call_consume'
-    && typeof checkResponse.nextAction.consumedRequestId === 'string'
-    && checkResponse.nextAction.consumedRequestId.length > 0
-  if (apiPolicy === 'continue' && apiOrder >= RISK_ORDER.HIGH && !isApprovedConsume) {
-    return {
-      policy: 're_check',
-      reason: `approval_contract_violation: api=${apiRisk} decision=${checkResponse.outcome.decision} action=${checkResponse.nextAction.action}`,
-      apiAvailable: true,
-      technicalCause: 'approval_contract_violation',
+      technicalCause: 'risk_rule_skew',
     }
   }
 
