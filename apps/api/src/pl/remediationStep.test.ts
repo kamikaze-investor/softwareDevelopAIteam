@@ -14,6 +14,7 @@ import { checkImplementJobDesignReviewEvidence, computeDesignTextHash } from '..
 import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
 import { ensureInitialWorkflowsForActiveTasks, recoverReadyTasksWithoutJob } from '../ctoAi/projectInitialization'
 import { executeQueuedRun } from '../designReview/queuedRunDispatch'
+import { passDesignReviewRetryCooldown } from '../designReview/retryCooldownTestClock'
 import { buildSystemState } from '../state/systemState'
 import { adoptRoadmapItem, buildAdoptedDescription } from '../ctoAi/roadmapAdoption'
 import {
@@ -894,6 +895,9 @@ describe('applyRevisedSpec — rawScope と submittedScope を取り違えない
  * が導く（同じ `createInitialImplementWorkflow()`・stepKey 一意で1回だけ）。
  */
 describe('fresh Review が判定を出さなかった（requeued）場合', () => {
+  // 判定の出なかった attempt の後の retry cooldown（retryCooldown.ts）は時計で明けさせる。
+  afterEach(() => { vi.useRealTimers() })
+
   function runnerDeps(stdout: string) {
     return {
       runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
@@ -925,6 +929,7 @@ describe('fresh Review が判定を出さなかった（requeued）場合', () =
     const run = storage.designReviewRuns.findLatestByTaskId(taskId)!
 
     // design_review_idle → rekick_design_review が使う経路と同じ dispatcher。
+    passDesignReviewRetryCooldown()
     const rekicked = await executeQueuedRun(storage, run, runnerDeps(ALIGNED_RESULT_JSON))
     expect(rekicked).toMatchObject({ kind: 'review', result: { status: 'evidence_registered' } })
     expect(storage.jobs.findByTaskId(taskId)).toEqual([])
@@ -947,6 +952,7 @@ describe('fresh Review が判定を出さなかった（requeued）場合', () =
     for (let i = 0; i < 5; i += 1) {
       const current = storage.designReviewRuns.findById(runId)!
       if (current.status !== 'queued') break
+      passDesignReviewRetryCooldown()
       await executeQueuedRun(storage, current, runnerDeps('null'))
     }
 

@@ -31,6 +31,7 @@ import {
   type ReviewOutcome,
 } from './harness'
 import { resetDesignReviewStub, scriptDesignReview } from './runnerStub'
+import { passDesignReviewRetryCooldown } from '../designReview/retryCooldownTestClock'
 
 vi.setConfig({ testTimeout: 240_000 })
 
@@ -40,6 +41,8 @@ beforeEach(() => {
   resetDesignReviewStub()
 })
 afterEach(async () => {
+  // retry cooldown を明けさせるために進めた壁時計を戻す（retryCooldownTestClock.ts）。
+  vi.useRealTimers()
   await env?.close()
 })
 afterAll(() => {
@@ -125,12 +128,36 @@ describe('M1: Mobile admission (shared predicates over GET responses) agrees wit
     expectAgreement(result)
   })
 
+  // 生きた Task 単位の人の判断（WAITING abort_task）がある形。Mobile は resumedByHuman: true で判定し、
+  // CEO（ADMIN）の resume はその判断を置き換える（storage が同じ transaction で SUPERSEDED にする）。
+  // APPROVED ではなく WAITING を使う: APPROVED を live とみなすには approval_actor=human を要求する方向へ
+  // 述語が変わる予定で、この形の意味（人の判断が生きている）を WAITING なら変えずに保てる。
+  it('rejected commit with a live task-scoped human decision (WAITING abort_task) — human resume admitted', async () => {
+    const { task } = await start('m-human-decision')
+    env.worker.behaviors.review = () => HIGH_FINDING
+    await env.worker.runUntilIdle()
+    const [approval] = env.storage.approvalRequests.findByTaskId(task.id)
+    await env.ceo.reject(approval!.id)
+    const abortRequest = env.storage.approvalRequests.create({
+      taskId: task.id, targetBranch: 'candidate/self-dev', targetCommit: 'c', targetDiffHash: 'd',
+      riskLevel: 'HIGH', requestedAction: 'abort_task', status: 'WAITING_FOR_USER',
+      expiresAt: new Date(Date.now() + 30 * 60 * 1000).toISOString(), invalidIf: [],
+    } as never)
+    const result = await compare('live task-scoped human decision', task.id)
+    expect(result.mobileResume).toBe('ok')
+    expectAgreement(result)
+    expect(env.storage.approvalRequests.findById(abortRequest.id)?.status).toBe('SUPERSEDED')
+  })
+
   it('repair Design Review failed and the Task escalated (R3 shape) — resume admitted', async () => {
     const { task } = await start('m-escalated')
     env.worker.behaviors.review = () => changesRequested('restructure')
     scriptDesignReview('RUNNER_UNAVAILABLE', 'RUNNER_UNAVAILABLE', 'RUNNER_UNAVAILABLE')
     await env.worker.runUntilIdle()
+    // Each rekick happens after the retry cooldown (retryCooldown.ts); advance the clock past it.
+    passDesignReviewRetryCooldown()
     await env.plTick({ diagnose: REKICK })
+    passDesignReviewRetryCooldown()
     await env.plTick({ diagnose: REKICK })
     expect(env.task(task.id).status).toBe('blocked')
     env.worker.behaviors.review = () => APPROVED_REVIEW

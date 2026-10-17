@@ -62,7 +62,17 @@ export type ResumeBlockedTaskResult =
          * WAITING の abort_task 等）がある間は行わない。否定ではなく正当な人の判断待ち。
          */
         | 'HUMAN_DECISION_PENDING'
+        /**
+         * Design Review を待つ間に resume 対象（最新 Job）が変わった。何も作っていない。
+         * 否定ではなく再試行可能（PL は pending、route は 409）。
+         */
+        | 'RESUME_TARGET_CHANGED'
       reason: string
+      /**
+       * `DESIGN_REVIEW_PRECONDITION_FAILED` のときだけ入る、この resume が再開する Job の id。
+       * resume-with-design-review が起票する run の `resumeSourceJobId` になる（推論せずここから渡す）。
+       */
+      sourceJobId?: string
     }
 
 /**
@@ -390,6 +400,12 @@ export interface IProjectStorage {
  * （独立レビュー round 7 指摘）。呼び出し側はこの値をそのまま上へ伝播すればよく、
  * `reason` 文字列を突き合わせて分類し直してはならない。
  */
+/** `ITaskStorage.escalateToHuman()` の結果。前4つは `task_escalated_to_human` audit の result と同じ語彙。 */
+export type TaskEscalationResult =
+  | { result: 'blocked' | 'already_blocked' | 'not_moved_done' | 'not_moved_parked' }
+  | { result: 'not_found' }
+  | { result: 'precondition_failed'; reason: string }
+
 export type RecoverFromBlockedResult =
   | { ok: true; task: Task }
   | { ok: false; code?: RecoverAdmissionCode; reason: string }
@@ -443,6 +459,20 @@ export interface ITaskStorage {
    * 戻すような実装はしないこと。
    */
   recoverFromBlocked(input: { taskId: string; detail: string }): RecoverFromBlockedResult
+  /**
+   * Human escalation（Task → `blocked`）と、その理由の audit 行を**1つの IMMEDIATE transaction**で書く。
+   * 意味論（park 済み・done は動かさない、既に blocked なら記録だけ）の正本は
+   * `designReview/repairFlow.ts` の `escalateTaskToHuman()` で、ここはそれを原子的に行う器である。
+   *
+   * `precondition` を渡すと、lock を取った後・書き込みの前に**同じ transaction の中で**評価する
+   * （呼び出し側が precheck に使った事実を読み直すため）。文字列を返したら何も書かずに
+   * `precondition_failed` を返す。precondition は park / done の判定より先に評価する。
+   */
+  escalateToHuman(input: {
+    taskId: string
+    audit: { operation: string; detail: string }
+    precondition?: (task: Task) => string | undefined
+  }): TaskEscalationResult
   findById(id: string): Task | undefined
   findSummaries(options?: { limit?: number; projectId?: string; status?: TaskStatus }): TaskSummary[]
   /**
@@ -652,6 +682,12 @@ export interface IJobStorage {
      * `human` の resume は新しい人の判断として、その Task の Task 単位の承認を置き換える（C-03）。
      */
     resumedBy?: ResumeActorEvidence
+    /**
+     * resume-with-design-review の2回目の呼び出しが渡す、review を起票したときの resume 対象 Job
+     * （1回目が返した `sourceJobId`）。transaction 内で最新 Job がこれと違えば、successor を作らず
+     * `RESUME_TARGET_CHANGED` を返す（review が見ていない Job を resume しない。C3-c）。
+     */
+    expectedSourceJobId?: string
   }): ResumeBlockedTaskResult
   /**
    * PR-C finding 14 修復 (BLOCKER B): quarantine を解除する（単一transaction・冪等）。
@@ -957,12 +993,26 @@ export interface DesignReviewRun {
    * repair 予算の計算へは一切関与しない。
    */
   repairSourceJobId?: string
+  /**
+   * **resume provenance。** resume-with-design-review（PL / Human）が起票した run でだけ入り、
+   * その resume が再開する Job の id（`ResumeBlockedTaskResult.sourceJobId`）。
+   *
+   * retry cooldown 中に PL が「この Job の復旧はこの run の判定待ち」と判断する唯一の根拠で、
+   * timestamp や「最新 Job」から推論しない（RC1）。NULL（legacy・他経路）は証明なしとして扱う。
+   * `repairSourceJobId` とは別の事実であり、流用しない。active run の再利用時は最初の値が残る。
+   */
+  resumeSourceJobId?: string
 }
 
 /** claim結果。claimできなかった場合は run=undefined。 */
 export interface ClaimDesignReviewRunResult {
   run?: DesignReviewRun
   claimToken?: string
+  /**
+   * 判定の出なかった attempt の後の retry cooldown 中で claim しなかったとき、明ける時刻（ISO）。
+   * 方針は `designReview/retryCooldown.ts`。
+   */
+  retryNotBefore?: string
 }
 
 /** terminal Job update と同一transactionでqueue するDesign Review run の内容。 */
@@ -1180,7 +1230,11 @@ export interface IDesignReviewRunStorage {
    * ここでは判定しない。
    */
   findTerminalRepairPurposeRuns(): DesignReviewRun[]
-  /** queuedのrunをrunningへ遷移し、attempt_countを加算して新しいclaim_tokenを発行する。 */
+  /**
+   * queuedのrunをrunningへ遷移し、attempt_countを加算して新しいclaim_tokenを発行する。
+   * 判定の出なかった task run の retry cooldown（`designReview/retryCooldown.ts`）中は claim せず
+   * `retryNotBefore` を返す。**cooldown を強制するのはここ1箇所だけ**である。
+   */
   claim(id: string, maxAttempts: number): ClaimDesignReviewRunResult
   /** claim_token一致時のみ終端へ遷移する。不一致（stale）ならfalseを返し、呼び出し側は結果を破棄する。 */
   complete(id: string, claimToken: string, status: 'succeeded' | 'failed', resultJson?: string, error?: string): boolean
@@ -1194,7 +1248,11 @@ export interface IDesignReviewRunStorage {
     resultJson: string,
     evidence: DesignReviewEvidenceCreateInput,
   ): DesignReviewEvidence | undefined
-  /** claim_token一致時のみqueuedへ戻し、tokenを無効化する。 */
+  /**
+   * claim_token一致時のみqueuedへ戻し、tokenを無効化する。
+   * 直前の attempt の終了時刻を `completedAt` に記録する（retry cooldown の起点）。queued の行でだけ
+   * この意味を持ち、次の claim で消える。
+   */
   requeue(id: string, claimToken: string, error: string): boolean
   /**
    * API process crash後の起動時回収専用。runningのまま残った行をqueuedへ戻す。
