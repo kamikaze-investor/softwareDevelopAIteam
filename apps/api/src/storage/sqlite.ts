@@ -1376,6 +1376,15 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   }
 
   /**
+   * 承認の期限が過ぎている、または期限値が読めない（壊れた値を「未失効」として通さない）。
+   * `new Date(bad) <= now` は NaN 比較で false になり、壊れた期限の APPROVED を使い切れてしまうため。
+   */
+  function isUnreadableOrPastExpiry(expiresAt: string): boolean {
+    const expiresAtMs = new Date(expiresAt).getTime()
+    return !Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()
+  }
+
+  /**
    * 同じ契約を **action 名を引数に取る形**で一般化したもの。abort 専用実装を
    * 複製しないために、上の関数はこれへ委譲している。
    *
@@ -5187,7 +5196,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             approvalRequest: existing,
           }
         }
-        if (new Date(existing.expiresAt) <= new Date()) {
+        // D2 hardening: 読めない期限値を「未失効」として通さない（NaN <= now は false になるため）。
+        if (isUnreadableOrPastExpiry(existing.expiresAt)) {
           const expired = approvalRequests.updateStatus(input.id, 'EXPIRED', undefined, true)
           return { ok: false, code: 'EXPIRED', reason: 'Approval request has expired', approvalRequest: expired }
         }
@@ -5200,6 +5210,28 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             approvalRequest: stale,
           }
         }
+        // D2 hardening: 人が決めた記録（approval_actor = human）の無い APPROVED は authority ではない。
+        // Task 操作の verifyAndConsumeTaskApproval と同じ処理（同じ transaction で SUPERSEDED + audit）。
+        if (readApprovalActorClass(storage, input.id) !== 'human') {
+          supersedeNonHumanApproval(input.id)
+          return {
+            ok: false,
+            code: 'APPROVAL_ACTOR_NOT_HUMAN',
+            reason: 'Approval request has no record that a human (ADMIN credential) decided it; it was superseded',
+            approvalRequest: approvalRequests.findById(input.id),
+          }
+        }
+        // D2 hardening: APPROVED → CONSUMED の遷移は実行中（claim 済み）の Job にだけ許す。queued / blocked /
+        // 終端の Job には使い切らせない（EXPIRED / STALE / SUPERSEDED への無効化は Job の状態に関係なく上で行う）。
+        if (job.status !== 'running') {
+          return {
+            ok: false,
+            code: 'JOB_NOT_RUNNING',
+            reason: `Cannot consume: Job is '${job.status}' (must be running)`,
+            approvalRequest: existing,
+          }
+        }
+
         const consumed = db.prepare(`
           UPDATE approval_requests SET status = 'CONSUMED'
           WHERE id = ? AND status = 'APPROVED'
@@ -5295,7 +5327,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           }
         }
 
-        if (new Date(existing.expiresAt) <= new Date()) {
+        // D2 hardening: 読めない期限値を「未失効」として通さない（NaN <= now は false になるため）。
+        if (isUnreadableOrPastExpiry(existing.expiresAt)) {
           db.prepare(`
             UPDATE approval_requests SET status = 'EXPIRED'
             WHERE id = ? AND status = 'APPROVED'
@@ -5305,6 +5338,32 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             code: 'EXPIRED',
             reason: 'Approval request has expired',
             approvalRequest: { ...existing, status: 'EXPIRED' },
+            linkedJobId: linkedJob.id,
+          }
+        }
+
+        // D2 hardening: 人が決めた記録（approval_actor = human）の無い APPROVED は authority ではない。
+        // Task 操作の verifyAndConsumeTaskApproval と同じ処理（同じ transaction で SUPERSEDED + audit）。
+        if (readApprovalActorClass(storage, input.id) !== 'human') {
+          supersedeNonHumanApproval(input.id)
+          return {
+            ok: false,
+            code: 'APPROVAL_ACTOR_NOT_HUMAN',
+            reason: 'Approval request has no record that a human (ADMIN credential) decided it; it was superseded',
+            approvalRequest: { ...existing, status: 'SUPERSEDED' },
+            linkedJobId: linkedJob.id,
+          }
+        }
+
+        // D2 hardening: APPROVED → CONSUMED の遷移は実行中（claim 済み）の Job にだけ許す。同じ Job による
+        // CONSUMED の再送（上の alreadyConsumed）は Job が running でなくても冪等な成功のまま。
+        // EXPIRED / STALE / SUPERSEDED への無効化も Job の状態に関係なく上で行う。
+        if (requestedJob.status !== 'running') {
+          return {
+            ok: false,
+            code: 'JOB_NOT_RUNNING',
+            reason: `Cannot consume: Job is '${requestedJob.status}' (must be running)`,
+            approvalRequest: existing,
             linkedJobId: linkedJob.id,
           }
         }

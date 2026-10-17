@@ -1,4 +1,5 @@
 import Fastify, { type FastifyInstance } from 'fastify'
+import { setCredentialClass } from '../auth/credentialClass.js'
 import { describe, expect, it, vi } from 'vitest'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { buildResumeAiCliPrompt } from './tasks'
@@ -36,6 +37,15 @@ async function buildApp(taskRouteOptions?: TaskRouteOptions): Promise<FastifyIns
   resetStorage()
 
   const app = Fastify()
+  // production では PATCH /approval-requests/:id/status は HUMAN_ONLY_ROUTES（split mode の ADMIN だけが届く）。
+  // このテスト app は認証 hook を持たないので、その境界だけを模して ADMIN として記録する
+  // （consume は approval_actor=human を要求する。D2 hardening 2026-10-17）。
+  app.addHook('preHandler', async (req) => {
+    const path = req.url.split('?')[0]!
+    if (req.method === 'PATCH' && path.startsWith('/api/approval-requests/') && path.endsWith('/status')) {
+      setCredentialClass(req, 'admin')
+    }
+  })
   app.register(approvalGateRoutes, { prefix: '/api' })
   app.register(taskRoutes, { ...(taskRouteOptions ?? {}), prefix: '/api/tasks' })
   app.register(jobRoutes, { prefix: '/api/jobs' })
@@ -502,6 +512,9 @@ describe('POST /api/tasks/:id/resume — expired WAITING_FOR_USER approval', () 
         payload: { status: 'APPROVED' },
       })
       expect(approveRes.statusCode).toBe(200)
+      // 承認（approveAndResumeJob）で Job は queued に戻る。Worker は claim（running）してから gate/check・consume する
+      // （consume は running の Job だけを受け付ける。D2 hardening 2026-10-17）。
+      await app.inject({ method: 'PATCH', url: `/api/jobs/${resumedJob.id}`, payload: { status: 'running' } })
 
       const afterApproval = await app.inject({
         method: 'POST',

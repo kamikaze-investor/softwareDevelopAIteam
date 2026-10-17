@@ -24,7 +24,7 @@ import { readJobsSupersededByHumanResume, withApprovalActorFacts } from '../desi
 import { designReviewRetryNotBeforeMs } from '../designReview/retryCooldown'
 import { isTechnicalRecoveryTargetExhausted } from '../pl/technicalResumePolicy'
 import type { IStorage } from '../storage/interface'
-import { isLiveApprovedApproval, isLiveTaskScopedDecision, isLiveWaitingApproval } from '@ai-team/shared'
+import { gateTechnicalStopCodeOfJob, isLiveApprovedApproval, isLiveTaskScopedDecision, isLiveWaitingApproval } from '@ai-team/shared'
 import type { ApprovalRequest, Job, Task, Project } from '@ai-team/shared'
 
 /**
@@ -620,7 +620,9 @@ export function buildSystemState(
           && !superseded.has(job.id)
           && task.status !== 'done'
           && !parentIsParked
-          && !isWaitingOnLiveApproval(storage, job, nowMs)
+          // D2: Gate の技術停止（risk_rule_skew 等）は、結び付いた WAITING 承認があっても job_blocked として見せる。
+          // 承認しても同じ不整合で再停止するので、それは人の判断待ちではない（下の approval_waiting は出さない）。
+          && (gateTechnicalStopCodeOfJob(job) !== undefined || !isWaitingOnLiveApproval(storage, job, nowMs))
           && findLiveTaskScopedDecision(storage, task.id, nowMs) === undefined
         ) {
           // **done な Task の blocked Job は attention にしない。**
@@ -764,18 +766,24 @@ export function buildSystemState(
       // 復旧経路は従来どおり残る。**行そのものは書き換えない**（lazy expiry を壊さない）。
       // 最新の active 行ではなく、実際に live な WAITING 行を referenceId に使う。
       const approval = findLiveWaitingApproval(storage, task.id, nowMs)
+      // D2: その WAITING 承認に結び付いた Job が Gate の技術停止で blocked なら、承認待ちとして見せない
+      // （承認しても実行されず同じ不整合で止まる。停止は上の job_blocked が技術停止として見せる）。
+      const heldByTechnicalStop = approval !== undefined
+        && jobs.some((job) => job.approvalId === approval.id && gateTechnicalStopCodeOfJob(job) !== undefined)
       if (approval !== undefined) {
-        attention.push({
-          kind: 'approval_waiting',
-          projectId: project.id,
-          projectName: project.name,
-          taskId: task.id,
-          referenceId: approval.id,
-          detail:
-            `approval request ${approval.id} (${approval.requestedAction}, risk ${approval.riskLevel}) `
-            + 'is waiting for a human decision',
-          stuckForMs: elapsedMs(approval.createdAt, nowMs),
-        })
+        if (!heldByTechnicalStop) {
+          attention.push({
+            kind: 'approval_waiting',
+            projectId: project.id,
+            projectName: project.name,
+            taskId: task.id,
+            referenceId: approval.id,
+            detail:
+              `approval request ${approval.id} (${approval.requestedAction}, risk ${approval.riskLevel}) `
+              + 'is waiting for a human decision',
+            stuckForMs: elapsedMs(approval.createdAt, nowMs),
+          })
+        }
       } else {
         // **APPROVED のまま実行されていない Task 単位の判断**（例: CEO が承認した abort_task を CEO が
         // /abort でまだ実行していない）も人の判断待ちである。新しい attention kind は作らず、同じ
