@@ -122,4 +122,15 @@ describe('outboxStore', () => {
     expect(store.hasPending()).toBe(true)
     expect(readRows()).toHaveLength(1)
   })
+
+  it('reports pending events per Job (startup recovery skips only those Jobs)', async () => {
+    const store = await loadStore()
+    store.recordPending('job-pending', { status: 'success' })
+
+    expect(store.hasPendingFor('job-pending')).toBe(true)
+    expect(store.hasPendingFor('job-other')).toBe(false)
+
+    store.deletePending('job-pending')
+    expect(store.hasPendingFor('job-pending')).toBe(false)
+  })
 })

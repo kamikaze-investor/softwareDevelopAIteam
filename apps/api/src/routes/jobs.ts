@@ -21,6 +21,7 @@ import {
   isWorkspaceQuarantined,
   prepareRepairFlow,
   recordRepairAdmissionSkipped,
+  REPAIR_ADMISSION_SKIPPED_OPERATION,
   resolveReviewedImplementation,
 } from '../designReview/repairFlow'
 import {
@@ -404,6 +405,20 @@ function buildOutboxEvent(
   return { ok: true, outboxEvent: { eventId, payloadHash: computedPayloadHash } }
 }
 
+/**
+ * この review の admission skip が既に audit に在るか（再送で同じ行を重ねないため）。
+ * 読めなければ false（記録する側へ倒す。skip の記録が欠けるより重複のほうが害が小さい）。
+ */
+function hasRecordedAdmissionSkip(storage: ReturnType<typeof getStorage>, taskId: string, reviewJobId: string): boolean {
+  try {
+    return storage.auditLog.findByEntity('task', taskId).some((entry) =>
+      entry.operation === REPAIR_ADMISSION_SKIPPED_OPERATION
+      && (entry.detail ?? '').split(' ').includes(`review_job_id=${reviewJobId}`))
+  } catch {
+    return false
+  }
+}
+
 function outboxResponse(job: Job, outboxEvent: OutboxEventInput | undefined, deduplicated: boolean): Job | (Job & { outbox: { eventId: string; deduplicated: boolean } }) {
   if (!outboxEvent) return job
   return {
@@ -727,8 +742,16 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(404).send({ error: 'Job not found' })
     }
 
+    // **完全な再送（同じ eventId・同じ payloadHash が適用済み）は、状態に依存する事前検証より先に
+    // 認識する**（lifecycle repair C2）。fingerprint の write-once / running-only 検査は「まだ適用して
+    // いない遷移」に対する規則で、適用済みの event を再送すると必ず 409 になる。応答が失われた
+    // 端末 PATCH の再送が 409 を受けると、Worker の Outbox event は pending のまま残り intake が止まる。
+    // 再送はこの後の storage 呼び出しで deduplicated として元の結果を返す（状態は変えない）。
+    // 同じ eventId で payload が違う再送（conflict）は従来どおり拒否される。
+    const isExactReplay = storage.jobs.classifyOutboxEvent(existing.id, outboxEvent) === 'deduplicated'
+
     const workspaceEndFingerprint = jobUpdate.failureMetadata?.workspaceEndFingerprint
-    if (workspaceEndFingerprint !== undefined) {
+    if (workspaceEndFingerprint !== undefined && !isExactReplay) {
       if (existing.failureMetadata?.workspaceEndFingerprint !== undefined) {
         return reply.status(409).send({
           error: 'workspaceEndFingerprint is write-once and has already been recorded',
@@ -785,7 +808,8 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
     // これは遅れて届いた報告ではなく「park された Task をもう一度動かせ」という要求なので、
     // stale 遷移として黙って落とすのではなく、理由を返して拒否する。
     if (
-      jobUpdate.status !== undefined
+      !isExactReplay
+      && jobUpdate.status !== undefined
       && isLiveJob({ status: jobUpdate.status })
       && storage.tasks.isParked(existing.taskId)
     ) {
@@ -917,7 +941,16 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       // **対象の implement Job は保存済み lineage から引く。** Human Resume で再実行された
       // review は `resume:<元review>:1` になり、以前の `implement:<id>:review` 一致だけでは
       // repair も escalation も作られずに終わっていた（2026-09-28 production・Task `9fdee5a3`）。
-      if (!approved && !persisted.deduplicated) {
+      //
+      // **deduplicated な再送でも Stage 2 を評価し直す**（lifecycle repair C2 / H-02）。review 結果の
+      // 永続化（Outbox 記録を含む）と Stage 2 は別 transaction なので、その間に API が落ちる
+      // （または run 作成が投げる）と、Worker の再送は deduplicated になり、以前はここで Stage 2 を
+      // 飛ばしていた —— Task は failed な最新 review と live Job / run 無しの pending のまま残り、
+      // resume も stored-review recovery も blocked を要求するので出口が無かった。
+      // 再評価は冪等である: repair Job は stepKey 一意、active run は prepareRepairFlow が止め、
+      // escalate は同じ blocked への遷移、終端済みの run は下の identity 照合で二重に作らない。
+      if (!approved) {
+        const replay = persisted.deduplicated === true
         const reviewed = resolveReviewedImplementation(storage, existing.id)
         if (!reviewed.ok && existing.workflowStepKey !== undefined) {
           // workflow 上の review なのに実装へ辿れない。黙って終わらせず理由を残す（fail-closed）。
@@ -942,17 +975,29 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
                 runId: reviewPreparation.runId,
               }, 'review requested changes but repair was not admitted; stage 2 skipped')
               // log は流れて消える。blocked な Task では audit にも残す（状態は変えない。L4）。
-              recordRepairAdmissionSkipped(storage, {
-                taskId: existing.taskId,
-                reviewJobId: existing.id,
-                implementJobId: implementJob.id,
-                skip: reviewPreparation,
-              })
+              // 再送では、同じ review の skip が既に記録されていれば重ねない。
+              if (!replay || !hasRecordedAdmissionSkip(storage, existing.taskId, existing.id)) {
+                recordRepairAdmissionSkipped(storage, {
+                  taskId: existing.taskId,
+                  reviewJobId: existing.id,
+                  implementJobId: implementJob.id,
+                  skip: reviewPreparation,
+                })
+              }
             } else if (reviewPreparation.action === 'escalate') {
               escalateTaskToHuman(storage, existing.taskId, reviewPreparation.reason)
             } else if (reviewPreparation.action === 'queue') {
-              const run = storage.designReviewRuns.create(reviewPreparation.run)
-              kickQueuedDesignReview(storage, req.log, run, reviewPreparation.stepKey)
+              // 再送で、同じ repair 計画（同じ source・同じ design text）の run が既に在るなら
+              // Stage 2 は前回の処理で始まっている（終端していても作り直さない = 判定の引き直しをしない）。
+              const started = replay
+                ? storage.designReviewRuns.findByTaskId(existing.taskId).find((run) =>
+                    run.repairSourceJobId === reviewPreparation.run.repairSourceJobId
+                    && run.designTextHash === reviewPreparation.run.designTextHash)
+                : undefined
+              if (started === undefined) {
+                const run = storage.designReviewRuns.create(reviewPreparation.run)
+                kickQueuedDesignReview(storage, req.log, run, reviewPreparation.stepKey)
+              }
             }
           } catch (err) {
             req.log.error({ err, jobId: existing.id }, 'failed to start stage 2 from review')
