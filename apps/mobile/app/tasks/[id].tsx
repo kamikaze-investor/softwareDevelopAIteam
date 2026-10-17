@@ -898,14 +898,14 @@ function TaskFailureExplanationSection({
 }
 
 interface StoredReviewRecoverySectionProps {
-  approvalRequests: ApprovalRequest[]
   isSubmitting: boolean
   jobs: Job[]
   onSubmit: (reviewJobId: string, evidence: DerivedQaEvidence[]) => void
   /** null = 取得できなかった。重複登録を避けられないので操作を出さない */
   qaResults: QAResult[] | null
   reviews: ReviewResult[]
-  task: Task
+  /** 承認状態は `TaskDetail.humanTaskDecisions`（API が authority を確定した事実）から出す。 */
+  task: TaskDetail
 }
 
 /**
@@ -916,7 +916,6 @@ interface StoredReviewRecoverySectionProps {
  * 通してよいかの最終判断は backend の admission が正本で、ここは表示制御だけである。
  */
 function StoredReviewRecoverySection({
-  approvalRequests,
   isSubmitting,
   jobs,
   onSubmit,
@@ -924,7 +923,7 @@ function StoredReviewRecoverySection({
   reviews,
   task,
 }: StoredReviewRecoverySectionProps): ReactElement | null {
-  const view = storedReviewRecoveryView(task, jobs, reviews, qaResults, approvalRequests)
+  const view = storedReviewRecoveryView(task, jobs, reviews, qaResults)
   if (view.kind === 'hidden') return null
 
   // 登録済み QA が分からないまま送ると、同じ事実を二重に登録する。操作は出さない。
@@ -1706,7 +1705,6 @@ export default function TaskDetailScreen(): ReactElement {
             task={data.task}
           />
           <StoredReviewRecoverySection
-            approvalRequests={data.approvalRequests}
             isSubmitting={isSubmittingStoredReviewRecovery}
             jobs={data.jobs}
             onSubmit={handleStoredReviewRecovery}

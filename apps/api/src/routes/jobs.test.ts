@@ -679,6 +679,74 @@ describe('Job API', () => {
     })
   })
 
+  // lifecycle repair C3: 適用できない Outbox 配送は「適用済み・何も適用しない」で受ける（H-02 の一般化）。
+  describe('a non-applicable Outbox delivery is acknowledged and applies nothing (lifecycle repair C3)', () => {
+    async function storedJob(status: 'running' | 'success') {
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const project = storage.projects.create({ name: 'P', goal: 'g', designPhilosophy: [], status: 'running' })
+      const task = storage.tasks.create({
+        projectId: project.id, title: 'T', description: '', status: 'in_progress', assignee: 'developer_ai', dependencies: [],
+      })
+      const job = storage.jobs.create({
+        taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status,
+        safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+      } as Parameters<typeof storage.jobs.create>[0])
+      return { storage, job }
+    }
+
+    it('operator ends a running Job, then the Worker resends its terminal event with a fingerprint: 200, nothing applied, event recorded', async () => {
+      await withApp(async (app) => {
+        const { storage, job } = await storedJob('running')
+        const operator = await app.inject({
+          method: 'PATCH', url: `/api/jobs/${job.id}`, payload: { status: 'failed', stderr: 'operator stopped it' },
+        })
+        expect(operator.statusCode).toBe(200)
+        const before = storage.jobs.findById(job.id)
+
+        const workerEvent = withOutbox({
+          status: 'success', exitCode: 0, stderr: 'worker result', commitHash: 'abc1234',
+          failureMetadata: { workspaceEndFingerprint: { mode: 'clean' as const, startCommitHash: '0805249b' } },
+        }, 'evt-after-operator')
+        const first = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload: workerEvent })
+
+        // 以前は fingerprint の running-only 検査が先に 409 を返し、再送が永久に 409 だった。
+        expect(first.statusCode).toBe(200)
+        expect(parseBody<OutboxJobResponse>(first.body)).toMatchObject({
+          status: 'failed', outbox: { eventId: 'evt-after-operator', deduplicated: false },
+        })
+        expect(storage.jobs.findById(job.id)).toEqual(before)
+
+        // event は適用済みとして記録されたので、再送は deduplicated（Worker は event を捨てられる）。
+        const replay = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload: workerEvent })
+        expect(replay.statusCode).toBe(200)
+        expect(parseBody<OutboxJobResponse>(replay.body).outbox).toEqual({ eventId: 'evt-after-operator', deduplicated: true })
+        expect(storage.jobs.findById(job.id)).toEqual(before)
+      })
+    })
+
+    it('a stale failed + quarantined result on a success row does not make the row "success but quarantined"', async () => {
+      await withApp(async (app) => {
+        const { storage, job } = await storedJob('success')
+        const before = storage.jobs.findById(job.id)
+
+        const res = await app.inject({
+          method: 'PATCH', url: `/api/jobs/${job.id}`,
+          payload: withOutbox({
+            status: 'failed', stderr: 'late', guardResult: { permissionAllowed: true, fileChangeAllowed: false },
+            failureMetadata: { kind: 'workspace_baseline_failure', quarantined: true, quarantineReason: 'late dirt' },
+          }, 'evt-stale-quarantine'),
+        })
+
+        expect(res.statusCode).toBe(200)
+        const after = storage.jobs.findById(job.id)
+        expect(after).toEqual(before)
+        expect(after?.failureMetadata?.quarantined).not.toBe(true)
+        expect(after?.stderr).toBeUndefined()
+      })
+    })
+  })
+
   describe('claim guard: another Task that is a live workspace owner (W5)', () => {
     async function setup(app: FastifyInstance) {
       const { getStorage } = await import('../storage/index.js')
@@ -2574,17 +2642,25 @@ describe('Job API', () => {
         expect(jobs).toHaveLength(1)
         // 遅延resultは受理されるが、確定済みterminal stateは上書きしない。
         // queuedのsourceはまだ確定していないため適用される。
-        const expectedStatus = status === 'queued' ? 'failed' : status
-        expect(jobs[0]).toMatchObject({
-          id: source.id,
-          status: expectedStatus,
-          exitCode: 1,
-          stderr: 'provider command timed out',
-          failureMetadata: {
-            kind: 'provider_timeout',
-            workspaceState: 'unchanged',
-          },
-        })
+        if (status === 'queued') {
+          expect(jobs[0]).toMatchObject({
+            id: source.id,
+            status: 'failed',
+            exitCode: 1,
+            stderr: 'provider command timed out',
+            failureMetadata: {
+              kind: 'provider_timeout',
+              workspaceState: 'unchanged',
+            },
+          })
+        } else {
+          // 適用できない配送は status 以外の payload も重ねない（lifecycle repair C3。以前は exitCode / stderr /
+          // failureMetadata を確定済みの行へ重ね、確定 state と矛盾する行を作っていた）。
+          expect(jobs[0]).toMatchObject({ id: source.id, status })
+          expect(jobs[0].exitCode).toBeUndefined()
+          expect(jobs[0].stderr).toBeUndefined()
+          expect(jobs[0].failureMetadata).toBeUndefined()
+        }
         expect(jobs.some((job) => job.workflowStepKey?.startsWith('retry:') === true)).toBe(false)
       })
     },
