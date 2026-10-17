@@ -106,8 +106,8 @@ export function formatRecoverErrorMessage(code: string | null): string {
 export const APPROVAL_DECISION_ERROR_MESSAGE_FALLBACK = '操作に失敗しました'
 
 /**
- * `PATCH /api/approval-requests/:id/status` の拒否 `code` ごとの文言。
- * この route も `HUMAN_ONLY_ROUTES`（C-02）なので、API の認証構成が人と自動を区別できないと 403 になる。
+ * `PATCH /api/approval-requests/:id/status` と `PATCH /api/approvals/:id` の拒否 `code` ごとの文言。
+ * どちらも `HUMAN_ONLY_ROUTES`（C-02 / 2026-10-17）なので、API の認証構成が人と自動を区別できないと 403 になる。
  */
 const APPROVAL_DECISION_ERROR_MESSAGE_BY_CODE: Readonly<Record<string, string>> = {
   HUMAN_ONLY_ROUTE_REQUIRES_SPLIT_CREDENTIALS:

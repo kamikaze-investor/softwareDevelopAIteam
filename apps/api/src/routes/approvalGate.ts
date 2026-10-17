@@ -50,6 +50,8 @@ import { gateEvaluationRoutes } from './gateEvaluations'
 // v3（2026-10-16 監査 RC4/RC6）: 承認を requestedAction 単位に束縛し、SAFE_WORK の HIGH には承認依頼を
 // 作らず、RISK_RULES の HIGH 対象（Gate / 承認の実装ファイル・docs/project_memory/rules/）を広げた。
 // v2 の evidence を読む側（roadmapAdoption の Candidate commit 証明）は v2 / v3 の両方を受け付ける。
+// 2026-10-17（RC6 / DA trigger 2）の RISK_RULES 拡張（authority・admission・recovery の定義ファイル）も v3 に含める。
+// v3 は同じ lifecycle repair の一連の変更で未リリース（origin/master は v2）なので、v4 へは上げない。
 const GATE_POLICY_VERSION = 'gate-policy-v3'
 
 function computeDiffHash(diffText: string): string {
@@ -762,9 +764,35 @@ export async function approvalGateRoutes(
         : existingReq
 
     // Gate 判定（純粋関数）
-    const outcome = decideGateOutcome(riskReview, existingReqForOutcome, targetCommit, targetDiffHash, {
+    let outcome = decideGateOutcome(riskReview, existingReqForOutcome, targetCommit, targetDiffHash, {
       requiresApprovalByPolicy,
     })
+
+    // **git_commit Job の承認枠は 1 Job につき 1 つ**（`createForJob` は job.approvalId がある Job を
+    // JOB_ALREADY_LINKED で拒否する）。linked approval がもう使えない状態（APPROVED のまま期限切れ →
+    // 上で EXPIRED にした行・EXPIRED・STALE・SUPERSEDED・CONSUMED・別 diff の REJECTED 等）で人間承認が
+    // 要る判定（BLOCKED）になったとき、ここで新しい依頼を作ろうとすると 409 になり、Worker はそれを
+    // failTechnical として Job を failed にしていた（2026-10-17 F-1）。failed の Job は resume
+    // （LATEST_JOB_NOT_BLOCKED）も recover（TASK_NOT_BLOCKED）も受け付けず、abort しか残らない。
+    //
+    // 既存の STALE 応答（re_check）で返し、Worker に blocked を報告させる。以後は期限切れ WAITING と同じ
+    // 出口（既存 resume が `resume:<job>:N` の新しい git_commit Job を作り、そこで Job-linked 承認を新規発行）
+    // に乗る。linked 行は書き換えない（APPROVED 期限切れは上で EXPIRED 済み。終端状態はそのまま）。
+    // createForJob での付け替え（relink）は選ばない: 承認と Job の 1:1 束縛を崩し、旧承認の audit 上の
+    // 対象 Job を曖昧にするため。
+    const linkedApprovalSpent =
+      isGitCommitPolicyAction
+      && outcome.decision === 'BLOCKED'
+      && gitCommitJob?.approvalId !== undefined
+    if (linkedApprovalSpent) {
+      outcome = {
+        decision: 'STALE',
+        requestId: gitCommitJob!.approvalId!,
+        reason:
+          'この Job に結び付いた承認は期限切れ・無効のため使えません。Job は blocked になります。'
+          + 'resume で新しい git_commit Job と承認依頼を作成してください。',
+      }
+    }
     const continuationPolicy = computeContinuationPolicy(riskReview.riskLevel, outcome.decision, requiresApprovalByPolicy)
 
     // **誰も待たない承認依頼を作らない。** HIGH の BLOCKED は Worker 側で continue_safe_work_only になり、
@@ -803,7 +831,10 @@ export async function approvalGateRoutes(
               : []),
           ]
 
-    if (outcome.decision === 'STALE') {
+    if (linkedApprovalSpent) {
+      // 終端済みの linked 行は書き換えない。応答には現状の行をそのまま載せる。
+      approvalRequest = storage.approvalRequests.findById(gitCommitJob!.approvalId!)
+    } else if (outcome.decision === 'STALE') {
       storage.approvalRequests.updateStatus(existingReq!.id, 'STALE', undefined, true)
       sideEffects.push({ type: 'MARKED_STALE', requestId: existingReq!.id })
       approvalRequest = storage.approvalRequests.findById(existingReq!.id)

@@ -1,9 +1,13 @@
-import { describe, expect, it } from 'vitest'
+import { afterEach, describe, expect, it, vi } from 'vitest'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import type { Job } from '@ai-team/shared'
 import { DESIGN_REVIEW_MAX_ATTEMPTS, recomputeDecision } from './designReviewCoordinator'
 import { executeQueuedRepair, prepareRepairFlow } from './repairFlow'
+import { passDesignReviewRetryCooldown } from './retryCooldownTestClock'
+
+// retry cooldown を明けさせるために壁時計を進めたテストの後始末。
+afterEach(() => { vi.useRealTimers() })
 
 /**
  * **low-load の Design Review が API 側で正しい判定になること。**
@@ -234,12 +238,15 @@ describe('T6 production 形の docs-only repair Design Review', () => {
 
     // REVIEW_UNAVAILABLE は判定ではないので、runner crash と同じく requeue され Task は止めない。
     for (let attempt = 1; attempt < DESIGN_REVIEW_MAX_ATTEMPTS; attempt += 1) {
+      // attempt の間には retry cooldown がある（retryCooldown.ts）。時計を進めて明けさせる。
+      passDesignReviewRetryCooldown()
       const requeued = await executeQueuedRepair(storage, storage.designReviewRuns.findById(run.id)!, preparation.stepKey, deps)
       expect(requeued.status).toBe('already_started')
       expect(storage.designReviewRuns.findById(run.id)?.status).toBe('queued')
       expect(storage.tasks.findById(ids.taskId)?.status).not.toBe('blocked')
     }
 
+    passDesignReviewRetryCooldown()
     const outcome = await executeQueuedRepair(storage, storage.designReviewRuns.findById(run.id)!, preparation.stepKey, deps)
 
     // 実行できなかった review から repair を作らない（fail-closed は維持）。

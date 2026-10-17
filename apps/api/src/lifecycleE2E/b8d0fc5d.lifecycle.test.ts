@@ -36,6 +36,7 @@ import {
   type ReviewOutcome,
 } from './harness'
 import { designReviewCalls, resetDesignReviewStub, scriptDesignReview, type StubVerdict } from './runnerStub'
+import { passDesignReviewRetryCooldown } from '../designReview/retryCooldownTestClock'
 
 vi.setConfig({ testTimeout: 240_000 })
 
@@ -45,6 +46,8 @@ beforeEach(() => {
   resetDesignReviewStub()
 })
 afterEach(async () => {
+  // retry cooldown を明けさせるために進めた壁時計を戻す（retryCooldownTestClock.ts）。
+  vi.useRealTimers()
   await env?.close()
 })
 afterAll(() => {
@@ -76,7 +79,11 @@ async function b8d0fc5dShape(repairVerdicts: StubVerdict[], reviews: ReviewOutco
   const steps = await env.worker.runUntilIdle()
   expect(steps.map((step) => [step.kind, step.reported])).toEqual([['implement', 'success'], ['review', 'failed']])
   // Remaining attempts of an unavailable repair review are driven by PL rekicks.
-  for (let i = 1; i < repairVerdicts.length; i += 1) await env.plTick({ diagnose: REKICK })
+  // Each rekick happens after the retry cooldown (retryCooldown.ts); advance the clock past it.
+  for (let i = 1; i < repairVerdicts.length; i += 1) {
+    passDesignReviewRetryCooldown()
+    await env.plTick({ diagnose: REKICK })
+  }
 
   const implementJob = env.jobsOf(task.id).find((job) => job.workflowStepKey === `task:${task.id}:initial-implement`)!
   const reviewJob = env.jobsOf(task.id).find((job) => job.aiCliMode === 'review')!

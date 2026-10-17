@@ -1848,7 +1848,8 @@ describe('SQLiteStorage', () => {
       })
       it('rolls back the whole transition when a side effect throws (atomic CAS + side effects)', () => {
         const job = createRunningJob()
-        vi.spyOn(storage.tasks, 'update').mockImplementation(() => {
+        // side effect は Task の escalation（2026-10-17 から tasks.escalateToHuman の単一 transaction）。
+        vi.spyOn(storage.tasks, 'escalateToHuman').mockImplementation(() => {
           throw new Error('simulated side effect failure')
         })
         try {
@@ -2955,6 +2956,65 @@ describe('SQLiteStorage', () => {
       expect(written.repairSourceJobId).toBe('job-legacy-source')
       expect(createSQLiteStorage(dbPath).designReviewRuns.findById(written.id)?.repairSourceJobId)
         .toBe('job-legacy-source')
+    })
+
+    it('keeps resume_source_job_id through the legacy table rebuild, with existing rows NULL (C3-c)', () => {
+      const dbPath = path.join(os.tmpdir(), `ai-team-c3c-legacy-rebuild-${randomUUID()}.db`)
+      createLegacyDesignReviewDatabase(dbPath)
+
+      const upgraded = createSQLiteStorage(dbPath)
+
+      const columns = readDatabase(dbPath, (db) =>
+        (db.pragma('table_info(design_review_runs)') as Array<{ name: string }>).map((c) => c.name),
+      )
+      expect(columns).toContain('resume_source_job_id')
+      // legacy 行の resume 元は推論で埋めない（NULL = 証明なし）。
+      const legacy = readDatabase(dbPath, (db) =>
+        (db.prepare('SELECT resume_source_job_id FROM design_review_runs').all() as Array<{
+          resume_source_job_id: string | null
+        }>).map((r) => r.resume_source_job_id),
+      )
+      expect(legacy.length).toBeGreaterThan(0)
+      expect(legacy.every((value) => value === null)).toBe(true)
+      expect(upgraded.designReviewRuns.findByTaskId('task-legacy-1').every((run) => run.resumeSourceJobId === undefined))
+        .toBe(true)
+
+      // rebuild 直後の同一起動で書け、再起動後も読めること。
+      const written = upgraded.designReviewRuns.create({
+        taskId: 'task-legacy-3',
+        taskTitle: 'Legacy post-upgrade write target',
+        designText: 'Design: post-rebuild resume provenance write.',
+        designTextHash: computeDesignTextHash('Design: post-rebuild resume provenance write.'),
+        changedFiles: [],
+        resumeSourceJobId: 'job-resumed',
+      })
+      expect(written.resumeSourceJobId).toBe('job-resumed')
+      expect(written.repairSourceJobId).toBeUndefined()
+      expect(createSQLiteStorage(dbPath).designReviewRuns.findById(written.id)?.resumeSourceJobId).toBe('job-resumed')
+    })
+
+    it('adds resume_source_job_id to an already-migrated database idempotently (C3-c)', () => {
+      const dbPath = path.join(os.tmpdir(), `ai-team-c3c-additive-${randomUUID()}.db`)
+      const first = createSQLiteStorage(dbPath)
+      const task = first.tasks.create({
+        projectId: first.projects.create({ name: 'P', goal: 'g', designPhilosophy: [], status: 'draft' }).id,
+        title: 'T', description: '', status: 'pending', assignee: 'developer_ai', dependencies: [],
+      } as Parameters<IStorage['tasks']['create']>[0])
+      const existing = first.designReviewRuns.create({
+        taskId: task.id, taskTitle: 'T', designText: 'd', designTextHash: computeDesignTextHash('d'), changedFiles: [],
+      })
+      // A database deployed before C3-c: same schema without the new column.
+      const raw = new Database(dbPath)
+      try {
+        raw.exec('ALTER TABLE design_review_runs DROP COLUMN resume_source_job_id')
+      } finally {
+        raw.close()
+      }
+
+      expect(() => createSQLiteStorage(dbPath)).not.toThrow()
+      const reopened = createSQLiteStorage(dbPath)
+      expect(reopened.designReviewRuns.findById(existing.id)?.resumeSourceJobId).toBeUndefined()
+      expect(() => createSQLiteStorage(dbPath)).not.toThrow()
     })
 
     it('is idempotent on repeat startup after the rebuild has run once', () => {
