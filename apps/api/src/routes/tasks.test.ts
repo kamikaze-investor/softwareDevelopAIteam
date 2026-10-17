@@ -612,7 +612,7 @@ describe('Task API', () => {
 
   it('GET /api/tasks/summary returns task summaries across projects', async () => {
     await withApp(async (app) => {
-      const alpha = await createProject(app, { name: 'Alpha' })
+      const alpha = await createProject(app, { name: 'Alpha', status: 'running' })
       const beta = await createProject(app, { name: 'Beta' })
       const alphaTask = await createTask(app, alpha.id, { title: 'Alpha task' })
       const betaTask = await createTask(app, beta.id, { title: 'Beta task' })
@@ -737,7 +737,7 @@ describe('Task API', () => {
 
   it('GET /api/tasks/summary treats REJECTED as stale once a newer Job is running', async () => {
     await withApp(async (app) => {
-      const project = await createProject(app)
+      const project = await createProject(app, { status: 'running' })
       const task = await createTask(app, project.id, { title: 'Retrying task' })
 
       const blockedJob = await createJob(app, task)
@@ -1628,6 +1628,47 @@ describe('Task API', () => {
 
       expect(res.statusCode).toBe(200)
       expect(parseBody<Task>(res.body).status).toBe('in_progress')
+    })
+  })
+
+  it.each(['pending', 'in_progress'] as const)(
+    'PATCH /api/tasks/:id refuses status done from %s (completion has its own audited routes)',
+    async (from) => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const created = await createTask(app, project.id, { status: from })
+
+        const res = await app.inject({
+          method: 'PATCH',
+          url: `/api/tasks/${created.id}`,
+          payload: { status: 'done', commitHash: 'abc123' },
+        })
+
+        expect(res.statusCode).toBe(409)
+        const body = parseBody<{ code: string; error: string }>(res.body)
+        expect(body.code).toBe('TASK_DONE_USE_COMPLETION_ROUTE')
+        expect(body.error).toContain('reconcile-external-completion')
+        const found = await app.inject({ method: 'GET', url: `/api/tasks/${created.id}` })
+        expect(parseBody<Task>(found.body)).toMatchObject({ status: from })
+        expect(parseBody<Task>(found.body).commitHash).toBeUndefined()
+      })
+    },
+  )
+
+  it('POST /api/tasks refuses creating a task that is already done', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/tasks',
+        payload: { projectId: project.id, title: 'Already done', status: 'done', assignee: 'developer_ai' },
+      })
+
+      expect(res.statusCode).toBe(409)
+      expect(parseBody<{ code: string }>(res.body).code).toBe('TASK_DONE_USE_COMPLETION_ROUTE')
+      const list = await app.inject({ method: 'GET', url: `/api/tasks?projectId=${project.id}` })
+      expect(parseBody<Task[]>(list.body)).toEqual([])
     })
   })
 
