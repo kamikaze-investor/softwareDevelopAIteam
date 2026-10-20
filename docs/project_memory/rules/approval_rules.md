@@ -280,7 +280,7 @@ Lifecycle 一括修復は、承認の **誰が（a）・何を要するか／何
 | --- | --- | --- | --- | --- |
 | H-1 | 決定者の種類を記録しない → `approval_actor` を記録し、ADMIN = human | 誰: split-credential ADMIN を人とみなす | 記録なし・矛盾 = human でない | 人の判断を証拠で特定する |
 | R-1 / R-2 | 初回 implement の修復は eligible refusal の resume だけ → 人の Stored Review Recovery 承認、または `changes_requested` review への Human Resume でも可。そこで予算を reset | 誰: 人 / 効果: blocked を越えて修復を再開・予算 reset | 証明できなければ認めず、reset しない | 人の明示操作で止まった Task を戻せるようにする |
-| R-4 | 後から作られた Human Resume が CONFLICT に答えた → その run id を作成時に明記した Human Resume だけが答える | 誰: 人 / 束縛: run id / 効果: その run に答える | 記録なし（legacy）= 答えない | 人の回答を特定の判断に束縛する（広げる範囲を狭く限定） |
+| R-4（implement lineage 経路） | 答える経路が無かった → implement lineage 上の Human Resume も、作成時に記録した run id と一致すれば答える | 誰: 人 / 束縛: run id / 効果: その run に答える | 記録なし（legacy）= 答えない | 人が答えられる場所を広げる（run id で狭く束縛） |
 
 **2. 承認の権限を狭める**（強化。技術判断の範囲）
 
@@ -288,6 +288,7 @@ Lifecycle 一括修復は、承認の **誰が（a）・何を要するか／何
 | --- | --- | --- | --- | --- |
 | §A | 方針承認が type 照合で PL action を通した → 何も通さない | 効果: PL action の根拠にならない | 拒否 | 束縛の無い承認を権限にしない |
 | H-2 | Task 単位の APPROVED は状態だけで有効 → human のときだけ有効 | 誰: 人だけ | human でない扱い | AI 承認を無効にする |
+| R-4（既存の review lineage 経路、D3） | run 完了後に作られた Human Resume は時刻だけで答えた → 作成時に記録した run id と一致するときだけ答える。**この変更より前の resume は CONFLICT に答えなくなる** | 束縛: run id | 記録なし = 答えない | 時刻からの推定で人の回答を作らない |
 | B | 承認が action・Job・時点に緩く結び付いた → 同じ action・実在 Job・1回限り、Task の承認待ちは1件 | 束縛: action / Job / commit・diff | 拒否・消費しない | 承認を狭く束縛する |
 | S | 承認が Task の状態変化後も残った → park・人の resume / recover・完了で無効化 | 効果: 古い判断を使わない | 操作ごと rollback | 古い判断で動かない |
 | C / X | ADMIN が Job の success・Task の lifecycle 状態・done を直接書けた / 外部完了が blocked Job を残して完了できた → できない | 何: 手の状態変更 | 拒否 | 証拠の無い完了・迂回を塞ぐ |
@@ -409,19 +410,25 @@ Lifecycle 一括修復は、承認の **誰が（a）・何を要するか／何
 
 **R-3 handoff が拒否された Stored Review Recovery 承認は使い切り**（(d)）
 - 旧: 消費済みの承認は、handoff の成否に関係なくその実装の recovery authority（human recovery epoch）として数えられた
-- 新: 消費後に handoff が拒否された（Task done / parked・Project not running）承認は、**使い切ったことを永続的に記録し**、recovery authority から外す。
+- 新: 消費後に handoff が拒否された（Task done / parked・Project not running・別の live 連鎖がある等）承認は、**使い切ったことを永続的に記録し**、recovery authority から外す。
   修復は作られず、再度必要なら新しい承認を求める
 - 不明時: handoff の成否・使い切りの記録が確定しなければ、authority として数えず修復 Job も作らない
 - 根拠: 承認は1回限りの効果であり、効果を生まなかった承認を後から別の修復の根拠にしない
 
 **R-4 人の resume が Design Review の CONFLICT に答える条件**（(d)）
-- 旧: review lineage 上の Human Resume が、source がこの implement の repair run にだけ答えた（作成順で推定）
-- 新: Human Resume が CONFLICT の run に答えるのは、次の**両方**を満たすときだけ:
-  - その resume が**作成時に**、止めていた run の id を明示的に記録している（`answered_run`）
-  - その resume が repair の対象（subject）の下流にある
-  記録を持たない resume（legacy を含む）は何にも答えない。修復は新しい Design Review を必ず起票する
-- 不明時: 記録が無い・読めない・下流と確定できない → 答えていない（止める）
-- 根拠: CONFLICT は Review 判断の不一致（DA 7）。人がその判断を見て続けさせた事実だけを回答とし、時刻や系譜からの推定で回答を作らない。PL の resume は答えない
+- 旧: 答える経路は1つ（D3、2026-09-28）。引き金の review lineage 上の Human Resume が、その run の完了**より後**に作られていれば、
+  この implement を source とする repair run に答えた（**時刻だけで判定**）。implement lineage 上の Human Resume は何にも答えなかった
+- 新: 答える経路は2つで、**どちらも作成時の記録の完全一致を要する**:
+  - **記録**: Human Resume は作られるときに、その時点で答える run の id を `answered_run=<id>` として記録する。
+    選ぶ run は、判定を出して終端した非 ALIGNED の run のうち、同じ対象のより新しい ALIGNED で解消されていない最も新しい1件。該当が無ければ何も記録しない
+  - **既存の review lineage 経路（D3）— 狭める**: 従来の条件（同じ source の repair run・終端・run 完了後に作成）に加え、記録した id がその run と一致すること
+  - **新しい implement lineage 経路 — 広げる**: implement lineage 上で repair の対象（subject）より下流の Human Resume が、run 完了後に作られ、記録した id がその run と一致すること。
+    Task-design run（対象なし）は lineage 全体が下流
+  - 記録を持たない resume（この変更より前に作られた resume を含む）と、人でない resume は何にも答えない。
+    **したがって、この変更より前に作られた Human Resume は、D3 経路でも CONFLICT に答えなくなる。** 修復は新しい Design Review を必ず起票する
+- 不明時: 記録が無い・読めない・一致しない・下流と確定できない・時刻が読めない → 答えていない（止める）
+- 根拠: CONFLICT は Review 判断の不一致（DA 7）。人がその判断を見て続けさせた事実だけを回答とし、時刻や系譜からの推定で回答を作らない。
+  新経路は人の authority を広げるので CEO の判断対象、D3 経路の変更は権限を狭める強化である
 
 **R-5 複数 run の扱い**（(b)）
 - 旧: 回答済みでない最新の run 1件だけで判定した。無関係な新しい ALIGNED が古い CONFLICT を隠し、lineage 外の repair run も数えた
@@ -474,11 +481,11 @@ Lifecycle 一括修復は、承認の **誰が（a）・何を要するか／何
 
 **T-1 Technical Abort を止める人の判断**（(b)）
 - 旧: 期限切れの WAITING も、actor を問わない APPROVED も Technical Abort を止めた
-- 新: 全経路で1つの述語を使い、次のどれかがあれば `HUMAN_DECISION_CONFLICT` で拒否する:
+- 新: 事前確認と最終 transaction で同じ1つの述語を使い、次のどれかがあれば拒否する（最終 transaction では `HUMAN_DECISION_CONFLICT`）:
   - WAITING で、未失効または期限が読めないもの
-  - `approval_actor=human` の APPROVED（未失効）
-  - cleanup 要求後に CONSUMED になった、`approval_actor=human` の行
-  期限切れの WAITING と human でない APPROVED / CONSUMED は止めない。cleanup generation に束縛する
+  - APPROVED で、`approval_actor=human` かつ（未失効または期限が読めない）もの
+  - CONSUMED で、`approval_actor=human` かつ cleanup 要求の時刻以降に作られたもの（cleanup 要求を知らない事前確認では CONSUMED を数えない）
+  期限切れの WAITING / APPROVED と、human でない APPROVED / CONSUMED は止めない。cleanup generation に束縛する
 - 不明時: 状態が読めなければ拒否。actor が読めない APPROVED / CONSUMED は human でない扱い（H-1）で、止めない
 - 根拠: 人の判断が生きている間は AI の技術判断で park しない。人でない承認は人の判断ではない（最重要原則）
 
@@ -557,7 +564,7 @@ Lifecycle 一括修復は、承認の **誰が（a）・何を要するか／何
 | 承認の決定 PATCH は人（split-credential ADMIN）専用・`PATCH /api/approvals/:id` も同じ | 最重要原則 |
 | Task 単位の承認は human のときだけ数える。systemState / stranded 判定 / Mobile でも同じ | 最重要原則（ADMIN = human の対応付けは H-1 で正本化） |
 | PL の resume は human でない APPROVED も置き換える | 最重要原則 |
-| 期限切れの WAITING の決定は EXPIRED へ進めて `409 APPROVAL_EXPIRED`。git_commit の承認で期限を解釈できなければ、状態を変えずに拒否 | TTL 24時間 |
+| 期限切れの WAITING の決定は EXPIRED へ進めて `409 APPROVAL_EXPIRED`。git_commit の承認で期限を解釈できなければ、状態を変えずに既存の EXPIRED と同じ code で拒否 | TTL 24時間 |
 | consume の強化（期限が読めない → 期限切れ・human でない APPROVED は置換・新規 consume は running Job が必要） | TTL・最重要原則・一回限り |
 | 承認を使い切った git_commit は STALE で blocked、resume が新しい承認を発行 | 期限切れ resume の規則・resume 不変条件 2 / 6 |
 | Human Resume は Design Review が見た Job に束縛（`RESUME_TARGET_CHANGED`） | resume 不変条件 3 |
@@ -568,7 +575,7 @@ Lifecycle 一括修復は、承認の **誰が（a）・何を要するか／何
 ### 付録. code の所在と修復の棚卸し
 
 Meta Review が「コードが本節どおりか」を照合するための索引。`[Lxx-n]` は修復の棚卸し（stack 層・項番）。
-（※）は修正中のコードで、修正の着地後に所在を再確認する。
+照合した code: `ai/lifecycle-integration` @ `cae856db`（= `ai/lifecycle-stack-13` @ `71187233`）。
 
 | 規則 | 棚卸し | code |
 | --- | --- | --- |
@@ -585,23 +592,23 @@ Meta Review が「コードが本節どおりか」を照合するための索�
 | B-9 | L02-5 | storage `persistProviderTimeoutFailure()`（`apps/api/src/storage/sqlite.ts`） |
 | S-1〜S-4 | L02-3・L09-4・L07-1・L02-6 | storage `parkTask()` / `releaseBlockedJobAndParkTask()` / `resumeBlockedTask()` / `recoverFromBlocked()`、clean completion の `jobs.update` と起動時の `reconcileResumedBlockedSourceJobs()`（`linked_job_terminal`） |
 | R-1 / R-2 | L01-1・L01-2・L06-11 | `apps/api/src/designReview/repairFlow.ts` `repairableBlockedReviewRequest()`（`coveredByHumanResume`・`recovery_authority_required`）/ `readImplementationAuthorities()` / `humanResumesOf()`、`repairPolicy.ts` `walkRepairGeneration()`、`resumeActor.ts` `recordRepairGeneration()`、`repairFromStoredReview.ts` `repairFromStoredReview()` |
-| R-3 | L04-4 | `repairFromStoredReview.ts` `repairFromStoredReview()`、`repairFlow.ts` `completeRepairHandoff()`、使い切りの記録（※） |
-| R-4 / R-5 / R-7 | L01-3・L01-5・L01-4 | `repairFlow.ts` `blockingDesignReviewRun()`、resume 作成時の `answered_run` 記録（※） |
+| R-3 | L04-4 | `apps/api/src/designReview/repairFlow.ts` `completeRepairHandoff()`（拒否時に `recordRefusedHandoffSpendsRecoveryApproval()`）、`repairRecoveryEpoch.ts` `isSpentStoredReviewRecoveryApproval()` / `humanRecoveryAuthorityByImplementation()`（audit `stored_review_recovery_spent`）、`repairFromStoredReview.ts` `repairFromStoredReview()` |
+| R-4 / R-5 / R-7 | L01-3・L01-5・L01-4 | `repairFlow.ts` `blockingDesignReviewRun()` / `answeredByHumanResume()`（D3 経路）/ `designReviewRunAnsweredByHumanResume()`（記録する run の選択）、`resumeBlockedTask.ts`（作成時の記録）、`resumeActor.ts` `ANSWERED_RUN_AUDIT_TOKEN`（`answered_run`） |
 | R-6 | L04-1 | `apps/api/src/designReviewEvidencePolicy.ts` `findSupersedingRun()` / `isUsableAlignedEvidence()` |
 | R-8 | L04-3・L10-3 | `apps/api/src/designReview/resumeBlockedTask.ts` `resumeBlockedTaskWithDesignReview()`、`packages/shared/src/resumeAdmission.ts` `evaluateResumeAdmission()`（`REPAIR_REVIEW_IN_FLIGHT`）、`apps/api/src/routes/tasks.ts` |
 | R-9 | L01-6・L01-7・L09-6 | `evaluateResumeAdmission()`、`packages/shared/src/recoverAdmission.ts`、storage `resumeBlockedTask()` / `recoverFromBlocked()` |
 | R-10 | L09-5 | `apps/api/src/pl/executionLoop.ts`、`approvalLiveness.ts` `isHumanExecutedTaskDecision()` / `liveTaskDecisionState()`、`apps/api/src/state/systemState.ts` `buildSystemState()` |
 | R-11 | L01-8・L07-2 | `repairFlow.ts` `escalateTaskToHuman()` / `isWorkspaceQuarantined()`、`apps/api/src/state/blockedRowOwnership.ts` |
-| T-1 | L02-4・L09-8 | `apps/api/src/pl/abortTask.ts` `requestTechnicalAbort()` / `completeAbortCleanup()`、`apps/worker/src/index.ts` `reportAbortCleanupObservationsOnce()`、共通の述語（※） |
+| T-1 | L02-4・L09-8 | `packages/shared/src/approvalLiveness.ts` `isApprovalBlockingTechnicalAbort()`、`apps/api/src/pl/abortTask.ts` `requestTechnicalAbort()`（事前確認、`ACTIVE_APPROVAL_PRESENT`）/ `completeAbortCleanup()`、storage の最終 transaction（`HUMAN_DECISION_CONFLICT`）、`apps/worker/src/index.ts` `reportAbortCleanupObservationsOnce()` |
 | T-2 | L11-5 | `abortTask.ts` `abortTask()`（`UNATTRIBUTED_DIRTY_WORKSPACE` / `TASK_STATE_CHANGED`） |
 | X-1 | （棚卸し外） | `apps/api/src/routes/tasks.ts` reconcile-external-completion（`findBlockedJobsPreventingReconcile()`・`TASK_HAS_BLOCKED_JOBS`）、storage `reconcileExternalCompletion()` |
 | T-3 | L13-4 | `apps/api/src/pl/blockedTriage.ts` `triageBlocked()`（rule 6.8 / 6.9、`BlockedDiagnosis.technicalStop`）、`executionLoop.ts` `technicalRecoveryExhaustion()` / `recordTechnicalRecoveryExhaustion()`、`buildSystemState()` |
 | G-1 | L13-1 | `apps/worker/src/guards/gatePolicy.ts` `resolvePolicy()`、`apps/worker/src/jobRunner.ts` `runJob()`、storage `consumeForJob()` |
-| G-2 | L13-2 | `gatePolicy.ts` `resolvePolicy()`、`approvalGateLogic.ts` `findGateTechnicalStopCode()`、consume id 不一致の扱い（※） |
+| G-2 | L13-2 | `apps/worker/src/guards/gatePolicy.ts` `resolvePolicy()` / `isCoherentGateResponse()`（consume id の一致）、`approvalGateLogic.ts` `findGateTechnicalStopCode()` |
 | G-3 | L09-7 | `apps/api/src/approvedRunBlock.ts` `classifyApprovedRunBlock()`、`blockedTriage.ts` rule 6.9 |
-| C-1 | L12-3 | `apps/api/src/routes/jobs.ts` `jobRoutes()`（`JOB_SUCCESS_REQUIRES_WORKER_RESULT`、未認証の拒否は※） |
+| C-1 | L12-3 | `apps/api/src/routes/jobs.ts` `jobRoutes()`（credential class が `worker` / `legacy` のときだけ、`JOB_SUCCESS_REQUIRES_WORKER_RESULT`） |
 | C-2 | L10-4 | `apps/api/src/routes/tasks.ts`（作成・PATCH の `TASK_DONE_REFUSAL` / `TASK_LIFECYCLE_STATE_OWNED_REFUSAL`）、`apps/api/src/state/strandedTask.ts` |
-| 9 章 | L09-1・L11-3・L09-2・L10-1・L10-2・L12-2・L13-3・L11-4・L11-6・L04-2 | 承認決定 route、storage `approveAndResumeJob()`（期限を解釈できない承認の拒否は※）、`consumeForJob()` ほか |
+| 9 章 | L09-1・L11-3・L09-2・L10-1・L10-2・L12-2・L13-3・L11-4・L11-6・L04-2 | 承認決定 route、storage `approveAndResumeJob()`（期限が読めなければ状態を変えず `EXPIRED`）、`consumeForJob()` ほか |
 | 対象外 | L03・L05・L08・L11-7 | — |
 
 ## Review finding の扱い — PL が統合判断してよい範囲（2026-09-15 CEO 指示）
