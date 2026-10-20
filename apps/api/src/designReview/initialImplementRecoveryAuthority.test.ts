@@ -269,6 +269,22 @@ describe('Human Resume: 引き金の review lineage 上の Human Resume を auth
     })
   })
 
+  it('Human Resume の review の verdict が changes_requested でなければ authority にならない（admit しない）', async () => {
+    const shape = await b8d0fc5dShape()
+    await terminalRun(shape, 'REVIEW_UNAVAILABLE')
+    const r1 = job(shape.storage, shape, { agentRole: 'qa_ai', aiCliMode: 'review', workflowStepKey: `resume:${shape.r0.id}:1` }, { status: 'success', exitCode: 0 })
+    recordResumeActor(shape.storage, { jobId: r1.id, taskId: shape.taskId, actorClass: 'human', evidence: 'admin_credential' })
+    shape.storage.reviewResults.create({
+      taskId: shape.taskId, jobId: r1.id, reviewer: 'qa_ai', status: 'approved', summary: 'approved', findings: [],
+    } as never)
+    await tick()
+
+    const result = prepareRepairFlow(shape.storage, { failedJob: shape.impl, reviewJobId: r1.id })
+
+    expect(result).toMatchObject({ action: 'skip' })
+    expect(result).not.toMatchObject({ action: 'queue' })
+  })
+
   it('PL Technical Resume の review は authority にならない（admit しない）', async () => {
     const shape = await b8d0fc5dShape()
     // 判定の無い run は根拠にならないので、step 4 の authority だけが効く形にする。
