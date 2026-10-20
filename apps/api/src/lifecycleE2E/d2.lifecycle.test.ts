@@ -478,22 +478,39 @@ describe('D2 criterion 15: approved commit → Task done → continuation → ne
   })
 })
 
+/**
+ * A technical Gate stop is not a CEO decision (spec 22 1-2 / 14-3). The PL records it once as a deduplicated
+ * technical_exhausted (reason code in `stop=`), sends no CEO escalation, never auto-resumes it, and the stop stays
+ * visible as job_blocked. The exit is an explicit resume (or approving the live WAITING approval) after the fix.
+ */
+async function expectTechnicalStopVisibleNotEscalated(taskId: string, jobId: string): Promise<void> {
+  const item = (await env.systemState()).attention.find((a) => a.kind === 'job_blocked' && a.jobId === jobId)!
+  expect(item.detail).toContain('risk_rule_skew')
+  const { triageBlocked } = await import('../pl/blockedTriage.js')
+  expect(triageBlocked(env.storage, item)).toMatchObject({
+    rootCauseClass: 'unknown', recommendedLane: 'auto_recovery', technicalStop: 'risk_rule_skew',
+    requiresAuthorityChange: false, recoverable: false,
+  })
+  // Even when the provider diagnosis proposes a resume, the PL does not auto-resume a technical stop.
+  const before = env.jobsOf(taskId).length
+  await env.plTick({ diagnose: RESUME })
+  await env.plTick({ diagnose: RESUME })
+  expect(env.jobsOf(taskId).length).toBe(before)
+  expect(await env.worker.runUntilIdle()).toEqual([])
+  // No CEO escalation for a technical stop.
+  expect(env.escalations.some((e) => e.body.includes('risk_rule_skew'))).toBe(false)
+  const rows = env.storage.auditLog.findByEntity('pl_loop_target', `job_blocked:${jobId}`)
+  expect(rows.some((entry) => entry.result === 'escalated')).toBe(false)
+  // One durable, deduplicated technical stop record that carries the reason code.
+  const exhausted = rows.filter((entry) => entry.result === 'technical_exhausted')
+  expect(exhausted).toHaveLength(1)
+  expect(exhausted[0]!.detail).toContain('stop=risk_rule_skew')
+  // Still visible after the ticks.
+  const still = (await env.systemState()).attention.find((a) => a.kind === 'job_blocked' && a.jobId === jobId)
+  expect(still?.detail).toContain('no CEO decision was requested')
+}
+
 describe('D2 v4: local risk > API risk (worker/api rule skew) → technical re_check, visible, never auto-resumed', () => {
-  async function expectTechnicalStopNotAutoResumed(taskId: string, jobId: string): Promise<void> {
-    const item = (await env.systemState()).attention.find((a) => a.kind === 'job_blocked' && a.jobId === jobId)!
-    expect(item.detail).toContain('risk_rule_skew')
-    const { triageBlocked } = await import('../pl/blockedTriage.js')
-    expect(triageBlocked(env.storage, item)).toMatchObject({
-      rootCauseClass: 'unknown', recommendedLane: 'ceo_escalation', requiresAuthorityChange: false, recoverable: false,
-    })
-    // Even when the provider diagnosis proposes a resume, the PL does not auto-resume a technical stop.
-    const before = env.jobsOf(taskId).length
-    await env.plTick({ diagnose: RESUME })
-    await env.plTick({ diagnose: RESUME })
-    expect(env.jobsOf(taskId).length).toBe(before)
-    expect(await env.worker.runUntilIdle()).toEqual([])
-    expect(env.escalations.some((e) => e.body.includes('risk_rule_skew'))).toBe(true)
-  }
 
   it('git_commit: the approved commit is not consumed; blocked with risk_rule_skew in stderr, visible, not auto-resumed; resume after the fix commits', async () => {
     const { task, commitJob, approval, head } = await highCommitWaiting('skew')
@@ -508,7 +525,7 @@ describe('D2 v4: local risk > API risk (worker/api rule skew) → technical re_c
     expect(env.storage.approvalRequests.findById(approval.id)?.status).toBe('APPROVED')
     expectNotCommitted(head, HIGH_FILE)
     expect((await env.mobileAdmission(task.id)).resume).toEqual({ ok: true })
-    await expectTechnicalStopNotAutoResumed(task.id, commitJob.id)
+    await expectTechnicalStopVisibleNotEscalated(task.id, commitJob.id)
     expectNotCommitted(head, HIGH_FILE)
 
     // After the cause is fixed, a (human) resume is the exit; the new git_commit Job asks for a new approval.
@@ -543,7 +560,7 @@ describe('D2 v4: local risk > API risk (worker/api rule skew) → technical re_c
     const review = env.jobsOf(task.id).find((job) => job.aiCliMode === 'review')!
     expect(review.status).toBe('blocked')
     expect(env.jobsOf(task.id).some((job) => job.safeCommand.kind === 'git_commit')).toBe(false)
-    await expectTechnicalStopNotAutoResumed(task.id, review.id)
+    await expectTechnicalStopVisibleNotEscalated(task.id, review.id)
 
     env.worker.localRiskOverride = undefined
     expect((await env.ceo.resume(task.id)).statusCode).toBe(201)
@@ -585,14 +602,7 @@ describe('D2 review P2: skew already active at the FIRST git_commit gate', () =>
     // The named exit is approving the existing approval (resume is not admitted while it is live WAITING).
     expect(triageBlocked(env.storage, blockedItem!).summary).toContain(`承認 ${approval.id} を承認する`)
     expect((await env.mobileAdmission(task.id)).resume.ok).toBe(false)
-    expect(triageBlocked(env.storage, blockedItem!)).toMatchObject({
-      rootCauseClass: 'unknown', recommendedLane: 'ceo_escalation', requiresAuthorityChange: false,
-    })
-    const before = env.jobsOf(task.id).length
-    await env.plTick({ diagnose: RESUME })
-    await env.plTick({ diagnose: RESUME })
-    expect(env.jobsOf(task.id).length).toBe(before)
-    expect(env.escalations.some((e) => e.body.includes('risk_rule_skew'))).toBe(true)
+    await expectTechnicalStopVisibleNotEscalated(task.id, commitJob.id)
     expect(env.escalations.some((e) => e.title.includes('approval_waiting'))).toBe(false)
     expectNotCommitted(head, HIGH_FILE)
 

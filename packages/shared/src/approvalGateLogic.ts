@@ -88,76 +88,6 @@ interface RiskRule {
   level: RiskLevel
 }
 
-/**
- * 'alignment / gate change' の exact path 対象（拡張子 `.ts` を除いた repository-relative path）。
- * **production の実ファイルだけ**を並べる。隣のテスト（`*.test.ts`）は一致しない。
- * 英数字と `/` だけなので RegExp へそのまま埋め込める（下の検査で固定する）。
- */
-export const GATE_CHANGE_EXACT_FILES: readonly string[] = [
-  // 2026-10-16 監査（RC4/RC6）: approval の保存・却下伝播・PL abort・停止判定・commit gate
-  'apps/api/src/storage/sqlite',
-  'apps/api/src/pl/abortTask',
-  'apps/api/src/pl/executionLoop',
-  'apps/api/src/state/systemState',
-  'apps/api/src/gitCommitResumeLineage',
-  'apps/api/src/linkedGitCommitRejection',
-  'apps/worker/src/approvalLevel/commitGate',
-  'packages/shared/src/approvalLiveness',
-  // 2026-10-17 監査（RC6 / DA trigger 2）: authority・approval/consume・actor 分類・admission・recovery の定義
-  'apps/api/src/designReview/resumeActor',                      // 承認 / resume の actor（人・AI）分類
-  'apps/api/src/designReview/repairRecoveryEpoch',              // repair 再発行 budget の epoch
-  'apps/api/src/designReview/repairFromStoredReview',           // stored-review recovery の authority
-  'apps/api/src/designReview/resumeBlockedTask',                // blocked Task resume の admission
-  'apps/api/src/designReview/terminalRepairSuccessorRecovery',  // Review を回さず successor を作る recovery
-  'apps/api/src/designReview/terminalRepairEscalationRecovery', // 却下の Human escalation recovery
-  'apps/api/src/designReview/designReviewCoordinator',          // recomputeDecision（formal verdict）
-  'apps/api/src/designReview/resultingCommitBinding',           // Gate ALLOW と resulting commit の bind
-  'apps/api/src/humanRecovery/recoverBlockedTask',              // Human Recovery の authority
-  'apps/api/src/humanRecovery/recoveryAudit',                   // Human Recovery 履歴（park / attention の根拠）
-  'apps/api/src/storage/interface',                             // approval consume / actor 記録の storage 契約
-  'packages/shared/src/resumeAdmission',                        // resume admission
-  'packages/shared/src/recoverAdmission',                       // recover admission
-  'packages/shared/src/taskOccupancy',                          // Task 占有（並走 admission）
-  'packages/shared/src/reviewSeparation',                       // generator / final reviewer の自己承認禁止
-  'apps/api/src/approvedRunBlock',                              // 承認済み run の block 判定
-  'apps/api/src/state/blockedRowOwnership',                     // blocked 行の所有（誰が解除してよいか）
-  'apps/api/src/reconcile/externalCompletion',                  // Candidate 外の完了を done にする authority
-  'apps/api/src/pl/technicalResumePolicy',                      // PL Technical Resume の budget / actor token
-  'apps/api/src/pl/technicalAbortEvidence',                     // PL technical abort の authority
-  'apps/api/src/ctoAi/roadmapAdoption',                         // adoption admission / 受理する policy version
-  // 2026-10-17 Codex review（c3-b）: recovery / attempt budget・admission・escalation 選択の定義
-  'apps/api/src/pl/adoptionStep',                               // adoption の authorizePlAction seam と試行 budget
-  'apps/api/src/ctoAi/initialImplementWorkflow',                // initial implement の U7 recovery admission
-  'apps/api/src/ctoAi/projectInitialization',                   // Roadmap CONFLICT recovery の admission と試行 budget
-  'apps/api/src/pl/remediationStep',                            // remediation の試行 budget
-  'apps/api/src/pl/conflictResolutionStep',                     // critic / recovery round の budget
-  'apps/api/src/pl/blockedTriage',                              // 自動 recovery か CEO escalation かの選択
-  'apps/api/src/pl/operatorRequestStep',                        // 外部依頼を PL 判断経路へ入れる対象照合（admission）
-  'apps/worker/src/jobStateManager',                            // stale Job recovery の admission
-  'apps/worker/src/workspaceVerification',                      // crash recovery で workspace 所有権を解放する exact 検証
-  'apps/worker/src/index',                                      // abort cleanup 再送 budget（fileChangeGuard 保護とは別に不変条件として）
-  // 2026-10-17 Codex review round 2（c3-b）
-  'apps/api/src/jobResultApplicationPolicy',                    // Job result の状態遷移 admission（正本）
-  'apps/api/src/routes/jobs',                                   // 直接遷移 / claim の拒否と Outbox 受理の境界
-  'apps/api/src/routes/designReviewEvidence',                   // Design Review evidence を発行する route（implement Job の admission 根拠）
-  'apps/api/src/routes/tasks',                                  // generic route で無許可の done を止める唯一の場所・lifecycle 所有状態の拒否
-  // 2026-10-17 最終監査（lifecycle repair final）
-  'apps/api/src/state/strandedTask',                            // lifecycle 所有状態（in_progress / review）から出してよいかの stranded 判定
-  'apps/api/src/ctoAi/taskContinuation',                        // Task continuation と CEO escalation の選択
-  'apps/api/src/designReview/retryCooldown',                    // 判定の出ない Design Review の再試行 budget の時間配分
-  // 2026-10-17 Codex review r5（RC6-LIST の authority coverage guard で非 authority 扱いにしていたもの）
-  'apps/api/src/designReview/queuedRunDispatch',                // queued run を review / repair のどちらの経路へ送るかを決める唯一の dispatcher
-  'apps/api/src/storage/roadmapTaskValidation',                 // Roadmap Task の admission / scope 検証（path traversal・allowedPaths・control_plane_operation）
-  'apps/api/src/designReview/repairPromptBuilder',              // repair prompt の untrusted data fence と無害化（信頼境界）
-  'apps/api/src/pl/adoptionFailure',                            // 採用失敗の incident 指紋（CEO へ通知するかの判定材料）
-  'apps/api/src/storage/index',                                 // 全 authority 判定が読む storage の選択と production DB_PATH の fail-closed 検査
-]
-for (const file of GATE_CHANGE_EXACT_FILES) {
-  if (!/^[A-Za-z0-9/]+$/.test(file)) {
-    throw new Error(`GATE_CHANGE_EXACT_FILES entry must be a plain path: ${file}`)
-  }
-}
-
 export const RISK_RULES: RiskRule[] = [
   { label: 'DB migration / schema',      pattern: /migration|schema\.ts/i,                    level: 'HIGH' },
   { label: 'auth / permission guard',    pattern: /auth|permission|guard/i,                   level: 'HIGH' },
@@ -172,26 +102,16 @@ export const RISK_RULES: RiskRule[] = [
   // git_commit Evidence が判定に使う lineage / Design Review / Candidate workspace の実装
   // （repairFlow・repairPolicy・designReviewEvidencePolicy・targetWorkingDir）も含める（独立レビュー A-1）。
   //
-  // 2026-10-16 監査（RC4/RC6）: approval の保存・却下伝播・PL abort・停止判定・commit gate の実装が
-  // 抜けていた。LOW のまま Evidence で commit できると、Gate を弱める変更が人の目を通らない。
-  // **production の実ファイルだけ**を exact path で足す（隣のテストまで HIGH にすると、
-  // テストを足すだけの変更まで Evidence の対象外になる）。
-  //
-  // 2026-10-17 監査（RC6 / DA trigger 2）: authority・admission・recovery の**定義そのもの**が LOW のままだった。
-  // これらを編集してよい Task が、CEO 依頼なしに Safety Evidence で auto-commit できてしまう。
-  // exact path の一覧は `GATE_CHANGE_EXACT_FILES`（理由つき）を正本にする。
-  {
-    label: 'alignment / gate change',
-    pattern: new RegExp(
-      String.raw`alignmentCheck|approvalGate|gateProcessor|gitCommitEvidence|actionGate|plActionPolicy|approvalLevelClassifier|approvalExplain\/(diffReader|changeManifest)|designReview\/(repairFlow|repairPolicy)\.ts$|designReviewEvidencePolicy|config\/targetWorkingDir`
-        + String.raw`|(^|\/)(` + GATE_CHANGE_EXACT_FILES.join('|') + String.raw`)\.ts$`,
-      'i',
-    ),
-    level: 'HIGH',
-  },
+  // 2026-10-20 PL 判断: commitGate（`evaluateCommitGate()`）は spec 22 DA trigger (2) が名指しする authority 定義なので
+  // exact path で足す。**production の実ファイルだけ**（隣のテストまで HIGH にすると、テストを足すだけの変更まで
+  // Evidence の対象外になる）。それ以外の技術実装（storage・PL loop・停止判定・admission・recovery 等）は足さない:
+  // Risk Level は Evidence の強度を決めるだけで、ceo_required は DA trigger からのみ導出する（spec 22 1-2 / 14-2 / 14-3）。
+  // authority 変更の検出は promotion 時の Meta Review（Approval Tuple rule）が担う。
+  { label: 'alignment / gate change',    pattern: /alignmentCheck|approvalGate|gateProcessor|gitCommitEvidence|actionGate|plActionPolicy|approvalLevelClassifier|approvalExplain\/(diffReader|changeManifest)|designReview\/(repairFlow|repairPolicy)\.ts$|designReviewEvidencePolicy|config\/targetWorkingDir|(^|\/)apps\/worker\/src\/approvalLevel\/commitGate\.ts$/i, level: 'HIGH' },
   // 2026-10-02: Decision Authority / Safety policy の正本 docs。docs/ 配下は SAFE_ONLY で LOW に
   // 落ちるため、下の SAFE_ONLY 早期リターンより先に評価する（NEVER_SAFE_ONLY_RULES）。
-  // 2026-10-16 監査: rules/ は approval_rules.md 以外も運用ルールの正本なので配下すべてを対象にする。
+  // 2026-10-16 監査: rules/ は approval_rules.md 以外も運用ルールの正本なので配下すべてを対象にする
+  // （CLAUDE.md 7 章の Operational Knowledge。spec 22 DA trigger (1) の Policy 文書）。
   // 依存定義（package.json / pnpm-lock.yaml）は入れない: 依存の変更は Decision Authority 上の技術判断で、
   // HIGH にすると該当する git_commit がすべて CEO 承認へ回る（PL 判断 2026-10-16）。
   { label: 'decision authority / safety policy doc', pattern: /(^|\/)specs\/(00_constitution|08_permissions|22_safety_approval_design_principle)\.md$|(^|\/)docs\/project_memory\/(goal|design_philosophy)\.md$|(^|\/)docs\/project_memory\/rules\/.+|(^|\/)docs\/multi_ai_step_review_flow\.md$/i, level: 'HIGH' },

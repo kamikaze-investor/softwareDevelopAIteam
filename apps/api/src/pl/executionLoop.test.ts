@@ -3446,7 +3446,7 @@ describe('approved git_commit blocked by the Worker gate policy', () => {
     expect(storage.jobs.findById(job.id)?.status).toBe('queued')
   })
 
-  it('the PL escalates it once to the CEO (not auto-resume) and does not churn on later ticks', async () => {
+  it('the PL neither auto-resumes nor escalates it: one technical_exhausted (technical stop), visible, no churn', async () => {
     const fx = approvedThenWorkerBlocked()
     const escalations: string[] = []
     const tickDeps = deps({
@@ -3455,15 +3455,23 @@ describe('approved git_commit blocked by the Worker gate policy', () => {
     })
 
     const first = await runPlTick(fx.storage, tickDeps)
-    expect(first.status).toBe('escalated')
-    expect(first.triage?.lane).toBe('ceo_escalation')
-    expect(escalations).toHaveLength(1)
+    expect(first.status).toBe('idle')
+    expect(escalations).toHaveLength(0)
 
     for (let tick = 0; tick < 3; tick += 1) {
       resetPlLoopInFlightForTest()
       await runPlTick(fx.storage, tickDeps)
     }
-    expect(escalations).toHaveLength(1)
+    expect(escalations).toHaveLength(0)
+    const rows = fx.storage.auditLog.findByEntity('pl_loop_target', `job_blocked:${fx.jobId}`)
+    expect(rows.some((entry) => entry.result === 'escalated')).toBe(false)
+    const exhausted = rows.filter((entry) => entry.result === 'technical_exhausted')
+    expect(exhausted).toHaveLength(1)
+    expect(exhausted[0]?.detail).toContain('stop=approved_commit_gate_refusal')
+    // 見える停止: job_blocked は attention に残る。
+    const item = buildSystemState(fx.storage, { now: () => NOW }).attention.find((a) => a.jobId === fx.jobId)
+    expect(item?.kind).toBe('job_blocked')
+    expect(item?.detail).toContain('no CEO decision was requested')
     // 自動 resume していない: 後継 Job も新しい承認も作られず、承認は APPROVED のまま。
     expect(fx.storage.jobs.findByTaskId(fx.taskId)).toHaveLength(1)
     expect(fx.storage.approvalRequests.findById(fx.approvalId)?.status).toBe('APPROVED')
@@ -3524,14 +3532,14 @@ describe('approved-run blocked cause comes from the evidence the Worker sent', (
     expect(triageBlocked(fx.storage, item).rootCauseClass).not.toBe('safety_or_authority_boundary')
   })
 
-  it('guards passed (gate-step refusal) is the only evidence that triage rule 6.9 escalates', () => {
+  it('guards passed (gate-step refusal) is the only evidence for the triage rule 6.9 technical stop', () => {
     const fx = approvedRunBlocked({ permissionAllowed: true, fileChangeAllowed: true, fileViolations: [] })
     const item = buildSystemState(fx.storage, { now: () => NOW }).attention.find((a) => a.jobId === fx.jobId)!
     // D2: after the fix this is worker/api skew or an unexpected consume refusal, not an authority boundary.
-    // The escalation lane stays visible; no authority change is requested; the existing resume is the exit.
+    // A visible technical stop (no CEO lane, no auto-resume); no authority change; the existing resume is the exit.
     expect(triageBlocked(fx.storage, item)).toMatchObject({
-      rootCauseClass: 'unknown', recommendedLane: 'ceo_escalation',
-      requiresAuthorityChange: false, existingRecoveryAvailable: true,
+      rootCauseClass: 'unknown', recommendedLane: 'auto_recovery', technicalStop: 'approved_commit_gate_refusal',
+      recoverable: false, requiresAuthorityChange: false, existingRecoveryAvailable: true,
     })
   })
 })
@@ -3629,6 +3637,7 @@ describe('a live task-scoped human decision is a human wait, not a blocked-job r
 
 // D2 v4: a technical Gate stop (risk_rule_skew / approval_contract_violation in job.stderr) is a visible,
 // non-auto stop for ANY command kind — it is recognized before rule 7, so the PL never auto-resumes it.
+// It is a technical stop, not a CEO decision: the technical lane with `technicalStop` set (technical_exhausted).
 describe('triage rule 6.8: technical Gate stop recognized from the persisted reason, for any command kind', () => {
   const SKEW = 'risk_rule_skew: local CRITICAL > API HIGH (worker/api rule skew); technical Gate inconsistency, not an approval decision'
   const CONTRACT = 'approval_contract_violation: decision=BLOCKED continuationPolicy=continue nextAction=wait_for_approval; technical Gate inconsistency, not an approval decision'
@@ -3653,17 +3662,16 @@ describe('triage rule 6.8: technical Gate stop recognized from the persisted rea
     ['git_status (safe-work kind)', 'git_status', SKEW, 'risk_rule_skew'],
     ['test (safe-work kind)', 'test', CONTRACT, 'approval_contract_violation'],
     ['git_commit without a linked approval', 'git_commit', SKEW, 'risk_rule_skew'],
-  ])('%s → non-auto lane, unknown, no authority change, visible', (_label, kind, stderr, code) => {
+  ])('%s → technical stop (no auto-recovery, no CEO lane), unknown, no authority change, visible', (_label, kind, stderr, code) => {
     const fx = blockedWith(kind, stderr)
     const item = buildSystemState(fx.storage, { now: () => NOW }).attention.find((a) => a.jobId === fx.jobId)!
     expect(item).toBeDefined()
     const triage = triageBlocked(fx.storage, item)
     expect(triage).toMatchObject({
-      rootCauseClass: 'unknown', recommendedLane: 'ceo_escalation', recoverable: false,
-      requiresAuthorityChange: false, existingRecoveryAvailable: true,
+      rootCauseClass: 'unknown', recommendedLane: 'auto_recovery', technicalStop: code, recoverable: false,
+      requiresAuthorityChange: false, existingRecoveryAvailable: true, confidence: 'high',
     })
     expect(triage.evidence.find((e) => e.fact.startsWith('gate technical stop code'))?.value).toBe(code)
-    expect(triage.recommendedLane).not.toBe('auto_recovery')
   })
 
   it('an ordinary blocked Job without a technical stop code still reaches rule 7 (unchanged)', () => {
@@ -3700,6 +3708,7 @@ describe('triage rule 6.8: only an unspoofable, pre-execution technical stop; a 
   it('a code on a later stderr line (command output) is not a technical stop', () => {
     const triage = triageOf(blocked('test', { stderr: `some output\n${SKEW}` }))
     expect(triage.evidence.some((e) => e.fact.startsWith('gate technical stop code'))).toBe(false)
+    expect(triage.technicalStop).toBeUndefined()
   })
 
   it('a Job that executed (exitCode recorded) is not a technical Gate stop even if stderr starts with the code', () => {
@@ -3767,7 +3776,7 @@ describe('triage rule 6.8: the exit it names matches what is actually admitted',
 
   it('a live WAITING linked approval → the summary names approving that approval (resume is not admitted while it waits)', () => {
     const { triage, approvalId } = commitJobStoppedBySkew('WAITING_FOR_USER')
-    expect(triage.recommendedLane).toBe('ceo_escalation')
+    expect(triage.technicalStop).toBe('risk_rule_skew')
     expect(triage.summary).toContain(`承認 ${approvalId} を承認する`)
     expect(triage.summary).toContain('承認待ちの間は resume できない')
     expect(triage.summary).not.toContain('新しい承認が求められる')
@@ -3782,5 +3791,50 @@ describe('triage rule 6.8: the exit it names matches what is actually admitted',
   it('an expired WAITING linked approval is not live → the summary names resume', () => {
     const { triage } = commitJobStoppedBySkew('WAITING_FOR_USER', -60 * 1000)
     expect(triage.summary).toContain('resume すれば再開でき')
+  })
+})
+
+describe('runPlTick — a technical Gate stop (rule 6.8) is a deduplicated technical_exhausted, never a CEO escalation', () => {
+  const SKEW = 'risk_rule_skew: local CRITICAL > API HIGH (worker/api rule skew); technical Gate inconsistency, not an approval decision'
+
+  it('no diagnosis, no resume, no escalation; one technical_exhausted with the reason code; the stop stays visible', async () => {
+    const { storage, taskId, projectId } = seed()
+    storage.tasks.update(taskId, { status: 'in_progress' })
+    const job = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, { status: 'running', startedAt: new Date().toISOString() })
+    storage.jobs.update(job.id, {
+      status: 'blocked', completedAt: new Date().toISOString(), stderr: SKEW,
+      guardResult: { permissionAllowed: true, fileChangeAllowed: true, fileViolations: [] },
+    } as never)
+
+    const escalations: string[] = []
+    let diagnoses = 0
+    const d = deps({
+      diagnose: async () => { diagnoses += 1; return '{"actionKind":"resume_task"}' },
+      escalate: async (p) => { escalations.push(p.title); return DELIVERED },
+    })
+    const jobsBefore = storage.jobs.findByTaskId(taskId).length
+    for (let i = 0; i < PL_MAX_ATTEMPTS_PER_TARGET + 2; i += 1) {
+      resetPlLoopInFlightForTest()
+      expect((await runPlTick(storage, d)).status).toBe('idle')
+    }
+
+    expect(escalations).toEqual([])
+    expect(diagnoses).toBe(0)
+    expect(storage.jobs.findByTaskId(taskId).length).toBe(jobsBefore)
+    const rows = storage.auditLog.findByEntity('pl_loop_target', `job_blocked:${job.id}`)
+    expect(rows.some((entry) => entry.result === 'escalated')).toBe(false)
+    const exhausted = rows.filter((entry) => entry.result === 'technical_exhausted')
+    expect(exhausted).toHaveLength(1)
+    expect(exhausted[0]?.detail).toContain('stop=risk_rule_skew')
+    expect(exhausted[0]?.detail).toContain('lane=auto_recovery')
+
+    // Visible: job_blocked stays in attention, marked as a technical stop that requested no CEO decision.
+    const item = buildSystemState(storage, { now: () => NOW }).attention.find((a) => a.jobId === job.id)
+    expect(item?.kind).toBe('job_blocked')
+    expect(item?.detail).toContain('no CEO decision was requested')
   })
 })
