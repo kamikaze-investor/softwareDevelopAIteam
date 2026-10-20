@@ -207,6 +207,14 @@ export class DesignReviewRunContentionError extends Error {
   }
 }
 
+/** handoff refusal と同じ transaction で使い切り marker を書けなかった（R-3）。refusal は確定していない。 */
+export class RecoveryApprovalSpentMarkerError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'RecoveryApprovalSpentMarkerError'
+  }
+}
+
 export type CreateRepairJobWithHandoffResult =
   | { ok: true; repairJob: Job }
   | {
@@ -562,6 +570,12 @@ export interface IJobStorage {
     repairJob: Omit<Job, 'id' | 'createdAt' | 'status'> & { status?: 'queued' }
     /** この handoff に属する Task / recovery 状態更新（任意）。 */
     taskUpdate?: Partial<Task>
+    /**
+     * source 実装に epoch を開いていた consume 済み Stored Review Recovery 承認（R-3）。
+     * handoff を断るとき、その承認の使い切り marker を**同じ transaction で**書く。marker が書けなければ
+     * `RecoveryApprovalSpentMarkerError` を投げ、refusal は確定しない。
+     */
+    spendRecoveryApprovalOnRefusal?: { approvalRequestId: string; runId: string }
   }): CreateRepairJobWithHandoffResult
   /** workflow Jobの結果保存と次step Jobの作成を単一transactionで冪等に行う。 */
   updateAndCreateNextWorkflowJob(input: {
