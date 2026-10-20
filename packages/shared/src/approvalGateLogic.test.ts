@@ -5,42 +5,38 @@ const GATE = 'alignment / gate change'
 const DA_DOC = 'decision authority / safety policy doc'
 
 /**
- * 2026-10-16 監査（RC4/RC6）で RISK_RULES に足した path の固定。
+ * alignment / gate change に exact path で足すのは commitGate（spec 22 DA trigger (2) が名指しする authority 定義）だけ。
  * production の実ファイルだけを HIGH にし、隣のテストファイルは対象外にする（テスト追加だけの変更まで
- * Evidence 対象外にしないため）。各 path を単独で渡し、label と level の両方を確かめる。
+ * Evidence 対象外にしないため）。
  */
-describe('RISK_RULES — alignment / gate change（2026-10-16 追加分）', () => {
-  const productionFiles = [
+describe('RISK_RULES — alignment / gate change（commitGate）', () => {
+  it('apps/worker/src/approvalLevel/commitGate.ts → HIGH / alignment / gate change', () => {
+    const result = runRiskReview(['apps/worker/src/approvalLevel/commitGate.ts'])
+    expect(result.riskLevel).toBe('HIGH')
+    expect(result.triggeredRules).toContain(GATE)
+  })
+
+  it.each([
+    'apps/worker/src/approvalLevel/commitGate.test.ts',
+    'apps/web/src/approvalLevel/commitGate.ts',
+    'apps/worker/src/approvalLevel/commitGateHelpers.ts',
+  ])('%s does not match alignment / gate change', (file) => {
+    expect(runRiskReview([file]).triggeredRules).not.toContain(GATE)
+  })
+
+  /**
+   * 2026-10-20 PL 判断: 技術実装を HIGH に足すと、Risk Level だけを理由に git_commit が人の承認へ回る
+   * （Approval Tuple (b) の拡張。spec 22 1-2 / 14-2 / 14-3 に反する）。authority 変更の検出は promotion 時の Meta Review が担う。
+   */
+  it.each([
     'apps/api/src/storage/sqlite.ts',
     'apps/api/src/pl/abortTask.ts',
     'apps/api/src/pl/executionLoop.ts',
     'apps/api/src/state/systemState.ts',
     'apps/api/src/gitCommitResumeLineage.ts',
     'apps/api/src/linkedGitCommitRejection.ts',
-    'apps/worker/src/approvalLevel/commitGate.ts',
     'packages/shared/src/approvalLiveness.ts',
-  ]
-
-  it.each(productionFiles)('%s → HIGH / alignment / gate change', (file) => {
-    const result = runRiskReview([file])
-    expect(result.riskLevel).toBe('HIGH')
-    expect(result.triggeredRules).toContain(GATE)
-  })
-
-  it.each([
-    'apps/api/src/storage/sqlite.test.ts',
-    'apps/api/src/pl/abortTask.test.ts',
-    'apps/api/src/pl/executionLoop.test.ts',
-    'apps/api/src/state/systemState.test.ts',
-    'apps/api/src/gitCommitResumeLineage.test.ts',
-    'apps/api/src/linkedGitCommitRejection.test.ts',
-    'apps/worker/src/approvalLevel/commitGate.test.ts',
-    'packages/shared/src/approvalLiveness.test.ts',
-    // 似た名前の別ファイル・別ディレクトリは対象外
-    'apps/api/src/storage/sqliteHelpers.ts',
-    'apps/web/src/pl/executionLoop.ts',
-    'apps/api/src/state/systemStateView.ts',
-  ])('%s does not match alignment / gate change', (file) => {
+  ])('%s (technical implementation) does not match alignment / gate change', (file) => {
     expect(runRiskReview([file]).triggeredRules).not.toContain(GATE)
   })
 })
