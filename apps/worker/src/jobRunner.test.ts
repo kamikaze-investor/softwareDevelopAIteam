@@ -2077,6 +2077,27 @@ describe('runJob — Notifier / CEO通知 integration (Step 3D)', () => {
     expect(payload.body).toContain('req-3d-003')
   })
 
+  // 技術停止の dedup は理由コードごと: 同じ承認依頼でも原因が違えばそれぞれ通知し、同じ原因は 1 回だけ。
+  it('同一 approvalRequestId でも技術停止の原因が違えば両方通知し、同じ原因の 2 回目は通知しない', async () => {
+    const ID = 'req-3d-tech-dedup'
+    callGateCheckMock.mockResolvedValue(makeBlockedResponse(ID))
+    const skew = 'risk_rule_skew: local CRITICAL > API HIGH (worker/api rule skew); technical Gate inconsistency, not an approval decision'
+    const contract = 'approval_contract_violation: decision=BLOCKED continuationPolicy=continue nextAction=wait_for_approval; technical Gate inconsistency, not an approval decision'
+
+    resolvePolicyMock.mockReturnValue({ policy: 're_check', reason: skew, apiAvailable: true })
+    await runJob(createJob(), createPolicy())
+    expect(sendAlertMock).toHaveBeenCalledTimes(1)
+
+    resolvePolicyMock.mockReturnValue({ policy: 're_check', reason: contract, apiAvailable: true })
+    await runJob(createJob(), createPolicy())
+    expect(sendAlertMock).toHaveBeenCalledTimes(2)
+    expect(sendAlertMock.mock.calls[1][0].body).toContain('approval_contract_violation')
+
+    resolvePolicyMock.mockReturnValue({ policy: 're_check', reason: skew, apiAvailable: true })
+    await runJob(createJob(), createPolicy())
+    expect(sendAlertMock).toHaveBeenCalledTimes(2)
+  })
+
   // 4. 同一 approvalRequestId の block_until_approved は 2 回目通知されない（dedup）
   it('同一 approvalRequestId の block_until_approved は 2 回目通知されない', async () => {
     const DEDUP_ID = 'req-3d-dedup-001'
