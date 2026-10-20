@@ -953,8 +953,12 @@ function repairableBlockedReviewRequest(
     && isAuthorizedTechnicalRecoveryLineage(storage, reviewResumeHops)
   const coveredByRecoveryApproval =
     implementationAuthorities.get(implementJob.id)?.kind === 'human_recovery'
+  //    (b) は human_resume の budget authority（`readImplementationAuthorities()`）と同じ条件にする:
+  //    引き金の review に保存された verdict が `changes_requested` であること。上の 2. が refusal の無い経路で
+  //    既に要求しているが、authority の判定そのものが verdict を確かめる（2. の形が変わっても (b) が緩まない）。
   const coveredByHumanResume =
     reviewRefusal === undefined
+    && stored?.status === 'changes_requested'
     && humanResumesOf(storage, reviewResumeHops).length > 0
   const isCanonicalInitialImplement = isLatestInitialImplement
     && (eligibleRefusalRecovery || coveredByRecoveryApproval || coveredByHumanResume)
