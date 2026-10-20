@@ -5,6 +5,7 @@ import path from 'node:path'
 import { describe, expect, it } from 'vitest'
 import type { JobWorkspaceBaseline } from '@ai-team/shared'
 import { createSQLiteStorage } from '../storage/sqlite'
+import { recordApprovalActor } from '../designReview/resumeActor'
 import type { IStorage } from '../storage/interface'
 import { buildSystemState } from '../state/systemState'
 import { completeAbortCleanup, requestTechnicalAbort } from './abortTask'
@@ -267,5 +268,56 @@ describe('dirty Technical Abort cleanup: STORAGE_BUSY, then the identical report
     expect(carrier?.failureMetadata?.workspaceEndFingerprint).toEqual(DIRTY)
     expect(storage.tasks.findById(taskId)?.roadmapActive).toBe(true)
     expect(storage.approvalRequests.findById(approvalId)?.status).toBe('WAITING_FOR_USER')
+  }, 30_000)
+})
+
+// T-1: 最終 transaction は CONSUMED 行の作成時刻を cleanup 要求時刻と Date.parse した値で比べる。
+// 行の時刻は別 connection で書き換える（storage は常に Z 形式で書くので、ここでしか作れない形）。
+describe('Technical Abort final transaction: human CONSUMED times are compared numerically and fail closed', () => {
+  function consumedHumanRow(storage: IStorage, taskId: string): string {
+    const id = storage.approvalRequests.create({
+      taskId, requestedAction: 'repair_from_stored_review:r', riskLevel: 'HIGH',
+      targetBranch: 'b', targetCommit: 'c', targetDiffHash: 'd',
+      changedFiles: [], triggeredRules: [], invalidIf: [],
+      status: 'APPROVED', expiresAt: FUTURE(),
+    } as Parameters<IStorage['approvalRequests']['create']>[0]).id
+    recordApprovalActor(storage, id, 'admin')
+    storage.approvalRequests.updateStatus(id, 'CONSUMED', undefined, true)
+    return id
+  }
+
+  function setCreatedAt(dbPath: string, id: string, createdAt: string): void {
+    const other = new Database(dbPath)
+    other.prepare('UPDATE approval_requests SET created_at = ? WHERE id = ?').run(createdAt, id)
+    other.close()
+  }
+
+  it.each([
+    ['a later instant written with a -05:00 offset (sorts before the Z cleanup time as text)', (requestedAt: string) =>
+      new Date(Date.parse(requestedAt) + 60_000 - 5 * 60 * 60 * 1000).toISOString().replace('Z', '-05:00')],
+    ['an empty created_at', () => ''],
+    ['an unreadable created_at', () => 'not-a-time'],
+  ])('%s → HUMAN_DECISION_CONFLICT, nothing parked', (_label, createdAtFor) => {
+    const dbPath = tempDbPath()
+    const storage = createSQLiteStorage(dbPath)
+    const { taskId, carrierId } = seedPendingTechnicalAbort(storage)
+    const requestedAt = storage.jobs.findById(carrierId)!.failureMetadata!.abortCleanupRequestedAt!
+    const id = consumedHumanRow(storage, taskId)
+    setCreatedAt(dbPath, id, createdAtFor(requestedAt))
+
+    expect(finish(storage, carrierId)).toMatchObject({ ok: false, code: 'HUMAN_DECISION_CONFLICT' })
+    expect(storage.tasks.findById(taskId)?.roadmapActive).toBe(true)
+    expect(storage.jobs.findById(carrierId)?.failureMetadata?.quarantined).toBeUndefined()
+  }, 30_000)
+
+  it('an earlier instant written with a +09:00 offset (sorts after as text) does not block', () => {
+    const dbPath = tempDbPath()
+    const storage = createSQLiteStorage(dbPath)
+    const { taskId, carrierId } = seedPendingTechnicalAbort(storage)
+    const requestedAt = storage.jobs.findById(carrierId)!.failureMetadata!.abortCleanupRequestedAt!
+    const id = consumedHumanRow(storage, taskId)
+    setCreatedAt(dbPath, id, new Date(Date.parse(requestedAt) - 60_000 + 9 * 60 * 60 * 1000).toISOString().replace('Z', '+09:00'))
+
+    expect(finish(storage, carrierId)).toMatchObject({ ok: true })
   }, 30_000)
 })
