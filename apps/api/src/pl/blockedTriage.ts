@@ -39,6 +39,8 @@
  * この性質のおかげで、**レーン分類を誤っても CEO を迂回することが原理的に起きない**:
  * B / C / D で未配線のものはすべて人へ届き、A だけが既存 Gate 経由で自動実行へ進む。
  * そして A は「既存の bounded recovery が実在する」機械的事実が立ったときにしか選ばれない。
+ * 例外は Gate 段階の技術停止（rule 6.8 / 6.9、`technicalStop`）で、A のまま budget 0 の
+ * `technical_exhausted` として止まる（自動実行もせず CEO にも上げず、attention には残る）。
  *
  * ## 効果検証可能性（Design Philosophy 8）
  *
@@ -67,7 +69,7 @@ import {
   predictHumanRecoveryDriver,
   type HumanRecoveryNextDriver,
 } from '../humanRecovery/recoverBlockedTask'
-import type { AuditLogEntry, Job } from '@ai-team/shared'
+import type { AuditLogEntry, GateTechnicalStopCode, Job } from '@ai-team/shared'
 import { gateTechnicalStopCodeOfJob, isLiveApprovedApproval, isLiveWaitingApproval } from '@ai-team/shared'
 import type { DesignReviewRun, IStorage } from '../storage/interface'
 import { isUsableAlignedEvidence } from '../designReviewEvidencePolicy'
@@ -82,6 +84,12 @@ import {
 // ────────────────────────────────────────────────────────────
 // 語彙
 // ────────────────────────────────────────────────────────────
+
+/**
+ * 技術停止の理由コード。Worker が stderr に残す Gate の理由コード（rule 6.8）に加え、
+ * 理由コードの無い「承認済み git_commit の Gate 段階の拒否」（rule 6.9）を表す値を1つだけ持つ。
+ */
+export type TechnicalStopCode = GateTechnicalStopCode | 'approved_commit_gate_refusal'
 
 /** 解決レーン。**増やさない。** 分類を増やす前に、既存4つで表せないかを先に疑うこと。 */
 export const BLOCKED_LANES = [
@@ -199,6 +207,12 @@ export interface BlockedDiagnosis {
   /** `low` は「機械的事実で特定できなかった」の意味。**low で自動実行はしない。** */
   confidence: 'high' | 'low'
   observation?: BlockedObservation
+  /**
+   * Gate 段階の技術停止（rule 6.8 / 6.9）の理由コード。立っているとき、PL はこの対象を自動 recovery せず
+   * CEO にも上げず、既存の `technical_exhausted`（対象単位・重複排除）として記録して見せ続ける
+   * （`executionLoop.ts` の `technicalRecoveryExhaustion()`）。原因を直した後の明示 resume は従来どおり admit される。
+   */
+  technicalStop?: TechnicalStopCode
   /** 人間向けの説明。**routing には一切使わない。** */
   summary: string
 }
@@ -960,8 +974,11 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
   // approval_contract_violation: Gate 応答の組が契約外）で re_check にした Job は、理由を stderr に
   // `<code>: ...` として残す（`findGateTechnicalStopCode`）。下の 7 へ落とすと auto_recovery → PL resume →
   // 同じ不整合で再停止、の連鎖になる（非 git の safe-work kind でも同じ）。原因（版ずれ等）は AI の
-  // resume では直らないので、6.9 と同じ自動実行しない lane で一度だけ見せる。Authority の変更は要求しない。
-  // 原因を直した後の resume が出口（git_commit なら新しい承認が求められる）。
+  // resume では直らないので自動実行しない。**CEO にも上げない**（技術停止であって Decision Authority の判断ではない。
+  // specs/22 1-2 / 14-3: ceo_required は DA trigger からのみ導出する）。lane は技術レーン（auto_recovery）のまま
+  // `technicalStop` を立て、PL は既存の `technical_exhausted`（対象単位・重複排除・理由コードつき）として記録して
+  // 止める。job_blocked は attention に残り続ける（見える停止）。Authority の変更は要求しない。
+  // 原因を直した後の明示 resume が出口（git_commit なら新しい承認が求められる）。
   // 照合は stderr の先頭だけ（findGateTechnicalStopCode）で、さらにコマンドが一度も実行されていない Job に限る
   // （Gate 段階の停止は exitCode も stdout ログも持たない。実行後の出力で技術停止を詐称させない）。
   // CEO が却下した git_commit は下の 7 の却下の扱い（指示つき Human Resume）を優先する。
@@ -983,11 +1000,12 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
       existingRecoveryAvailable: true,
       requiresAuthorityChange: false,
       confidence: 'high',
-      recommendedLane: 'ceo_escalation',
+      recommendedLane: 'auto_recovery',
+      technicalStop: technicalStopCode,
       summary:
         `Gate の技術的な不整合（${technicalStopCode}）で ${facts.job.safeCommand.kind} が停止した。`
         + '承認の判断ではなく、未解決の技術的制約（Authority の境界ではない）。'
-        + '自動 resume は同じ不整合で再停止するだけなので行わない。'
+        + '自動 resume は同じ不整合で再停止するだけなので行わず、CEO 判断も求めない（技術停止として見せ続ける）。'
         + (facts.liveWaitingLinkedApprovalId !== undefined
           // live な WAITING の間 resume は admit されない。出口は既存の承認を承認すること。
           ? `原因を直した後、承認一覧で承認 ${facts.liveWaitingLinkedApprovalId} を承認する（承認待ちの間は resume できない）。`
@@ -999,7 +1017,9 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
   //
   // linked Approval は APPROVED（未 consume）で、Gate は ALLOW + call_consume を返したが、Worker が
   // Gate 段階で実行しなかった（両 Guard は通過）。下の 7 へ落とすと auto_recovery → PL resume →
-  // 新しい承認 → CEO 承認 → また同じ停止、の無限往復になりうるので、CEO に一度だけ見せて止める。
+  // 新しい承認 → CEO 承認 → また同じ停止、の無限往復になりうるので、自動 recovery しない。
+  // 6.8 と同じく **CEO にも上げず**、技術停止（`technicalStop`）として既存の `technical_exhausted` に記録して
+  // 見せ続ける（specs/22 1-2 / 14-3: 技術的制約は Decision Authority の判断ではない）。
   // **D2（2026-10-17）以後、これは Authority の境界ではなく未解決の技術的制約である。** Worker は承認済みの
   // ALLOW + call_consume をローカルのリスクで格下げしない。Worker の技術的不整合（risk_rule_skew 等）は
   // stderr の理由コードで上の 6.8 が先に扱うので、ここへ来るのは consume の想定外の拒否など原因コードの
@@ -1026,12 +1046,13 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
       existingRecoveryAvailable: true,
       requiresAuthorityChange: false,
       confidence: 'high',
-      recommendedLane: 'ceo_escalation',
+      recommendedLane: 'auto_recovery',
+      technicalStop: 'approved_commit_gate_refusal',
       summary:
         'CEO が承認し Gate も許可した git_commit を、Worker が Gate 段階で実行しなかった'
         + '（承認は APPROVED のまま未使用）。未解決の技術的制約（consume の想定外の拒否など）で、'
         + 'Authority の境界ではない。原因を直した後に既存の resume で再開できる。'
-        + '自動 resume は同じ停止を繰り返しうるので行わず、一度だけ見せる。',
+        + '自動 resume は同じ停止を繰り返しうるので行わず、CEO 判断も求めない（技術停止として見せ続ける）。',
     }
   }
 
@@ -1394,6 +1415,7 @@ export function formatTriageAuditDetail(diagnosis: BlockedDiagnosis): string {
   return (
     `lane=${diagnosis.recommendedLane} cause=${diagnosis.rootCauseClass} `
     + `layer=${diagnosis.blockingLayer} conf=${diagnosis.confidence}`
+    + (diagnosis.technicalStop !== undefined ? ` stop=${diagnosis.technicalStop}` : '')
   )
 }
 
