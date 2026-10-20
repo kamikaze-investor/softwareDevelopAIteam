@@ -500,9 +500,10 @@ Lifecycle 一括修復は、承認の **誰が（a）・何を要するか／何
 - 新: 事前確認と最終 transaction で同じ1つの述語を使い、次のどれかがあれば拒否する（最終 transaction では `HUMAN_DECISION_CONFLICT`）:
   - WAITING で、未失効または期限が読めないもの
   - APPROVED で、`approval_actor=human` かつ（未失効または期限が読めない）もの
-  - CONSUMED で、`approval_actor=human` かつ cleanup 要求の時刻以降に作られたもの（cleanup 要求を知らない事前確認では CONSUMED を数えない）
+  - CONSUMED で、`approval_actor=human` かつ cleanup 要求の時刻以降に作られたもの。時刻は数値として比べる。
+    行の作成時刻か cleanup 要求の時刻が無い・読めない human の CONSUMED は止める側に数える（cleanup 要求を知らない事前確認では CONSUMED を数えない）
   期限切れの WAITING / APPROVED と、human でない APPROVED / CONSUMED は止めない。cleanup generation に束縛する
-- 不明時: 状態が読めなければ拒否。actor が読めない APPROVED / CONSUMED は human でない扱い（H-1）で、止めない
+- 不明時: 状態が読めなければ拒否。human の行の期限・時刻が読めなければ拒否。actor が読めない APPROVED / CONSUMED は human でない扱い（H-1）で、止めない
 - 根拠: 人の判断が生きている間は AI の技術判断で park しない。人でない承認は人の判断ではない（最重要原則）
 
 **T-2 帰属不明の dirty workspace は park しない**（(b)(d)）
@@ -562,8 +563,9 @@ Lifecycle 一括修復は、承認の **誰が（a）・何を要するか／何
 
 **C-1 Job の `success` は Worker の結果だけ**（(a)(d)）
 - 旧: ADMIN credential で Job を直接 `success` にできた
-- 新: `success` は Worker Outbox の配送で、Worker / legacy credential のものだけ受け付ける。ADMIN の直接の success は拒否する。
-  **認証されていない（credential が無い）呼び出しも拒否する**。人の credential から権限を1つ減らす
+- 新: **すべての** `success` の書き込み（既に success の Job への書き込みを含む）は、Outbox event を持ち、かつ Worker / legacy credential からの配送であることを要する。
+  この確認は replay 判定や適用対象外の扱いより**前**に行う。ADMIN の直接の success も、**認証されていない（credential が無い）呼び出しも拒否する**。
+  人の credential から権限を1つ減らす
 - 不明時: credential 区分が Worker / legacy と確定しなければ拒否
 - 根拠: 権限の縮小は技術判断（`specs/22` 1-5）。実行していない Job の完了を手で作らせない
 
@@ -595,7 +597,7 @@ Lifecycle 一括修復は、承認の **誰が（a）・何を要するか／何
 ### 付録. code の所在と修復の棚卸し
 
 Meta Review が「コードが本節どおりか」を照合するための索引。`[Lxx-n]` は修復の棚卸し（stack 層・項番）。
-照合した code: `ai/lifecycle-integration` @ `cae856db`（= `ai/lifecycle-stack-13` @ `71187233`）。
+照合した code: `ai/lifecycle-integration` @ `40386da0`。ただし C-1（既に success の Job を含む全 success 書き込みの確認）と T-1（human の CONSUMED の時刻が読めない場合・数値比較）は着地中の修正で、この commit には未収録（着地後に再照合する）。
 
 | 規則 | 棚卸し | code |
 | --- | --- | --- |
@@ -611,9 +613,9 @@ Meta Review が「コードが本節どおりか」を照合するための索�
 | B-7 | L06-6・L06-10 | `approvalGateRoutes()`、storage `supersedeUnwaitedSafeWorkRequests()` |
 | B-9 | L02-5 | storage `persistProviderTimeoutFailure()`（`apps/api/src/storage/sqlite.ts`） |
 | S-1〜S-4 | L02-3・L09-4・L07-1・L02-6 | storage `parkTask()` / `releaseBlockedJobAndParkTask()` / `resumeBlockedTask()` / `recoverFromBlocked()`、clean completion の `jobs.update` と起動時の `reconcileResumedBlockedSourceJobs()`（`linked_job_terminal`） |
-| S-5 | PR #377（risk の下限） | `packages/shared/src/approvalGateLogic.ts` `decideGateOutcome()`（統合後に照合する。上記の照合 commit には未収録） |
+| S-5 | PR #377（risk の下限） | `packages/shared/src/approvalGateLogic.ts` `decideGateOutcome()`（承認時の riskLevel の順位が現在の評価より低い・読めないと STALE）、`apps/api/src/routes/approvalGate.ts` `approvalGateRoutes()`（行を STALE にする） |
 | R-1 / R-2 | L01-1・L01-2・L06-11 | `apps/api/src/designReview/repairFlow.ts` `repairableBlockedReviewRequest()`（`coveredByHumanResume`・`recovery_authority_required`）/ `readImplementationAuthorities()` / `humanResumesOf()`、`repairPolicy.ts` `walkRepairGeneration()`、`resumeActor.ts` `recordRepairGeneration()`、`repairFromStoredReview.ts` `repairFromStoredReview()` |
-| R-3 | L04-4 | `apps/api/src/designReview/repairFlow.ts` `completeRepairHandoff()`（拒否時に `recordRefusedHandoffSpendsRecoveryApproval()`）、`repairRecoveryEpoch.ts` `isSpentStoredReviewRecoveryApproval()` / `humanRecoveryAuthorityByImplementation()`（audit `stored_review_recovery_spent`）、`repairFromStoredReview.ts` `repairFromStoredReview()` |
+| R-3 | L04-4 | `apps/api/src/designReview/repairFlow.ts` `completeRepairHandoff()`（拒否時の使い切りを `spendRecoveryApprovalOnRefusal` で渡す）、storage `createRepairJobWithHandoff()`（`apps/api/src/storage/sqlite.ts`。拒否と同じ transaction で marker を書く。書けなければ `apps/api/src/storage/interface.ts` `RecoveryApprovalSpentMarkerError` を投げ、何も commit せず handoff は再試行される）、`repairRecoveryEpoch.ts` `isSpentStoredReviewRecoveryApproval()` / `humanRecoveryAuthorityByImplementation()`（audit `stored_review_recovery_spent`）、`repairFromStoredReview.ts` `repairFromStoredReview()` |
 | R-4 / R-5 / R-7 | L01-3・L01-5・L01-4 | `repairFlow.ts` `blockingDesignReviewRun()` / `answeredByHumanResume()`（D3 経路）/ `designReviewRunAnsweredByHumanResume()`（記録する run の選択）、`resumeBlockedTask.ts`（作成時の記録）、`resumeActor.ts` `ANSWERED_RUN_AUDIT_TOKEN`（`answered_run`） |
 | R-6 | L04-1 | `apps/api/src/designReviewEvidencePolicy.ts` `findSupersedingRun()` / `isUsableAlignedEvidence()` |
 | R-8 | L04-3・L10-3 | `apps/api/src/designReview/resumeBlockedTask.ts` `resumeBlockedTaskWithDesignReview()`、`packages/shared/src/resumeAdmission.ts` `evaluateResumeAdmission()`（`REPAIR_REVIEW_IN_FLIGHT`）、`apps/api/src/routes/tasks.ts` |
@@ -627,7 +629,7 @@ Meta Review が「コードが本節どおりか」を照合するための索�
 | G-1 | L13-1 | `apps/worker/src/guards/gatePolicy.ts` `resolvePolicy()`、`apps/worker/src/jobRunner.ts` `runJob()`、storage `consumeForJob()` |
 | G-2 | L13-2 | `apps/worker/src/guards/gatePolicy.ts` `resolvePolicy()` / `isCoherentGateResponse()`（consume id の一致）、`approvalGateLogic.ts` `findGateTechnicalStopCode()` |
 | G-3 | L09-7 | `apps/api/src/approvedRunBlock.ts` `classifyApprovedRunBlock()`、`blockedTriage.ts` rule 6.9 |
-| C-1 | L12-3 | `apps/api/src/routes/jobs.ts` `jobRoutes()`（credential class が `worker` / `legacy` のときだけ、`JOB_SUCCESS_REQUIRES_WORKER_RESULT`） |
+| C-1 | L12-3 | `apps/api/src/routes/jobs.ts` `jobRoutes()`（全 success 書き込みに Outbox event と credential class `worker` / `legacy` を要求、replay・適用対象外の扱いより前。`JOB_SUCCESS_REQUIRES_WORKER_RESULT`） |
 | C-2 | L10-4 | `apps/api/src/routes/tasks.ts`（作成・PATCH の `TASK_DONE_REFUSAL` / `TASK_LIFECYCLE_STATE_OWNED_REFUSAL`）、`apps/api/src/state/strandedTask.ts` |
 | 9 章 | L09-1・L11-3・L09-2・L10-1・L10-2・L12-2・L13-3・L11-4・L11-6・L04-2 | 承認決定 route、storage `approveAndResumeJob()`（期限が読めなければ状態を変えず `EXPIRED`）、`consumeForJob()` ほか |
 | 対象外 | L03・L05・L08・L11-7 | — |
