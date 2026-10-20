@@ -68,14 +68,16 @@ export const RISK_RULES: RiskRule[] = [
   // git_commit Evidence が判定に使う lineage / Design Review / Candidate workspace の実装
   // （repairFlow・repairPolicy・designReviewEvidencePolicy・targetWorkingDir）も含める（独立レビュー A-1）。
   //
-  // 2026-10-16 監査（RC4/RC6）: approval の保存・却下伝播・PL abort・停止判定・commit gate の実装が
-  // 抜けていた。LOW のまま Evidence で commit できると、Gate を弱める変更が人の目を通らない。
-  // **production の実ファイルだけ**を exact path で足す（隣のテストまで HIGH にすると、
-  // テストを足すだけの変更まで Evidence の対象外になる）。
-  { label: 'alignment / gate change',    pattern: /alignmentCheck|approvalGate|gateProcessor|gitCommitEvidence|actionGate|plActionPolicy|approvalLevelClassifier|approvalExplain\/(diffReader|changeManifest)|designReview\/(repairFlow|repairPolicy)\.ts$|designReviewEvidencePolicy|config\/targetWorkingDir|(^|\/)(apps\/api\/src\/(storage\/sqlite|pl\/abortTask|pl\/executionLoop|state\/systemState|gitCommitResumeLineage|linkedGitCommitRejection)|apps\/worker\/src\/approvalLevel\/commitGate|packages\/shared\/src\/approvalLiveness)\.ts$/i, level: 'HIGH' },
+  // 2026-10-20 PL 判断: commitGate（`evaluateCommitGate()`）は spec 22 DA trigger (2) が名指しする authority 定義なので
+  // exact path で足す。**production の実ファイルだけ**（隣のテストまで HIGH にすると、テストを足すだけの変更まで
+  // Evidence の対象外になる）。それ以外の技術実装（storage・PL loop・停止判定・admission・recovery 等）は足さない:
+  // Risk Level は Evidence の強度を決めるだけで、ceo_required は DA trigger からのみ導出する（spec 22 1-2 / 14-2 / 14-3）。
+  // authority 変更の検出は promotion 時の Meta Review（Approval Tuple rule）が担う。
+  { label: 'alignment / gate change',    pattern: /alignmentCheck|approvalGate|gateProcessor|gitCommitEvidence|actionGate|plActionPolicy|approvalLevelClassifier|approvalExplain\/(diffReader|changeManifest)|designReview\/(repairFlow|repairPolicy)\.ts$|designReviewEvidencePolicy|config\/targetWorkingDir|(^|\/)apps\/worker\/src\/approvalLevel\/commitGate\.ts$/i, level: 'HIGH' },
   // 2026-10-02: Decision Authority / Safety policy の正本 docs。docs/ 配下は SAFE_ONLY で LOW に
   // 落ちるため、下の SAFE_ONLY 早期リターンより先に評価する（NEVER_SAFE_ONLY_RULES）。
-  // 2026-10-16 監査: rules/ は approval_rules.md 以外も運用ルールの正本なので配下すべてを対象にする。
+  // 2026-10-16 監査: rules/ は approval_rules.md 以外も運用ルールの正本なので配下すべてを対象にする
+  // （CLAUDE.md 7 章の Operational Knowledge。spec 22 DA trigger (1) の Policy 文書）。
   // 依存定義（package.json / pnpm-lock.yaml）は入れない: 依存の変更は Decision Authority 上の技術判断で、
   // HIGH にすると該当する git_commit がすべて CEO 承認へ回る（PL 判断 2026-10-16）。
   { label: 'decision authority / safety policy doc', pattern: /(^|\/)specs\/(00_constitution|08_permissions|22_safety_approval_design_principle)\.md$|(^|\/)docs\/project_memory\/(goal|design_philosophy)\.md$|(^|\/)docs\/project_memory\/rules\/.+|(^|\/)docs\/multi_ai_step_review_flow\.md$/i, level: 'HIGH' },
