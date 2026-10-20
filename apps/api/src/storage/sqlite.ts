@@ -4779,6 +4779,17 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         }
 
         const reviewedAt = now()
+        // 読めない期限は「期限切れではない」ではない。`new Date(invalid) <= now` は false になり、下の SQL の
+        // 文字列比較（`expires_at > ?`）も素通りしうるので、承認と Job の再 queue へ進む前に止める。
+        // 状態は変えずに EXPIRED と同じ code で拒否する（期限が確かめられない承認は使えない）。
+        if (!Number.isFinite(Date.parse(existing.expiresAt))) {
+          return record({
+            ok: false,
+            code: 'EXPIRED',
+            reason: 'Approval request expiry is unreadable',
+            approvalRequest: existing,
+          })
+        }
         if (new Date(existing.expiresAt) <= new Date(reviewedAt)) {
           const expired = db.prepare(`
             UPDATE approval_requests
