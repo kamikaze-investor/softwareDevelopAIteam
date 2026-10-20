@@ -53,7 +53,7 @@ import {
   recordRepairAdmissionSkipped,
 } from './repairFlow'
 import { resolveStoredReviewChain } from './repairRecoveryEpoch'
-import { readApprovalActorClass } from './resumeActor'
+import { APPROVAL_ACTOR_REQUIRED, readApprovalActorClass } from './resumeActor'
 
 /** 承認の有効期限。既存 `APPROVAL_REQUEST_TTL_MINUTES` と同じ考え方で、新しい値を作らない。 */
 const APPROVAL_TTL_MINUTES = 60
@@ -242,7 +242,8 @@ export function repairFromStoredReview(
   //     epoch は `approval_actor` = human の記録がある承認しか数えない
   //     （`humanRecoveryAuthorityByImplementation()`）。証明できない承認を consume すると、
   //     authority にならないまま承認だけが使い切られる。consume せずに返し、承認は残す。
-  if (readApprovalActorClass(storage, approved.id) !== 'human') {
+  //     stack 暫定: 書き手（stack-06）が入るまで要求しない（`APPROVAL_ACTOR_REQUIRED`）。
+  if (APPROVAL_ACTOR_REQUIRED && readApprovalActorClass(storage, approved.id) !== 'human') {
     return {
       status: 'rejected',
       code: 'APPROVAL_ACTOR_NOT_HUMAN',
