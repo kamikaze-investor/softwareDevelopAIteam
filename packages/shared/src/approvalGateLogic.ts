@@ -265,6 +265,22 @@ export function decideGateOutcome(
   if (existingReq) {
     const effective = resolveEffectiveStatus(existingReq, currentCommit, currentDiffHash)
 
+    // 人が承認した時点のリスクより今回の評価が高いときは、その承認では通さない（lifecycle repair D2・
+    // Codex review round 4）。人はこのリスクを見て承認していない。既存の STALE 経路（承認を STALE にし、
+    // Worker は re_check → 新しい承認サイクル）に乗せる。保存値が読めないときは低いとみなす（fail-closed）。
+    const riskOrder: Record<string, number> = { LOW: 0, MEDIUM: 1, HIGH: 2, CRITICAL: 3 }
+    const approvedRiskOrder = Object.prototype.hasOwnProperty.call(riskOrder, existingReq.riskLevel)
+      ? riskOrder[existingReq.riskLevel]
+      : -1
+    if (effective === 'APPROVED' && riskOrder[riskLevel] > approvedRiskOrder) {
+      return {
+        decision: 'STALE',
+        requestId: existingReq.id,
+        reason:
+          `承認時のリスク（${existingReq.riskLevel}）より現在の評価（${riskLevel}）が高いため、`
+          + 'この承認は使えません。再承認が必要です。',
+      }
+    }
     if (effective === 'APPROVED') {
       // consumedRequestId を返すことで呼び出し元が承認を SUPERSEDED にできる
       // （一回限りの承認を保証するため、呼び出し元が必ず updateStatus を呼ぶ）

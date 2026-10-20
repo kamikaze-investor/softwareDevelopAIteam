@@ -932,6 +932,7 @@ describe('POST /api/gate/check', () => {
       expect(body.sideEffects[0].type).toBe('MARKED_STALE')
       expect(body.continuationPolicy).toBe('continue_safe_work_only')
       expect(body.nextAction.action).toBe('re_check')
+      expect(body.nextAction.message).toContain('commit または diff が変化')
       // DB が STALE になっていること
       const getRes = await app.inject({ method: 'GET', url: `/api/approval-requests/${req.id}` })
       const stored = parseBody<ApprovalRequest>(getRes.body)
@@ -1212,6 +1213,60 @@ describe('POST /api/gate/check', () => {
       })
       expect(statusCode).toBe(200)
       expect((consumed as ApprovalRequest).status).toBe('CONSUMED')
+    })
+  })
+
+  // lifecycle repair D2・Codex review round 4: 承認時より現在のリスクが高い承認は使えない。
+  // 低い riskLevel で作られ承認された依頼を、HIGH / CRITICAL と評価された同じ ref の実行に流用させない。
+  it.each([
+    { stored: 'LOW', files: ['apps/api/src/storage/migration.ts'], current: 'HIGH' },
+    { stored: 'MEDIUM', files: ['apps/api/src/storage/migration.ts'], current: 'HIGH' },
+    { stored: 'HIGH', files: ['AGENTS.md'], current: 'CRITICAL' },
+  ])('approved at $stored but evaluated $current now → STALE (no call_consume), and the row cannot be consumed', async ({ stored, files, current }) => {
+    await withApp(async (app) => {
+      const taskId = `gate-task-risk-${stored}-${current}`
+      const req = await createApprovalRequest(app, {
+        taskId, riskLevel: stored, targetCommit: 'commit-abc123', targetDiffHash: 'hash-deadbeef',
+      })
+      await patchStatus(app, req.id, 'APPROVED')
+
+      const { statusCode, body } = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD, taskId, changedFiles: files,
+        targetCommit: 'commit-abc123', targetDiffHash: 'hash-deadbeef',
+      })
+      expect(statusCode).toBe(200)
+      expect(body.riskReview.riskLevel).toBe(current)
+      expect(body.outcome.decision).toBe('STALE')
+      expect(body.nextAction.action).toBe('re_check')
+      expect(body.nextAction.consumedRequestId).toBeUndefined()
+      // STALE の案内は無効化の実際の理由（リスク上昇）を伝える。commit/diff の変化とは言わない。
+      expect(body.nextAction.message).toContain('承認時のリスク')
+      expect(body.nextAction.message).not.toContain('commit/diff')
+      expect(body.sideEffects).toContainEqual({ type: 'MARKED_STALE', requestId: req.id })
+      const getRes = await app.inject({ method: 'GET', url: `/api/approval-requests/${req.id}` })
+      expect(parseBody<ApprovalRequest>(getRes.body).status).toBe('STALE')
+
+      // consume 側でも流用は成立しない（STALE は consume 不可）
+      const consumed = await consumeRequest(app, req.id, { currentCommit: 'commit-abc123', currentDiffHash: 'hash-deadbeef' })
+      expect(consumed.statusCode).toBe(409)
+    })
+  })
+
+  it('approved at CRITICAL and evaluated HIGH now (same ref) → ALLOW + call_consume as before', async () => {
+    await withApp(async (app) => {
+      const req = await createApprovalRequest(app, {
+        taskId: 'gate-task-risk-lower', riskLevel: 'CRITICAL', targetCommit: 'commit-abc123', targetDiffHash: 'hash-deadbeef',
+      })
+      await patchStatus(app, req.id, 'APPROVED')
+
+      const { body } = await gateCheck(app, {
+        ...BASE_GATE_PAYLOAD, taskId: 'gate-task-risk-lower',
+        targetCommit: 'commit-abc123', targetDiffHash: 'hash-deadbeef',
+      })
+      expect(body.riskReview.riskLevel).toBe('HIGH')
+      expect(body.outcome.decision).toBe('ALLOW')
+      expect(body.nextAction.action).toBe('call_consume')
+      expect(body.nextAction.consumedRequestId).toBe(req.id)
     })
   })
 })

@@ -603,8 +603,11 @@ export async function runJob(
       checkResponse?.nextAction?.consumedRequestId
     const expiresAt = checkResponse?.approvalRequest?.expiresAt
 
-    // dedup: 同一 approvalRequestId への重複通知を抑制
-    const dedupKey = approvalRequestId
+    // dedup: 同一 approvalRequestId への重複通知を抑制。技術停止は理由コードも key に含める
+    // （同じ承認依頼でも、別の技術的原因で止まったならそれぞれ通知する）。
+    const dedupKey = approvalRequestId !== undefined && technicalStopCode !== undefined
+      ? `${approvalRequestId}:${technicalStopCode}`
+      : approvalRequestId
     if (!dedupKey || !notifiedApprovalRequests.has(dedupKey)) {
       if (dedupKey) notifiedApprovalRequests.add(dedupKey)
 

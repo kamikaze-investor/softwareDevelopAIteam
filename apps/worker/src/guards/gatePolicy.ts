@@ -123,7 +123,11 @@ export function resolvePolicy(
 
   // ── 3. ローカルのリスク > API のリスク（Worker / API の rule の版ずれ）──
   // 実行可否の判定には使わない。食い違う評価のまま実行・safe work・consume をしない。
-  const localRisk = localResult.finalRiskLevel
+  // ローカルの評価が既知の RiskLevel でなければ CRITICAL として比べる（fail closed。読めない評価で
+  // API より低いと見なして実行・safe work・consume に進まない）。
+  const localRisk: RiskLevel = Object.prototype.hasOwnProperty.call(RISK_RANK, localResult.finalRiskLevel)
+    ? localResult.finalRiskLevel
+    : 'CRITICAL'
   const apiRisk = checkResponse.riskReview.riskLevel as RiskLevel
   if (RISK_RANK[localRisk] > RISK_RANK[apiRisk]) {
     return technicalStop('risk_rule_skew', `local ${localRisk} > API ${apiRisk} (worker/api rule skew)`)

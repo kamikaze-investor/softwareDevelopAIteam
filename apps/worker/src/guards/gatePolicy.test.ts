@@ -214,6 +214,21 @@ describe('resolvePolicy — ALLOW はローカルの HIGH / CRITICAL で格下�
   })
 })
 
+describe('resolvePolicy — 既知でないローカルのリスクは CRITICAL として比べる', () => {
+  it('ローカルが未知の値 + API HIGH → re_check risk_rule_skew（低いと見なして実行しない）', () => {
+    const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'SEVERE' as never }), approvedConsume('HIGH'))
+    expect(result.policy).toBe('re_check')
+    expect(findGateTechnicalStopCode(result.reason)).toBe('risk_rule_skew')
+    expect(result.reason).toContain('local CRITICAL > API HIGH')
+  })
+
+  it('ローカルが未知の値 + API CRITICAL → skew ではない（API に従う）', () => {
+    const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'SEVERE' as never }), approvedConsume('CRITICAL'))
+    expect(findGateTechnicalStopCode(result.reason)).toBeUndefined()
+    expect(result.policy).toBe('continue')
+  })
+})
+
 describe('resolvePolicy — ローカルのリスク > API のリスク → re_check risk_rule_skew（技術的不整合。承認待ちにも safe work にもしない）', () => {
   it.each([
     ['ALLOW + proceed', 'HIGH', allowProceed('LOW')],
