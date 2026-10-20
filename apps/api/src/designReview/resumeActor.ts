@@ -159,6 +159,11 @@ export interface ResumeActorEvidence {
   evidence: ResumeAuthorizationEvidence
   /** Rule 5.5 の review execution failure に対する PL Technical Resume。 */
   technicalResume?: boolean
+  /**
+   * Human Resume が作られた時点で Task を止めていた Design Review run の id（R-4）。
+   * この run だけが、その Human Resume によって「答えられた」run になる（`readAnsweredRunIds()`）。
+   */
+  answeredRunId?: string
 }
 
 /**
@@ -179,6 +184,9 @@ export function resumeActorAuditRecord(
       `resume_actor=${input.actorClass}`,
       `authorization_evidence=${input.evidence}`,
       input.technicalResume === true ? TECHNICAL_RESUME_AUDIT_TOKEN : undefined,
+      input.actorClass === 'human' && input.answeredRunId !== undefined
+        ? `${ANSWERED_RUN_AUDIT_TOKEN}=${input.answeredRunId}`
+        : undefined,
     ].filter((token) => token !== undefined).join(' '),
   }
 }
@@ -390,6 +398,38 @@ export function resumeActorClassFromAudit(entries: readonly AuditLogEntry[]): Re
   }
   if (only !== 'human') return 'unknown'
   return rows.every((row) => ADMIN_EVIDENCE_PATTERN.test(row.detail ?? '')) ? 'human' : 'unknown'
+}
+
+/** resume_actor の detail に載る、Human Resume が答えた Design Review run の token 名（R-4）。 */
+export const ANSWERED_RUN_AUDIT_TOKEN = 'answered_run'
+
+/**
+ * Human Resume ごとに、**作成時に明示的に記録された**「答えた Design Review run」の id を引く（R-4）。
+ *
+ * 時刻の前後からは推論しない。human と証明できない resume・記録の無い legacy resume・
+ * 行どうしで食い違う resume は何も答えない（fail closed）。
+ */
+export function readAnsweredRunIds(
+  storage: IStorage,
+  jobs: readonly Job[],
+): Map<string, string> {
+  const answered = new Map<string, string>()
+  for (const job of jobs) {
+    if (!job.workflowStepKey?.startsWith(RESUME_STEP_PREFIX)) continue
+    try {
+      const rows = storage.auditLog.findByEntity('job', job.id)
+        .filter((entry) => entry.operation === RESUME_ACTOR_OPERATION)
+      if (resumeActorClassFromAudit(rows) !== 'human') continue
+      const ids = new Set(rows.map((row) =>
+        new RegExp(`(?:^|\\s)${ANSWERED_RUN_AUDIT_TOKEN}=(\\S+)`).exec(row.detail ?? '')?.[1]))
+      if (ids.size !== 1) continue
+      const only = [...ids][0]
+      if (only !== undefined) answered.set(job.id, only)
+    } catch {
+      // 読めない記録は何も答えない。
+    }
+  }
+  return answered
 }
 
 /**

@@ -5,6 +5,7 @@ import type { IStorage } from '../storage/interface'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { prepareRepairFlow } from './repairFlow'
 import { recordResumeActor } from './resumeActor'
+import { designReviewRunAnsweredByHumanResume } from './repairFlow'
 
 /**
  * **D3: Human Resume で回答済みの Design Review run は、repair admission の根拠から外す。**
@@ -113,9 +114,18 @@ async function terminalRun(shape: Shape, result: RunResult, repairSourceJobId: s
 }
 
 /** R1 = resume:R0:1（review）。actor を記録してから verdict を保存する。 */
-async function resumedReview(shape: Shape, actor: 'human' | 'ai' | 'none' | 'human_without_admin', source: Job = shape.r0): Promise<Job> {
+async function resumedReview(shape: Shape, actor: 'human' | 'human_legacy' | 'ai' | 'none' | 'human_without_admin', source: Job = shape.r0): Promise<Job> {
   const r1 = job(shape.storage, shape, { agentRole: 'qa_ai', aiCliMode: 'review', workflowStepKey: `resume:${source.id}:1` }, { status: 'failed', exitCode: 0 })
-  if (actor === 'human') recordResumeActor(shape.storage, { jobId: r1.id, taskId: shape.taskId, actorClass: 'human', evidence: 'admin_credential' })
+  // Human Resume は作成時に、その時点で Task を止めていた run を記録する（R-4。route と同じ関数）。
+  const answeredRunId = designReviewRunAnsweredByHumanResume(shape.storage, shape.taskId)
+  if (actor === 'human') {
+    recordResumeActor(shape.storage, {
+      jobId: r1.id, taskId: shape.taskId, actorClass: 'human', evidence: 'admin_credential',
+      ...(answeredRunId !== undefined ? { answeredRunId } : {}),
+    })
+  }
+  // R-4 以前の Human Resume（answered_run の記録が無い）。
+  if (actor === 'human_legacy') recordResumeActor(shape.storage, { jobId: r1.id, taskId: shape.taskId, actorClass: 'human', evidence: 'admin_credential' })
   if (actor === 'ai') recordResumeActor(shape.storage, { jobId: r1.id, taskId: shape.taskId, actorClass: 'ai', evidence: 'in_process_pl' })
   if (actor === 'human_without_admin') recordResumeActor(shape.storage, { jobId: r1.id, taskId: shape.taskId, actorClass: 'human', evidence: 'worker_credential' })
   verdict(shape.storage, shape.taskId, r1.id)
@@ -146,6 +156,27 @@ describe('D3: Human Resume で回答済みの repair run は admission の根拠
     const r1 = await resumedReview(shape, 'human')
 
     expect(admit(shape, r1.id).action).toBe('queue')
+  })
+
+  it('R-4: answered_run を記録していない（legacy）Human Resume は、時刻が後でも CONFLICT を答えない', async () => {
+    const shape = await shapeBeforeRun()
+    const runId = await terminalRun(shape, 'CONFLICT', shape.i1.id)
+    const r1 = await resumedReview(shape, 'human_legacy')
+
+    expect(admit(shape, r1.id)).toMatchObject({ action: 'skip', runId })
+  })
+
+  it('R-4: 別の run を答えたと記録した Human Resume は、この run を答えない', async () => {
+    const shape = await shapeBeforeRun()
+    const runId = await terminalRun(shape, 'CONFLICT', shape.i1.id)
+    const r1 = job(shape.storage, shape, { agentRole: 'qa_ai', aiCliMode: 'review', workflowStepKey: `resume:${shape.r0.id}:1` }, { status: 'failed', exitCode: 0 })
+    recordResumeActor(shape.storage, {
+      jobId: r1.id, taskId: shape.taskId, actorClass: 'human', evidence: 'admin_credential', answeredRunId: 'some-other-run',
+    })
+    verdict(shape.storage, shape.taskId, r1.id)
+    await tick()
+
+    expect(admit(shape, r1.id)).toMatchObject({ action: 'skip', runId })
   })
 
   it('run の完了より前に作られた resume は回答ではない（従来どおり skip、runId を返す）', async () => {
