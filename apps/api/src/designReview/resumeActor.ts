@@ -217,6 +217,16 @@ export function recordRepairGeneration(
 export const APPROVAL_ACTOR_AUDIT_OPERATION = 'approval_actor'
 
 /**
+ * **stack 分割の暫定措置（[lifecycle-repair] stack）。** 読み側（`repairFromStoredReview()` /
+ * `humanRecoveryAuthorityByImplementation()`）が `approval_actor` = human を要求するのは、
+ * 承認 PATCH route が `recordApprovalActor()` を書くようになってからである（stack-06・W3）。
+ * 書き手の無い層でこの要求を有効にすると、正当な stored-review 承認がすべて拒否される
+ * （fail closed だが liveness の後退）。この層では master 既存の数え方を保ち、
+ * 書き手と同じ層（stack-06）でこの定数ごと要求を戻す。helper・型・audit は残す。
+ */
+export const APPROVAL_ACTOR_REQUIRED: boolean = false
+
+/**
  * **ApprovalRequest を決定した主体の種別を、credential だけから決めて残す**（Codex review・b8d0fc5d）。
  *
  * consume 済みの `repair_from_stored_review:*` 承認は repair budget を作り直す authority になる。
