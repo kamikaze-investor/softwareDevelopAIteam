@@ -106,18 +106,6 @@ export function resolvePolicy(
     )
   }
 
-  // ── STALE / re_check ──
-  if (
-    checkResponse.outcome.decision === 'STALE' ||
-    checkResponse.nextAction.action === 're_check'
-  ) {
-    return {
-      policy: 're_check',
-      reason: 'Approval is stale. Re-run gate/check to start a new approval flow.',
-      apiAvailable: true,
-    }
-  }
-
   // ── API の continuationPolicy をベースにする ──
   const apiPolicy = checkResponse.continuationPolicy
   const apiRisk = checkResponse.riskReview.riskLevel as string
@@ -152,6 +140,23 @@ export function resolvePolicy(
     + ` (${localResult.reason ?? 'no reason'})`
   if (localOrder > apiOrder && localOrder >= RISK_ORDER.CRITICAL) {
     return { policy: 're_check', reason: skewReason, apiAvailable: true, technicalCause: 'risk_rule_skew' }
+  }
+
+  // ── STALE / re_check ──
+  // 版ずれの検査より後に置く（Codex final review）。API が承認を STALE にしても、Worker と API の判定が
+  // 食い違っているなら、それは技術停止として扱う（承認問題として通知しない）。
+  if (
+    checkResponse.outcome.decision === 'STALE' ||
+    checkResponse.nextAction.action === 're_check'
+  ) {
+    if (localOrder > apiOrder && localOrder >= RISK_ORDER.HIGH) {
+      return { policy: 're_check', reason: skewReason, apiAvailable: true, technicalCause: 'risk_rule_skew' }
+    }
+    return {
+      policy: 're_check',
+      reason: 'Approval is stale. Re-run gate/check to start a new approval flow.',
+      apiAvailable: true,
+    }
   }
 
   const isApprovedConsume =

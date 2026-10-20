@@ -369,6 +369,38 @@ describe('resolvePolicy — 承認済み HIGH / CRITICAL と Worker 側の fail-
     expect(result.technicalCause).toBe('approval_contract_violation')
   })
 
+  // Codex final review: API が承認を STALE にしても、Worker と API の判定が食い違っていれば技術停止として返す
+  it.each([
+    { local: 'CRITICAL' as const, api: 'HIGH' as const },
+    { local: 'HIGH' as const, api: 'MEDIUM' as const },
+  ])('STALE with local $local > api $api → re_check tagged risk_rule_skew (not an approval problem)', ({ local, api }) => {
+    const result = resolvePolicy(
+      makeGateResult({ finalRiskLevel: local }),
+      makeCheckResponse({
+        outcome: { decision: 'STALE', requestId: 'r-stale', reason: 'risk rose' },
+        riskReview: { riskLevel: api, triggeredRules: [], requiresIndependentReview: api !== 'MEDIUM' },
+        continuationPolicy: 'continue_safe_work_only',
+        nextAction: { action: 're_check', message: 're-check' },
+      } as Partial<GateCheckResponse>),
+    )
+    expect(result.policy).toBe('re_check')
+    expect(result.technicalCause).toBe('risk_rule_skew')
+  })
+
+  it('STALE with local == api → plain re_check (approval stale, no technicalCause)', () => {
+    const result = resolvePolicy(
+      makeGateResult({ finalRiskLevel: 'HIGH' }),
+      makeCheckResponse({
+        outcome: { decision: 'STALE', requestId: 'r-stale-2', reason: 'risk rose' },
+        riskReview: { riskLevel: 'HIGH', triggeredRules: [], requiresIndependentReview: true },
+        continuationPolicy: 'continue_safe_work_only',
+        nextAction: { action: 're_check', message: 're-check' },
+      } as Partial<GateCheckResponse>),
+    )
+    expect(result.policy).toBe('re_check')
+    expect(result.technicalCause).toBeUndefined()
+  })
+
   it('api HIGH call_consume without a consumedRequestId → re_check (approval_contract_violation)', () => {
     const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'HIGH' }), consumeResponse('HIGH', null))
     expect(result.policy).toBe('re_check')
@@ -415,6 +447,7 @@ describe('resolvePolicy — 承認済み HIGH / CRITICAL と Worker 側の fail-
       makeGateResult({ finalRiskLevel: 'HIGH' }),
       makeCheckResponse({
         outcome: { decision: 'STALE', requestId: 'r2', reason: 'changed' },
+        riskReview: { riskLevel: 'HIGH', triggeredRules: [], requiresIndependentReview: true },
         nextAction: { action: 're_check', message: 're-check' },
       } as Partial<GateCheckResponse>),
     )
