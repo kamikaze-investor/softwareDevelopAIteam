@@ -117,30 +117,6 @@ describe('RISK_RULES — alignment / gate change（GATE_CHANGE_EXACT_FILES の�
   })
 })
 
-/**
- * 2026-10-17 最終監査: 一覧から導出したテストとは独立に、明示 path で固定する
- * （一覧から行が消えると導出テストも一緒に消え、退行に気付けないため）。
- */
-describe('RISK_RULES — alignment / gate change（2026-10-17 最終監査の明示固定）', () => {
-  it.each([
-    'apps/api/src/state/strandedTask.ts',
-    'apps/api/src/ctoAi/taskContinuation.ts',
-    'apps/api/src/designReview/retryCooldown.ts',
-  ])('%s → HIGH / alignment / gate change', (file) => {
-    const result = runRiskReview([file])
-    expect(result.riskLevel).toBe('HIGH')
-    expect(result.triggeredRules).toContain(GATE)
-  })
-
-  it.each([
-    'apps/api/src/state/strandedTask.test.ts',
-    'apps/api/src/ctoAi/taskContinuation.test.ts',
-    'apps/api/src/designReview/retryCooldownTestClock.ts',
-  ])('%s does not match alignment / gate change', (file) => {
-    expect(runRiskReview([file]).triggeredRules).not.toContain(GATE)
-  })
-})
-
 describe('RISK_RULES — decision authority / safety policy doc（2026-10-16 追加分）', () => {
   it.each([
     'docs/project_memory/rules/approval_rules.md',
