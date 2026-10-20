@@ -20,7 +20,7 @@ import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
 import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IPrincipleApplicationStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReplaceActiveApprovalAndCreateResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, ConsumeApprovalForCommandJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult, RepairHandoffRefusalCode, CreateInitialImplementJobResult, CreateManualJobResult, AcknowledgeOutboxEventResult } from './interface'
 import { DesignReviewRunContentionError } from './interface'
-import { isTaskScopedApprovalAction, computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS, evaluateRecoverAdmission, evaluateResumeAdmission, isSupervisedRunKind, isLiveApprovedApproval, isLiveWaitingApproval } from '@ai-team/shared'
+import { isApprovalBlockingTechnicalAbort, isTaskScopedApprovalAction, computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS, evaluateRecoverAdmission, evaluateResumeAdmission, isSupervisedRunKind, isLiveApprovedApproval, isLiveWaitingApproval } from '@ai-team/shared'
 import type { SupervisedRunKind } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, JobWorkspaceBaseline, JobWorkspaceBaselineEntry, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type {
@@ -1186,23 +1186,31 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     // もう一度行う。precheck 後に作られた承認を、park の STALE 化で黙って消さないため（新しい gate ではなく
     // 同じ条件の atomic 化）。期限解釈は shared isLiveWaitingApproval / isLiveApprovedApproval
     // （期限切れ APPROVED は consume できないので人の判断として生きていない。監査 B-2）。
+    // 判定は precheck と同じ shared `isApprovalBlockingTechnicalAbort`（H-2 / T-1）: 期限内または期限の
+    // 読めない WAITING、決定主体（approval_actor）が human の APPROVED、cleanup 要求の後に作られ human が
+    // 決めた CONSUMED（承認→消費まで Worker の報告が届かなかった場合）だけが止める。
     const nowMs = Date.parse(now())
-    const humanDecision = (db.prepare(`
-      SELECT status, expires_at FROM approval_requests
-      WHERE task_id = ? AND status IN ('WAITING_FOR_USER', 'APPROVED')
+    const blockingRows = (db.prepare(`
+      SELECT id, status, expires_at, created_at FROM approval_requests
+      WHERE task_id = ? AND status IN ('WAITING_FOR_USER', 'APPROVED', 'CONSUMED')
       ORDER BY created_at DESC, rowid DESC
-    `).all(task.id) as Array<{ status: ApprovalGateStatus; expires_at: string }>)
-      .find((row) => isLiveApprovedApproval({ status: row.status, expiresAt: row.expires_at }, nowMs)
-        || isLiveWaitingApproval({ status: row.status, expiresAt: row.expires_at }, nowMs))
-    // cleanup 要求の後に作られ、既に CONSUMED になった request も人の判断である（承認→消費まで
-    // Worker の報告が届かなかった場合、上の status 条件だけでは見えない）。
-    const consumedAfterRequest = metadata.abortCleanupRequestedAt === undefined
-      ? undefined
-      : db.prepare(`
-          SELECT id FROM approval_requests
-          WHERE task_id = ? AND status = 'CONSUMED' AND created_at >= ?
-          LIMIT 1
-        `).get(task.id, metadata.abortCleanupRequestedAt) as { id: string } | undefined
+    `).all(task.id) as Array<{ id: string; status: ApprovalGateStatus; expires_at: string; created_at: string }>)
+      .filter((row) => isApprovalBlockingTechnicalAbort(
+        {
+          status: row.status,
+          expiresAt: row.expires_at,
+          createdAt: row.created_at,
+          approvalActor: readApprovalActorClass(storage, row.id),
+        },
+        {
+          nowMs,
+          ...(metadata.abortCleanupRequestedAt !== undefined
+            ? { cleanupRequestedAt: metadata.abortCleanupRequestedAt }
+            : {}),
+        },
+      ))
+    const humanDecision = blockingRows.find((row) => row.status !== 'CONSUMED')
+    const consumedAfterRequest = blockingRows.find((row) => row.status === 'CONSUMED')
     if (humanDecision !== undefined || consumedAfterRequest !== undefined) {
       // 専用 code で返す: 呼び出し側は cleanup の失敗として扱わず carrier を quarantine しない。
       // その代わりこの cleanup generation を同じ transaction で取り消す（再送は NOT_REQUESTED になる）。
@@ -4950,6 +4958,17 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         }
 
         const reviewedAt = now()
+        // 読めない期限は「期限切れではない」ではない。`new Date(invalid) <= now` は false になり、下の SQL の
+        // 文字列比較（`expires_at > ?`）も素通りしうるので、承認と Job の再 queue へ進む前に止める。
+        // 状態は変えずに EXPIRED と同じ code で拒否する（期限が確かめられない承認は使えない）。
+        if (!Number.isFinite(Date.parse(existing.expiresAt))) {
+          return record({
+            ok: false,
+            code: 'EXPIRED',
+            reason: 'Approval request expiry is unreadable',
+            approvalRequest: existing,
+          })
+        }
         if (new Date(existing.expiresAt) <= new Date(reviewedAt)) {
           const expired = db.prepare(`
             UPDATE approval_requests
