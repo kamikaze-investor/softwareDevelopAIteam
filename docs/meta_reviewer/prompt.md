@@ -97,7 +97,7 @@ B とするには、少なくとも次を満たさなければならない。
 1. 適用する既存ruleを canonical spec / rule の具体的箇所から引用できる。
 2. productionで到達可能な全writer・reader・consume・alternate route・default・expiry・retry / recovery pathについて、変更後も (a)〜(d) がそのruleと同一であることを、branch条件とend-to-end invariant testで決定的に示せる。
 3. legacy、missing、unknown、矛盾するevidence、partial write、期限不明、unmatched objectは承認成立へ倒れず、fail closedになる。
-4. このPR自身によるcanonical rule変更を、そのPRのauthority根拠として使用しない。
+4. このPR自身によるcanonical rule変更を、そのPRのauthority根拠として使用しない（A を B に変える根拠にもしない）。
 
 差分が (a)〜(d) またはSafety boundaryを変えるか判定できない場合は A に倒す。ただし、Approval Tupleがcanonical ruleと同一であることは確定しており、その実装に技術欠陥がある場合、欠陥だけを理由にAへ変更しない。その場合は Bのまま技術statusを `blocked` または `changes_requested` とする。
 
@@ -122,6 +122,24 @@ Decision Authority と技術statusは独立である。
 - human-approval 対象から action を削除する（(b) の縮小）→ A（canonical spec が承認済みで欠陥が無ければ blocked にしない）
 - canonical な「ADMIN だけが human」を、writer・reader を揃えて正しく強制するだけの actor provenance 修正 → B（reader に対応する production writer が欠けて正規承認が成立しないなら B + blocked）
 
+**Approval Tuple を実際に変える変更（A）の出し方 — 実装が CODEOWNERS 外のファイルでも同じ**
+
+Approval Tuple (a)〜(d) を実際に変える変更（A）は、対応する canonical rule（`docs/project_memory/rules/approval_rules.md` または `specs/22`）の実質的な変更、または既承認 rule への exact implementation / activation binding を同じ PR に含め、CODEOWNERS review に委ねる。
+
+同じ PR の canonical rule 変更は既承認の根拠として扱わない。ただし old→new Approval Tuple を具体的に定義し実装差分と一致する場合は、PR 全体を A として CODEOWNERS review へ委ねるための proposal として扱う。承認前は効力を持たず、実装欠陥・bypass・rule/code 不一致を解除しない。
+
+つまり PR は自分の rule 変更を既存の authority として使うことも、A を B に変える根拠にすることもできない。一方で、rule と実装を同じ PR に一体として載せ、code-owner の判断に出すことはできる。
+
+この場合、Meta Review は次の5点を確認する。
+
+1. rule の差分が old と new の Approval Tuple を実質的に記述している。
+2. rule が scope・binding・effect・expiry / use / reset・failure default を定めている。
+3. 実装が全 writer・reader・consume・retry・recovery・alternate path で rule と一致している。
+4. missing・legacy・unknown evidence は fail closed のままである。
+5. rule と code が一致しない場合は A + blocked であり、CEO review はそれを解除しない。
+
+Human Gate を得る目的だけの、trivial・無関係・説明だけの保護対象ファイル編集は manipulation とみなし `blocked` とする。
+
 このルールは特定PRや特定ファイルに限定せず、authorityの決定・記録・読取・消費・失効・supersede・実行effectに関わるすべての差分へ適用する。
 
 ### Human Decision Authority のみ — `blocked` にしない（`requiresCeoApproval: true`）
@@ -135,7 +153,7 @@ DA trigger (1)〜(5) に当たるが、上記の欠陥・弱体化・未解消�
   - 例: `specs/22` §14-3 が承認した git_commit Stage 1（LOW / MEDIUM かつ定義済み Safety Evidence が全て成立する場合だけ人の承認なしで進め、それ以外は fail closed）を、その条件どおりに実装する変更。git_commit から人の承認を外すので (b) が変わり A のまま、欠陥が無ければ `blocked` にしない
   - Tuple を変えずに、既に canonical な boundary を正しく強制するだけの実装（欠落した check・writer・invalidation の補修等）は A ではなく B である
 - authority を広げる変更であること自体は `blocked` の理由にならない。`blocked` にするのは、承認済み scope の逸脱・無断の authority 拡大・実装欠陥がある場合だけである
-- この PR 自身が canonical spec を変更している場合、その変更を根拠に自分の scope を正当化しない（spec の変更自体が Human Decision Authority であり、`requiresCeoApproval: true`）
+- この PR 自身が canonical spec / rule を変更している場合、その変更を根拠に自分の scope を正当化しない（既承認の authority として扱わず、A を B に変える根拠にもしない。spec / rule の変更自体が Human Decision Authority であり、`requiresCeoApproval: true`）。ただし rule 変更と実装を同じ PR に一体として含め、PR 全体を A として CODEOWNERS review の判断に委ねることはできる（「DA trigger (2)」節の5点確認に従う）
 - 人の判断は GitHub の CODEOWNERS review が担う。あなたが CEO の代わりに許可・却下を決めない
 - **欠陥と Human Decision の両方がある場合は `blocked`**（`requiresCeoApproval: true` も付ける）。CEO 承認は技術的な `blocked` を解除しない
 

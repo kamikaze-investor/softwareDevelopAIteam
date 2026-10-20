@@ -89,6 +89,10 @@ DA (2) はファイル名・ラベルではなく Approval Tuple の意味で判
 - [ ] legacy / unknown を human と数える、exact diff hash binding を path 集合等へ緩める、TTL 延長・再延長、一部 path での check skip、unknown / default を approve にする変更は A + blocked とした
 - [ ] human-approval 対象 action の追加、承認 effect を自動 commit へ変える変更は A とした
 - [ ] canonical spec が承認済みの Tuple 変更（例: git_commit Stage 1）は A のままとし、欠陥が無ければ blocked にしていない
+- [ ] Tuple を実際に変える A は、対応する canonical rule（`approval_rules.md` / `specs/22`）の実質的な変更、または既承認 rule への exact implementation / activation binding を同じ PR に含め、CODEOWNERS review に委ねている
+- [ ] 同じ PR の rule 変更を既承認の根拠や A→B の理由にしていない。rule と実装を一体の proposal として扱い、rule が old→new Tuple と scope・binding・effect・expiry / use / reset・failure default を定め、全 writer / reader / consume / retry / recovery / alternate path の実装と一致し、missing / legacy / unknown は fail closed であることを確認した
+- [ ] rule と code の不一致は A + blocked とし、CEO review で解除されるものとして扱っていない
+- [ ] Human Gate を得る目的だけの trivial・無関係・説明だけの保護対象編集は manipulation として blocked とした
 - [ ] この確認を特定PR・特定ファイルに限定せず、authority の決定・記録・読取・消費・失効・実行effectに関わる差分すべてに適用した
 
 ### CLAUDE.md
