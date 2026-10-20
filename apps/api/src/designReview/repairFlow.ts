@@ -50,7 +50,7 @@ import {
   type ResumeActorClass,
   type GenerationAuthority,
 } from './repairPolicy'
-import { humanRecoveryAuthorityByImplementation, recordRefusedHandoffSpendsRecoveryApproval } from './repairRecoveryEpoch'
+import { humanRecoveryAuthorityByImplementation } from './repairRecoveryEpoch'
 import { readAnsweredRunIds, readResumeActorClasses, recordRepairGeneration } from './resumeActor'
 import { isVerifiedPlTechnicalResumeAudit } from '../pl/technicalResumePolicy'
 
@@ -1585,9 +1585,11 @@ export function completeRepairHandoff(
   // Design Review を待っている間に `abort_task` がこの Task を park しうる。
   // ここで repair Job を作ると park が黙って取り消される（escalate もしない —
   // park された Task を blocked へ上げるのは park の取り消しと同じ結果になる）。
-  if (storage.tasks.isParked(taskId)) {
-    // 断られた handoff は、その実装に epoch を開いた承認を使い切る（R-3）。
-    recordRefusedHandoffSpendsRecoveryApproval(storage, { taskId, sourceJobId: sourceJob.id, runId: run.id, reason: 'TASK_PARKED' })
+  // R-3: source 実装に epoch を開いていた consume 済み承認。handoff が断られたら、storage がその refusal と
+  // 同じ transaction で使い切り marker を書く。承認が無いときだけ、ここで先に park を見て何も書かずに返す
+  // （承認があるときは storage の transaction が TASK_PARKED で断り、marker と一緒に確定させる）。
+  const recoveryAuthority = humanRecoveryAuthorityByImplementation(storage, taskId).get(sourceJob.id)
+  if (recoveryAuthority === undefined && storage.tasks.isParked(taskId)) {
     return { status: 'skipped', reason: 'task was parked by abort_task while the review ran' }
   }
 
@@ -1609,6 +1611,9 @@ export function completeRepairHandoff(
       aiCliProvider: sourceJob.aiCliProvider,
       aiCliPrompt: run.designText,
     },
+    ...(recoveryAuthority !== undefined
+      ? { spendRecoveryApprovalOnRefusal: { approvalRequestId: recoveryAuthority.approvalRequestId, runId: run.id } }
+      : {}),
   })
 
   // **Task / Project 状態の再確認は storage の handoff transaction 内で行われる**（TOCTOU 回避）。
@@ -1617,8 +1622,7 @@ export function completeRepairHandoff(
   // **blocked では断られない** —— Stored Review Recovery は blocked な Task から正規に handoff する。
   if (!repairJob.ok && isRepairHandoffRefusal(repairJob.code)) {
     console.warn(`[repairFlow] repair handoff refused for task ${taskId} (${repairJob.code}): ${repairJob.reason}`)
-    // 承認で開いた epoch が何も実体化しなかった。その承認を恒久 authority として残さない（R-3）。
-    recordRefusedHandoffSpendsRecoveryApproval(storage, { taskId, sourceJobId: sourceJob.id, runId: run.id, reason: repairJob.code })
+    // 承認で開いた epoch の使い切り marker は、この refusal と同じ transaction で storage が書いた（R-3）。
     return { status: 'skipped', reason: repairJob.reason }
   }
 
