@@ -5,8 +5,9 @@ import type { IStorage } from '../storage/interface'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { completeRepairHandoff, prepareRepairFlow } from './repairFlow'
 import { repairFromStoredReview } from './repairFromStoredReview'
-import { repairRecoveryActionFor } from './repairRecoveryEpoch'
+import { humanRecoveryAuthorityByImplementation, repairRecoveryActionFor } from './repairRecoveryEpoch'
 import { recordApprovalActor, recordResumeActor } from './resumeActor'
+import { designReviewRunAnsweredByHumanResume } from './repairFlow'
 
 /**
  * **最新の初回 implement を、stepKey の形ではなく human authority の意味で認める**（b8d0fc5d）。
@@ -111,7 +112,12 @@ async function terminalRun(shape: Shape, kind: RunKind, repairSourceJobId: strin
 async function resumedReview(shape: Shape, actor: 'human' | 'pl', source: Job = shape.r0): Promise<Job> {
   const r1 = job(shape.storage, shape, { agentRole: 'qa_ai', aiCliMode: 'review', workflowStepKey: `resume:${source.id}:1` }, { status: 'failed', exitCode: 0 })
   if (actor === 'human') {
-    recordResumeActor(shape.storage, { jobId: r1.id, taskId: shape.taskId, actorClass: 'human', evidence: 'admin_credential' })
+    // R-4: Human Resume は作成時点で Task を止めていた run を記録する（route と同じ関数）。
+    const answeredRunId = designReviewRunAnsweredByHumanResume(shape.storage, shape.taskId)
+    recordResumeActor(shape.storage, {
+      jobId: r1.id, taskId: shape.taskId, actorClass: 'human', evidence: 'admin_credential',
+      ...(answeredRunId !== undefined ? { answeredRunId } : {}),
+    })
   } else {
     recordResumeActor(shape.storage, { jobId: r1.id, taskId: shape.taskId, actorClass: 'pl', evidence: 'in_process_pl', technicalResume: true })
   }
@@ -171,6 +177,46 @@ describe('Stored Review Recovery: 最新の初回 implement は consume 済み�
         authority: { kind: 'human_recovery', approvalRequestId: first.approvalRequestId, reviewJobId: shape.r0.id },
       },
     })
+  })
+
+  it('handoff を断られた consume 済み承認は使い切られ、次の Stored Review Recovery は新しい承認を求める（R-3）', async () => {
+    const shape = await b8d0fc5dShape()
+    await terminalRun(shape, 'REVIEW_UNAVAILABLE')
+    const first = recover(shape)
+    if (first.status !== 'awaiting_approval') throw new Error('fixture expected awaiting_approval')
+    shape.storage.approvalRequests.recordDecision(first.approvalRequestId, 'APPROVED', undefined, { credentialClass: 'admin' })
+    const queued = recover(shape)
+    if (queued.status !== 'queued') throw new Error('fixture expected queued')
+    expect(shape.storage.approvalRequests.findById(first.approvalRequestId)?.status).toBe('CONSUMED')
+
+    // Design Review は ALIGNED で終わったが、その間に Project が止まった → handoff は断られる。
+    const run = shape.storage.designReviewRuns.findById(queued.runId)!
+    const claimed = shape.storage.designReviewRuns.claim(run.id, 3)
+    shape.storage.designReviewRuns.complete(run.id, claimed.claimToken!, 'succeeded', JSON.stringify({
+      reviewLoad: 'low', selectedFocuses: [], focusedReviewResults: [],
+      integrationReviewResult: { decision: 'ALIGNED', summary: 'ALIGNED', findings: [] },
+      finalDecision: 'ALIGNED',
+    }))
+    await tick()
+    shape.storage.projects.update(shape.projectId, { status: 'paused' })
+    const handoff = completeRepairHandoff(shape.storage, shape.storage.designReviewRuns.findById(run.id)!, queued.stepKey, shape.taskId, shape.impl)
+    expect(handoff.status).toBe('skipped')
+
+    const spent = shape.storage.auditLog.findByEntity('approval_request', first.approvalRequestId)
+      .filter((entry) => entry.operation === 'stored_review_recovery_spent')
+    expect(spent).toHaveLength(1)
+    expect(humanRecoveryAuthorityByImplementation(shape.storage, shape.taskId).has(shape.impl.id)).toBe(false)
+
+    // Project が再開しても、使い切られた承認は authority にならない。
+    shape.storage.projects.update(shape.projectId, { status: 'running' })
+    expect(prepareRepairFlow(shape.storage, { failedJob: shape.impl })).toMatchObject({
+      action: 'skip',
+      code: 'recovery_authority_required',
+    })
+    const again = recover(shape)
+    expect(again).toMatchObject({ status: 'awaiting_approval', reused: false })
+    if (again.status !== 'awaiting_approval') return
+    expect(again.approvalRequestId).not.toBe(first.approvalRequestId)
   })
 
   it('repair run が CONFLICT なら承認を作らずに skipped を返す', async () => {
@@ -548,12 +594,14 @@ describe('Stored Review Recovery の skip も repair_admission_skipped を残す
 
 describe('step 7: 実装 lineage 上の Human Resume も run への回答になる', () => {
   async function resumedImplementation(shape: Shape, actor: 'human' | 'ai'): Promise<{ i1: Job; review: Job }> {
+    const answeredRunId = designReviewRunAnsweredByHumanResume(shape.storage, shape.taskId)
     const i1 = job(shape.storage, shape, { aiCliMode: 'implement', workflowStepKey: `resume:${shape.impl.id}:1` }, { status: 'success', exitCode: 0, changedFiles: [DOC] })
     recordResumeActor(shape.storage, {
       jobId: i1.id,
       taskId: shape.taskId,
       actorClass: actor,
       evidence: actor === 'human' ? 'admin_credential' : 'worker_credential',
+      ...(actor === 'human' && answeredRunId !== undefined ? { answeredRunId } : {}),
     })
     await tick()
     const review = job(shape.storage, shape, { agentRole: 'qa_ai', aiCliMode: 'review', workflowStepKey: `implement:${i1.id}:review` }, { status: 'failed', exitCode: 0 })
@@ -568,6 +616,22 @@ describe('step 7: 実装 lineage 上の Human Resume も run への回答にな�
     const { i1, review } = await resumedImplementation(shape, 'human')
 
     expect(prepareRepairFlow(shape.storage, { failedJob: i1, reviewJobId: review.id }).action).toBe('queue')
+  })
+
+  it('R-4: answered_run を記録していない（legacy）実装の Human Resume は答えにならない', async () => {
+    const shape = await b8d0fc5dShape()
+    const conflict = await terminalRun(shape, 'CONFLICT')
+    const i1 = job(shape.storage, shape, { aiCliMode: 'implement', workflowStepKey: `resume:${shape.impl.id}:1` }, { status: 'success', exitCode: 0, changedFiles: [DOC] })
+    recordResumeActor(shape.storage, { jobId: i1.id, taskId: shape.taskId, actorClass: 'human', evidence: 'admin_credential' })
+    await tick()
+    const review = job(shape.storage, shape, { agentRole: 'qa_ai', aiCliMode: 'review', workflowStepKey: `implement:${i1.id}:review` }, { status: 'failed', exitCode: 0 })
+    verdict(shape.storage, shape.taskId, review.id)
+    await tick()
+
+    expect(prepareRepairFlow(shape.storage, { failedJob: i1, reviewJobId: review.id })).toMatchObject({
+      action: 'skip',
+      runId: conflict,
+    })
   })
 
   it('AI の resume は答えにならない', async () => {

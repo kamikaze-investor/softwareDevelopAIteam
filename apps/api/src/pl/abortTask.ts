@@ -50,6 +50,7 @@ import path from 'node:path'
 import {
   getBaseRoadmapId,
   holdsWorkspaceWhenBlocked,
+  isApprovalBlockingTechnicalAbort,
   isLiveJob,
   isLiveApprovedApproval,
   isLiveTaskScopedDecision,
@@ -59,6 +60,7 @@ import {
 } from '@ai-team/shared'
 import { withApprovalActorFacts } from '../designReview/resumeActor'
 import type { IStorage } from '../storage/interface'
+import { readApprovalActorClass } from '../designReview/resumeActor'
 import type { Job, JobWorkspaceBaseline, Task } from '@ai-team/shared'
 import { authorizePlAction, PlActionBlockedError } from './actionGate'
 import { buildSystemState, type AttentionItem } from '../state/systemState'
@@ -935,8 +937,14 @@ export function requestTechnicalAbort(
   // 全行を見るのは、新しい期限切れ WAITING の陰に古い APPROVED が残る legacy 状態でも人の判断を見落とさないため。
   // 期限切れの APPROVED は consume できない（gate と同じ遅延判定）ので、もう誰の authority でもない。
   // それを数えると、期限切れ未消費の承認 1 行で Technical Abort が恒久的に拒否される（2026-10-16 監査 B-2）。
+  // 判定は最終 transaction（storage `completeTechnicalAbortCleanup`）と同じ shared の1つ（H-2 / T-1）:
+  // 期限内または期限の読めない WAITING、決定主体が human の APPROVED だけが止める。
+  const nowMs = Date.now()
   const activeApproval = storage.approvalRequests.findByTaskId(task.id)
-    .find((request) => isLiveApprovedApproval(request) || isLiveWaitingApproval(request))
+    .find((request) => isApprovalBlockingTechnicalAbort(
+      { ...request, approvalActor: readApprovalActorClass(storage, request.id) },
+      { nowMs },
+    ))
   if (activeApproval !== undefined) {
     recordTechnicalAbortRefusal(storage, {
       taskId: task.id,

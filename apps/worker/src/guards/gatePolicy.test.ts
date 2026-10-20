@@ -268,6 +268,8 @@ describe('resolvePolicy — 組の整合（全 decision × continuationPolicy ×
       riskReview: { riskLevel: 'HIGH', triggeredRules: [], requiresIndependentReview: true },
       continuationPolicy: policy as never,
       nextAction: { action: action as never, message: 'm', ...(action === 'call_consume' ? { consumedRequestId: 'x' } : {}) },
+      // call_consume は consume する承認（同じ id）を返す（G-2: id の一致も整合の一部）。
+      ...(action === 'call_consume' ? { approvalRequest: { id: 'x', status: 'APPROVED', expiresAt: '2099-01-01T00:00:00.000Z', riskLevel: 'HIGH' } } : {}),
     })
   }
 
@@ -286,6 +288,23 @@ describe('resolvePolicy — 組の整合（全 decision × continuationPolicy ×
   it('契約違反はローカルのリスク比較より先（ローカル CRITICAL でも理由は approval_contract_violation）', () => {
     const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'CRITICAL' }), build('BLOCKED', 'continue', 'wait_for_approval'))
     expect(findGateTechnicalStopCode(result.reason)).toBe('approval_contract_violation')
+  })
+})
+
+describe('resolvePolicy — call_consume の承認 id の食い違いは契約外（G-2）', () => {
+  it.each([
+    ['outcome.consumedRequestId が無い', { ...approvedConsume('HIGH'), outcome: { decision: 'ALLOW', riskLevel: 'HIGH' } }],
+    ['outcome.consumedRequestId が違う', { ...approvedConsume('HIGH'), outcome: { decision: 'ALLOW', riskLevel: 'HIGH', consumedRequestId: 'other' } }],
+    ['approvalRequest が無い', { ...approvedConsume('HIGH'), approvalRequest: undefined }],
+    ['approvalRequest.id が違う', { ...approvedConsume('HIGH'), approvalRequest: { id: 'other', status: 'APPROVED', expiresAt: '2099-01-01T00:00:00.000Z', riskLevel: 'HIGH' } }],
+  ] as const)('%s → re_check approval_contract_violation（failed にしない）', (_label, response) => {
+    const result = resolvePolicy(makeGateResult({ finalRiskLevel: 'HIGH' }), response as unknown as GateCheckResponse)
+    expect(result.policy).toBe('re_check')
+    expect(findGateTechnicalStopCode(result.reason)).toBe('approval_contract_violation')
+  })
+
+  it('一致していれば従来どおり continue', () => {
+    expect(resolvePolicy(makeGateResult({ finalRiskLevel: 'HIGH' }), approvedConsume('HIGH')).policy).toBe('continue')
   })
 })
 

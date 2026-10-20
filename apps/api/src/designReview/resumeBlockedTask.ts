@@ -1,6 +1,7 @@
 import type { Task } from '@ai-team/shared'
 import type { IStorage, ResumeBlockedTaskResult } from '../storage/interface'
 import type { ResumeActorEvidence } from './resumeActor'
+import { designReviewRunAnsweredByHumanResume } from './repairFlow'
 import {
   buildDefaultCoordinatorDeps,
   createAndExecuteDesignReview,
@@ -47,7 +48,7 @@ export async function resumeBlockedTaskWithDesignReview(
   let resumed = storage.jobs.resumeBlockedTask({
     taskId: input.task.id,
     instructionPrompt: input.instructionPrompt,
-    resumedBy: input.resumedBy,
+    resumedBy: withAnsweredRun(storage, input.task.id, input.resumedBy),
   })
 
   if (!resumed.ok && resumed.code === 'DESIGN_REVIEW_PRECONDITION_FAILED') {
@@ -89,10 +90,20 @@ export async function resumeBlockedTaskWithDesignReview(
     resumed = storage.jobs.resumeBlockedTask({
       taskId: input.task.id,
       instructionPrompt: input.instructionPrompt,
-      resumedBy: input.resumedBy,
+      resumedBy: withAnsweredRun(storage, input.task.id, input.resumedBy),
       ...(reviewedSourceJobId !== undefined ? { expectedSourceJobId: reviewedSourceJobId } : {}),
     })
   }
 
   return resumed
+}
+
+/**
+ * Human Resume は、作成時点で Task を止めていた Design Review run を明示的に答える（R-4）。
+ * その id を resume_actor 行（resume Job と同じ transaction で書かれる）へ載せる。human 以外は何も答えない。
+ */
+function withAnsweredRun(storage: IStorage, taskId: string, resumedBy: ResumeActorEvidence): ResumeActorEvidence {
+  if (resumedBy.actorClass !== 'human') return resumedBy
+  const answeredRunId = designReviewRunAnsweredByHumanResume(storage, taskId)
+  return answeredRunId === undefined ? resumedBy : { ...resumedBy, answeredRunId }
 }
