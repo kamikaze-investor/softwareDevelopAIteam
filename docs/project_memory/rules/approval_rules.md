@@ -276,13 +276,29 @@ DA trigger (2) により、その変更は本節で旧→新を明示し、CEO �
 
 ### 0. 変えないもの
 
-- **Gate の risk 分類は origin/master のまま（+ `evaluateCommitGate()`）。** 修復が一時広げた HIGH の一覧
+- **Gate の risk 分類は、下記 0-1 の2件を除き origin/master のまま。** 修復が一時広げた HIGH の一覧
   （`RISK_RULES` [L06-7]・`GATE_CHANGE_EXACT_FILES` [L11-1]・追加 HIGH files と authority-coverage CI guard [L12-1]）は
   戻した。Risk は必要な Evidence の強さを決め、誰が決めるかは決めない（`specs/22` 14-3）
 - **CODEOWNERS は広げない。**
-- **Gate の技術停止（`risk_rule_skew` / `approval_contract_violation`）は CEO escalation ではない。** 見える技術停止
-  （`technical_exhausted`）として扱う（下記 T-3）
+- **Gate の技術停止（`risk_rule_skew` / `approval_contract_violation` / 承認済み commit の Gate 段階拒否）は CEO escalation ではない。**
+  見える技術停止（`technical_exhausted`）として扱う（下記 T-3）
 - 最重要原則（AI承認は無効）・TTL 24時間・Candidate Freeze・「resume は Gate を代替しない」の6点・Yellow Zone の列挙は変えない
+
+### 0-1. Risk 分類で変えるもの（何が承認を要するか (b) の拡大）
+
+**K-1 `docs/project_memory/rules/` 配下をすべて HIGH にする**（(b)）
+- 旧: この配下で HIGH（decision authority / safety policy doc）は `rules/approval_rules.md` 1ファイルだけ
+- 新: `docs/project_memory/rules/` 配下の**全ファイル**が HIGH。したがって、これらに触れる Tier A の git_commit は人の承認（Approval Gate B）を要する
+- 不明時: パスが配下に当たるか判定できなければ HIGH 側に倒す（パターン照合は大文字小文字を区別しない）
+- 根拠: rules/ は承認ルール以外も運用ルールの正本（CLAUDE.md 7 章の Operational Knowledge）であり、`specs/22` 14-3 DA trigger (1) の Policy 文書に当たる。
+  Policy 文書の変更は人の判断（同 1-2）。risk を上げる理由は Decision Authority であって「危険だから」ではない
+- code: `packages/shared/src/approvalGateLogic.ts` `RISK_RULES`（label `decision authority / safety policy doc`）
+
+**K-2 commitGate の実ファイルを HIGH にする**（(b)）
+- 旧: `apps/worker/src/approvalLevel/commitGate.ts` は HIGH の対象外
+- 新: その production ファイル（exact path。隣のテストは含まない）を HIGH にする
+- 根拠: `evaluateCommitGate()` は `specs/22` 14-3 DA trigger (2) が名指しする authority 定義である
+- code: `approvalGateLogic.ts` `RISK_RULES`（label `alignment / gate change`）
 
 ### 1. 人の authority の証拠
 
@@ -309,21 +325,21 @@ DA trigger (2) により、その変更は本節で旧→新を明示し、CEO �
 | --- | --- | --- |
 | B-1 PL の `approval_gate` evidence（(c)、[L06-2]） | requestedAction の完全一致は `abort_task` だけ | **全 PL action** で `requiredApprovalRequestAction()` と完全一致 |
 | B-2 git_commit 以外の `/consume`（(c)、[L06-4]） | jobId 不要。Task 単位の承認も消費できた | jobId 必須。Job 実在・同一 Task・command kind = requestedAction・APPROVED・未失効・commit / diff 一致を 1 transaction で確認。Task 単位の承認は `/consume` では消費できない |
-| B-3 jobId 無しの `/gate/check`（(c)、[L06-5]） | 既存承認を読み、起票し得た | **評価だけ**。承認を読まない・作らない・`call_consume` を返さない |
-| B-4 `/gate/check` の再利用（(c)、[L06-3]） | 再利用対象を同 action の最新行に限っていなかった | 同 action の最新の WAITING / APPROVED だけ |
+| B-3 jobId 無しの `/gate/check`（(c)、[L06-5]） | 既存承認を読み、起票し得た | **評価だけ**（`gate_evaluations` だけを残す）。active な承認を読まない・作らない・`call_consume` を返さない。REJECTED の参照は実行を許さない側の情報なので従来どおり行う |
+| B-4 git_commit 以外の `/gate/check` の再利用（(c)、[L06-3]） | Task の最新の WAITING / APPROVED 1件を requestedAction を問わず再利用した（別 action への承認でも通り得た） | 同じ requestedAction の active 行だけを新しい順に見て再利用する。git_commit は従来どおり Job に紐づく承認だけ |
 | B-5 Task あたり WAITING は1件（(d)、[L06-9, L02-1]） | 新しい要求が他の WAITING を残した | 起票（`/gate/check` の BLOCKED・`POST /approval-requests`・Stored Review Recovery）は1 transaction で Task の WAITING を action・期限を問わず全部 SUPERSEDED、同 action の APPROVED も置換。**別 action の APPROVED（人の判断）は残す** |
 | B-6 git_commit の起票（(c)(d)、[L02-2]） | 他の WAITING を残した | Job への紐付けと同時に Task の他の WAITING を SUPERSEDED（APPROVED は残す）。Job が running / blocked でなければ `JOB_NOT_ACTIVE` で拒否 |
 | B-7 HIGH の safe work（(b)(d)、[L06-6, L06-10]） | 承認要求を起票し、誰も待たない WAITING が残った | `git_status` / `diff` / `log` / `typecheck` / `test` / `lint` の HIGH 判定は起票しない。残っている HIGH の safe-work WAITING は SUPERSEDED（`safe_work_no_waiter`）。**CRITICAL の行には触れない** |
 | B-8 git_commit 以外の REJECTED（(d)、[L06-8]） | 他の action も止めた | 同じ requestedAction だけを止める |
-| B-9 Stage-1 retry を止める承認（(b)、[L02-5]） | 期限切れの WAITING・古い REJECTED も止めた | 生きた WAITING か最新の REJECTED だけ |
+| B-9 provider timeout 失敗後の自動 retry を止める承認（(b)、[L02-5]） | Task の**最新行**が WAITING（期限切れを含む）か REJECTED なら止めた | Task の**全行**のうち生きた（未失効の）WAITING があるか、最新行が REJECTED（期限を問わない）なら止める。期限切れの WAITING は止めない。新しい行の陰にある古い生きた WAITING は止める側に数える |
 
 - 不明時: 一致・実在・状態を確認できなければ evidence 不足として拒否し、消費しない（期限切れ → EXPIRED、
   commit / diff 不一致 → STALE）。safe work と確定できなければ従来どおり起票する。transaction が完了しなければ何も起票しない
 - 根拠: 承認を「その操作・その Job・その時点の人の判断」へ狭く束縛する強化であり、技術判断（`specs/22` 1-2 末尾）。
   B-7 は読み取り・検証だけで人の判断が発生しない（同 1-2・14-3）。Risk 分類自体は変えない
 - code: `apps/api/src/pl/actionGate.ts` `checkApprovalGate()` / `requiredApprovalRequestAction()`、
-  `apps/api/src/routes/approvalGate.ts` `approvalGateRoutes()`（`/gate/check`・`/consume`・`findRelevantRejectedRequest()`）、
-  storage `replaceActiveAndCreate()` / `createForJob()` / `consumeForCommandJob()` / `supersedeUnwaitedSafeWorkRequests()`
+  `apps/api/src/routes/approvalGate.ts` `approvalGateRoutes()`（`/gate/check`・`/consume`・`findActiveRequestForAction()`・`findRelevantRejectedRequest()`）、
+  storage `replaceActiveAndCreate()` / `createForJob()` / `consumeForCommandJob()` / `supersedeUnwaitedSafeWorkRequests()` / `persistProviderTimeoutFailure()`（B-9）
 
 ### 3. 置換・無効化
 
@@ -359,8 +375,8 @@ DA trigger (2) により、その変更は本節で旧→新を明示し、CEO �
 - 不明時: verdict が `changes_requested` と読めない・actor 不明 → 根にしない（予算は reset しない）
 - 根拠: 予算 reset は「人がこの実装の修正要求を見て続けさせた」事実の効果に限る。PL Technical Resume は reset しない（1-2: AI 自身に予算＝Safety Level を戻させない、7 章）
 - code: `repairFlow.ts` `readImplementationAuthorities()`、`repairPolicy.ts` `walkRepairGeneration()`、`resumeActor.ts` `recordRepairGeneration()`
-- **既知の不一致（要コード整合）**: 現コードは `human_resume` の予算 authority には `changes_requested` を要求するが、
-  R-1 (ii) の admission（`coveredByHumanResume`）は要求しない。本規則は厳しい側（admission (ii) にも `changes_requested` を要求）を採る
+- 注: 修復の途中では、予算 authority だけが `changes_requested` を要求し、R-1 (ii) の admission は要求していなかった。
+  本規則は厳しい側を採り、最終コードは両方で要求する（`repairFlow.ts` `coveredByHumanResume`）
 
 **R-3 Stored Review Recovery の承認の効果**（(d)、[L04-4]）
 - 新: consume 済みの承認でも、handoff が拒否される（Task done / parked・Project not running）と修復は作られない。承認は再利用しない。再度必要なら新しい承認を求める
@@ -437,12 +453,18 @@ DA trigger (2) により、その変更は本節で旧→新を明示し、CEO �
 
 **T-3 Gate の技術停止は CEO escalation ではない**（(b)、[L13-4]）
 - 旧: triage rule 6.8（Gate の技術停止）と 6.9（承認済み git_commit を Worker が拒否）は CEO escalation で、6.9 は `requiresAuthorityChange` を立てた
-- 新: どちらも見える技術停止として扱う。自動 resume はせず、PL の記録は `technical_exhausted`、`requiresAuthorityChange=false`。
-  systemState は技術停止した Job に `approval_waiting` を出さない。原因を直した後の resume が出口（git_commit なら新しい承認）
-- 不明時: 停止理由が技術停止と確定できなければ既存の rule（却下・guard・quarantine 等）へ回す
-- 根拠: 版ずれ・契約外の応答は技術判断であり CEO へ上げない（`specs/22` 1-3・14-3「停止回数は CEO escalation 条件にしない」）
-- code: `apps/api/src/pl/blockedTriage.ts` `triageBlocked()`（rule 6.8 / 6.9）、`systemState.ts` `buildSystemState()`
-- **要コード整合**: 現コードは 6.8 / 6.9 とも `recommendedLane: 'ceo_escalation'` のまま
+- 新: どちらも技術レーン（`auto_recovery`）のまま `technicalStop`（6.8 は `risk_rule_skew` / `approval_contract_violation`、
+  6.9 は `approved_commit_gate_refusal`）を立てる。効果は次のとおり:
+  - 自動 recovery の budget は最初から 0。最初の観測で対象単位の `technical_exhausted` audit を1回だけ残す（`limit=0`・`stop=<code>`）
+  - escalation 行を作らず、通知もしない。`requiresAuthorityChange=false`
+  - `job_blocked` は attention に残る（見える停止）。結び付いた WAITING があっても systemState は `approval_waiting` ではなく `job_blocked` を出す
+  - 原因を直した後の明示 resume は従来どおり admit される（新しい Job なので上の audit に縛られない。git_commit なら新しい承認）。
+    生きた WAITING がある間は resume は admit されず、出口はその WAITING を承認すること
+- 不明時: 停止理由が技術停止と確定できなければ（stderr 先頭の理由コード・コマンド未実行・Worker の証拠が Gate 段階の拒否を示す、のどれかが欠ける）
+  `technicalStop` を立てず、既存の rule（却下・guard・quarantine 等）へ回す。CEO が却下した git_commit は却下の扱いを優先する
+- 根拠: 版ずれ・契約外の応答・consume の想定外の拒否は技術判断であり CEO へ上げない（`specs/22` 1-3・14-3「停止回数は CEO escalation 条件にしない」）
+- code: `apps/api/src/pl/blockedTriage.ts` `triageBlocked()`（rule 6.8 / 6.9、`BlockedDiagnosis.technicalStop`）、
+  `apps/api/src/pl/executionLoop.ts` `technicalRecoveryExhaustion()` / `recordTechnicalRecoveryExhaustion()`、`systemState.ts` `buildSystemState()`
 
 ### 6. git_commit 承認の効果と Worker の技術停止
 
@@ -569,4 +591,4 @@ Rollback可否:
 *Updated: 2026-09-16 — 「2種類の承認 — 役割と使い分け」「Mobile導線」「既知の制約」章を追加（Roadmap「2種類の承認の役割整理とMobile導線設計」の文書化分）*
 *Updated: 2026-09-30 — Mobile導線にホーム入口（バッジ件数・キャッシュ先読み）とProject詳細（B のみ・表示専用）を追記。既知の制約4を追加*
 *Updated: 2026-10-02 — 上位原則を Decision Authority Principle（`specs/22` 1章）へ改訂。Yellow Zone の各項目に意味ベースの解釈を付記。Binding Review の Escalate 条件を「弱化・拡大」に限定*
-*Updated: 2026-10-20 — 「Lifecycle 一括修復による承認の意味の変更」章を追加（Approval Tuple の旧→新。CEO code-owner review 対象）。2種類の承認 A を改訂し、方針承認は PL action を認可しないとした*
+*Updated: 2026-10-20 — 「Lifecycle 一括修復による承認の意味の変更」章を追加（Approval Tuple の旧→新。CEO code-owner review 対象）。2種類の承認 A を改訂し、方針承認は PL action を認可しないとした。`docs/project_memory/rules/` 配下と commitGate を HIGH にする規則（0-1）を明記*
