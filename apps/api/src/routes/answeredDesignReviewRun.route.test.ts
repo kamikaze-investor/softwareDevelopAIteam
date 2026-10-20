@@ -1,4 +1,5 @@
 import Fastify, { type FastifyInstance } from 'fastify'
+import { setCredentialClass } from '../auth/credentialClass'
 import { Writable } from 'node:stream'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { createHash } from 'node:crypto'
@@ -42,6 +43,11 @@ async function buildApp(lines: LogLine[]): Promise<FastifyInstance> {
     },
   })
   const app = Fastify({ logger: { level: 'warn', stream } })
+  // C-1: the Worker's result delivery is authenticated as the Worker (apiTokenAuth sets the class in
+  // production). These route tests have no auth plugin, so stand in for it on the Worker's PATCH /api/jobs/:id.
+  app.addHook('onRequest', async (req) => {
+    if (req.method === 'PATCH' && /^\/api\/jobs\/[^/?]+(\?|$)/.test(req.url)) setCredentialClass(req, 'worker')
+  })
   app.register(jobRoutes, { prefix: '/api/jobs' })
   await app.ready()
   return app

@@ -817,9 +817,10 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
     // 従来どおり `PATCH /:id/fail-if-running`・eventId 無しの failed / blocked・requeue（→ queued）である。
     // **Outbox event の由来も確かめる**（Codex review r5）: eventId と payloadHash は呼び出し側が計算できるので、
     // split credential では Worker credential の配送だけを Worker の結果として受ける。ADMIN が event 欄を付けても
-    // success は書けない。legacy（単一 token）と未認証のテスト構成は由来を区別できないため従来どおり。
+    // success は書けない。legacy（単一 token）は由来を区別できないため従来どおり。credential class の無い
+    // （認証を通っていない）配送は Worker の由来ではない（C-1）: 未認証の success 書き込みを受け付けない。
     const credentialClass = getCredentialClass(req)
-    const workerProvenance = credentialClass === undefined || credentialClass === 'worker' || credentialClass === 'legacy'
+    const workerProvenance = credentialClass === 'worker' || credentialClass === 'legacy'
     if (
       (outboxEvent === undefined || !workerProvenance)
       && jobUpdate.status === 'success'

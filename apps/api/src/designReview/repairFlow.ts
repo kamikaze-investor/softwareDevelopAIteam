@@ -50,8 +50,8 @@ import {
   type ResumeActorClass,
   type GenerationAuthority,
 } from './repairPolicy'
-import { humanRecoveryAuthorityByImplementation } from './repairRecoveryEpoch'
-import { readResumeActorClasses, recordRepairGeneration } from './resumeActor'
+import { humanRecoveryAuthorityByImplementation, recordRefusedHandoffSpendsRecoveryApproval } from './repairRecoveryEpoch'
+import { readAnsweredRunIds, readResumeActorClasses, recordRepairGeneration } from './resumeActor'
 import { isVerifiedPlTechnicalResumeAudit } from '../pl/technicalResumePolicy'
 
 /**
@@ -712,15 +712,43 @@ function answeredByHumanResume(
   run: DesignReviewRun,
   repairSourceJobId: string,
   humanResumes: readonly Job[],
+  answeredRunIds: ReadonlyMap<string, string>,
 ): boolean {
   if (run.repairSourceJobId === undefined || run.repairSourceJobId !== repairSourceJobId) return false
   if (run.status !== 'succeeded' && run.status !== 'failed') return false
   const completedAt = run.completedAt === undefined ? Number.NaN : Date.parse(run.completedAt)
   if (!Number.isFinite(completedAt)) return false
+  // R-4: 時刻の前後だけでは答えにならない。その resume が**この run を答えたと記録している**ことを要る。
   return humanResumes.some((job) => {
     const createdAt = Date.parse(job.createdAt)
-    return Number.isFinite(createdAt) && createdAt > completedAt
+    return Number.isFinite(createdAt) && createdAt > completedAt && answeredRunIds.get(job.id) === run.id
   })
+}
+
+/**
+ * **いま Human Resume を作ると、それが答える Design Review run**（R-4。resume 作成時に記録する値）。
+ *
+ * Task の run を新しい順に見て、判定を出して終端した非 ALIGNED の run のうち、同じ対象
+ * （`repairSourceJobId`）のより新しい ALIGNED で解消されていない最も新しい 1 件を返す
+ * （`blockingDesignReviewRun()` と同じ除外規則）。無ければ undefined（その resume は何も答えない）。
+ */
+export function designReviewRunAnsweredByHumanResume(
+  storage: IStorage,
+  taskId: string,
+): string | undefined {
+  const runs = storage.designReviewRuns.findByTaskId(taskId)
+  for (const [index, run] of runs.entries()) {
+    if (run.status !== 'succeeded') continue
+    if (isTerminalRunWithoutJudgment(run)) continue
+    if (safeRecomputedDecision(run) === 'ALIGNED') continue
+    const resolvedLater = runs.slice(0, index).some((newer) =>
+      newer.repairSourceJobId === run.repairSourceJobId
+      && newer.status === 'succeeded'
+      && safeRecomputedDecision(newer) === 'ALIGNED')
+    if (resolvedLater) continue
+    return run.id
+  }
+  return undefined
 }
 
 /**
@@ -771,6 +799,8 @@ function blockingDesignReviewRun(
     /** 実装自身から近い順の lineage（`[実装, ...ancestors]`）。 */
     lineageJobIds: readonly string[]
     lineageHumanResumes: readonly Job[]
+    /** Human Resume の Job id → その resume が作成時に記録した「答えた run」の id（R-4）。 */
+    answeredRunIds: ReadonlyMap<string, string>
   },
 ): { reason: string; runId: string } | undefined {
   const sameSubject = (a: DesignReviewRun, b: DesignReviewRun): boolean =>
@@ -782,7 +812,7 @@ function blockingDesignReviewRun(
   }
 
   for (const [index, run] of runs.entries()) {
-    if (answeredByHumanResume(run, context.implementJobId, context.reviewHumanResumes)) continue
+    if (answeredByHumanResume(run, context.implementJobId, context.reviewHumanResumes, context.answeredRunIds)) continue
     if (run.status === 'queued' || run.status === 'running') {
       return { reason: 'latest design review decision could not be recomputed', runId: run.id }
     }
@@ -804,8 +834,12 @@ function blockingDesignReviewRun(
     if (resolvedLater) continue
 
     const answerableHops = new Set(context.lineageJobIds.slice(0, subjectIndex))
+    // R-4: repair 対象より下流の Human Resume で、かつ**この run を答えたと記録している**ものだけ。
+    // 記録の無い legacy resume は何も答えない（時刻の前後からは推論しない）。
     const answeredInLineage = context.lineageHumanResumes.some((job) =>
-      answerableHops.has(job.id) && createdAfterCompletion(run, job))
+      answerableHops.has(job.id)
+      && createdAfterCompletion(run, job)
+      && context.answeredRunIds.get(job.id) === run.id)
     if (answeredInLineage) continue
 
     if (recomputed === undefined) {
@@ -1080,14 +1114,17 @@ function repairableBlockedReviewRequest(
   //    非除外 run だけを見ていたため、新しい無関係な ALIGNED（別の repair や Task 設計の run）が
   //    古い未回答の CONFLICT を隠していた。規則は `blockingDesignReviewRun()` に 1 か所でまとめてある。
   const lineageJobIds = [implementJob.id, ...lineage.lineageAncestorJobIds]
+  const reviewHumanResumes = humanResumesOf(storage, reviewResumeHops)
+  const lineageHumanResumes = taskJobs.filter((job) =>
+    lineageJobIds.includes(job.id) && resumeActorClasses.get(job.id) === 'human')
   const blockingRun = blockingDesignReviewRun(
     storage.designReviewRuns.findByTaskId(task.id),
     {
       implementJobId: implementJob.id,
-      reviewHumanResumes: humanResumesOf(storage, reviewResumeHops),
+      reviewHumanResumes,
       lineageJobIds,
-      lineageHumanResumes: taskJobs.filter((job) =>
-        lineageJobIds.includes(job.id) && resumeActorClasses.get(job.id) === 'human'),
+      lineageHumanResumes,
+      answeredRunIds: readAnsweredRunIds(storage, [...reviewHumanResumes, ...lineageHumanResumes]),
     },
   )
   if (blockingRun !== undefined) return { ok: false, ...blockingRun }
@@ -1525,6 +1562,8 @@ export function completeRepairHandoff(
   // ここで repair Job を作ると park が黙って取り消される（escalate もしない —
   // park された Task を blocked へ上げるのは park の取り消しと同じ結果になる）。
   if (storage.tasks.isParked(taskId)) {
+    // 断られた handoff は、その実装に epoch を開いた承認を使い切る（R-3）。
+    recordRefusedHandoffSpendsRecoveryApproval(storage, { taskId, sourceJobId: sourceJob.id, runId: run.id, reason: 'TASK_PARKED' })
     return { status: 'skipped', reason: 'task was parked by abort_task while the review ran' }
   }
 
@@ -1554,6 +1593,8 @@ export function completeRepairHandoff(
   // **blocked では断られない** —— Stored Review Recovery は blocked な Task から正規に handoff する。
   if (!repairJob.ok && isRepairHandoffRefusal(repairJob.code)) {
     console.warn(`[repairFlow] repair handoff refused for task ${taskId} (${repairJob.code}): ${repairJob.reason}`)
+    // 承認で開いた epoch が何も実体化しなかった。その承認を恒久 authority として残さない（R-3）。
+    recordRefusedHandoffSpendsRecoveryApproval(storage, { taskId, sourceJobId: sourceJob.id, runId: run.id, reason: repairJob.code })
     return { status: 'skipped', reason: repairJob.reason }
   }
 

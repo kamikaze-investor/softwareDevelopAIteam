@@ -1,4 +1,5 @@
 import Fastify, { type FastifyInstance } from 'fastify'
+import { setCredentialClass } from '../auth/credentialClass'
 import { createHash, randomUUID } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 import { canonicalizeJobUpdate, type Job, type Task } from '@ai-team/shared'
@@ -33,6 +34,11 @@ async function withApp(run: (app: FastifyInstance) => Promise<void>): Promise<vo
   ])
   resetStorage()
   const app = Fastify()
+  // C-1: the Worker's result delivery is authenticated as the Worker (apiTokenAuth sets the class in
+  // production). These route tests have no auth plugin, so stand in for it on the Worker's PATCH /api/jobs/:id.
+  app.addHook('onRequest', async (req) => {
+    if (req.method === 'PATCH' && /^\/api\/jobs\/[^/?]+(\?|$)/.test(req.url)) setCredentialClass(req, 'worker')
+  })
   app.register(approvalGateRoutes, { prefix: '/api' })
   app.register(taskRoutes, { prefix: '/api/tasks' })
   app.register(jobRoutes, { prefix: '/api/jobs' })
