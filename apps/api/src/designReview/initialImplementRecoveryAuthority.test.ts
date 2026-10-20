@@ -219,6 +219,74 @@ describe('Stored Review Recovery: 最新の初回 implement は consume 済み�
     expect(again.approvalRequestId).not.toBe(first.approvalRequestId)
   })
 
+  it('使い切り marker が書けなければ refusal は確定せず、再試行で marker と一緒に断られる（R-3: 同じ transaction）', async () => {
+    const shape = await b8d0fc5dShape()
+    await terminalRun(shape, 'REVIEW_UNAVAILABLE')
+    const first = recover(shape)
+    if (first.status !== 'awaiting_approval') throw new Error('fixture expected awaiting_approval')
+    shape.storage.approvalRequests.recordDecision(first.approvalRequestId, 'APPROVED', undefined, { credentialClass: 'admin' })
+    const queued = recover(shape)
+    if (queued.status !== 'queued') throw new Error('fixture expected queued')
+    const run = shape.storage.designReviewRuns.findById(queued.runId)!
+    const claimed = shape.storage.designReviewRuns.claim(run.id, 3)
+    shape.storage.designReviewRuns.complete(run.id, claimed.claimToken!, 'succeeded', JSON.stringify({
+      reviewLoad: 'low', selectedFocuses: [], focusedReviewResults: [],
+      integrationReviewResult: { decision: 'ALIGNED', summary: 'ALIGNED', findings: [] },
+      finalDecision: 'ALIGNED',
+    }))
+    await tick()
+    shape.storage.projects.update(shape.projectId, { status: 'paused' })
+    const auditBefore = shape.storage.auditLog.findByEntity('approval_request', first.approvalRequestId).length
+    const jobsBefore = shape.storage.jobs.findByTaskId(shape.taskId).length
+
+    // audit の書き込みだけを壊す。
+    const originalRecord = shape.storage.auditLog.record.bind(shape.storage.auditLog)
+    shape.storage.auditLog.record = (() => { throw new Error('audit disk full') }) as typeof shape.storage.auditLog.record
+    try {
+      expect(() => completeRepairHandoff(
+        shape.storage, shape.storage.designReviewRuns.findById(run.id)!, queued.stepKey, shape.taskId, shape.impl,
+      )).toThrow(/spent marker/)
+    } finally {
+      shape.storage.auditLog.record = originalRecord
+    }
+    // 何も確定していない: marker も repair Job も無く、Task も escalation されていない。
+    expect(shape.storage.auditLog.findByEntity('approval_request', first.approvalRequestId)).toHaveLength(auditBefore)
+    expect(shape.storage.jobs.findByTaskId(shape.taskId)).toHaveLength(jobsBefore)
+
+    // 再試行: refusal と marker が一緒に確定し、承認は authority から外れる。
+    const retried = completeRepairHandoff(
+      shape.storage, shape.storage.designReviewRuns.findById(run.id)!, queued.stepKey, shape.taskId, shape.impl,
+    )
+    expect(retried.status).toBe('skipped')
+    expect(shape.storage.auditLog.findByEntity('approval_request', first.approvalRequestId)
+      .filter((entry) => entry.operation === 'stored_review_recovery_spent')).toHaveLength(1)
+    expect(humanRecoveryAuthorityByImplementation(shape.storage, shape.taskId).has(shape.impl.id)).toBe(false)
+  })
+
+  it('park で断られた handoff も同じ transaction で承認を使い切る（R-3）', async () => {
+    const shape = await b8d0fc5dShape()
+    await terminalRun(shape, 'REVIEW_UNAVAILABLE')
+    const first = recover(shape)
+    if (first.status !== 'awaiting_approval') throw new Error('fixture expected awaiting_approval')
+    shape.storage.approvalRequests.recordDecision(first.approvalRequestId, 'APPROVED', undefined, { credentialClass: 'admin' })
+    const queued = recover(shape)
+    if (queued.status !== 'queued') throw new Error('fixture expected queued')
+    const run = shape.storage.designReviewRuns.findById(queued.runId)!
+    const claimed = shape.storage.designReviewRuns.claim(run.id, 3)
+    shape.storage.designReviewRuns.complete(run.id, claimed.claimToken!, 'succeeded', JSON.stringify({
+      reviewLoad: 'low', selectedFocuses: [], focusedReviewResults: [],
+      integrationReviewResult: { decision: 'ALIGNED', summary: 'ALIGNED', findings: [] },
+      finalDecision: 'ALIGNED',
+    }))
+    await tick()
+    shape.storage.auditLog.record({ actor: 'api', operation: 'task_aborted', entityType: 'task', entityId: shape.taskId, result: 'success' })
+    expect(shape.storage.tasks.isParked(shape.taskId)).toBe(true)
+
+    const handoff = completeRepairHandoff(shape.storage, shape.storage.designReviewRuns.findById(run.id)!, queued.stepKey, shape.taskId, shape.impl)
+    expect(handoff.status).toBe('skipped')
+    expect(humanRecoveryAuthorityByImplementation(shape.storage, shape.taskId).has(shape.impl.id)).toBe(false)
+  })
+
   it('repair run が CONFLICT なら承認を作らずに skipped を返す', async () => {
     const shape = await b8d0fc5dShape()
     const runId = await terminalRun(shape, 'CONFLICT')

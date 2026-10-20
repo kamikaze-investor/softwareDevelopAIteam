@@ -19,7 +19,8 @@ import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
 import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IPrincipleApplicationStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReplaceActiveApprovalAndCreateResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, ConsumeApprovalForCommandJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult, RepairHandoffRefusalCode, CreateInitialImplementJobResult, CreateManualJobResult, AcknowledgeOutboxEventResult, TaskEscalationResult } from './interface'
-import { DesignReviewRunContentionError } from './interface'
+import { DesignReviewRunContentionError, RecoveryApprovalSpentMarkerError } from './interface'
+import { storedReviewRecoverySpentAuditRecord } from '../designReview/repairRecoveryEpoch'
 import { isApprovalBlockingTechnicalAbort, isTaskScopedApprovalAction, computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS, evaluateRecoverAdmission, evaluateResumeAdmission, isSupervisedRunKind, isLiveApprovedApproval, isLiveWaitingApproval } from '@ai-team/shared'
 import type { SupervisedRunKind } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, JobWorkspaceBaseline, JobWorkspaceBaselineEntry, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
@@ -3060,6 +3061,24 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           input.repairJob.workflowStepKey,
         )
         if (refusal !== undefined) {
+          // R-3: この refusal で何も実体化しなかった承認は使い切られる。marker は refusal と同じ transaction で書き、
+          // 書けなければ refusal ごと確定させない（承認が再利用できる状態で refusal だけが確定する窓を作らない）。
+          if (input.spendRecoveryApprovalOnRefusal !== undefined) {
+            try {
+              auditLog.record(storedReviewRecoverySpentAuditRecord({
+                approvalRequestId: input.spendRecoveryApprovalOnRefusal.approvalRequestId,
+                taskId: input.repairJob.taskId,
+                sourceJobId: input.sourceJobId,
+                runId: input.spendRecoveryApprovalOnRefusal.runId,
+                reason: refusal.code,
+              }))
+            } catch (err: unknown) {
+              throw new RecoveryApprovalSpentMarkerError(
+                `could not record the spent marker for approval ${input.spendRecoveryApprovalOnRefusal.approvalRequestId}: `
+                + (err instanceof Error ? err.message : String(err)),
+              )
+            }
+          }
           return { ok: false, ...refusal }
         }
 
@@ -3113,8 +3132,11 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       })
 
       try {
-        return handoffTransaction()
+        return handoffTransaction.immediate()
       } catch (err: unknown) {
+        // marker が書けなかった refusal は確定していない。STORAGE_ERROR（→ human escalation）へ畳まず投げ返し、
+        // handoff を後で再試行させる（R-3）。
+        if (err instanceof RecoveryApprovalSpentMarkerError) throw err
         const message = err instanceof Error ? err.message : String(err)
         if (/not found for repair handoff/.test(message)) {
           return {
