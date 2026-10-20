@@ -293,6 +293,7 @@ Lifecycle 一括修復は、承認の **誰が（a）・何を要するか／何
 | S-1 park / abort | 使った承認だけが変わった → Task の WAITING / APPROVED を action・期限・actor を問わず全部 STALE | 範囲: その Task の全 action。除外: REJECTED / CONSUMED / EXPIRED / SUPERSEDED / STALE | 操作ごと rollback | park 前の判断を後の Job に使わせない |
 | S-2 人の resume / recover | Task 単位の承認は残った → Task 単位（command kind でない）の WAITING / APPROVED を期限切れも含め全部 SUPERSEDED | 範囲: Task 単位の行だけ。除外: Job に紐づく（command kind・git_commit の）承認、終端状態の行。PL の resume は置換しない（human でないと読める未失効 APPROVED だけを例外的に置換） | 操作ごと rollback | 人の新しい操作が古い Task 単位の判断を置き換える |
 | S-3 完了時の後始末 | 残った blocked Job の承認は残った → 完了で終端にした blocked Job に紐づく WAITING / APPROVED 1件を SUPERSEDED | 範囲: その Job の `approval_id` の行だけ。除外: 人の resume で置き換え済みの Job・quarantine の Job（終端にしない） | 何もしない | 終わった Job の承認を残さない |
+| S-5 risk の下限 | 保存 riskLevel と現在の risk 評価を比べずに APPROVED を使えた → 保存 riskLevel が現在の評価より低い・読めない APPROVED は STALE（Worker は re_check、resume で新しい承認） | 束縛: 承認時に開示した risk / 効果: 高い risk の実行を認可しない | 読めなければ STALE | rule 変更後に低い risk の承認で高い risk を実行させない |
 | B-5 承認待ち1件（置換） | 新しい要求が他の WAITING を残した → 起票時に Task の WAITING を action・期限を問わず全部、同じ action の APPROVED も SUPERSEDED | 除外: 別 action の APPROVED（人の判断）、終端状態の行 | 何も起票しない | Task の承認待ちを1件にする |
 | C / X | ADMIN が Job の success・Task の lifecycle 状態・done を直接書けた / 外部完了が workspace を持つ blocked Job を残して完了できた → できない | 何: 手の状態変更・出口の無い完了 | 拒否 | 証拠の無い完了・迂回を塞ぐ |
 | R-3 | 消費済みの Stored Review Recovery 承認は handoff が拒否されても authority のまま → 拒否と同じ transaction で使い切りを永続的に記録し、authority から外す | 効果: 1回限り。次の修復には新しい承認 | authority として数えない | 効果を生まなかった承認を再利用させない |
@@ -318,7 +319,7 @@ Lifecycle 一括修復は、承認の **誰が（a）・何を要するか／何
 | B-7 | HIGH の safe work も承認待ちを作った → 作らない（CRITICAL は従来どおり） | 何: 読み取り・検証だけの操作 | 従来どおり起票 | 誰も待たない承認待ちを作らない |
 | R-7 | 判定の無い終端 run も修復を止めた → 止めない | 何: failed・結果なし・REVIEW_UNAVAILABLE | 進行中の run は止める | 判定の無いことを不一致とみなさない |
 | B-9・S-4・T-1 の期限切れ | 期限切れの WAITING も止めた → 止めない | 何: 誰も待っていない行 | 期限が読めなければ止める | TTL を一貫させる |
-| G-1 | 承認済み HIGH / CRITICAL commit を Worker がローカル risk で再び止めた → atomic consume の後に実行 | 効果: 既存の承認どおり実行 | consume できなければ実行しない | 承認の効果を既存規則どおりにする |
+| G-1 | 承認済み HIGH / CRITICAL commit を Worker がローカル risk で再び止めた → consume の前に API が risk の下限（S-5）を適用し、atomic consume の後に実行 | 効果: 既存の承認どおり実行 | consume できなければ実行しない | 承認の効果を既存規則どおりにする |
 
 ### 0. 変えないもの
 
@@ -392,6 +393,17 @@ Lifecycle 一括修復は、承認の **誰が（a）・何を要するか／何
 
 - 不明時: 置換の transaction が完了しなければ元の操作ごと rollback する（承認だけ残して操作が進むことはない）
 - 根拠: Task の前提が変わった後、または同じ Task に人が新しく操作した後は、古い判断を使わない（新しい判断が正）。権限を狭める側の変更
+
+**S-5 risk の下限 — 承認時より高い risk の実行には使えない**（(d)。新しい無効化条件）
+- 旧: APPROVED の行は commit / diff・期限・状態が合えば、承認時に保存した riskLevel と現在の Gate の risk 評価を比べずに使えた
+  （結果として、Worker がローカルの risk で再び止めることが偶然この保護になっていた。G-1 でその再判定は無くなる）
+- 新: 保存した riskLevel が**現在の Gate の risk 評価より低い**、または**読めない** APPROVED は使えない。Gate は STALE を返し、行は STALE になり、
+  Worker は `re_check` で止まる。新しい承認は resume を通じて発行される（STALE の行は再利用・再承認しない）
+- 不明時: 保存した riskLevel が読めなければ使えない（STALE）
+- 根拠: 人が承認したのは、そのとき開示された特定の risk である。承認後の rule 変更で、低い risk への承認が高い risk の実行を認可してはならない。
+  承認を狭める強化であり、技術判断（`specs/22` 1-2 末尾）
+- **既知の限界**: 下限の照合は `/gate/check` で行い、consume では再照合しない。照合と consume の間に API と Worker の版が食い違う
+  （mixed-version deploy の）窓が残る。deploy 手順で API と Worker を同時に止めて入れ替えることで緩和する
 
 ### 5. 復旧の authority
 
@@ -526,8 +538,9 @@ Lifecycle 一括修復は、承認の **誰が（a）・何を要するか／何
 
 **G-1 承認済みの HIGH / CRITICAL commit は atomic consume の後に実行される**（(d)）
 - 旧: API が ALLOW + `call_consume` を返しても、Worker がローカルの risk で再び止めた
-- 新: Worker は API の ALLOW + `call_consume` に従う。承認（Job・commit・diff に束縛）を1回だけ atomic に consume できたときだけ実行する
-- 不明時: consume できなければ実行しない
+- 新: Worker は API の ALLOW + `call_consume` に従う。承認（Job・commit・diff に束縛）を1回だけ atomic に consume できたときだけ実行する。
+  consume の前に、API が S-5 の risk の下限を適用する（承認時の riskLevel が現在の評価より低ければ ALLOW にならず STALE）
+- 不明時: consume できなければ実行しない。保存した riskLevel が読めなければ S-5 により STALE
 - 根拠: 承認の効果は既存規則どおり（Approval Gate B）。Worker 側の再判定は Decision Authority ではない
 
 **G-2 Gate 応答の技術停止**（(b)）
@@ -598,6 +611,7 @@ Meta Review が「コードが本節どおりか」を照合するための索�
 | B-7 | L06-6・L06-10 | `approvalGateRoutes()`、storage `supersedeUnwaitedSafeWorkRequests()` |
 | B-9 | L02-5 | storage `persistProviderTimeoutFailure()`（`apps/api/src/storage/sqlite.ts`） |
 | S-1〜S-4 | L02-3・L09-4・L07-1・L02-6 | storage `parkTask()` / `releaseBlockedJobAndParkTask()` / `resumeBlockedTask()` / `recoverFromBlocked()`、clean completion の `jobs.update` と起動時の `reconcileResumedBlockedSourceJobs()`（`linked_job_terminal`） |
+| S-5 | PR #377（risk の下限） | `packages/shared/src/approvalGateLogic.ts` `decideGateOutcome()`（統合後に照合する。上記の照合 commit には未収録） |
 | R-1 / R-2 | L01-1・L01-2・L06-11 | `apps/api/src/designReview/repairFlow.ts` `repairableBlockedReviewRequest()`（`coveredByHumanResume`・`recovery_authority_required`）/ `readImplementationAuthorities()` / `humanResumesOf()`、`repairPolicy.ts` `walkRepairGeneration()`、`resumeActor.ts` `recordRepairGeneration()`、`repairFromStoredReview.ts` `repairFromStoredReview()` |
 | R-3 | L04-4 | `apps/api/src/designReview/repairFlow.ts` `completeRepairHandoff()`（拒否時に `recordRefusedHandoffSpendsRecoveryApproval()`）、`repairRecoveryEpoch.ts` `isSpentStoredReviewRecoveryApproval()` / `humanRecoveryAuthorityByImplementation()`（audit `stored_review_recovery_spent`）、`repairFromStoredReview.ts` `repairFromStoredReview()` |
 | R-4 / R-5 / R-7 | L01-3・L01-5・L01-4 | `repairFlow.ts` `blockingDesignReviewRun()` / `answeredByHumanResume()`（D3 経路）/ `designReviewRunAnsweredByHumanResume()`（記録する run の選択）、`resumeBlockedTask.ts`（作成時の記録）、`resumeActor.ts` `ANSWERED_RUN_AUDIT_TOKEN`（`answered_run`） |
