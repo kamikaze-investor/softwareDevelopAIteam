@@ -42,7 +42,7 @@
  */
 
 import type { IStorage } from '../storage/interface'
-import type { Job, ReviewResult } from '@ai-team/shared'
+import type { AuditLogEntry, Job, ReviewResult } from '@ai-team/shared'
 import { readApprovalActorClass } from './resumeActor'
 
 /** `requestedAction` の接頭辞。**新しい承認種別ではなく、既存の自由文字列欄の値**である。 */
@@ -194,21 +194,24 @@ export function isSpentStoredReviewRecoveryApproval(storage: IStorage, approvalR
 }
 
 /**
- * handoff を断られた repair の source 実装に epoch を開いていた承認を使い切り済みにする。
- * その実装に human recovery authority が無ければ何もしない（通常の review 経路の refusal）。
+ * 使い切り marker の行の**唯一の形**。書くのは storage の `createRepairJobWithHandoff()` だけで、
+ * handoff を断ると決めたのと**同じ immediate transaction の中**で書く（refusal が marker より先に
+ * 確定する窓を作らない）。marker が書けなければ refusal も成立させない（例外で呼び出し側へ返し、
+ * handoff は後で再試行される）。
  */
-export function recordRefusedHandoffSpendsRecoveryApproval(
-  storage: IStorage,
-  input: { taskId: string; sourceJobId: string; runId: string; reason: string },
-): void {
-  const authority = humanRecoveryAuthorityByImplementation(storage, input.taskId).get(input.sourceJobId)
-  if (authority === undefined) return
-  storage.auditLog.record({
+export function storedReviewRecoverySpentAuditRecord(input: {
+  approvalRequestId: string
+  taskId: string
+  sourceJobId: string
+  runId: string
+  reason: string
+}): Omit<AuditLogEntry, 'id' | 'createdAt'> {
+  return {
     actor: 'api',
     operation: STORED_REVIEW_RECOVERY_SPENT_OPERATION,
     entityType: 'approval_request',
-    entityId: authority.approvalRequestId,
+    entityId: input.approvalRequestId,
     result: 'spent',
     detail: `task=${input.taskId} source_job=${input.sourceJobId} run=${input.runId} reason=${input.reason}`.slice(0, 500),
-  })
+  }
 }
