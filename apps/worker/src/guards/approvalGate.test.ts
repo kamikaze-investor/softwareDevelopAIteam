@@ -309,6 +309,35 @@ describe('decideGateOutcome', () => {
     }
   })
 
+  // lifecycle repair D2・Codex review round 4: 承認時のリスクより今回の評価が高い承認は使えない
+  it.each([
+    { stored: 'LOW' as const, review: 'high' as const },
+    { stored: 'MEDIUM' as const, review: 'high' as const },
+    { stored: 'HIGH' as const, review: 'critical' as const },
+  ])('APPROVED at $stored but evaluated higher now → STALE (re-approval), not ALLOW', ({ stored, review }) => {
+    const req = makeApprovalRequest({ riskLevel: stored, status: 'APPROVED', targetCommit: COMMIT, targetDiffHash: DIFF_HASH })
+    const outcome = decideGateOutcome(review === 'high' ? highReview : criticalReview, req, COMMIT, DIFF_HASH)
+    expect(outcome.decision).toBe('STALE')
+    if (outcome.decision === 'STALE') expect(outcome.requestId).toBe(req.id)
+  })
+
+  it('APPROVED with an unreadable stored riskLevel → STALE (fail-closed)', () => {
+    const req = makeApprovalRequest({ riskLevel: 'SEVERE' as never, status: 'APPROVED', targetCommit: COMMIT, targetDiffHash: DIFF_HASH })
+    expect(decideGateOutcome(highReview, req, COMMIT, DIFF_HASH).decision).toBe('STALE')
+  })
+
+  it('APPROVED at CRITICAL and evaluated HIGH now → ALLOW with consumedRequestId (risk did not rise)', () => {
+    const req = makeApprovalRequest({ riskLevel: 'CRITICAL', status: 'APPROVED', targetCommit: COMMIT, targetDiffHash: DIFF_HASH })
+    const outcome = decideGateOutcome(highReview, req, COMMIT, DIFF_HASH)
+    expect(outcome.decision).toBe('ALLOW')
+    if (outcome.decision === 'ALLOW') expect(outcome.consumedRequestId).toBe(req.id)
+  })
+
+  it('APPROVED at a higher risk but commit changed → still STALE (existing ref binding kept)', () => {
+    const req = makeApprovalRequest({ riskLevel: 'CRITICAL', status: 'APPROVED', targetCommit: 'other-commit', targetDiffHash: DIFF_HASH })
+    expect(decideGateOutcome(highReview, req, COMMIT, DIFF_HASH).decision).toBe('STALE')
+  })
+
   it('HIGH with APPROVED but commit changed → STALE', () => {
     const req = makeApprovalRequest({ riskLevel: 'HIGH', status: 'APPROVED', targetCommit: COMMIT, targetDiffHash: DIFF_HASH })
     const outcome = decideGateOutcome(highReview, req, OTHER_COMMIT, DIFF_HASH)
