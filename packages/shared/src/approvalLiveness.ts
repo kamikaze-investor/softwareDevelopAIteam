@@ -48,7 +48,9 @@ export function isLiveApprovedApproval<T extends Pick<ApprovalRequest, 'status' 
  *   主体の無い・AI の APPROVED は人の判断ではない。期限切れの APPROVED は consume できず、もう誰の
  *   authority でもない（2026-10-16 監査 B-2）。
  * - `CONSUMED`: cleanup 要求の**後に作られ**、決定主体が human のときだけ止める（承認→消費まで Worker の
- *   報告が届かなかった場合）。cleanup 要求が無い（precheck）ときは数えない。
+ *   報告が届かなかった場合）。cleanup 要求が無い（precheck）ときは数えない。時刻は文字列ではなく
+ *   `Date.parse` した値で比べ（タイムゾーン表記の違いで順序を誤らない）、cleanup 要求時刻か作成時刻の
+ *   どちらかが無い・読めないときは止める（fail closed）。
  * - それ以外の状態は止めない。
  *
  * `approvalActor` は API が `approval_actor` audit から読んだ事実（shared は storage を読まない）。
@@ -67,11 +69,13 @@ export function isApprovalBlockingTechnicalAbort(
       return liveOrUnreadable
     case 'APPROVED':
       return approval.approvalActor === 'human' && liveOrUnreadable
-    case 'CONSUMED':
-      return approval.approvalActor === 'human'
-        && context.cleanupRequestedAt !== undefined
-        && approval.createdAt !== undefined
-        && approval.createdAt >= context.cleanupRequestedAt
+    case 'CONSUMED': {
+      if (approval.approvalActor !== 'human' || context.cleanupRequestedAt === undefined) return false
+      const cleanupMs = Date.parse(context.cleanupRequestedAt)
+      const createdMs = approval.createdAt === undefined ? Number.NaN : Date.parse(approval.createdAt)
+      if (!Number.isFinite(cleanupMs) || !Number.isFinite(createdMs)) return true
+      return createdMs >= cleanupMs
+    }
     default:
       return false
   }
