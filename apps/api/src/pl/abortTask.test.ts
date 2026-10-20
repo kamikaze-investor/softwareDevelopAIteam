@@ -1658,6 +1658,15 @@ describe('P2-2 Automatic Technical Abort', () => {
     expect(finishTechnical(actorless)).toMatchObject({ ok: true })
   })
 
+  // T-1: precheck には cleanup 要求が無いので、human の CONSUMED 行は（作成時刻に関係なく）数えない。
+  it('precheck: a human CONSUMED row never blocks (there is no cleanup request yet), whatever its time', () => {
+    const fx = seedTechnicalAbort()
+    const consumed = lateRequest(fx, 'APPROVED')
+    fx.storage.approvalRequests.updateStatus(consumed, 'CONSUMED', undefined, true)
+    requestTechnical(fx)
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.failureMetadata?.abortCleanupRequestedAt).toBeDefined()
+  })
+
   it('final transaction: a request CONSUMED after the cleanup request without a human actor does not refuse', () => {
     const fx = seedTechnicalAbort()
     requestTechnical(fx)
