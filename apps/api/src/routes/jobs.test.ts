@@ -801,12 +801,15 @@ describe('Job API', () => {
       },
     )
 
-    it('a direct write that keeps an already-successful Job at success is not a transition and is not refused', async () => {
+    // C-1 (Codex review): every success needs the Worker's Outbox delivery, even when the Job is already success.
+    it('a direct success write to an already-successful Job is refused and changes nothing', async () => {
       await withApp(async (app) => {
         const { storage, job } = await storedJob('success')
+        const before = storage.jobs.findById(job.id)
         const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload: { status: 'success' } })
-        expect(res.statusCode).toBe(200)
-        expect(storage.jobs.findById(job.id)?.status).toBe('success')
+        expect(res.statusCode).toBe(409)
+        expect(parseBody<{ code: string }>(res.body).code).toBe('JOB_SUCCESS_REQUIRES_WORKER_RESULT')
+        expect(storage.jobs.findById(job.id)).toEqual(before)
       })
     })
 
@@ -2408,7 +2411,8 @@ describe('Job API', () => {
       })
 
       expect(first.statusCode).toBe(200)
-      expect(resend.statusCode).toBe(200)
+      // C-1: a resend without the Worker's Outbox event cannot write success (even to a success Job).
+      expect(resend.statusCode).toBe(409)
       const jobsResponse = await app.inject({
         method: 'GET',
         url: `/api/jobs?taskId=${task.id}`,
@@ -3386,6 +3390,71 @@ describe('event-bearing success provenance by credential class', () => {
   }
 
   const delivery = (eventId: string) => withOutbox({ status: 'success', exitCode: 0, stdout: 'result' }, eventId)
+
+  // C-1 (Codex review): every success needs the Worker's delivery, even to a Job that is already success,
+  // and the check runs before the replay / non-applicable handling.
+  async function successJob(kind: 'review' | 'implement' | 'git_commit', status: 'success' | 'failed' = 'success') {
+    const { getStorage } = await import('../storage/index.js')
+    const storage = getStorage()
+    const project = storage.projects.create({ name: 'P', goal: 'g', designPhilosophy: [], status: 'running' })
+    const task = storage.tasks.create({
+      projectId: project.id, title: 'T', description: '', status: 'pending', assignee: 'developer_ai', dependencies: [],
+    })
+    const job = storage.jobs.create({
+      taskId: task.id, projectId: project.id, agentRole: kind === 'review' ? 'qa_ai' : 'developer_ai', status,
+      safeCommand: { kind: kind === 'git_commit' ? 'git_commit' : 'git_status', workingDir: '/workspace/target' },
+      ...(kind === 'review' ? { aiCliMode: 'review', aiCliProvider: 'claude', workflowStepKey: 'implement:src-job:review' } : {}),
+      ...(kind === 'implement' ? { aiCliMode: 'implement', aiCliProvider: 'claude', workflowStepKey: `task:${task.id}:initial-implement` } : {}),
+    } as Parameters<typeof storage.jobs.create>[0])
+    const snapshot = () => ({
+      job: storage.jobs.findById(job.id),
+      audit: storage.auditLog.findByEntity('job', job.id).length,
+      reviews: storage.reviewResults.findByTaskId(task.id).length,
+      jobs: storage.jobs.findByTaskId(task.id).length,
+      task: storage.tasks.findById(task.id),
+    })
+    return { storage, job, snapshot }
+  }
+
+  const forgedSuccess = (kind: 'review' | 'implement' | 'git_commit', eventId: string) => withOutbox({
+    status: 'success', exitCode: 0, stdout: 'forged',
+    ...(kind === 'review' ? { reviewResult: { status: 'approved', summary: 'forged', findings: [] } } : {}),
+    ...(kind === 'git_commit' ? { commitHash: 'deadbeef' } : {}),
+  }, eventId)
+
+  it.each([
+    ['admin', 'review'], ['admin', 'implement'], ['admin', 'git_commit'],
+    [undefined, 'review'], [undefined, 'implement'], [undefined, 'git_commit'],
+  ] as const)('C-1: credential %s cannot send a same-state success to an already-successful %s Job (nothing changes)', async (credential, kind) => {
+    await withCredential(credential, async (app) => {
+      const { job, snapshot } = await successJob(kind)
+      const before = snapshot()
+      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload: forgedSuccess(kind, `evt-forged-${kind}`) })
+      expect(res.statusCode).toBe(409)
+      expect(parseBody<{ code: string }>(res.body).code).toBe('JOB_SUCCESS_REQUIRES_WORKER_RESULT')
+      expect(snapshot()).toEqual(before)
+    })
+  })
+
+  it('C-1: an ADMIN success delivery to a Job it no longer applies to is rejected, not acknowledged (nothing changes)', async () => {
+    await withCredential('admin', async (app) => {
+      const { job, snapshot } = await successJob('implement', 'failed')
+      const before = snapshot()
+      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload: forgedSuccess('implement', 'evt-admin-nonapplicable') })
+      expect(res.statusCode).toBe(409)
+      expect(parseBody<{ code: string }>(res.body).code).toBe('JOB_SUCCESS_REQUIRES_WORKER_RESULT')
+      expect(snapshot()).toEqual(before)
+    })
+  })
+
+  it('C-1: the Worker credential still gets its non-applicable success delivery acknowledged (unchanged)', async () => {
+    await withCredential('worker', async (app) => {
+      const { job, storage } = await successJob('implement', 'failed')
+      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload: forgedSuccess('implement', 'evt-worker-nonapplicable') })
+      expect(res.statusCode).toBe(200)
+      expect(storage.jobs.findById(job.id)?.status).toBe('failed')
+    })
+  })
 
   it('C-1: an unauthenticated request (no credential class) with a valid eventId cannot write success', async () => {
     await withCredential(undefined, async (app) => {
