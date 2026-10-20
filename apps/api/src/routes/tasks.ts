@@ -17,6 +17,7 @@ import { buildResumeAiCliPrompt } from '../implementPrompt'
 import { authorizePlAction, PlActionBlockedError } from '../pl/actionGate'
 import { verifyExternalCompletion } from '../reconcile/externalCompletion'
 import { repairFromStoredReview } from '../designReview/repairFromStoredReview'
+import { designReviewRunAnsweredByHumanResume } from '../designReview/repairFlow'
 import { getStorage } from '../storage'
 import {
   answerTaskFailureQuestion,
@@ -602,11 +603,16 @@ export async function taskRoutes(
     // `ResumeTaskBody` が落とすうえ、ここは request の認証結果しか読まない。
     // repair budget の generation 境界はこの記録だけを根拠にする（`../designReview/resumeActor`）。
     const actor = classifyResumeActorFromRequest(req)
+    // Human Resume は、作成時点で Task を止めていた Design Review run を明示的に答える（R-4）。
+    const answeredRunId = actor.actorClass === 'human'
+      ? designReviewRunAnsweredByHumanResume(storage, task.id)
+      : undefined
     recordResumeActor(storage, {
       jobId: resumed.job.id,
       taskId: task.id,
       actorClass: actor.actorClass,
       evidence: actor.evidence,
+      ...(answeredRunId !== undefined ? { answeredRunId } : {}),
     })
 
     return reply.status(201).send(resumed.job)
