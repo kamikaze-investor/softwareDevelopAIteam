@@ -305,7 +305,8 @@ function computeNextAction(
     case 'STALE':
       return {
         action: 're_check',
-        message: '承認が無効化されました（commit/diff が変化）。再度 /api/gate/check を呼び出して新しい承認フローを開始してください。',
+        // 無効化の理由は outcome.reason がそのまま持つ（commit / diff の変化・承認時より高いリスク）。
+        message: `承認が無効化されました: ${outcome.reason} 再度 /api/gate/check を呼び出して新しい承認フローを開始してください。`,
       }
   }
 }

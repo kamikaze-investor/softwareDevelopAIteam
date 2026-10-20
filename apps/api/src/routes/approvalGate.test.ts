@@ -932,6 +932,7 @@ describe('POST /api/gate/check', () => {
       expect(body.sideEffects[0].type).toBe('MARKED_STALE')
       expect(body.continuationPolicy).toBe('continue_safe_work_only')
       expect(body.nextAction.action).toBe('re_check')
+      expect(body.nextAction.message).toContain('commit または diff が変化')
       // DB が STALE になっていること
       const getRes = await app.inject({ method: 'GET', url: `/api/approval-requests/${req.id}` })
       const stored = parseBody<ApprovalRequest>(getRes.body)
@@ -1238,6 +1239,9 @@ describe('POST /api/gate/check', () => {
       expect(body.outcome.decision).toBe('STALE')
       expect(body.nextAction.action).toBe('re_check')
       expect(body.nextAction.consumedRequestId).toBeUndefined()
+      // STALE の案内は無効化の実際の理由（リスク上昇）を伝える。commit/diff の変化とは言わない。
+      expect(body.nextAction.message).toContain('承認時のリスク')
+      expect(body.nextAction.message).not.toContain('commit/diff')
       expect(body.sideEffects).toContainEqual({ type: 'MARKED_STALE', requestId: req.id })
       const getRes = await app.inject({ method: 'GET', url: `/api/approval-requests/${req.id}` })
       expect(parseBody<ApprovalRequest>(getRes.body).status).toBe('STALE')
