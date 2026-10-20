@@ -40,6 +40,44 @@ export function isLiveApprovedApproval<T extends Pick<ApprovalRequest, 'status' 
 }
 
 /**
+ * **その承認行が Technical Abort を止める人の判断か**（H-2 / T-1。precheck と最終 transaction の唯一の判定）。
+ *
+ * - `WAITING_FOR_USER`: 期限内、**または期限が読めない**なら止める。読めない期限を「生きていない」と
+ *   読むと、ここでは fail open になる（人の判断待ちを cleanup で上書きする）。
+ * - `APPROVED`: **決定主体が human**（`approval_actor`）で、期限内または期限が読めないときだけ止める。
+ *   主体の無い・AI の APPROVED は人の判断ではない。期限切れの APPROVED は consume できず、もう誰の
+ *   authority でもない（2026-10-16 監査 B-2）。
+ * - `CONSUMED`: cleanup 要求の**後に作られ**、決定主体が human のときだけ止める（承認→消費まで Worker の
+ *   報告が届かなかった場合）。cleanup 要求が無い（precheck）ときは数えない。
+ * - それ以外の状態は止めない。
+ *
+ * `approvalActor` は API が `approval_actor` audit から読んだ事実（shared は storage を読まない）。
+ */
+export function isApprovalBlockingTechnicalAbort(
+  approval: Pick<ApprovalRequest, 'status' | 'expiresAt'> & {
+    createdAt?: string
+    approvalActor?: 'human' | 'ai' | 'unknown'
+  },
+  context: { nowMs: number; cleanupRequestedAt?: string },
+): boolean {
+  const expiresMs = Date.parse(approval.expiresAt)
+  const liveOrUnreadable = !Number.isFinite(expiresMs) || expiresMs > context.nowMs
+  switch (approval.status) {
+    case 'WAITING_FOR_USER':
+      return liveOrUnreadable
+    case 'APPROVED':
+      return approval.approvalActor === 'human' && liveOrUnreadable
+    case 'CONSUMED':
+      return approval.approvalActor === 'human'
+        && context.cleanupRequestedAt !== undefined
+        && approval.createdAt !== undefined
+        && approval.createdAt >= context.cleanupRequestedAt
+    default:
+      return false
+  }
+}
+
+/**
  * **その requestedAction が Task 単位の人の判断か**（abort_task / reconcile_external_completion /
  * repair_from_stored_review:* 等）。command kind（git_commit を含む）の承認は commit / diff / Job に
  * 束縛されており、Task 単位ではない。分類の唯一の出どころ（API storage の supersede / 拒否、
