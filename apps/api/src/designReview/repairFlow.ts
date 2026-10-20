@@ -50,7 +50,7 @@ import {
   type ResumeActorClass,
   type GenerationAuthority,
 } from './repairPolicy'
-import { humanRecoveryAuthorityByImplementation } from './repairRecoveryEpoch'
+import { humanRecoveryAuthorityByImplementation, recordRefusedHandoffSpendsRecoveryApproval } from './repairRecoveryEpoch'
 import { readResumeActorClasses, recordRepairGeneration } from './resumeActor'
 import { isVerifiedPlTechnicalResumeAudit } from '../pl/technicalResumePolicy'
 
@@ -1545,6 +1545,8 @@ export function completeRepairHandoff(
   // ここで repair Job を作ると park が黙って取り消される（escalate もしない —
   // park された Task を blocked へ上げるのは park の取り消しと同じ結果になる）。
   if (storage.tasks.isParked(taskId)) {
+    // 断られた handoff は、その実装に epoch を開いた承認を使い切る（R-3）。
+    recordRefusedHandoffSpendsRecoveryApproval(storage, { taskId, sourceJobId: sourceJob.id, runId: run.id, reason: 'TASK_PARKED' })
     return { status: 'skipped', reason: 'task was parked by abort_task while the review ran' }
   }
 
@@ -1574,6 +1576,8 @@ export function completeRepairHandoff(
   // **blocked では断られない** —— Stored Review Recovery は blocked な Task から正規に handoff する。
   if (!repairJob.ok && isRepairHandoffRefusal(repairJob.code)) {
     console.warn(`[repairFlow] repair handoff refused for task ${taskId} (${repairJob.code}): ${repairJob.reason}`)
+    // 承認で開いた epoch が何も実体化しなかった。その承認を恒久 authority として残さない（R-3）。
+    recordRefusedHandoffSpendsRecoveryApproval(storage, { taskId, sourceJobId: sourceJob.id, runId: run.id, reason: repairJob.code })
     return { status: 'skipped', reason: repairJob.reason }
   }
 

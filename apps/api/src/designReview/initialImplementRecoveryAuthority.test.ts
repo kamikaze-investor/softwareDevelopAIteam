@@ -5,7 +5,7 @@ import type { IStorage } from '../storage/interface'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { completeRepairHandoff, prepareRepairFlow } from './repairFlow'
 import { repairFromStoredReview } from './repairFromStoredReview'
-import { repairRecoveryActionFor } from './repairRecoveryEpoch'
+import { humanRecoveryAuthorityByImplementation, repairRecoveryActionFor } from './repairRecoveryEpoch'
 import { recordApprovalActor, recordResumeActor } from './resumeActor'
 
 /**
@@ -173,6 +173,47 @@ describe('Stored Review Recovery: 最新の初回 implement は consume 済み�
         authority: { kind: 'human_recovery', approvalRequestId: first.approvalRequestId, reviewJobId: shape.r0.id },
       },
     })
+  })
+
+  it('handoff を断られた consume 済み承認は使い切られ、次の Stored Review Recovery は新しい承認を求める（R-3）', async () => {
+    const shape = await b8d0fc5dShape()
+    await terminalRun(shape, 'REVIEW_UNAVAILABLE')
+    const first = recover(shape)
+    if (first.status !== 'awaiting_approval') throw new Error('fixture expected awaiting_approval')
+    recordApprovalActor(shape.storage, first.approvalRequestId, 'admin')
+    shape.storage.approvalRequests.recordDecision(first.approvalRequestId, 'APPROVED')
+    const queued = recover(shape)
+    if (queued.status !== 'queued') throw new Error('fixture expected queued')
+    expect(shape.storage.approvalRequests.findById(first.approvalRequestId)?.status).toBe('CONSUMED')
+
+    // Design Review は ALIGNED で終わったが、その間に Project が止まった → handoff は断られる。
+    const run = shape.storage.designReviewRuns.findById(queued.runId)!
+    const claimed = shape.storage.designReviewRuns.claim(run.id, 3)
+    shape.storage.designReviewRuns.complete(run.id, claimed.claimToken!, 'succeeded', JSON.stringify({
+      reviewLoad: 'low', selectedFocuses: [], focusedReviewResults: [],
+      integrationReviewResult: { decision: 'ALIGNED', summary: 'ALIGNED', findings: [] },
+      finalDecision: 'ALIGNED',
+    }))
+    await tick()
+    shape.storage.projects.update(shape.projectId, { status: 'paused' })
+    const handoff = completeRepairHandoff(shape.storage, shape.storage.designReviewRuns.findById(run.id)!, queued.stepKey, shape.taskId, shape.impl)
+    expect(handoff.status).toBe('skipped')
+
+    const spent = shape.storage.auditLog.findByEntity('approval_request', first.approvalRequestId)
+      .filter((entry) => entry.operation === 'stored_review_recovery_spent')
+    expect(spent).toHaveLength(1)
+    expect(humanRecoveryAuthorityByImplementation(shape.storage, shape.taskId).has(shape.impl.id)).toBe(false)
+
+    // Project が再開しても、使い切られた承認は authority にならない。
+    shape.storage.projects.update(shape.projectId, { status: 'running' })
+    expect(prepareRepairFlow(shape.storage, { failedJob: shape.impl })).toMatchObject({
+      action: 'skip',
+      code: 'recovery_authority_required',
+    })
+    const again = recover(shape)
+    expect(again).toMatchObject({ status: 'awaiting_approval', reused: false })
+    if (again.status !== 'awaiting_approval') return
+    expect(again.approvalRequestId).not.toBe(first.approvalRequestId)
   })
 
   it('repair run が CONFLICT なら承認を作らずに skipped を返す', async () => {

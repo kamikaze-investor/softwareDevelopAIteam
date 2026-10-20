@@ -162,6 +162,8 @@ export function humanRecoveryAuthorityByImplementation(
     if (request.status !== 'CONSUMED') continue
     const reviewJobId = parseRepairRecoveryAction(request.requestedAction)
     if (reviewJobId === undefined) continue
+    // handoff が断られた承認は使い切られている（R-3）。恒久的な authority として再利用させない。
+    if (isSpentStoredReviewRecoveryApproval(storage, request.id)) continue
     // 人が決めたと証明できない承認は authority ではない（Human Resume と同じ規則）。
     // stack 暫定: 書き手（stack-06）が入るまで要求しない（`APPROVAL_ACTOR_REQUIRED`）。
     if (APPROVAL_ACTOR_REQUIRED && readApprovalActorClass(storage, request.id) !== 'human') continue
@@ -174,4 +176,40 @@ export function humanRecoveryAuthorityByImplementation(
   }
 
   return covered
+}
+
+/**
+ * consume 済みの Stored Review Recovery 承認が **repair handoff を断られて使い切られた**ことの audit（R-3）。
+ *
+ * consume は epoch を開くが、その epoch が作るはずの repair Job が handoff で断られた
+ * （Task done / park・Project 停止・別の live 連鎖）なら、承認は何も実体化しないまま消費されたことになる。
+ * そのまま `humanRecoveryAuthorityByImplementation()` に数え続けると、後の任意の時点で同じ承認が
+ * 恒久的な recovery authority として再利用される。断られた時点でこの行を承認 id に対して1回だけ残し、
+ * 以後の Stored Review Recovery は新しい承認を求める。
+ */
+export const STORED_REVIEW_RECOVERY_SPENT_OPERATION = 'stored_review_recovery_spent'
+
+export function isSpentStoredReviewRecoveryApproval(storage: IStorage, approvalRequestId: string): boolean {
+  return storage.auditLog.findByEntity('approval_request', approvalRequestId)
+    .some((entry) => entry.operation === STORED_REVIEW_RECOVERY_SPENT_OPERATION)
+}
+
+/**
+ * handoff を断られた repair の source 実装に epoch を開いていた承認を使い切り済みにする。
+ * その実装に human recovery authority が無ければ何もしない（通常の review 経路の refusal）。
+ */
+export function recordRefusedHandoffSpendsRecoveryApproval(
+  storage: IStorage,
+  input: { taskId: string; sourceJobId: string; runId: string; reason: string },
+): void {
+  const authority = humanRecoveryAuthorityByImplementation(storage, input.taskId).get(input.sourceJobId)
+  if (authority === undefined) return
+  storage.auditLog.record({
+    actor: 'api',
+    operation: STORED_REVIEW_RECOVERY_SPENT_OPERATION,
+    entityType: 'approval_request',
+    entityId: authority.approvalRequestId,
+    result: 'spent',
+    detail: `task=${input.taskId} source_job=${input.sourceJobId} run=${input.runId} reason=${input.reason}`.slice(0, 500),
+  })
 }
