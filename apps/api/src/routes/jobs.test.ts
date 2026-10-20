@@ -1,5 +1,6 @@
 import cors from '@fastify/cors'
 import Fastify, { type FastifyInstance } from 'fastify'
+import { setCredentialClass } from '../auth/credentialClass'
 import { createHash, randomUUID } from 'node:crypto'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { canonicalizeJobUpdate, type DesignReviewEvidence, type Job, type Project, type Task } from '@ai-team/shared'
@@ -17,6 +18,11 @@ async function buildApp(): Promise<FastifyInstance> {
   resetStorage()
 
   const app = Fastify()
+  // C-1: the Worker's result delivery is authenticated as the Worker (apiTokenAuth sets the class in
+  // production). These route tests have no auth plugin, so stand in for it on the Worker's PATCH /api/jobs/:id.
+  app.addHook('onRequest', async (req) => {
+    if (req.method === 'PATCH' && /^\/api\/jobs\/[^/?]+(\?|$)/.test(req.url)) setCredentialClass(req, 'worker')
+  })
   app.register(cors, { origin: true })
   app.register(projectRoutes, { prefix: '/api/projects' })
   // Design Review runner を**必ず注入する**。既定の `buildDefaultCoordinatorDeps()` は
@@ -3339,8 +3345,8 @@ describe('Job API', () => {
 
 // R-FINAL-OPPATCH (Codex review r5): eventId / payloadHash are caller-computable, so the Outbox event alone
 // does not prove the Worker sent the result. Under split credentials only the WORKER credential's event-bearing
-// success is applied. `legacy` (one shared API_TOKEN for humans and the Worker) and an unauthenticated route
-// (no credential class recorded, i.e. these unit tests) cannot tell the sender apart and keep accepting it.
+// success is applied. `legacy` (one shared API_TOKEN for humans and the Worker) cannot tell the sender apart and
+// keeps accepting it. A request with no credential class (unauthenticated) is not Worker provenance (C-1).
 describe('event-bearing success provenance by credential class', () => {
   async function withCredential(
     credential: 'admin' | 'worker' | 'legacy' | undefined,
@@ -3381,6 +3387,17 @@ describe('event-bearing success provenance by credential class', () => {
 
   const delivery = (eventId: string) => withOutbox({ status: 'success', exitCode: 0, stdout: 'result' }, eventId)
 
+  it('C-1: an unauthenticated request (no credential class) with a valid eventId cannot write success', async () => {
+    await withCredential(undefined, async (app) => {
+      const { storage, job } = await runningJob()
+      const before = storage.jobs.findById(job.id)
+      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload: delivery('evt-none') })
+      expect(res.statusCode).toBe(409)
+      expect(parseBody<{ code: string }>(res.body).code).toBe('JOB_SUCCESS_REQUIRES_WORKER_RESULT')
+      expect(storage.jobs.findById(job.id)).toEqual(before)
+    })
+  })
+
   it('ADMIN with a valid eventId + payloadHash cannot write success (409, nothing changes)', async () => {
     await withCredential('admin', async (app) => {
       const { storage, job } = await runningJob()
@@ -3392,7 +3409,7 @@ describe('event-bearing success provenance by credential class', () => {
     })
   })
 
-  it.each(['worker', 'legacy', undefined] as const)(
+  it.each(['worker', 'legacy'] as const)(
     'credential %s with an Outbox event applies success',
     async (credential) => {
       await withCredential(credential, async (app) => {
