@@ -290,9 +290,13 @@ Lifecycle 一括修復は、承認の **誰が（a）・何を要するか／何
 | H-2 | Task 単位の APPROVED は状態だけで有効 → human のときだけ有効 | 誰: 人だけ | human でない扱い | AI 承認を無効にする |
 | R-4（既存の review lineage 経路、D3） | run 完了後に作られた Human Resume は時刻だけで答えた → 作成時に記録した run id と一致するときだけ答える。**この変更より前の resume は CONFLICT に答えなくなる** | 束縛: run id | 記録なし = 答えない | 時刻からの推定で人の回答を作らない |
 | B | 承認が action・Job・時点に緩く結び付いた → 同じ action・実在 Job・1回限り、Task の承認待ちは1件 | 束縛: action / Job / commit・diff | 拒否・消費しない | 承認を狭く束縛する |
-| S | 承認が Task の状態変化後も残った → park・人の resume / recover・完了で無効化 | 効果: 古い判断を使わない | 操作ごと rollback | 古い判断で動かない |
-| C / X | ADMIN が Job の success・Task の lifecycle 状態・done を直接書けた / 外部完了が blocked Job を残して完了できた → できない | 何: 手の状態変更 | 拒否 | 証拠の無い完了・迂回を塞ぐ |
-| R-3・R-5・R-6・R-10・R-11・T-1・T-2 | 修復・abort の各経路で人の判断を推定・上書きし得た → しない | 効果: 人の判断と未解決の CONFLICT を優先 | 止める側 | 人の判断を AI が上書きしない |
+| S-1 park / abort | 使った承認だけが変わった → Task の WAITING / APPROVED を action・期限・actor を問わず全部 STALE | 範囲: その Task の全 action。除外: REJECTED / CONSUMED / EXPIRED / SUPERSEDED / STALE | 操作ごと rollback | park 前の判断を後の Job に使わせない |
+| S-2 人の resume / recover | Task 単位の承認は残った → Task 単位（command kind でない）の WAITING / APPROVED を期限切れも含め全部 SUPERSEDED | 範囲: Task 単位の行だけ。除外: Job に紐づく（command kind・git_commit の）承認、終端状態の行。PL の resume は置換しない（human でないと読める未失効 APPROVED だけを例外的に置換） | 操作ごと rollback | 人の新しい操作が古い Task 単位の判断を置き換える |
+| S-3 完了時の後始末 | 残った blocked Job の承認は残った → 完了で終端にした blocked Job に紐づく WAITING / APPROVED 1件を SUPERSEDED | 範囲: その Job の `approval_id` の行だけ。除外: 人の resume で置き換え済みの Job・quarantine の Job（終端にしない） | 何もしない | 終わった Job の承認を残さない |
+| B-5 承認待ち1件（置換） | 新しい要求が他の WAITING を残した → 起票時に Task の WAITING を action・期限を問わず全部、同じ action の APPROVED も SUPERSEDED | 除外: 別 action の APPROVED（人の判断）、終端状態の行 | 何も起票しない | Task の承認待ちを1件にする |
+| C / X | ADMIN が Job の success・Task の lifecycle 状態・done を直接書けた / 外部完了が workspace を持つ blocked Job を残して完了できた → できない | 何: 手の状態変更・出口の無い完了 | 拒否 | 証拠の無い完了・迂回を塞ぐ |
+| R-3 | 消費済みの Stored Review Recovery 承認は handoff が拒否されても authority のまま → 拒否と同じ transaction で使い切りを永続的に記録し、authority から外す | 効果: 1回限り。次の修復には新しい承認 | authority として数えない | 効果を生まなかった承認を再利用させない |
+| R-5・R-6・R-10・R-11・T-1・T-2 | 修復・abort の各経路で人の判断や未解決の CONFLICT を推定・上書きし得た → しない | 効果: 人の判断と未解決の CONFLICT を優先 | 止める側 | 人の判断を AI が上書きしない |
 
 **3. 技術停止の再分類**（CEO へ上げるものを減らす）
 
@@ -381,9 +385,9 @@ Lifecycle 一括修復は、承認の **誰が（a）・何を要するか／何
 
 | 規則 | 旧 | 新 |
 | --- | --- | --- |
-| S-1 park / abort 成功（(d)） | 使った承認だけが変わった | Task の WAITING / APPROVED を action を問わず全部 STALE |
-| S-2 人の resume / recover（(d)） | Task 単位の承認は残った | 状態が active（WAITING / APPROVED）の Task 単位の行を**期限切れも含めて**全部 SUPERSEDED（`superseded_by_resume` / `superseded_by_recover`。期限切れ行は後始末）。**PL の resume は置換しない**（human でない APPROVED を除く。9 章） |
-| S-3 clean な完了（(d)） | 残った blocked Job の承認は残った | 完了が blocked Job を終端にするとき、その Job に紐づく WAITING / APPROVED を SUPERSEDED（`linked_job_terminal`） |
+| S-1 park / abort 成功（(d)） | 使った承認だけが変わった | 認可が通った後、同じ transaction で Task の WAITING / APPROVED を action・期限・actor を問わず全部 STALE。終端状態（REJECTED / CONSUMED / EXPIRED / SUPERSEDED / STALE）の行は変えない |
+| S-2 人の resume / recover（(d)） | Task 単位の承認は残った | 状態が active（WAITING / APPROVED）の Task 単位の行を**期限切れも含めて**全部 SUPERSEDED（`superseded_by_resume` / `superseded_by_recover`。期限切れ行は後始末）。Job に紐づく（command kind の）承認には触れない。**PL の resume は置換しない**。例外は、主体の記録が human 以外と読め、期限が読めて未失効の APPROVED だけ（`approval_actor_not_human` で SUPERSEDED。期限切れ・期限の読めない行は残す。9 章） |
+| S-3 clean な完了（(d)） | 残った blocked Job の承認は残った | 完了が blocked Job を終端にするとき、その Job の `approval_id` が指す WAITING / APPROVED の行だけを SUPERSEDED（`linked_job_terminal`）。人の resume で置き換え済みの Job と quarantine の Job は終端にしないので、その承認も変えない。起動時の照合で successor を持つ resume 済み source Job を終端にするときも、その Job の承認を同じく SUPERSEDED |
 | S-4 期限切れの WAITING（(d)） | resume 済みの source Job を blocked に留めた | 留めない |
 
 - 不明時: 置換の transaction が完了しなければ元の操作ごと rollback する（承認だけ残して操作が進むことはない）
@@ -410,9 +414,9 @@ Lifecycle 一括修復は、承認の **誰が（a）・何を要するか／何
 
 **R-3 handoff が拒否された Stored Review Recovery 承認は使い切り**（(d)）
 - 旧: 消費済みの承認は、handoff の成否に関係なくその実装の recovery authority（human recovery epoch）として数えられた
-- 新: 消費後に handoff が拒否された（Task done / parked・Project not running・別の live 連鎖がある等）承認は、**使い切ったことを永続的に記録し**、recovery authority から外す。
-  修復は作られず、再度必要なら新しい承認を求める
-- 不明時: handoff の成否・使い切りの記録が確定しなければ、authority として数えず修復 Job も作らない
+- 新: 消費後に handoff が拒否された（Task done / parked・Project not running・別の live 連鎖がある等）承認は、**使い切ったことを拒否と同じ transaction で永続的に記録し**、recovery authority から外す
+  （拒否と記録の片方だけが残ることはない）。修復は作られず、再度必要なら新しい承認を求める
+- 不明時: handoff の成否・使い切りの記録が確定しなければ、authority として数えず修復 Job も作らない。記録が書けなければ拒否ごと rollback する
 - 根拠: 承認は1回限りの効果であり、効果を生まなかった承認を後から別の修復の根拠にしない
 
 **R-4 人の resume が Design Review の CONFLICT に答える条件**（(d)）
@@ -496,11 +500,14 @@ Lifecycle 一括修復は、承認の **誰が（a）・何を要するか／何
 - 不明時: 所有者を特定できなければ park しない
 - 根拠: 誰の変更か分からない差分を承認1つで捨てない（データ消失の防止、`specs/22` 1-7）
 
-**X-1 blocked Job が残る Task は外部完了で取り込まない**（(b)(d)）
+**X-1 workspace を持つ blocked Job が残る Task は外部完了で取り込まない**（(b)(d)）
 - 旧: `reconcile_external_completion` は blocked Job が残る Task も done にできた
-- 新: Task に置換されていない blocked Job が残る間は拒否する。拒否は **Gate を評価する前**と、**完了を書く transaction の中**の2回行う。
-  承認は消費されずに残る。出口は resume か abort / park で blocked Job を片付け、その後に新しい承認で取り込むこと
-- 不明時: blocked Job の有無が読めなければ拒否
+- 新: Task に **workspace を所有している（対処が必要な）blocked 行**が残る間は拒否する。対象は claim guard と同じ判定で、
+  quarantine の行、または stale 候補でも Human Resume に置き換えられてもいない行。
+  park された Task の非 quarantine 行（stale 候補。解放は Worker の観測が担う）と、Human Resume に置き換えられた行は残っていてもよい。
+  拒否は **Gate を評価する前**と、**完了を書く transaction の中**の2回、同じ判定で行う。
+  承認は消費されずに残る。出口は resume か abort / park で blocked 行を片付け、その後に新しい承認で取り込むこと
+- 不明時: Task が読めない・所有の判定ができなければ取り込まない
 - 根拠: done の Task に残った blocked 行には出口が無い。断られる操作のために承認を評価・消費させない
 
 **T-3 Gate の技術停止は CEO escalation ではない**（(b)）
@@ -563,7 +570,7 @@ Lifecycle 一括修復は、承認の **誰が（a）・何を要するか／何
 | --- | --- |
 | 承認の決定 PATCH は人（split-credential ADMIN）専用・`PATCH /api/approvals/:id` も同じ | 最重要原則 |
 | Task 単位の承認は human のときだけ数える。systemState / stranded 判定 / Mobile でも同じ | 最重要原則（ADMIN = human の対応付けは H-1 で正本化） |
-| PL の resume は human でない APPROVED も置き換える | 最重要原則 |
+| PL の resume は、主体の記録が human 以外と読め、期限が読めて未失効の APPROVED だけを置き換える（期限切れ・期限の読めない行は残す） | 最重要原則 |
 | 期限切れの WAITING の決定は EXPIRED へ進めて `409 APPROVAL_EXPIRED`。git_commit の承認で期限を解釈できなければ、状態を変えずに既存の EXPIRED と同じ code で拒否 | TTL 24時間 |
 | consume の強化（期限が読めない → 期限切れ・human でない APPROVED は置換・新規 consume は running Job が必要） | TTL・最重要原則・一回限り |
 | 承認を使い切った git_commit は STALE で blocked、resume が新しい承認を発行 | 期限切れ resume の規則・resume 不変条件 2 / 6 |
@@ -601,7 +608,7 @@ Meta Review が「コードが本節どおりか」を照合するための索�
 | R-11 | L01-8・L07-2 | `repairFlow.ts` `escalateTaskToHuman()` / `isWorkspaceQuarantined()`、`apps/api/src/state/blockedRowOwnership.ts` |
 | T-1 | L02-4・L09-8 | `packages/shared/src/approvalLiveness.ts` `isApprovalBlockingTechnicalAbort()`、`apps/api/src/pl/abortTask.ts` `requestTechnicalAbort()`（事前確認、`ACTIVE_APPROVAL_PRESENT`）/ `completeAbortCleanup()`、storage の最終 transaction（`HUMAN_DECISION_CONFLICT`）、`apps/worker/src/index.ts` `reportAbortCleanupObservationsOnce()` |
 | T-2 | L11-5 | `abortTask.ts` `abortTask()`（`UNATTRIBUTED_DIRTY_WORKSPACE` / `TASK_STATE_CHANGED`） |
-| X-1 | （棚卸し外） | `apps/api/src/routes/tasks.ts` reconcile-external-completion（`findBlockedJobsPreventingReconcile()`・`TASK_HAS_BLOCKED_JOBS`）、storage `reconcileExternalCompletion()` |
+| X-1 | （棚卸し外） | `apps/api/src/reconcile/externalCompletion.ts` `findBlockedJobsPreventingReconcile()`（`apps/api/src/state/blockedRowOwnership.ts` `findBlockedRowsHoldingWorkspace()`）、`apps/api/src/routes/tasks.ts` reconcile-external-completion（`findBlockedJobsPreventingReconcile()`・`TASK_HAS_BLOCKED_JOBS`）、storage `reconcileExternalCompletion()` |
 | T-3 | L13-4 | `apps/api/src/pl/blockedTriage.ts` `triageBlocked()`（rule 6.8 / 6.9、`BlockedDiagnosis.technicalStop`）、`executionLoop.ts` `technicalRecoveryExhaustion()` / `recordTechnicalRecoveryExhaustion()`、`buildSystemState()` |
 | G-1 | L13-1 | `apps/worker/src/guards/gatePolicy.ts` `resolvePolicy()`、`apps/worker/src/jobRunner.ts` `runJob()`、storage `consumeForJob()` |
 | G-2 | L13-2 | `apps/worker/src/guards/gatePolicy.ts` `resolvePolicy()` / `isCoherentGateResponse()`（consume id の一致）、`approvalGateLogic.ts` `findGateTechnicalStopCode()` |
