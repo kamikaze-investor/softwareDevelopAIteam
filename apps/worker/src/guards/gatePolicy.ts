@@ -198,7 +198,9 @@ function technicalStop(code: GateTechnicalStopCode, detail: string): ResolvePoli
  *   - REJECTED                    → wait_for_approval + (continue_safe_work_only | block_until_approved)
  *   - STALE                       → re_check
  *   - outcome.riskLevel があれば riskReview.riskLevel と一致すること
- * call_consume の id 一致・RiskLevel の妥当性は gateClient が応答検証で保証する。
+ *   - call_consume なら consume する承認の id が outcome / nextAction / approvalRequest で一致すること（G-2。
+ *     食い違いは技術障害ではなく契約違反として re_check approval_contract_violation にする）
+ * RiskLevel の妥当性・consumedRequestId が非空文字列であることは gateClient が応答検証（構造）で保証する。
  */
 function isCoherentGateResponse(checkResponse: GateCheckResponse): boolean {
   const decision = checkResponse.outcome.decision
@@ -210,7 +212,12 @@ function isCoherentGateResponse(checkResponse: GateCheckResponse): boolean {
   switch (decision) {
     case 'ALLOW': {
       if (policy !== 'continue') return false
-      if (action === 'call_consume') return true
+      if (action === 'call_consume') {
+        const consumeId = checkResponse.nextAction.consumedRequestId
+        return consumeId !== undefined
+          && checkResponse.outcome.consumedRequestId === consumeId
+          && checkResponse.approvalRequest?.id === consumeId
+      }
       // HIGH / CRITICAL の ALLOW は承認を使い切るとき（call_consume）だけ。decideGateOutcome は HIGH / CRITICAL を
       // consumedRequestId 付きでしか ALLOW しない。HIGH / CRITICAL の ALLOW + proceed は consume 無しの実行になるので契約外。
       const risk = checkResponse.riskReview.riskLevel

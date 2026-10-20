@@ -2009,6 +2009,27 @@ describe('runJob — Notifier / CEO通知 integration (Step 3D)', () => {
     expect(payload.sourceType).toBe('gate_technical_stop')
   })
 
+  // G-2: call_consume の id の食い違いは gateClient を通り（構造は正しい）、本物の resolvePolicy が
+  // re_check approval_contract_violation にする。Job は failed ではなく見える blocked の技術停止になる。
+  it('call_consume の承認 id の食い違い → 本物の resolvePolicy で blocked + approval_contract_violation（failed にしない・consume しない）', async () => {
+    const actual = await vi.importActual<typeof import('./guards/gatePolicy.js')>('./guards/gatePolicy.js')
+    resolvePolicyMock.mockImplementation(actual.resolvePolicy)
+    callGateCheckMock.mockResolvedValue({
+      ...ALLOW_PROCEED_RESPONSE,
+      outcome: { decision: 'ALLOW' as const, riskLevel: 'LOW', consumedRequestId: 'req-g2' },
+      nextAction: { action: 'call_consume' as const, consumedRequestId: 'req-g2', message: 'consume it' },
+      approvalRequest: makeApprovalRequest('req-other'),
+    })
+
+    const result = await runJob(createJob(), createPolicy())
+
+    expect(result.status).toBe('blocked')
+    expect(result.gatePolicy).toBe('re_check')
+    expect(result.stderr).toMatch(/^approval_contract_violation: /)
+    expect(callConsumeMock).not.toHaveBeenCalled()
+    expect(resolveCommandMock).not.toHaveBeenCalled()
+  })
+
   it('STALE の re_check は従来どおり「承認無効」と通知し、stderr は付けない', async () => {
     callGateCheckMock.mockResolvedValue(makeBlockedResponse('req-3d-stale'))
     resolvePolicyMock.mockReturnValue({ policy: 're_check', reason: 'Approval is stale. Re-run gate/check to start a new approval flow.', apiAvailable: true })
