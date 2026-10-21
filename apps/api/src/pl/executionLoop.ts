@@ -162,6 +162,15 @@ const ACTIONABLE_ATTENTION_KINDS: readonly AttentionItem['kind'][] = [
   // （CEO 決定・2026-09-18）ので PL に実行させない。ここに載せるのは「CEO へ届ける」ためだけで、
   // 外すと `GET /api/state` には出るが誰も知らせないまま止まり続ける。
   'task_blocked_without_job',
+  // workspace quarantine。**通知だけ**する（下の NOTIFY_ONLY 参照）。解除は観測 + known-good を
+  // 要求する既存経路に限り、PL には実行させない。ここに無かったため PL は一度も escalate せず、
+  // 一方で採用は「全 attention が escalate 済み / exhausted」を要求するので、**どこか1件の
+  // quarantine が全 Project の採用を通知なしに止めていた**（lifecycle repair W5）。
+  'workspace_quarantined',
+  // 自力では進まない所有者（paused / draft Project の Job、done / park された Task の blocked 行）が
+  // 共有 workspace を握り、running Project の claim が止まっている。**通知だけ**する。
+  // 解消（Project の再開・放棄、既存 abort_task の観測による解放）は CEO の判断（lifecycle repair W5）。
+  'workspace_held_by_stalled_owner',
   // blocked は notify-only にしない。blocked reason を読んで sanctioned な復旧を選ばせる
   // （CEO 指示・2026-09-15）。executor が無い・判断不能なら fail-closed で Escalation へ倒れる。
   'job_blocked',
@@ -187,6 +196,9 @@ const ATTENTION_PRIORITY: readonly AttentionItem['kind'][] = [
   // blocked かつ Job 0 件は、他のどの経路からも解消できない（人の明示操作だけが解く）ため
   // 早く人へ届ける。**ここに無いと `selectTarget()` が走査せず永久に選ばれない。**
   'task_blocked_without_job',
+  // quarantine も人の判断（観測と再受け入れ）だけが解く。1回だけ CEO へ届ける。
+  'workspace_quarantined',
+  'workspace_held_by_stalled_owner',
   // blocked は workflow を止めているので早く見る。
   // **`ACTIONABLE_ATTENTION_KINDS` に入れてもここに無ければ永久に選ばれない**（selectTarget が
   // この順序を走査するため）。両方に入れること。
@@ -370,6 +382,12 @@ const NOTIFY_ONLY_ATTENTION_KINDS: readonly AttentionItem['kind'][] = [
   // `PL_ACTION_KINDS` に対応する語彙が無いため、仮にここから外しても PL は
   // `forbidden` にしか到達できない。二重に閉じている。
   'task_blocked_without_job',
+  // workspace quarantine。**PL には直せない**（解除は Worker の観測 + known-good を要する既存経路だけ）。
+  // 1回 escalate すれば `hasEscalated()` で以後は「CEO 判断待ち」として数えられ、
+  // その Project 以外の採用を止めなくなる。解除条件そのものはここでは一切変えない。
+  'workspace_quarantined',
+  // 進まない所有者が workspace を握っている。PL には Project の再開・放棄も stale 行の解放もできない。
+  'workspace_held_by_stalled_owner',
 ]
 
 /**
@@ -1209,8 +1227,17 @@ function tailText(value: string | undefined, max: number): string | undefined {
  * **ここに載せることは「実行してよい」を意味しない。** 可否は必ず `authorizePlAction()` が決める。
  * 載せるのは「PL に考えさせる選択肢」であり、Gate に落ちれば実行されない。
  * 一覧に無い値を PL が出した場合は Policy が未知値として forbidden にする。
+ *
+ * **このループに executor が配線された action だけを返す**（`PL_ACTION_EXECUTORS` が唯一の正本）。
+ * 以前は `retry_job` / `clear_workspace_quarantine` も候補に並び、PL が選ぶと Gate を通っても
+ * `no executor wired` で失敗して attempt を焼き、最後は誰にも知らされない `technical_exhausted`
+ * に落ちていた（lifecycle repair W5）。候補の意図は下の一覧に残し、提示は配線済みに絞る。
  */
 export function allowedActionsFor(kind: AttentionItem['kind']): readonly string[] {
+  return candidateActionsFor(kind).filter(hasWiredPlExecutor)
+}
+
+function candidateActionsFor(kind: AttentionItem['kind']): readonly string[] {
   switch (kind) {
     case 'design_review_idle':
     case 'design_review_failed':
@@ -1425,19 +1452,27 @@ export function verifyOutcome(
   return 'normalized'
 }
 
-async function executeAction(
+type PlActionExecutor = (
   storage: IStorage,
-  kind: string,
   item: AttentionItem,
   deps: Required<Pick<PlLoopDeps, 'rekickDesignReview'>> & PlLoopDeps,
   technicalResume: boolean,
-): Promise<{ ok: boolean; summary: string }> {
-  if (kind === 'escalate_to_ceo') {
+) => Promise<{ ok: boolean; summary: string }>
+
+/**
+ * このループで実際に実行できる action と、その executor。
+ *
+ * **PL に提示する候補（`allowedActionsFor()`）はこの表から導く。** 一覧を手で写すと、
+ * executor の無い action が候補に残り、選ばれるたびに attempt を焼いて黙って枯渇する
+ * （lifecycle repair W5）。executor を足すときはここに足せば候補にも現れる。
+ */
+const PL_ACTION_EXECUTORS: Readonly<Record<string, PlActionExecutor>> = {
+  escalate_to_ceo: async () => {
     // Escalation は「実行」ではなく報告である。ここでは成功扱いにせず、呼び出し側が escalated を返す。
     return { ok: true, summary: 'escalation requested by PL' }
-  }
+  },
 
-  if (kind === 'rekick_design_review') {
+  rekick_design_review: async (storage, item, deps) => {
     if (item.taskId === undefined) {
       return { ok: false, summary: 'attention has no taskId; cannot locate the design review run' }
     }
@@ -1456,16 +1491,16 @@ async function executeAction(
 
     const result = await deps.rekickDesignReview(storage, run.id)
     return { ok: result.status !== 'stale', summary: `design review rekick: ${result.status}` }
-  }
+  },
 
-  if (kind === 'observe_state') {
+  observe_state: async () => {
     // 「待つ」。既存の復旧が進行中だと PL が判断した場合。何も実行しない。
     // 状態が変わらなければ verification が `unchanged` になり、technical budget 到達を
     // `technical_exhausted` audit に残して以後の自動試行を止める。
     return { ok: true, summary: 'waiting: PL judged that an existing recovery is already in progress' }
-  }
+  },
 
-  if (kind === 'resume_task') {
+  resume_task: async (storage, item, deps, technicalResume) => {
     if (item.taskId === undefined) {
       return { ok: false, summary: 'attention has no taskId; cannot resume' }
     }
@@ -1500,10 +1535,27 @@ async function executeAction(
       ...(technicalResume ? { technicalResume: true } : {}),
     })
     return { ok: true, summary: `resume queued job ${resumed.job.id}` }
-  }
+  },
+}
 
-  // Gate は通ったが v1 に executor が無い操作。**勝手に別の操作で代替しない。**
-  return { ok: false, summary: `no executor wired for '${kind}' in this loop version` }
+/** その action にこのループの executor が配線されているか。 */
+export function hasWiredPlExecutor(kind: string): boolean {
+  return Object.prototype.hasOwnProperty.call(PL_ACTION_EXECUTORS, kind)
+}
+
+async function executeAction(
+  storage: IStorage,
+  kind: string,
+  item: AttentionItem,
+  deps: Required<Pick<PlLoopDeps, 'rekickDesignReview'>> & PlLoopDeps,
+  technicalResume: boolean,
+): Promise<{ ok: boolean; summary: string }> {
+  const executor = hasWiredPlExecutor(kind) ? PL_ACTION_EXECUTORS[kind] : undefined
+  if (executor === undefined) {
+    // 候補には出さないが、念のため残す。**勝手に別の操作で代替しない。**
+    return { ok: false, summary: `no executor wired for '${kind}' in this loop version` }
+  }
+  return executor(storage, item, deps, technicalResume)
 }
 
 /**
@@ -1661,7 +1713,14 @@ async function handleTarget(
   // `protected_path` だけが、現 Task の通常 Executor では recovery が変えられない
   // high-confidence / Task-caused / non-transient class。回数枯渇では発火しない。
   // HTTP ADMIN /abort はこの経路を通らず、従来どおり APPROVED approval_gate を要求する。
-  if (diagnosis.rootCauseClass === 'protected_path' && item.taskId !== undefined) {
+  // `workspace_quarantined` は notify-only として届けるだけにする（W5 で通知対象に加えたが、
+  // 隔離中の workspace に対して cleanup を伴う Abort を新たに起こさない）。
+  if (
+    diagnosis.rootCauseClass === 'protected_path'
+    && item.taskId !== undefined
+    && item.kind !== 'workspace_quarantined'
+    && item.kind !== 'workspace_held_by_stalled_owner'
+  ) {
     const abort = requestTechnicalAbort(storage, {
       taskId: item.taskId,
       attention: item,
@@ -1982,7 +2041,12 @@ async function maybeAdoptNext(
   }
 
   if (result.status === 'no_candidate') {
-    // ledger を全部やり切った状態。異常ではないので記録も Escalation もしない。
+    // ledger を全部やり切った状態。異常ではないので Escalation はしない。
+    // ただし「全項目が Candidate promotion 待ち」は終わったのではなく**外部の promotion を待って
+    // 止まっている**状態で、以前は何も残らず静かに停滞した（lifecycle repair W5）。
+    if (result.failureCode === 'awaiting_promotion') {
+      recordAwaitingPromotion(storage, key, result.reason ?? '')
+    }
     return undefined
   }
 
@@ -2004,6 +2068,27 @@ async function maybeAdoptNext(
     ...(result.reason !== undefined ? { reason: result.reason } : {}),
     attempt,
   }
+}
+
+/** `adoption=no_candidate code=awaiting_promotion` の行。分類は detail の構造化欄だけで判定する。 */
+const AWAITING_PROMOTION_DETAIL_PREFIX = 'adoption=no_candidate code=awaiting_promotion '
+
+/**
+ * promotion 待ちの停滞を既存 `pl_loop_target:adopt:<projectId>` に1行だけ残す。
+ *
+ * result は `idle` にする（`ATTEMPT_RESULTS` に入らないので採用予算も失敗分類も動かさない）。
+ * **毎 tick 書かない。** 直近の行が既に同じ記録なら何もしない（`technical_exhausted` と同じ dedup 形）。
+ * 間に採用試行・成功・Escalation が挟まれば、再び promotion 待ちになった時点で新しく残る。
+ */
+function recordAwaitingPromotion(storage: IStorage, key: string, reason: string): void {
+  const latest = storage.auditLog.findByEntity(AUDIT_ENTITY_TYPE, key)[0]
+  if (
+    latest !== undefined
+    && latest.operation === AUDIT_OPERATION
+    && latest.result === 'idle'
+    && (latest.detail ?? '').startsWith(AWAITING_PROMOTION_DETAIL_PREFIX)
+  ) return
+  record(storage, key, 'idle', `${AWAITING_PROMOTION_DETAIL_PREFIX}target=- ${reason}`)
 }
 
 async function escalateTo(

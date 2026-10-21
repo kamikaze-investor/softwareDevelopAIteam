@@ -13,7 +13,8 @@
  */
 
 import type { Job, Project, ReviewResult, Task } from '@ai-team/shared'
-import { isStaleBlockedJobCandidate } from '@ai-team/shared'
+import { isStaleBlockedJobCandidate, isLiveWorkspaceOwnerJob } from '@ai-team/shared'
+import { isInitialImplementStepKey as isSharedInitialImplementStepKey } from '@ai-team/shared'
 import {
   assertTransition,
   reconcileRunningJob,
@@ -103,7 +104,8 @@ export interface QueuedWork {
  * （＝そのTaskはまだ何も実行していない）は対象外のままにする。
  */
 function isInitialImplementStepKey(taskId: string, workflowStepKey: string | undefined): boolean {
-  return workflowStepKey === `task:${taskId}:initial-implement`
+  // 判定の実体は `@ai-team/shared` に置いた（API の claim guard が同じ意味を使うため）。
+  return isSharedInitialImplementStepKey(taskId, workflowStepKey)
 }
 
 /**
@@ -190,16 +192,17 @@ function isStaleBlockedJobOfFinishedTask(task: Task, job: Job): boolean {
  * canonical resume lineage がある行の終端化は API startup reconciliation の責務であり、
  * この Worker の述語は proof の無い stale 行そのものには触れない。
  */
-function findWorkspaceOwningTaskId(perTask: readonly { task: Task; jobs: Job[] }[]): string | undefined {
-  for (const { task, jobs } of perTask) {
-    const owns = jobs.some((job) => (
-      job.status === 'running' ||
-      (job.status === 'blocked' && !isStaleBlockedJobOfFinishedTask(task, job)) ||
-      (job.status === 'queued' && !isInitialImplementStepKey(task.id, job.workflowStepKey))
-    ))
-    if (owns) return task.id
-  }
-  return undefined
+function findWorkspaceOwningTaskIds(perTask: readonly { task: Task; jobs: Job[] }[]): string[] {
+  // **全件を返す。** 以前は API の並び順で最初の1件を所有者にしていたため、所有者が2つ
+  // 同時に立つ（＝既に不変条件が破れている）状態で、どちらか一方の Job を claim してしまえた。
+  // 所有権判定を archived 以外の全 Project へ広げた（W5）ことで現実に起こりうるので、
+  // 呼び出し側で fail-closed にする。
+  return perTask
+    .filter(({ task, jobs }) => jobs.some((job) => (
+      isLiveWorkspaceOwnerJob(task.id, job) ||
+      (job.status === 'blocked' && !isStaleBlockedJobOfFinishedTask(task, job))
+    )))
+    .map(({ task }) => task.id)
 }
 
 /**
@@ -253,8 +256,15 @@ export function resolveWorkspaceOwnership(
   readHead: (dir: string) => string | undefined = getCommitHash,
   readGitOperations: (dir: string) => readonly string[] = detectGitOperationState,
 ): WorkspaceOwnership {
-  const existing = findWorkspaceOwningTaskId(perTask)
-  if (existing !== undefined) return { kind: 'owner', taskId: existing }
+  const existing = findWorkspaceOwningTaskIds(perTask)
+  if (existing.length > 1) {
+    console.warn(
+      `[Worker] workspace の所有者が複数 Task に一致しました ` +
+      `(${existing.join(', ')})。任意に選ばず claim を見送ります。`,
+    )
+    return { kind: 'ambiguous' }
+  }
+  if (existing.length === 1) return { kind: 'owner', taskId: existing[0] }
 
   // 終わった Task に取り残された blocked 行。次の Task をまだ始められない間だけ所有権を保持する。
   const staleOwners = perTask.filter(({ task, jobs }) => (
@@ -343,17 +353,35 @@ export async function fetchQueuedJob(): Promise<QueuedWork | null> {
   const projects = await fetchJson<Project[]>('/api/projects')
   if (!projects) return null
 
+  // **所有権は archived 以外のすべての Project の Task で判定し、claim は running Project に限る。**
+  //
+  // workspace は deployment ごとに1つ（TARGET_ROOT）であり、paused / draft の Project も同じ
+  // worktree を使う。以前は running 以外を判定から外していたため、paused Project の running /
+  // blocked / dirty な所有者がいても別 Project の Job を claim し、未 commit の変更の上で
+  // 走らせうるところだった（lifecycle repair W5）。pause は CEO の停止スイッチなので止めない代わりに、
+  // 止めた Project の所有者はここで見え続ける（fail-closed）。止めた Project 自身の queued Job は実行しない。
   const perTask: Array<{ task: Task; jobs: Job[] }> = []
+  const claimableTaskIds = new Set<string>()
   for (const project of projects) {
-    if (project.status !== 'running') continue
+    if (project.status === 'archived') continue
 
+    // **一覧を1つでも読めなければ、この poll では何も claim しない。** 読めなかった Project /
+    // Task を黙って飛ばすと、そこにいる所有者（paused Project の blocked Job 等）が判定から
+    // 消え、所有者不在として別 Task を claim してしまう（fail-open。W5 独立レビュー指摘）。
     const tasks = await fetchJson<Task[]>(`/api/tasks?projectId=${encodeURIComponent(project.id)}`)
-    if (!tasks) continue
+    if (!tasks) {
+      console.warn(`[Worker] Project ${project.id} の Task 一覧を読めないため、この poll では claim しません`)
+      return null
+    }
 
     for (const task of tasks) {
       const jobs = await fetchJson<Job[]>(`/api/jobs?taskId=${encodeURIComponent(task.id)}`)
-      if (!jobs) continue
+      if (!jobs) {
+        console.warn(`[Worker] Task ${task.id} の Job 一覧を読めないため、この poll では claim しません`)
+        return null
+      }
       perTask.push({ task, jobs })
+      if (project.status === 'running') claimableTaskIds.add(task.id)
     }
   }
 
@@ -363,6 +391,7 @@ export async function fetchQueuedJob(): Promise<QueuedWork | null> {
 
   for (const { task, jobs } of perTask) {
     if (ownership.kind === 'owner' && ownership.taskId !== task.id) continue
+    if (!claimableTaskIds.has(task.id)) continue
 
     const queued = jobs.find((job) => job.status === 'queued')
     if (queued) return { job: queued, task, jobs }
@@ -395,7 +424,18 @@ export interface PatchJobResult {
    * 既存の `revertBlockedJobChanges()` で自分の変更だけを取り消す。
    */
   workspaceCleanupRequired?: boolean
+  /**
+   * API が更新を**確定的に拒否した**ときの code（現在は claim 拒否の `JOB_CLAIM_REFUSED` だけ）。
+   * 応答が失われた場合とは違い、Job は API 側で queued のまま確定している。
+   */
+  refusedCode?: typeof JOB_CLAIM_REFUSED_CODE
 }
+
+/**
+ * claim（queued -> running）を API が拒否した（Project が running でない / quarantine）ときの code。
+ * 通常の CEO pause でも起きる確定応答なので、retry・reconcile・通知の対象にしない（lifecycle repair W5）。
+ */
+export const JOB_CLAIM_REFUSED_CODE = 'JOB_CLAIM_REFUSED'
 
 export function normalizePatchJobResult(value: boolean | PatchJobResult): PatchJobResult {
   return typeof value === 'boolean' ? { ok: value } : value
@@ -440,6 +480,17 @@ export async function patchJobWithRetry(
           workspaceCleanupRequired = false
         }
         return { ok: true, workspaceCleanupRequired }
+      }
+      // claim 拒否は確定応答。retry しても結果は変わらないので即座に返す。
+      // それ以外の非 2xx（未知の 409 を含む）は従来どおり retry する。
+      if (response.status === 409) {
+        let code: unknown
+        try {
+          code = (await response.json() as { code?: unknown })?.code
+        } catch {
+          code = undefined
+        }
+        if (code === JOB_CLAIM_REFUSED_CODE) return { ok: false, refusedCode: JOB_CLAIM_REFUSED_CODE }
       }
     } catch {
       // A network error and an AbortController timeout are both retryable here.
@@ -793,7 +844,7 @@ async function confirmRunningTransition(
   // ── PR-C: claim（queued -> running）と workspace baseline を同一 PATCH で原子化する ──
   // baseline は Job の子プロセスが workspace を変更し得る**前**に durable に保存しなければ
   // ならない。ここで Job はまだ queued であり、initial-implement 以外の queued Job は
-  // findWorkspaceOwningTaskId() により該当 Task が workspace を保有している扱いになる。
+  // findWorkspaceOwningTaskIds() により該当 Task が workspace を保有している扱いになる。
   // Worker は systemd の flock で単一インスタンス化され、poll loop も単一スレッドのため、
   // baseline 計算と claim の間に他 Task が workspace を奪うことは無い。
   // baseline 取得に失敗したら claim せず fail-closed で failed へ落とす（子プロセスを起動しない）。
@@ -853,8 +904,19 @@ async function confirmRunningTransition(
     startedAt: (dependencies.now ?? (() => new Date().toISOString()))(),
     workspaceBaseline: baseline.baseline,
   }
-  const confirmed = await (dependencies.patchJob ?? patchJobWithRetry)(job.id, runningPayload)
-  if (confirmed) return true
+  // `patchJobWithRetry()` は失敗時も `{ ok: false }`（truthy なオブジェクト）を返す。
+  // そのまま `if (confirmed)` で見ると claim の失敗・拒否を成功とみなして実行してしまう。
+  const confirmed = normalizePatchJobResult(
+    await (dependencies.patchJob ?? patchJobWithRetry)(job.id, runningPayload),
+  )
+  if (confirmed.ok) return true
+
+  // API が claim を確定的に拒否した（Project が pause された等）。応答が失われたわけではないので
+  // reconcile（fail-if-running）も CRITICAL 通知もしない。Job は queued のまま、この poll では実行しない。
+  if (confirmed.refusedCode === JOB_CLAIM_REFUSED_CODE) {
+    console.warn(`[Worker] Job ${job.id} の claim は API に拒否されました（Project が running でない、または quarantine）。queued のまま見送ります`)
+    return false
+  }
 
   await reconcileAfterPatchFailure(
     job.id,
