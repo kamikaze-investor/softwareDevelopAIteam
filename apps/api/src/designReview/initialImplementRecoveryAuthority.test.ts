@@ -397,9 +397,7 @@ function consumedRecoveryApproval(shape: Shape, actor: 'admin' | 'worker' | 'leg
 }
 
 describe('consume 済み承認は、人が決めた記録があるときだけ authority になる（Codex review）', () => {
-  // stack 暫定: actor 要求は書き手（承認 PATCH の recordApprovalActor）と同じ stack-06 で戻す
-  // （APPROVAL_ACTOR_REQUIRED）。拒否側の 2 件は re-enabled with the writer in stack-06。
-  it.skip.each([
+  it.each([
     ['記録なし', 'none'],
     ['WORKER credential（ai）', 'worker'],
     ['legacy 単一 token（unknown）', 'legacy'],
@@ -425,22 +423,7 @@ describe('consume 済み承認は、人が決めた記録があるときだけ a
     })
   })
 
-  // stack 暫定の liveness 確認（stack-06 で actor 要求と一緒に外す）: 書き手の無い層では、
-  // 承認 PATCH が approval_actor を書かなくても正当な承認は master と同じく通る。
-  it('stack 暫定: approval_actor の記録が無い承認でも承認 → consume で repair run を queue する', async () => {
-    const shape = await b8d0fc5dShape()
-    await terminalRun(shape, 'REVIEW_UNAVAILABLE')
-    const first = recover(shape)
-    if (first.status !== 'awaiting_approval') throw new Error('fixture expected awaiting_approval')
-    shape.storage.approvalRequests.recordDecision(first.approvalRequestId, 'APPROVED')
-
-    expect(recover(shape)).toMatchObject({ status: 'queued', stepKey: `repair:${shape.impl.id}:1` })
-    expect(shape.storage.approvalRequests.findById(first.approvalRequestId)?.status).toBe('CONSUMED')
-    expect(shape.storage.designReviewRuns.findQueued()).toHaveLength(1)
-  })
-
-  // re-enabled with the writer in stack-06（APPROVAL_ACTOR_REQUIRED）。
-  it.skip('人が決めた記録の無い APPROVED は consume せずに rejected を返す（承認を焼かない）', async () => {
+  it('人が決めた記録の無い APPROVED は consume せずに rejected を返す（承認を焼かない）', async () => {
     const shape = await b8d0fc5dShape()
     await terminalRun(shape, 'REVIEW_UNAVAILABLE')
     const first = recover(shape)
