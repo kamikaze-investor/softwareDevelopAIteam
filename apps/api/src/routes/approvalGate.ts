@@ -48,10 +48,9 @@ import { gateEvaluationRoutes } from './gateEvaluations'
 // v2（2026-10-02 Decision Authority Principle Stage 1）: git_commit の一律人間承認を、
 // Safety Evidence が全て成立する LOW / MEDIUM に限って外した（`gitCommitEvidence.ts`）。
 // v3（2026-10-16 監査 RC4/RC6）: 承認を requestedAction 単位に束縛し、SAFE_WORK の HIGH には承認依頼を
-// 作らず、RISK_RULES の HIGH 対象（Gate / 承認の実装ファイル・docs/project_memory/rules/）を広げた。
+// 作らず、RISK_RULES の HIGH 対象に commitGate.ts（K-2）と docs/project_memory/rules/**（K-1）だけを足した。
+// 2026-10-17 の authority・admission・recovery 定義ファイルへの拡張は Risk と Authority の混同として取り下げた。
 // v2 の evidence を読む側（roadmapAdoption の Candidate commit 証明）は v2 / v3 の両方を受け付ける。
-// 2026-10-17（RC6 / DA trigger 2）の RISK_RULES 拡張（authority・admission・recovery の定義ファイル）も v3 に含める。
-// v3 は同じ lifecycle repair の一連の変更で未リリース（origin/master は v2）なので、v4 へは上げない。
 export const GATE_POLICY_VERSION = 'gate-policy-v3'
 
 /** 承認 PATCH が期限切れの WAITING を決定しなかったときの 409 `code`（Mobile が文言へ写す）。 */
@@ -305,7 +304,8 @@ function computeNextAction(
     case 'STALE':
       return {
         action: 're_check',
-        message: '承認が無効化されました（commit/diff が変化）。再度 /api/gate/check を呼び出して新しい承認フローを開始してください。',
+        // 無効化の理由は outcome.reason がそのまま持つ（commit / diff の変化・承認時より高いリスク）。
+        message: `承認が無効化されました: ${outcome.reason} 再度 /api/gate/check を呼び出して新しい承認フローを開始してください。`,
       }
   }
 }

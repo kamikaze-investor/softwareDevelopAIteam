@@ -578,6 +578,19 @@ function technicalRecoveryExhaustion(
   }
 
   const targetAttempts = countPriorAttempts(storage, targetKeyOf(item))
+  // Gate 段階の技術停止（triage rule 6.8）は自動 recovery の budget が最初から 0 である: AI の resume は
+  // 同じ不整合で再停止するだけで、CEO 判断の対象でもない（specs/22 1-2 / 14-3）。最初の観測で対象単位の
+  // technical_exhausted として記録し（理由コードは detail の `stop=`）、attention には残したまま自動試行から外す。
+  // 原因を直した後の明示 resume は新しい Job を作るので、この記録には縛られない。
+  if (diagnosis.technicalStop !== undefined) {
+    return {
+      scope: 'target',
+      auditKey: targetKeyOf(item),
+      attempts: targetAttempts,
+      limit: 0,
+      diagnosis,
+    }
+  }
   if (targetAttempts >= PL_MAX_ATTEMPTS_PER_TARGET) {
     return {
       scope: 'target',
@@ -1962,7 +1975,9 @@ async function handleTarget(
       status: 'idle',
       target,
       triage,
-      reason: `${exhaustion.scope} technical recovery budget exhausted; CEO decision was not requested by count`,
+      reason: exhaustion.diagnosis.technicalStop !== undefined
+        ? `technical Gate stop (${exhaustion.diagnosis.technicalStop}) is not auto-recovered; CEO decision was not requested`
+        : `${exhaustion.scope} technical recovery budget exhausted; CEO decision was not requested by count`,
       attempt,
     }
   }

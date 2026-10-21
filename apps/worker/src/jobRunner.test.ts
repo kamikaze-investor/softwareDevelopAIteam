@@ -1986,6 +1986,63 @@ describe('runJob — Notifier / CEO通知 integration (Step 3D)', () => {
     )
   })
 
+  // D2: 技術的不整合の re_check は「承認無効」と通知しない。理由を stderr に残す（PL triage が自動 resume しない）
+  it.each([
+    'risk_rule_skew: local CRITICAL > API HIGH (worker/api rule skew); technical Gate inconsistency, not an approval decision',
+    'approval_contract_violation: decision=BLOCKED continuationPolicy=continue nextAction=wait_for_approval; technical Gate inconsistency, not an approval decision',
+  ])('技術的不整合の re_check（%s）→ 技術停止の通知・stderr に理由・コマンド未実行', async (reason) => {
+    callGateCheckMock.mockResolvedValue(makeBlockedResponse(`req-3d-tech-${reason.slice(0, 12)}`))
+    resolvePolicyMock.mockReturnValue({ policy: 're_check', reason, apiAvailable: true })
+
+    const result = await runJob(createJob(), createPolicy())
+
+    expect(result.status).toBe('blocked')
+    expect(result.gatePolicy).toBe('re_check')
+    expect(result.stderr).toBe(reason)
+    expect(resolveCommandMock).not.toHaveBeenCalled()
+    expect(callConsumeMock).not.toHaveBeenCalled()
+    const payload = sendAlertMock.mock.calls[0][0]
+    expect(payload.title).toContain('Gate の技術的不整合')
+    expect(payload.title).not.toContain('承認無効')
+    expect(payload.body).toContain('承認の判断ではありません')
+    expect(payload.body).toContain('承認待ちの承認があればそれを承認し、無ければ resume してください')
+    expect(payload.sourceType).toBe('gate_technical_stop')
+  })
+
+  // G-2: call_consume の id の食い違いは gateClient を通り（構造は正しい）、本物の resolvePolicy が
+  // re_check approval_contract_violation にする。Job は failed ではなく見える blocked の技術停止になる。
+  it('call_consume の承認 id の食い違い → 本物の resolvePolicy で blocked + approval_contract_violation（failed にしない・consume しない）', async () => {
+    const actual = await vi.importActual<typeof import('./guards/gatePolicy.js')>('./guards/gatePolicy.js')
+    resolvePolicyMock.mockImplementation(actual.resolvePolicy)
+    callGateCheckMock.mockResolvedValue({
+      ...ALLOW_PROCEED_RESPONSE,
+      outcome: { decision: 'ALLOW' as const, riskLevel: 'LOW', consumedRequestId: 'req-g2' },
+      nextAction: { action: 'call_consume' as const, consumedRequestId: 'req-g2', message: 'consume it' },
+      approvalRequest: makeApprovalRequest('req-other'),
+    })
+
+    const result = await runJob(createJob(), createPolicy())
+
+    expect(result.status).toBe('blocked')
+    expect(result.gatePolicy).toBe('re_check')
+    expect(result.stderr).toMatch(/^approval_contract_violation: /)
+    expect(callConsumeMock).not.toHaveBeenCalled()
+    expect(resolveCommandMock).not.toHaveBeenCalled()
+  })
+
+  it('STALE の re_check は従来どおり「承認無効」と通知し、stderr は付けない', async () => {
+    callGateCheckMock.mockResolvedValue(makeBlockedResponse('req-3d-stale'))
+    resolvePolicyMock.mockReturnValue({ policy: 're_check', reason: 'Approval is stale. Re-run gate/check to start a new approval flow.', apiAvailable: true })
+
+    const result = await runJob(createJob(), createPolicy())
+
+    expect(result.status).toBe('blocked')
+    expect(result.stderr).toBeUndefined()
+    const payload = sendAlertMock.mock.calls[0][0]
+    expect(payload.title).toContain('承認無効')
+    expect(payload.sourceType).toBe('gate_stale')
+  })
+
   // 2. block_until_approved の title に safeCommand.kind が含まれる
   it('block_until_approved の title に safeCommand.kind が含まれる', async () => {
     callGateCheckMock.mockResolvedValue(makeBlockedResponse('req-3d-002'))
@@ -2018,6 +2075,27 @@ describe('runJob — Notifier / CEO通知 integration (Step 3D)', () => {
     expect(payload.body).toContain('task-notif-3d')
     expect(payload.body).toContain('job-notif-3d')
     expect(payload.body).toContain('req-3d-003')
+  })
+
+  // 技術停止の dedup は理由コードごと: 同じ承認依頼でも原因が違えばそれぞれ通知し、同じ原因は 1 回だけ。
+  it('同一 approvalRequestId でも技術停止の原因が違えば両方通知し、同じ原因の 2 回目は通知しない', async () => {
+    const ID = 'req-3d-tech-dedup'
+    callGateCheckMock.mockResolvedValue(makeBlockedResponse(ID))
+    const skew = 'risk_rule_skew: local CRITICAL > API HIGH (worker/api rule skew); technical Gate inconsistency, not an approval decision'
+    const contract = 'approval_contract_violation: decision=BLOCKED continuationPolicy=continue nextAction=wait_for_approval; technical Gate inconsistency, not an approval decision'
+
+    resolvePolicyMock.mockReturnValue({ policy: 're_check', reason: skew, apiAvailable: true })
+    await runJob(createJob(), createPolicy())
+    expect(sendAlertMock).toHaveBeenCalledTimes(1)
+
+    resolvePolicyMock.mockReturnValue({ policy: 're_check', reason: contract, apiAvailable: true })
+    await runJob(createJob(), createPolicy())
+    expect(sendAlertMock).toHaveBeenCalledTimes(2)
+    expect(sendAlertMock.mock.calls[1][0].body).toContain('approval_contract_violation')
+
+    resolvePolicyMock.mockReturnValue({ policy: 're_check', reason: skew, apiAvailable: true })
+    await runJob(createJob(), createPolicy())
+    expect(sendAlertMock).toHaveBeenCalledTimes(2)
   })
 
   // 4. 同一 approvalRequestId の block_until_approved は 2 回目通知されない（dedup）

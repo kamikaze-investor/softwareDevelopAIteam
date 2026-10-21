@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest'
-import { runRiskReview, SAFE_WORK_COMMAND_KINDS, isSafeWorkCommandKind } from './approvalGateLogic'
+import {
+  GATE_TECHNICAL_STOP_CODES,
+  findGateTechnicalStopCode,
+  gateTechnicalStopCodeOfJob,
+  runRiskReview,
+  SAFE_WORK_COMMAND_KINDS,
+  isSafeWorkCommandKind,
+} from './approvalGateLogic'
 
 const GATE = 'alignment / gate change'
 const DA_DOC = 'decision authority / safety policy doc'
@@ -90,5 +97,46 @@ describe('SAFE_WORK_COMMAND_KINDS', () => {
       expect(isSafeWorkCommandKind(kind)).toBe(false)
     }
     expect(isSafeWorkCommandKind('git_status')).toBe(true)
+  })
+})
+
+describe('findGateTechnicalStopCode (D2)', () => {
+  it.each([
+    ['risk_rule_skew: local CRITICAL > API HIGH (worker/api rule skew); technical Gate inconsistency, not an approval decision', 'risk_rule_skew'],
+    ['approval_contract_violation: decision=BLOCKED continuationPolicy=continue nextAction=wait_for_approval', 'approval_contract_violation'],
+  ])('matches a reason that starts with the code at offset 0: %s', (text, code) => {
+    expect(findGateTechnicalStopCode(text)).toBe(code)
+  })
+
+  it.each([
+    ['a later line', 'test output\nrisk_rule_skew: local CRITICAL > API HIGH'],
+    ['leading whitespace', '  risk_rule_skew: local CRITICAL > API HIGH'],
+    ['a prefix', '[gate] approval_contract_violation: x'],
+    ['no space after the colon', 'risk_rule_skew:local CRITICAL'],
+    ['an unknown code', 'risk_rule: x'],
+    ['empty', ''],
+    ['undefined', undefined],
+  ])('does not match %s (command output cannot spoof a technical stop)', (_label, text) => {
+    expect(findGateTechnicalStopCode(text)).toBeUndefined()
+  })
+
+  it('exposes exactly the two D2 codes', () => {
+    expect([...GATE_TECHNICAL_STOP_CODES]).toEqual(['risk_rule_skew', 'approval_contract_violation'])
+  })
+})
+
+describe('gateTechnicalStopCodeOfJob (D2)', () => {
+  const SKEW = 'risk_rule_skew: local CRITICAL > API HIGH (worker/api rule skew)'
+  it('a blocked Job that never executed, with the code at the start of stderr', () => {
+    expect(gateTechnicalStopCodeOfJob({ status: 'blocked', stderr: SKEW })).toBe('risk_rule_skew')
+  })
+  it.each([
+    ['not blocked', { status: 'failed', stderr: SKEW }],
+    ['executed (exitCode)', { status: 'blocked', stderr: SKEW, exitCode: 0 }],
+    ['executed (stdout log)', { status: 'blocked', stderr: SKEW, stdoutPath: '/logs/x.out' }],
+    ['code on a later line', { status: 'blocked', stderr: `out\n${SKEW}` }],
+    ['no stderr', { status: 'blocked' }],
+  ])('%s → undefined', (_label, job) => {
+    expect(gateTechnicalStopCodeOfJob(job)).toBeUndefined()
   })
 })
