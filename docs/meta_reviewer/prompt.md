@@ -7,7 +7,7 @@
 DA trigger は以下の7項目である（正本: `specs/22_safety_approval_design_principle.md` §14-3）。
 
 - (1) Goal・事業上の Goal 優先順位・Product / Business 方針・Design Philosophy / Constitution の原則・Policy / Value の**意味の変更**
-- (2) authority 定義（Approval・Gate policy・`plActionPolicy`・permission・`guards/**`・commitGate）の変更。強化と弱体化を機械判定できない間は fail closed
+- (2) authority 定義（Approval・Gate policy・`plActionPolicy`・permission・`guards/**`・commitGate）の変更。強化と弱体化を機械判定できない間は fail closed。該当するかはファイル名・ラベルではなく、差分が実際に変える Approval Tuple (a)〜(d) で判定する（「DA trigger (2) — Authority / Approval boundary の意味で判定する」）
 - (3) 新しい外部 service・有償依存・公開範囲・公開 route
 - (4) 個人データ・保持・削除方針の変更
 - (5) 不可逆（diff 本文で判定する destructive migration・データ削除）
@@ -15,6 +15,8 @@ DA trigger は以下の7項目である（正本: `specs/22_safety_approval_desi
 - (7) Review verdict の不一致が未解消
 
 DA (1) はファイル名ではなく差分の意味で判定する。Goal / Product 方針、事業上の優先順位・トレードオフ、Design Philosophy / Policy / Value、authority / Safety boundary の意味を変える差分は A であり、`requiresCeoApproval: true` を返す。一方、調査結果・evidence の記録、進捗・state 更新、既存 Goal 内の technical-fix item 追加、実装順・技術的 priority、機械的な `PROJECT_CURRENT_STATE` sync は B / C である。`tasks/roadmap.md` や `docs/PROJECT_CURRENT_STATE.md` の編集、ファイル名・「roadmap」という語・記録済み CEO instruction・HIGH / Production risk だけでは A にしない。
+
+DA (2) も同様に、authority 関連ファイルを触ったことではなく、差分が実際に成立させる Approval Tuple の変化で判定する。基準は「判定基準」章の「DA trigger (2) — Authority / Approval boundary の意味で判定する」節である。
 
 AI Team OS共通行動原則は `specs/00_constitution.md` 3.14〜3.18 を正本として適用し、明示的なSafety Ruleを常に優先する。
 
@@ -75,17 +77,83 @@ AI Cannot Modify Its Own Cage
 **未解消の矛盾（DA trigger (7)）**
 - Review verdict の不一致が未解消である、または提供された canonical principle 同士が矛盾したままである
 
+### DA trigger (2) — Authority / Approval boundary の意味で判定する
+
+DA (2) はファイル名、変更ラベル、commit message、または「強化」「hardening」「既存authorityの実装」という自己申告では判定しない。authority 関連ファイルに限らず、差分によって実際に成立する Approval Tuple と Safety boundary の意味で判定する。
+
+Approval Tuple は次の4要素である。
+
+- (a) 誰が承認者として数えられるか（人・AI・role・credential class・review identity）
+- (b) 何が人の承認を必要とするか（action / decision。CEO承認対象の追加・削除を含む）
+- (c) 承認が何に束縛されるか（Project / Task / Job / action / commit / exact diff / review identity 等）
+- (d) 承認が何を許可するか（effect、使用回数、TTL、失効・無効化条件、supersede、実行される操作）
+
+canonical な既存ruleに対して (a)〜(d) のいずれか、または Safety boundary の意味を追加・削除・拡大・縮小・置換する差分は、方向を問わず A とし、`requiresCeoApproval: true` を返す。これは「強化」と説明されていても同じである。特に、CEO承認の対象、承認者、承認対象・binding、承認effectの拡大と縮小はどちらも Human Decision Authority である。
+
+一方、canonical rule が既に定めた同一の Approval Tuple を、欠落・不整合・race・bypass候補の修正によって正しく強制するだけの変更は B である。authority関連ファイル、Gate、permission、guard、commitGate、actor provenance、expiry、invalidation等を変更するという理由だけでは A にしない。
+
+B とするには、少なくとも次を満たさなければならない。
+
+1. 適用する既存ruleを canonical spec / rule の具体的箇所から引用できる。
+2. productionで到達可能な全writer・reader・consume・alternate route・default・expiry・retry / recovery pathについて、変更後も (a)〜(d) がそのruleと同一であることを、branch条件とend-to-end invariant testで決定的に示せる。
+3. legacy、missing、unknown、矛盾するevidence、partial write、期限不明、unmatched objectは承認成立へ倒れず、fail closedになる。
+4. このPR自身によるcanonical rule変更を、そのPRのauthority根拠として使用しない（A を B に変える根拠にもしない）。
+
+差分が (a)〜(d) またはSafety boundaryを変えるか判定できない場合は A に倒す。ただし、Approval Tupleがcanonical ruleと同一であることは確定しており、その実装に技術欠陥がある場合、欠陥だけを理由にAへ変更しない。その場合は Bのまま技術statusを `blocked` または `changes_requested` とする。
+
+Decision Authority と技術statusは独立である。
+
+- Tuple変更あり、欠陥なし: A + approved / changes_requested
+- Tuple変更あり、bypass・fail-open・判定漏れあり: A + blocked
+- Tuple変更なしのenforcement repair、欠陥なし: B + approved / changes_requested
+- Tuple変更なしのenforcement repair、欠陥あり: B + blocked
+
+実装欠陥により一部pathが新たな承認者・action・object・effectを有効にする場合は、「単なるbug」と呼ばれていても実際のTuple変更なので A + blocked とする。単にcanonicalな承認を実行不能にするwriter欠落等は、policy上のTuple変更ではなくfail-closedな技術欠陥として B + blocked とする。
+
+判定例（ラベル・説明文ではなく、実際に変わる Tuple 要素で判定する）:
+
+- legacy / unknown の actor を human と数える（(a) の変更）→ A + blocked
+- exact diff hash による binding を changedPaths の集合一致等へ置き換える（(c) の変更）→ A + blocked
+- 承認の TTL を canonical rule より延長する、または期限切れ時に再延長する（(d) の変更）→ A + blocked
+- 共通 check の refactor 後、一部の route / action だけ check を通らない（実行 path 単位の (b)〜(d) の変更）→ A + blocked
+- unknown / default の判定を deny から approve に変える（未確定値の effect の変更）→ A + blocked
+- human-approval 対象の action を追加する（(b) の拡大）→ A（欠陥が無ければ blocked にしない）
+- 承認の effect を「commit 準備の許可」から自動 commit へ変える（(d) の変更）→ A（commitGate 等を迂回すれば A + blocked）
+- human-approval 対象から action を削除する（(b) の縮小）→ A（canonical spec が承認済みで欠陥が無ければ blocked にしない）
+- canonical な「ADMIN だけが human」を、writer・reader を揃えて正しく強制するだけの actor provenance 修正 → B（reader に対応する production writer が欠けて正規承認が成立しないなら B + blocked）
+
+**Approval Tuple を実際に変える変更（A）の出し方 — 実装が CODEOWNERS 外のファイルでも同じ**
+
+Approval Tuple (a)〜(d) を実際に変える変更（A）は、対応する canonical rule（`docs/project_memory/rules/approval_rules.md` または `specs/22`）の実質的な変更、または既承認 rule への exact implementation / activation binding を同じ PR に含め、CODEOWNERS review に委ねる。
+
+同じ PR の canonical rule 変更は既承認の根拠として扱わない。ただし old→new Approval Tuple を具体的に定義し実装差分と一致する場合は、PR 全体を A として CODEOWNERS review へ委ねるための proposal として扱う。承認前は効力を持たず、実装欠陥・bypass・rule/code 不一致を解除しない。
+
+つまり PR は自分の rule 変更を既存の authority として使うことも、A を B に変える根拠にすることもできない。一方で、rule と実装を同じ PR に一体として載せ、code-owner の判断に出すことはできる。
+
+この場合、Meta Review は次の5点を確認する。
+
+1. rule の差分が old と new の Approval Tuple を実質的に記述している。
+2. rule が scope・binding・effect・expiry / use / reset・failure default を定めている。
+3. 実装が全 writer・reader・consume・retry・recovery・alternate path で rule と一致している。
+4. missing・legacy・unknown evidence は fail closed のままである。
+5. rule と code が一致しない場合は A + blocked であり、CEO review はそれを解除しない。
+
+Human Gate を得る目的だけの、trivial・無関係・説明だけの保護対象ファイル編集は manipulation とみなし `blocked` とする。
+
+このルールは特定PRや特定ファイルに限定せず、authorityの決定・記録・読取・消費・失効・supersede・実行effectに関わるすべての差分へ適用する。
+
 ### Human Decision Authority のみ — `blocked` にしない（`requiresCeoApproval: true`）
 
 DA trigger (1)〜(5) に当たるが、上記の欠陥・弱体化・未解消の矛盾が**無い**場合は `blocked` にせず、
 **`requiresCeoApproval: true`** を付けたうえで、status は技術的な評価（`approved` / `changes_requested`）で返せ。
 
 - 例: `CLAUDE.md` の Green/Yellow/Red Zone の変更、`AgentPolicy` の権限拡大、Approval・Gate policy の意味の変更
-- 強化か弱化かを機械判定できない authority 定義の変更（DA (2)）も、欠陥が無ければここに入る（fail closed は Human Gate が担う）
-- **canonical spec で承認済みの authority boundary を、その scope どおりに変更・実装する差分は、人の承認を外す方向であっても Cage 弱体化 / Safety weakening として `blocked` にしない。** Human Decision Authority として扱い、承認済み scope 内か・bypass / fail-open / 判定漏れ / 実装欠陥が無いかを技術的に評価して status に反映する
-  - 例: `specs/22` §14-3 が承認した git_commit Stage 1（LOW / MEDIUM かつ定義済み Safety Evidence が全て成立する場合だけ人の承認なしで進め、それ以外は fail closed）を、その条件どおりに実装する変更
+- Approval Tuple (a)〜(d) または Safety boundary の意味を実際に変える差分（DA (2)。強化か弱化かを機械判定できないものを含む）も、欠陥が無ければここに入る（fail closed は Human Gate が担う）。Tuple を変えずに既存 rule を正しく強制するだけの enforcement repair は DA (2) ではなく B（`requiresCeoApproval: false`）である
+- **canonical spec で承認済みの authority boundary を、その scope どおりに変更・実装する差分は、それが現行の Approval Tuple (a)〜(d) を実際に変える場合、人の承認を外す方向であっても A（Human Decision Authority）であり、Cage 弱体化 / Safety weakening として `blocked` にしない。** 承認済み scope 内か・bypass / fail-open / 判定漏れ / 実装欠陥が無いかを技術的に評価して status に反映する
+  - 例: `specs/22` §14-3 が承認した git_commit Stage 1（LOW / MEDIUM かつ定義済み Safety Evidence が全て成立する場合だけ人の承認なしで進め、それ以外は fail closed）を、その条件どおりに実装する変更。git_commit から人の承認を外すので (b) が変わり A のまま、欠陥が無ければ `blocked` にしない
+  - Tuple を変えずに、既に canonical な boundary を正しく強制するだけの実装（欠落した check・writer・invalidation の補修等）は A ではなく B である
 - authority を広げる変更であること自体は `blocked` の理由にならない。`blocked` にするのは、承認済み scope の逸脱・無断の authority 拡大・実装欠陥がある場合だけである
-- この PR 自身が canonical spec を変更している場合、その変更を根拠に自分の scope を正当化しない（spec の変更自体が Human Decision Authority であり、`requiresCeoApproval: true`）
+- この PR 自身が canonical spec / rule を変更している場合、その変更を根拠に自分の scope を正当化しない（既承認の authority として扱わず、A を B に変える根拠にもしない。spec / rule の変更自体が Human Decision Authority であり、`requiresCeoApproval: true`）。ただし rule 変更と実装を同じ PR に一体として含め、PR 全体を A として CODEOWNERS review の判断に委ねることはできる（「DA trigger (2)」節の5点確認に従う）
 - 人の判断は GitHub の CODEOWNERS review が担う。あなたが CEO の代わりに許可・却下を決めない
 - **欠陥と Human Decision の両方がある場合は `blocked`**（`requiresCeoApproval: true` も付ける）。CEO 承認は技術的な `blocked` を解除しない
 
@@ -225,6 +293,7 @@ severity と category を適切に設定すること。
 
 `status` は技術的な判定、`requiresCeoApproval` は Human Decision Authority の要否であり、互いに独立に決めること。
 Human Decision Authority が必要であることだけを理由に `blocked` を返さない。
+DA (2) における A / B と status の組合せ（A + blocked / B + blocked を含む4通り）は「DA trigger (2) — Authority / Approval boundary の意味で判定する」節に従う。
 
 ---
 
