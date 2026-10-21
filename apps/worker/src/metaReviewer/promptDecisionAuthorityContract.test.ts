@@ -280,6 +280,12 @@ describe('Meta Reviewer 判定契約 — DA (2) の rule は実際に model へ�
     expect(built).toContain('- Tuple変更なしのenforcement repair、欠陥あり: B + blocked')
     expect(built).toContain('#### DA (2): Approval Tuple の意味確認')
 
+    // 既承認 rule（base branch の approval_rules.md）が全文、A/B 指示と共に届く（canonical context delivery gap）
+    const approvalRules = readFileSync(path.join(REPO_ROOT, 'docs/project_memory/rules/approval_rules.md'), 'utf-8')
+    expect(built).toContain('### 承認済み canonical approval rules (base branch)')
+    expect(built).toContain(approvalRules.trimEnd())
+    expect(built.indexOf('### 承認済み canonical approval rules (base branch)')).toBeLessThan(built.indexOf('**Git Diff**:'))
+
     // rule は diff より前にあり、prompt は末尾の回答指示まで揃っている
     expect(built.indexOf('### DA trigger (2)')).toBeLessThan(built.indexOf('**Git Diff**:'))
     expect(built).toContain(diff)

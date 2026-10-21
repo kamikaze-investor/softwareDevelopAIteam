@@ -315,7 +315,8 @@ async function main(): Promise<void> {
     gitDiff,
     prBody,
   )
-  const prompt = buildMetaReviewPrompt(request)
+  // 承認済み approval rules は PR の checkout ではなく base SHA から読む（CODEOWNERS と同じ理由）
+  const prompt = buildMetaReviewPrompt(request, undefined, { approvalRulesRef: baseSha })
   const providedPrincipleIds = providedCanonicalPrincipleIds(request)
 
   // --- レビューを依頼（Gemini API → Gemini CLI → Copilot CLI） ---
