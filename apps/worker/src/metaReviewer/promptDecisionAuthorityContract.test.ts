@@ -34,8 +34,10 @@ describe('Meta Reviewer 判定契約 — 承認済み authority boundary の扱�
   const blockedSection = section(prompt, '### `blocked`')
   const humanDecisionSection = section(prompt, '### Human Decision Authority のみ')
 
-  it('承認済み boundary を scope どおりに実装する変更は、Tuple を変えるなら Human Decision 側に置かれ、blocked にしない', () => {
-    expect(humanDecisionSection).toContain('canonical spec で承認済みの authority boundary を、その scope どおりに変更・実装する差分は、それが現行の Approval Tuple (a)〜(d) を実際に変える場合')
+  it('承認済み boundary の実装は、base rule が exact Tuple を定めていれば B、原則だけなら Tuple を変える限り A で、どちらも blocked にしない', () => {
+    expect(humanDecisionSection).toContain('canonical spec で承認済みの authority boundary を実装する差分の扱いは、base canonical rule が具体的な Tuple を定めているかで決まる')
+    expect(humanDecisionSection).toContain('実装が全 path でそれと一致する場合は B（`requiresCeoApproval: false`。2回目の CEO review は不要）')
+    expect(humanDecisionSection).toContain('原則・方針としての散文承認だけで具体的な Tuple binding が無い boundary を実装し、現行の Approval Tuple (a)〜(d) を実際に変える場合は')
     expect(humanDecisionSection).toContain('Cage 弱体化 / Safety weakening として `blocked` にしない')
   })
 
@@ -183,12 +185,18 @@ describe('Meta Reviewer 判定契約 — DA trigger (2) は Approval Tuple の�
   })
 
   // 10
-  it('canonical spec が承認済みの Tuple 変更（Stage 1 型）は A のままで、欠陥が無ければ blocked にしない', () => {
-    expect(humanDecisionSection).toContain('それが現行の Approval Tuple (a)〜(d) を実際に変える場合、人の承認を外す方向であっても A（Human Decision Authority）であり、Cage 弱体化 / Safety weakening として `blocked` にしない')
-    expect(humanDecisionSection).toContain('git_commit から人の承認を外すので (b) が変わり A のまま、欠陥が無ければ `blocked` にしない')
-    expect(da2Section).toContain('- human-approval 対象から action を削除する（(b) の縮小）→ A（canonical spec が承認済みで欠陥が無ければ blocked にしない）')
-    expect(checklist).toContain('それが現行の Approval Tuple (a)〜(d) を実際に変える場合（例: git_commit Stage 1 で人の承認を外す）は A（`requiresCeoApproval: true`）のままで、欠陥が無ければ `blocked` にしない')
-    expect(checklistDa2).toContain('canonical spec が承認済みの Tuple 変更（例: git_commit Stage 1）は A のままとし、欠陥が無ければ blocked にしていない')
+  it('Tuple の基準点は base の承認済み canonical rule: exact Tuple の実装は B、原則だけの承認（Stage 1 型）は A で欠陥が無ければ blocked にしない', () => {
+    expect(da2Section).toContain('**基準点 — Approval Tuple の変化は base branch の承認済み canonical rule に対して測る**')
+    expect(da2Section).toContain('差分の実行時挙動が全 path でその Tuple と一致する場合は enforcement であり B（`requiresCeoApproval: false`）とする。コードの従来挙動を変える場合も同じである。')
+    expect(da2Section).toContain('base canonical rule を超える、またはそれと異なる Tuple 変更は A とする。rule と実装の不一致は A + blocked とする。')
+    expect(da2Section).toContain('具体的な Tuple（old→new）を定めていない boundary の実装は、基準となる Tuple が無いので A のままとする。')
+    expect(da2Section).toContain('承認済み rule を正確に実装する差分には2回目の CEO review を求めない')
+    expect(humanDecisionSection).toContain('§14-3 は境界を定めるが `approval_rules.md` に exact Tuple binding が無いので、git_commit から人の承認を外す実装は (b) が変わり A のまま、欠陥が無ければ `blocked` にしない')
+    expect(da2Section).toContain('base canonical rule がその削除を old→new として具体的に定義済みで実装が一致するなら B）')
+    expect(checklist).toContain('base rule が old→new Tuple を具体的に定義済みで実装が全 path で一致すれば B（`requiresCeoApproval: false`。2回目の CEO review は不要）')
+    expect(checklist).toContain('（例: git_commit Stage 1 で人の承認を外す。`approval_rules.md` に exact binding が無い）は A（`requiresCeoApproval: true`）のままで、欠陥が無ければ `blocked` にしない')
+    expect(checklistDa2).toContain('原則としてのみ承認済みで exact Tuple binding が無い Tuple 変更（例: git_commit Stage 1）は A のままとし、欠陥が無ければ blocked にしていない')
+    expect(checklistDa2).toContain('base canonical rule が old→new として具体的に定義済みの Tuple を全 path で一致させて実装する変更は B とし、不一致は A + blocked とした')
   })
 
   // 11
@@ -225,10 +233,10 @@ describe('Meta Reviewer 判定契約 — Approval Tuple を実際に変える A 
   const checklistDa2 = checklist.slice(checklist.indexOf('#### DA (2): Approval Tuple の意味確認'))
   const humanDecisionSection = section(prompt, '### Human Decision Authority のみ')
 
-  it('mechanism: canonical rule の実質的変更または exact binding を同じ PR に含め、CODEOWNERS review に委ねる', () => {
-    expect(da2Section).toContain('Approval Tuple (a)〜(d) を実際に変える変更（A）は、対応する canonical rule（`docs/project_memory/rules/approval_rules.md` または `specs/22`）の実質的な変更、または既承認 rule への exact implementation / activation binding を同じ PR に含め、CODEOWNERS review に委ねる。')
+  it('mechanism: canonical rule の実質的変更または activation binding を同じ PR に含め、CODEOWNERS review に委ねる（base rule の exact Tuple 実装は B）', () => {
+    expect(da2Section).toContain('基準点（base canonical rule）に対して Approval Tuple (a)〜(d) を実際に変える変更（A）は、対応する canonical rule（`docs/project_memory/rules/approval_rules.md` または `specs/22`）の実質的な変更（old→new Tuple の定義）、または原則としてのみ承認済みの boundary に具体的な Tuple を与える activation binding を同じ PR に含め、CODEOWNERS review に委ねる。base canonical rule が exact Tuple を既に定めている実装はこれに当たらず、B である。')
     expect(da2Section).toContain('実装が CODEOWNERS 外のファイルでも同じ')
-    expect(checklistDa2).toContain('既承認 rule への exact implementation / activation binding を同じ PR に含め、CODEOWNERS review に委ねている')
+    expect(checklistDa2).toContain('原則としてのみ承認済みの boundary への activation binding を同じ PR に含め、CODEOWNERS review に委ねている')
   })
 
   it('同じ PR の rule 変更は既承認の根拠ではなく、承認前は効力を持たない proposal である', () => {
@@ -279,6 +287,12 @@ describe('Meta Reviewer 判定契約 — DA (2) の rule は実際に model へ�
     expect(built).toContain('- Tuple変更なしのenforcement repair、欠陥なし: B + approved / changes_requested')
     expect(built).toContain('- Tuple変更なしのenforcement repair、欠陥あり: B + blocked')
     expect(built).toContain('#### DA (2): Approval Tuple の意味確認')
+
+    // 既承認 rule（base branch の approval_rules.md）が全文、A/B 指示と共に届く（canonical context delivery gap）
+    const approvalRules = readFileSync(path.join(REPO_ROOT, 'docs/project_memory/rules/approval_rules.md'), 'utf-8')
+    expect(built).toContain('### 承認済み canonical approval rules (base branch)')
+    expect(built).toContain(approvalRules.trimEnd())
+    expect(built.indexOf('### 承認済み canonical approval rules (base branch)')).toBeLessThan(built.indexOf('**Git Diff**:'))
 
     // rule は diff より前にあり、prompt は末尾の回答指示まで揃っている
     expect(built.indexOf('### DA trigger (2)')).toBeLessThan(built.indexOf('**Git Diff**:'))
