@@ -18,7 +18,9 @@ import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IPrincipleApplicationStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReplaceActiveApprovalAndCreateResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult } from './interface'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IPrincipleApplicationStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReplaceActiveApprovalAndCreateResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult, RepairHandoffRefusalCode } from './interface'
+import { DesignReviewRunContentionError, RecoveryApprovalSpentMarkerError } from './interface'
+import { storedReviewRecoverySpentAuditRecord } from '../designReview/repairRecoveryEpoch'
 import { computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS, evaluateResumeAdmission, isSupervisedRunKind, isLiveWaitingApproval } from '@ai-team/shared'
 import type { SupervisedRunKind } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, JobWorkspaceBaseline, JobWorkspaceBaselineEntry, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
@@ -32,7 +34,8 @@ import type { TaskContinuation, OperatorRequest } from '@ai-team/shared'
 import type { PrincipleAggregateQuery, PrincipleAggregateRow, PrincipleApplication, PrincipleApplicationInput, PrincipleDisagreementRow, PrincipleReviewStage, StrategicDecision } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
-import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
+import { checkImplementJobDesignReviewEvidence, findSupersedingRun } from '../designReviewEvidencePolicy'
+import { classifyStoredRunJudgment } from '../designReview/designReviewCoordinator'
 import { escalateTaskToHuman, isWorkspaceQuarantined, prepareRepairFlow } from '../designReview/repairFlow'
 import {
   parseResumeSource,
@@ -916,6 +919,48 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       + "AND operation = 'task_aborted' AND result = 'success' LIMIT 1",
     ).get(taskId)
     return row !== undefined
+  }
+
+  /**
+   * repair handoff を断る理由（無ければ undefined）。`createRepairJobWithHandoff` の
+   * transaction 内からだけ呼ぶ —— 外で呼ぶと判定と Job 作成の間に状態が変わりうる。
+   */
+  function repairHandoffRefusal(
+    taskId: string,
+    repairProjectId: string,
+    sourceJobId: string,
+  ): { code: RepairHandoffRefusalCode; reason: string } | undefined {
+    const task = db.prepare('SELECT status, project_id FROM tasks WHERE id = ?').get(taskId) as
+      | { status: string; project_id: string }
+      | undefined
+    if (task === undefined) return { code: 'TASK_NOT_FOUND', reason: 'task no longer exists' }
+    if (task.status === 'done') return { code: 'TASK_DONE', reason: 'task is already done' }
+    if (isParkedTaskId(taskId)) return { code: 'TASK_PARKED', reason: 'task was parked by abort_task while the review ran' }
+    // **見る Project は Task の正本（tasks.project_id）から引く。** 呼び出し側が渡した projectId を
+    // そのまま信じると、別 Project の running を根拠に止まっている Project へ Job を作りうる。
+    // repair Job と source Job の projectId がどちらも Task の Project と一致しなければ断る。
+    const source = db.prepare('SELECT project_id, task_id FROM jobs WHERE id = ?').get(sourceJobId) as
+      | { project_id: string; task_id: string }
+      | undefined
+    // **source Job は repair 先と同じ Task のものでなければならない。** 別 Task の Job を source に
+    // すると lineage が Task をまたぎ、`walkRepairGeneration()` が数えられない親を持つ repair になる。
+    if (source !== undefined && source.task_id !== taskId) {
+      return {
+        code: 'LINEAGE_MISMATCH',
+        reason: `source job ${sourceJobId} belongs to task ${source.task_id}, not to the repair task ${taskId}`,
+      }
+    }
+    if (repairProjectId !== task.project_id || (source !== undefined && source.project_id !== task.project_id)) {
+      return {
+        code: 'PROJECT_MISMATCH',
+        reason: `repair job / source job project does not match the task's project ${task.project_id}`,
+      }
+    }
+    const project = db.prepare('SELECT status FROM projects WHERE id = ?').get(task.project_id) as { status: string } | undefined
+    if (project?.status !== 'running') {
+      return { code: 'PROJECT_NOT_RUNNING', reason: `project is not running (${project?.status ?? 'missing'})` }
+    }
+    return undefined
   }
 
   /**
@@ -2662,6 +2707,34 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
     createRepairJobWithHandoff(input) {
       const handoffTransaction = db.transaction((): CreateRepairJobWithHandoffResult => {
+        // 0) **Task / Project 状態の再確認は Job を作る transaction の中で行う。**
+        //    Design Review run は handoff の時点で既に succeeded なので、呼び出し側で先に
+        //    確かめると、その後に done / park / Project 停止が起きても repair Job が作られる
+        //    （TOCTOU）。断るときは何も書かず、source Job の所有権にも触らない。
+        //    **blocked では断らない** —— Stored Review Recovery は blocked な Task から正規に handoff する。
+        const refusal = repairHandoffRefusal(input.repairJob.taskId, input.repairJob.projectId, input.sourceJobId)
+        if (refusal !== undefined) {
+          // R-3: この refusal で何も実体化しなかった承認は使い切られる。marker は refusal と同じ transaction で書き、
+          // 書けなければ refusal ごと確定させない（承認が再利用できる状態で refusal だけが確定する窓を作らない）。
+          if (input.spendRecoveryApprovalOnRefusal !== undefined) {
+            try {
+              auditLog.record(storedReviewRecoverySpentAuditRecord({
+                approvalRequestId: input.spendRecoveryApprovalOnRefusal.approvalRequestId,
+                taskId: input.repairJob.taskId,
+                sourceJobId: input.sourceJobId,
+                runId: input.spendRecoveryApprovalOnRefusal.runId,
+                reason: refusal.code,
+              }))
+            } catch (err: unknown) {
+              throw new RecoveryApprovalSpentMarkerError(
+                `could not record the spent marker for approval ${input.spendRecoveryApprovalOnRefusal.approvalRequestId}: `
+                + (err instanceof Error ? err.message : String(err)),
+              )
+            }
+          }
+          return { ok: false, ...refusal }
+        }
+
         // 1) 後続 repair Job を**先に**作成する。所有権保持（queued + non-initial
         //    workflowStepKey）であり、source Job を解放する前に workspace の所有者が
         //    1本でも存在することを保証する。
@@ -2712,8 +2785,11 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       })
 
       try {
-        return handoffTransaction()
+        return handoffTransaction.immediate()
       } catch (err: unknown) {
+        // marker が書けなかった refusal は確定していない。STORAGE_ERROR（→ human escalation）へ畳まず投げ返し、
+        // handoff を後で再試行させる（R-3）。
+        if (err instanceof RecoveryApprovalSpentMarkerError) throw err
         const message = err instanceof Error ? err.message : String(err)
         if (/not found for repair handoff/.test(message)) {
           return {
@@ -4810,21 +4886,46 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
     findByTaskId(taskId) {
       const rows = db.prepare(
-        'SELECT * FROM design_review_evidence WHERE task_id = ? ORDER BY created_at DESC, rowid DESC'
+        'SELECT * FROM design_review_evidence WHERE task_id = ? ORDER BY rowid DESC'
       ).all(taskId) as any[]
       return rows.map(deserializeDesignReviewEvidence)
     },
     findLatestByTaskId(taskId) {
       const row = db.prepare(
-        'SELECT * FROM design_review_evidence WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1'
+        'SELECT * FROM design_review_evidence WHERE task_id = ? ORDER BY rowid DESC LIMIT 1'
       ).get(taskId) as any
       return row ? deserializeDesignReviewEvidence(row) : undefined
     },
     findLatestBySubjectId(reviewKind, subjectId) {
       const row = db.prepare(
-        'SELECT * FROM design_review_evidence WHERE review_kind = ? AND subject_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1'
+        'SELECT * FROM design_review_evidence WHERE review_kind = ? AND subject_id = ? ORDER BY rowid DESC LIMIT 1'
       ).get(reviewKind, subjectId) as any
       return row ? deserializeDesignReviewEvidence(row) : undefined
+    },
+    findSupersedingRun(evidence) {
+      // 規則は designReviewEvidencePolicy.findSupersedingRun() の1箇所。ここは同じ subject・同じ hash の
+      // 候補 run を新しい順に渡し、終端 run の判定は API と同じ再計算（classifyStoredRunJudgment）で決める。
+      const rows = db.prepare(
+        'SELECT *, rowid AS _rowid FROM design_review_runs WHERE review_kind = ? AND subject_id = ? AND design_text_hash = ?'
+        + ' ORDER BY rowid DESC'
+      ).all(evidence.reviewKind, evidence.subjectId, evidence.designTextHash) as any[]
+      // **順序は run の挿入順（rowid）で決める。** evidence が生んだ run を知っていれば、それより後に
+      // 挿入された run だけが「新しい」。timestamp（ms 精度・時計の巻き戻り）には頼らない。
+      // 生んだ run が分からない（legacy / 手動登録）・見つからない evidence だけ timestamp 規則に落とす。
+      const origin = evidence.runId !== undefined
+        ? db.prepare('SELECT rowid AS _rowid FROM design_review_runs WHERE id = ?').get(evidence.runId) as
+          | { _rowid: number }
+          | undefined
+        : undefined
+      const insertionOrder = new Map<string, number>(rows.map((row) => [row.id as string, row._rowid as number]))
+      return findSupersedingRun(
+        evidence,
+        rows.map(deserializeDesignReviewRun),
+        classifyStoredRunJudgment,
+        origin !== undefined
+          ? (run) => (insertionOrder.get(run.id) ?? 0) > origin._rowid
+          : undefined,
+      )
     },
     create(data) {
       const subject = resolveDesignReviewSubject(data)
@@ -4839,8 +4940,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       db.prepare(`
         INSERT INTO design_review_evidence
           (id, review_kind, subject_id, task_id, design_text_hash, review_load, decision,
-           independent_review_required, independent_review_verdict, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           independent_review_required, independent_review_verdict, created_at, run_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         evidence.id,
         evidence.reviewKind,
@@ -4852,6 +4953,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         evidence.independentReviewRequired ? 1 : 0,
         evidence.independentReviewVerdict ?? null,
         evidence.createdAt,
+        evidence.runId ?? null,
       )
       return evidence
     },
@@ -5199,21 +5301,25 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       ).get(taskId) as any
       return row ? deserializeDesignReviewRun(row) : undefined
     },
+    // **run / evidence の「最新」「新しい順」は挿入順（rowid）で決める。** created_at は ms 精度で
+    // 時計の巻き戻りもあり、後から挿入された CONFLICT run が「最新」にならないことがあった
+    // （独立レビュー round 11）。evidence の失効順序（findSupersedingRun）と同じ順序を使う。
+    // timestamp は表示用にだけ残す。
     findLatestByTaskId(taskId) {
       const row = db.prepare(
-        'SELECT * FROM design_review_runs WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1'
+        'SELECT * FROM design_review_runs WHERE task_id = ? ORDER BY rowid DESC LIMIT 1'
       ).get(taskId) as any
       return row ? deserializeDesignReviewRun(row) : undefined
     },
     findByTaskId(taskId) {
       const rows = db.prepare(
-        'SELECT * FROM design_review_runs WHERE task_id = ? ORDER BY created_at DESC, rowid DESC'
+        'SELECT * FROM design_review_runs WHERE task_id = ? ORDER BY rowid DESC'
       ).all(taskId) as any[]
       return rows.map(deserializeDesignReviewRun)
     },
     findQueued() {
       const rows = db.prepare(
-        "SELECT * FROM design_review_runs WHERE status = 'queued' ORDER BY created_at ASC, rowid ASC"
+        "SELECT * FROM design_review_runs WHERE status = 'queued' ORDER BY rowid ASC"
       ).all() as any[]
       return rows.map(deserializeDesignReviewRun)
     },
@@ -5228,7 +5334,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       const rows = db.prepare(
         "SELECT * FROM design_review_runs "
         + "WHERE status = 'succeeded' AND repair_source_job_id IS NOT NULL "
-        + 'ORDER BY created_at ASC, rowid ASC'
+        + 'ORDER BY rowid ASC'
       ).all() as any[]
       return rows.map(deserializeDesignReviewRun)
     },
@@ -5242,7 +5348,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           "SELECT * FROM design_review_runs WHERE review_kind = ? AND subject_id = ? AND status IN ('queued','running') LIMIT 1"
         ).get(subject.reviewKind, subject.subjectId) as any
         if (existing) {
-          return reuseActiveRun(existing, data.repairSourceJobId)
+          return reuseActiveRun(existing, data)
         }
 
         const run: DesignReviewRun = {
@@ -5280,7 +5386,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           if (!existingAfterConflict) {
             throw err
           }
-          return reuseActiveRun(existingAfterConflict, data.repairSourceJobId)
+          return reuseActiveRun(existingAfterConflict, data)
         }
         return run
       })
@@ -5340,7 +5446,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           return undefined
         }
 
-        return designReviewEvidence.create(evidenceData)
+        // evidence を生んだ run を結び付ける（失効順序を timestamp ではなく run の挿入順で決めるため）。
+        return designReviewEvidence.create({ ...evidenceData, runId: id })
       })
       return completeTransaction()
     },
@@ -6529,6 +6636,7 @@ function deserializeDesignReviewEvidence(row: any): DesignReviewEvidence {
     independentReviewRequired: row.independent_review_required === 1,
     independentReviewVerdict: (row.independent_review_verdict ?? undefined) as DesignReviewEvidence['independentReviewVerdict'] | undefined,
     createdAt: row.created_at,
+    runId: row.run_id ?? undefined,
   }
 }
 
@@ -6631,13 +6739,30 @@ function deserializeDesignReviewRun(row: any): DesignReviewRun {
  * `repairFlow.ts` の `createRepairJobWithHandoff` 周辺が依拠しているのと同じ不変条件）。
  * ここはその不変条件が将来崩れたときに**黙って壊れない**ための保険である。
  */
-function reuseActiveRun(existingRow: any, requestedRepairSourceJobId: string | undefined): DesignReviewRun {
+function reuseActiveRun(
+  existingRow: any,
+  requested: { repairSourceJobId?: string; designTextHash: string; changedFiles: readonly string[] },
+): DesignReviewRun {
   const existing = deserializeDesignReviewRun(existingRow)
-  if (existing.repairSourceJobId !== requestedRepairSourceJobId) {
-    throw new Error(
+  if (existing.repairSourceJobId !== requested.repairSourceJobId) {
+    throw new DesignReviewRunContentionError(
       'design review run intent mismatch: an active run for this subject has repairSourceJobId='
-      + `${existing.repairSourceJobId ?? 'null'} but ${requestedRepairSourceJobId ?? 'null'} was requested`
+      + `${existing.repairSourceJobId ?? 'null'} but ${requested.repairSourceJobId ?? 'null'} was requested`
       + ` (runId=${existing.id})`,
+      existing.id,
+    )
+  }
+  // **intent が同じでも、runner から見える同一性が違えば別の review である。** 以前は intent だけを
+  // 見ていたため、別の design text / changedFiles の run（例: Challenge の再評価や resume instruction とは
+  // 別の review）を返し、その判定がレビューされていない設計に帰属しえた（独立レビュー指摘・2026-10-16）。
+  // changedFiles は focus 選択に順序が効かないので集合として比べる。
+  const sameFiles = JSON.stringify([...existing.changedFiles].sort())
+    === JSON.stringify([...requested.changedFiles].sort())
+  if (existing.designTextHash !== requested.designTextHash || !sameFiles) {
+    throw new DesignReviewRunContentionError(
+      'design review run identity mismatch: an active run for this subject reviews a different design'
+      + ` (runId=${existing.id})`,
+      existing.id,
     )
   }
   return existing
@@ -7108,15 +7233,18 @@ function runDesignReviewSubjectMigration(db: Database.Database): void {
         independent_review_required INTEGER NOT NULL DEFAULT 0,
         independent_review_verdict TEXT,
         created_at TEXT NOT NULL,
+        -- この rebuild は runMigrations() の後に走るので、追加済みの run_id もここに書く
+        -- （書かないと同一起動中の evidence 作成が no such column で落ちる）。legacy 行は NULL。
+        run_id TEXT,
         FOREIGN KEY (task_id) REFERENCES tasks(id)
       );
 
       INSERT INTO design_review_evidence_new
         (id, review_kind, subject_id, task_id, design_text_hash, review_load, decision,
-         independent_review_required, independent_review_verdict, created_at)
+         independent_review_required, independent_review_verdict, created_at, run_id)
       SELECT
         id, 'task', task_id, task_id, design_text_hash, review_load, decision,
-        independent_review_required, independent_review_verdict, created_at
+        independent_review_required, independent_review_verdict, created_at, NULL
       FROM design_review_evidence;
 
       DROP TABLE design_review_evidence;

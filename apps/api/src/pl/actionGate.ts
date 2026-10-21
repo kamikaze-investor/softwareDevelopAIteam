@@ -275,6 +275,15 @@ function checkDesignReview(
     return { satisfied: false, rejection: `${label} evidence ${evidenceId} is not the latest for the target` }
   }
 
+  // 最新の evidence でも、それより新しい同じ設計の run（active / ALIGNED 以外の判定）があれば覆されている。
+  const superseding = storage.designReviewEvidence.findSupersedingRun(evidence)
+  if (superseding !== undefined) {
+    return {
+      satisfied: false,
+      rejection: `${label} evidence ${evidenceId} is superseded by newer run ${superseding.id} (${superseding.status})`,
+    }
+  }
+
   if (requireIndependent) {
     if (!evidence.independentReviewRequired) {
       return { satisfied: false, rejection: `evidence ${evidenceId} did not run an independent review` }

@@ -103,13 +103,15 @@ import {
 } from './conflictResolutionStep'
 import type { AuditLogEntry } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
+import { isUsableAlignedEvidence } from '../designReviewEvidencePolicy'
 import { recordResumeActor } from '../designReview/resumeActor'
-import { resumeBlockedTaskWithDesignReview } from '../designReview/resumeBlockedTask'
+import { RESUME_DESIGN_REVIEW_PENDING, resumeBlockedTaskWithDesignReview } from '../designReview/resumeBlockedTask'
 import {
   countPlTechnicalResumes,
   PL_MAX_TECHNICAL_RESUMES_PER_TASK,
   taskTechnicalResumeAuditKey,
   technicalRecoveryTargetKey,
+  findPlTargetAuditEntries,
   technicalResumeBudget,
 } from './technicalResumePolicy'
 import {
@@ -504,11 +506,11 @@ function recordTechnicalRecoveryExhaustion(
   item: AttentionItem,
   exhaustion: TechnicalRecoveryExhaustion,
 ): void {
-  const prior = storage.auditLog.findByEntity(AUDIT_ENTITY_TYPE, exhaustion.auditKey)
+  // legacy な Task 単位キーの exhaustion も同じ target のものとして数える（findPlTargetAuditEntries）。
+  const prior = findPlTargetAuditEntries(storage, exhaustion.auditKey)
   if (prior.some((entry) =>
     entry.operation === AUDIT_OPERATION
     && entry.entityType === AUDIT_ENTITY_TYPE
-    && entry.entityId === exhaustion.auditKey
     && entry.result === 'technical_exhausted')) return
 
   storage.auditLog.record({
@@ -626,8 +628,7 @@ function selfResolutionBlockedReason(diagnosis: BlockedDiagnosis): string {
 const STRUCTURED_AUDIT_FIELDS = /\b(?:lane|cause|layer|conf|kind|adoption|code)=[^\s]+/g
 
 function attemptHistoryFor(storage: IStorage, targetKey: string): string[] {
-  return storage.auditLog
-    .findByEntity(AUDIT_ENTITY_TYPE, targetKey)
+  return findPlTargetAuditEntries(storage, targetKey)
     .filter((entry) => ATTEMPT_RESULTS.includes(entry.result))
     .slice(0, PL_ESCALATION_HISTORY_LINES)
     .reverse()
@@ -704,6 +705,15 @@ async function remediateConflict(
   const reason = result?.reason ?? round.reason
   const provider = result?.provider ?? round.criticProvider
   const model = result?.model ?? round.criticModel
+
+  // **fresh Review がまだ判定を出していない（requeued）。** 否定的な判定ではないので
+  // 試行として数えず（'idle' は ATTEMPT_RESULTS に入らない）、escalation もしない。
+  // queued run は design_review_idle → rekick で再開され、ALIGNED なら既存
+  // `recoverReadyTasksWithoutJob()` が Job を作る。CONFLICT ならこの Round の続きがそこから始まる。
+  if (status === 'review_pending') {
+    record(storage, key, 'idle', `stage=${round.stage} outcome=${status} ${reason ?? ''}`)
+    return { status: 'idle', reason: `design review pending (stage=${round.stage}): ${reason ?? ''}` }
+  }
 
   /** 設計が既存 Review Pipeline を通って実装へ進める状態になったか。 */
   const resolved = status === 'remediated'
@@ -850,14 +860,12 @@ async function actOnOperatorTarget(
 }
 
 export function countPriorAttempts(storage: IStorage, targetKey: string): number {
-  return storage.auditLog
-    .findByEntity(AUDIT_ENTITY_TYPE, targetKey)
+  return findPlTargetAuditEntries(storage, targetKey)
     .filter((entry) => ATTEMPT_RESULTS.includes(entry.result)).length
 }
 
 function hasEscalated(storage: IStorage, targetKey: string): boolean {
-  return storage.auditLog
-    .findByEntity(AUDIT_ENTITY_TYPE, targetKey)
+  return findPlTargetAuditEntries(storage, targetKey)
     .some((entry) => entry.result === 'escalated')
 }
 
@@ -1166,7 +1174,8 @@ function collectSystemEvidence(
   //
   // 最新が ALIGNED でない / task-kind でない場合は**何も積まない**（古いものへ遡らない）。
   const latest = storage.designReviewEvidence.findLatestByTaskId(item.taskId)
-  if (latest?.decision === 'ALIGNED' && latest.reviewKind === 'task') {
+  // 新しい同じ設計の判定に覆された ALIGNED は積まない（isUsableAlignedEvidence）。
+  if (latest?.reviewKind === 'task' && isUsableAlignedEvidence(latest, storage.designReviewEvidence)) {
     evidence.push({ gate: 'design_review', designReviewEvidenceId: latest.id })
   }
 
@@ -1457,7 +1466,7 @@ type PlActionExecutor = (
   item: AttentionItem,
   deps: Required<Pick<PlLoopDeps, 'rekickDesignReview'>> & PlLoopDeps,
   technicalResume: boolean,
-) => Promise<{ ok: boolean; summary: string }>
+) => Promise<{ ok: boolean; summary: string; stale?: boolean; pending?: boolean }>
 
 /**
  * このループで実際に実行できる action と、その executor。
@@ -1476,9 +1485,19 @@ const PL_ACTION_EXECUTORS: Readonly<Record<string, PlActionExecutor>> = {
     if (item.taskId === undefined) {
       return { ok: false, summary: 'attention has no taskId; cannot locate the design review run' }
     }
-    const run = storage.designReviewRuns.findLatestByTaskId(item.taskId)
-    if (!run) {
-      return { ok: false, summary: `no design review run for task ${item.taskId}` }
+    // **attention が名指した run だけを動かす。** 診断（await）の間に run が差し替わる・
+    // 状態が進むことがある。Task の最新 run を引き直すと、PL が見ていない別 episode の run を
+    // rekick してしまう。名指した run がもう actionable でなければ stale として何もせず、
+    // 試行も消費しない（呼び出し側が audit を書かない）。
+    const run = item.referenceId !== undefined ? storage.designReviewRuns.findById(item.referenceId) : undefined
+    if (!run || run.taskId !== item.taskId) {
+      return { ok: false, stale: true, summary: `design review run ${item.referenceId ?? '(none)'} is not this task's attention run` }
+    }
+    const stillActionable = item.kind === 'design_review_idle'
+      ? run.status === 'queued' && run.startedAt === undefined
+      : item.kind === 'design_review_failed' && run.status === 'failed'
+    if (!stillActionable) {
+      return { ok: false, stale: true, summary: `design review run ${run.id} is no longer ${item.kind} (status=${run.status})` }
     }
     // **盲目的な re-kick をしない**（CEO 指示）。attempt を使い切った run は再実行しても
     // `not_claimable` になるだけなので、Escalation 側へ倒す。
@@ -1521,6 +1540,12 @@ const PL_ACTION_EXECUTORS: Readonly<Record<string, PlActionExecutor>> = {
       ),
       ...(deps.coordinatorDeps !== undefined ? { coordinatorDeps: deps.coordinatorDeps } : {}),
     })
+    // 判定がまだ出ていない Design Review は否定ではない。試行を消費せず、attention を残す。
+    // 次の tick で同じ（決定的な）instruction を再送すれば、active-run dedup で同じ run が
+    // 再開され、ALIGNED evidence があれば resume が通る。
+    if (!resumed.ok && resumed.code === RESUME_DESIGN_REVIEW_PENDING) {
+      return { ok: false, pending: true, summary: `resume pending: ${resumed.reason}` }
+    }
     if (!resumed.ok) {
       return { ok: false, summary: `resume refused: ${resumed.reason}` }
     }
@@ -1549,7 +1574,7 @@ async function executeAction(
   item: AttentionItem,
   deps: Required<Pick<PlLoopDeps, 'rekickDesignReview'>> & PlLoopDeps,
   technicalResume: boolean,
-): Promise<{ ok: boolean; summary: string }> {
+): ReturnType<PlActionExecutor> {
   const executor = hasWiredPlExecutor(kind) ? PL_ACTION_EXECUTORS[kind] : undefined
   if (executor === undefined) {
     // 候補には出さないが、念のため残す。**勝手に別の操作で代替しない。**
@@ -1934,6 +1959,19 @@ async function handleTarget(
         )
       }),
   }, diagnosis.rootCauseClass === 'review_execution_failed')
+
+  // 対象が既に actionable でない（run の差し替え等）、または Design Review の判定がまだ出ていない
+  // （pending）。どちらも否定的な結果ではなく何も実行していないので、試行として記録しない。
+  if (execution.stale || execution.pending) {
+    return {
+      status: 'idle',
+      target,
+      triage,
+      proposedKind: proposal.kind,
+      reason: execution.stale ? `stale target: ${execution.summary}` : execution.summary,
+      attempt,
+    }
+  }
 
   // ── Verify（実行側の戻り値だけで成功としない）────────────────────
   const after = buildSystemState(storage, deps.now ? { now: deps.now } : {})

@@ -24,7 +24,7 @@
  */
 
 import type { Job, JobRefusalMetadata, Task, ReviewResult, QAResult } from '@ai-team/shared'
-import type { IStorage, DesignReviewRun } from '../storage/interface'
+import type { IStorage, DesignReviewRun, RepairHandoffRefusalCode } from '../storage/interface'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import {
   buildDefaultCoordinatorDeps,
@@ -1581,7 +1581,11 @@ export function completeRepairHandoff(
   // Design Review を待っている間に `abort_task` がこの Task を park しうる。
   // ここで repair Job を作ると park が黙って取り消される（escalate もしない —
   // park された Task を blocked へ上げるのは park の取り消しと同じ結果になる）。
-  if (storage.tasks.isParked(taskId)) {
+  // R-3: source 実装に epoch を開いていた consume 済み承認。handoff が断られたら、storage がその refusal と
+  // 同じ transaction で使い切り marker を書く。承認が無いときだけ、ここで先に park を見て何も書かずに返す
+  // （承認があるときは storage の transaction が TASK_PARKED で断り、marker と一緒に確定させる）。
+  const recoveryAuthority = humanRecoveryAuthorityByImplementation(storage, taskId).get(sourceJob.id)
+  if (recoveryAuthority === undefined && storage.tasks.isParked(taskId)) {
     return { status: 'skipped', reason: 'task was parked by abort_task while the review ran' }
   }
 
@@ -1603,7 +1607,20 @@ export function completeRepairHandoff(
       aiCliProvider: sourceJob.aiCliProvider,
       aiCliPrompt: run.designText,
     },
+    ...(recoveryAuthority !== undefined
+      ? { spendRecoveryApprovalOnRefusal: { approvalRequestId: recoveryAuthority.approvalRequestId, runId: run.id } }
+      : {}),
   })
+
+  // **Task / Project 状態の再確認は storage の handoff transaction 内で行われる**（TOCTOU 回避）。
+  // Review 中に Task が done / park・Project が停止した場合はそこで断られ、Job は作られず
+  // source Job の所有権も変わらない。上の park 判定と同じく escalation せず skipped で返す。
+  // **blocked では断られない** —— Stored Review Recovery は blocked な Task から正規に handoff する。
+  if (!repairJob.ok && isRepairHandoffRefusal(repairJob.code)) {
+    console.warn(`[repairFlow] repair handoff refused for task ${taskId} (${repairJob.code}): ${repairJob.reason}`)
+    // 承認で開いた epoch の使い切り marker は、この refusal と同じ transaction で storage が書いた（R-3）。
+    return { status: 'skipped', reason: repairJob.reason }
+  }
 
   if (!repairJob.ok) {
     // **良性の重複を human escalation へ送らない。**
@@ -1648,6 +1665,22 @@ export function completeRepairHandoff(
 }
 
 /**
+ * 状態変化による「良性の」refusal（skipped で返す）。`PROJECT_MISMATCH` / `LINEAGE_MISMATCH` は含めない ——
+ * Task / Job の Project が食い違うのは lineage の破損であり、別 Task の source と同じく
+ * 既存の escalation 経路へ渡す（source Job の所有権は storage 側で変わっていない）。
+ */
+const REPAIR_HANDOFF_REFUSAL_CODES: readonly RepairHandoffRefusalCode[] = [
+  'TASK_NOT_FOUND',
+  'TASK_DONE',
+  'TASK_PARKED',
+  'PROJECT_NOT_RUNNING',
+]
+
+function isRepairHandoffRefusal(code: string): boolean {
+  return (REPAIR_HANDOFF_REFUSAL_CODES as readonly string[]).includes(code)
+}
+
+/**
  * durable にqueuedとなったrunを実行し、ALIGNEDならrepair Jobを作る。
  *
  * startup recovery からも、PATCH直後のkickからも同じ経路で呼ばれる。
@@ -1667,6 +1700,15 @@ export async function executeQueuedRepair(
 
   const outcome = await executeDesignReviewRun(storage, run, deps)
   if (outcome.status === 'stale' || outcome.status === 'not_claimable') {
+    return { status: 'already_started', stepKey }
+  }
+  // **requeued は判定ではないので escalation しない。** Design Review が判定を出せなかった
+  // （runner crash・critical の independent 欠落など）run は durable に queued へ戻っており、
+  // `already_started` は「durably queued」を意味する。既存の design_review_idle →
+  // PL rekick_design_review 経路がこの関数を再び通して再開する。ここで Task を blocked に
+  // すると、一時的な欠落（Codex logout）が retry 前に人へ渡る（2026-10-16 production・
+  // Task `b8d0fc5d`）。attempt 上限での failed と非 ALIGNED の判定は従来どおり下で escalation する。
+  if (outcome.status === 'requeued') {
     return { status: 'already_started', stepKey }
   }
   if (outcome.status !== 'evidence_registered') {

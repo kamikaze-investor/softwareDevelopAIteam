@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach } from 'vitest'
+import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import { buildSystemState, type AttentionItem } from '../state/systemState'
@@ -23,6 +23,7 @@ import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
 import type { Job, JobRefusalMetadata, ReviewStatus } from '@ai-team/shared'
 import { retryStepKeyFor } from '../designReview/repairPolicy'
+import { findRemediationSubject } from './remediationStep'
 
 /**
  * ここで固定しているのは次の2つである。
@@ -1282,5 +1283,114 @@ describe('観測 — 既存 audit_log から集計できる', () => {
       cause: diagnosis.rootCauseClass,
       confidence: diagnosis.confidence,
     })
+  })
+})
+/**
+ * **「最新の run」は挿入順で決める**（独立レビュー round 11・2026-10-16）。
+ *
+ * 時計が巻き戻ると、後から挿入された CONFLICT run の created_at が古い ALIGNED run より前になる。
+ * created_at で並べると古い ALIGNED が「最新」になり、Remediation・Triage が CONFLICT を見失った。
+ */
+describe('時計の巻き戻り後に挿入された CONFLICT run', () => {
+  afterEach(() => { vi.useRealTimers() })
+
+  it('最新として返り、Remediation と Triage がその CONFLICT を見る', () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-16T10:00:00.000Z'))
+    const storage = createSQLiteStorage(':memory:')
+    const project = storage.projects.create({ name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running' })
+    const task = storage.tasks.create({
+      projectId: project.id, title: 'CONFLICT した項目', description: 'body', status: 'pending',
+      assignee: 'developer_ai', dependencies: [], allowedPaths: ['apps/api/src'], acceptanceCriteria: ['c'],
+      roadmapTaskKey: 'conflicted-item', phase: 1, roadmapActive: true,
+    } as Parameters<IStorage['tasks']['create']>[0])
+    const designText = buildInitialImplementAiCliPrompt(task)
+    const designTextHash = computeDesignTextHash(designText)
+
+    // R1: 同じ設計を ALIGNED にした run（evidence 付き）。
+    const r1 = storage.designReviewRuns.create({ taskId: task.id, taskTitle: task.title, designText, designTextHash, changedFiles: [] })
+    const c1 = storage.designReviewRuns.claim(r1.id, 3)
+    storage.designReviewRuns.completeWithEvidence(r1.id, c1.claimToken!, JSON.stringify({
+      focusedReviewResults: [{ focus: 'scope_simplicity', decision: 'ALIGNED' }],
+      integrationReviewResult: { decision: 'ALIGNED' },
+    }), {
+      reviewKind: 'task', subjectId: task.id, taskId: task.id, designTextHash,
+      reviewLoad: 'medium', decision: 'ALIGNED', independentReviewRequired: false,
+    })
+
+    // 時計が巻き戻った後に挿入された R2: 同じ設計の CONFLICT。
+    vi.setSystemTime(new Date('2026-10-16T09:00:00.000Z'))
+    const r2 = storage.designReviewRuns.create({ taskId: task.id, taskTitle: task.title, designText, designTextHash, changedFiles: [] })
+    const c2 = storage.designReviewRuns.claim(r2.id, 3)
+    storage.designReviewRuns.complete(r2.id, c2.claimToken!, 'succeeded', JSON.stringify({
+      focusedReviewResults: [{ focus: 'scope_simplicity', decision: 'CONFLICT' }],
+      integrationReviewResult: { decision: 'CONFLICT', summary: 'scope は 1 件に絞るべき' },
+      finalDecision: 'CONFLICT',
+    }))
+    expect(r2.createdAt < r1.createdAt).toBe(true)
+
+    expect(storage.designReviewRuns.findLatestByTaskId(task.id)?.id).toBe(r2.id)
+    expect(storage.designReviewRuns.findByTaskId(task.id)[0]?.id).toBe(r2.id)
+    expect(findRemediationSubject(storage, task.id)?.task.id).toBe(task.id)
+
+    const diagnosis = triageBlocked(storage, attentionOf(storage, 'task_ready_without_job', '2026-10-16T12:00:00.000Z'))
+    expect(diagnosis.rootCauseClass).toBe('design_review_conflict')
+    expect(diagnosis.recommendedLane).toBe('independent_remediation')
+  })
+})
+/**
+ * **Triage は runner の自己申告（finalDecision）を判定に使わない**（独立レビュー指摘・2026-10-16）。
+ *
+ * task_ready_without_job の分類も task_blocked_without_job と同じ API の再計算で決める。
+ */
+describe('task_ready_without_job の Design Review 判定は再計算値', () => {
+  function seedWithResult(resultJson: string): { storage: IStorage; taskId: string } {
+    const storage = createSQLiteStorage(':memory:')
+    const project = storage.projects.create({ name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running' })
+    const task = storage.tasks.create({
+      projectId: project.id, title: 'T', description: 'body', status: 'pending', assignee: 'developer_ai',
+      dependencies: [], roadmapActive: true, phase: 1,
+    } as Parameters<IStorage['tasks']['create']>[0])
+    const designText = buildInitialImplementAiCliPrompt(task)
+    const run = storage.designReviewRuns.create({
+      taskId: task.id, taskTitle: task.title, designText, designTextHash: computeDesignTextHash(designText), changedFiles: [],
+    })
+    const claimed = storage.designReviewRuns.claim(run.id, 3)
+    storage.designReviewRuns.complete(run.id, claimed.claimToken!, 'succeeded', resultJson)
+    return { storage, taskId: task.id }
+  }
+
+  const FOCUSED_CONFLICT = [{ focus: 'scope_simplicity', decision: 'CONFLICT', summary: 'scope が広すぎる' }]
+
+  it('focus は CONFLICT で finalDecision が無い（#255 形）→ design_review_conflict', () => {
+    const { storage, taskId } = seedWithResult(JSON.stringify({ focusedReviewResults: FOCUSED_CONFLICT }))
+
+    expect(readLatestDesignReview(storage, taskId)?.decision).toBe('CONFLICT')
+    const diagnosis = triageBlocked(storage, attentionOf(storage, 'task_ready_without_job'))
+    expect(diagnosis.rootCauseClass).toBe('design_review_conflict')
+    expect(diagnosis.recommendedLane).toBe('independent_remediation')
+  })
+
+  it('focus は CONFLICT なのに finalDecision: ALIGNED と自己申告 → 自己申告を信じず design_review_conflict', () => {
+    const { storage, taskId } = seedWithResult(JSON.stringify({
+      focusedReviewResults: FOCUSED_CONFLICT,
+      finalDecision: 'ALIGNED',
+    }))
+
+    expect(readLatestDesignReview(storage, taskId)?.decision).toBe('CONFLICT')
+    expect(triageBlocked(storage, attentionOf(storage, 'task_ready_without_job')).rootCauseClass)
+      .toBe('design_review_conflict')
+  })
+
+  it('finalDecision: CONFLICT と自己申告していても、組み直して ALIGNED なら CONFLICT 扱いしない', () => {
+    const { storage, taskId } = seedWithResult(JSON.stringify({
+      focusedReviewResults: [{ focus: 'scope_simplicity', decision: 'ALIGNED' }],
+      integrationReviewResult: { decision: 'ALIGNED' },
+      finalDecision: 'CONFLICT',
+    }))
+
+    expect(readLatestDesignReview(storage, taskId)?.decision).toBe('ALIGNED')
+    expect(triageBlocked(storage, attentionOf(storage, 'task_ready_without_job')).rootCauseClass)
+      .not.toBe('design_review_conflict')
   })
 })
