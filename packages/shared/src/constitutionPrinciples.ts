@@ -91,6 +91,27 @@ function extractNamedMarkdownSection(content: string, label: string): string | u
   return section.length > 0 ? section : undefined
 }
 
+/** 1つの文書本文から、要求された section をすべて取り出す。1つでも欠ければ失敗（部分 excerpt は返さない）。 */
+function extractNamedMarkdownSections(
+  content: string,
+  sectionLabels: readonly string[],
+): { ok: true; text: string } | { ok: false; reason: string } {
+  const sections: string[] = []
+  for (const label of sectionLabels) {
+    const section = extractNamedMarkdownSection(content, label)
+    if (section === undefined) return { ok: false, reason: `section ${label} not found` }
+    if (section.length > MAX_PRINCIPLE_SECTION_CHARS) {
+      return { ok: false, reason: `section ${label} exceeds ${MAX_PRINCIPLE_SECTION_CHARS} characters` }
+    }
+    sections.push(section)
+  }
+  const text = sections.join('\n\n').trim()
+  if (text.length === 0 || text.length > MAX_PRINCIPLE_EXCERPT_CHARS) {
+    return { ok: false, reason: `requested excerpt is empty or exceeds ${MAX_PRINCIPLE_EXCERPT_CHARS} characters` }
+  }
+  return { ok: true, text }
+}
+
 /**
  * Existing markdown principle extraction, generalized to an explicit bounded list of sections.
  * Every requested section must be present; partial excerpts are rejected so callers can warn.
@@ -113,33 +134,13 @@ export function loadNamedMarkdownSections(
       continue
     }
 
-    const sections: string[] = []
-    let invalidReason: string | undefined
-    for (const label of sectionLabels) {
-      const section = extractNamedMarkdownSection(content, label)
-      if (section === undefined) {
-        invalidReason = `section ${label} not found`
-        break
-      }
-      if (section.length > MAX_PRINCIPLE_SECTION_CHARS) {
-        invalidReason = `section ${label} exceeds ${MAX_PRINCIPLE_SECTION_CHARS} characters`
-        break
-      }
-      sections.push(section)
-    }
-
-    if (invalidReason !== undefined) {
-      failures.push(`${candidatePath}: ${invalidReason}`)
+    const extracted = extractNamedMarkdownSections(content, sectionLabels)
+    if (!extracted.ok) {
+      failures.push(`${candidatePath}: ${extracted.reason}`)
       continue
     }
 
-    const text = sections.join('\n\n').trim()
-    if (text.length === 0 || text.length > MAX_PRINCIPLE_EXCERPT_CHARS) {
-      failures.push(`${candidatePath}: requested excerpt is empty or exceeds ${MAX_PRINCIPLE_EXCERPT_CHARS} characters`)
-      continue
-    }
-
-    const result: ConstitutionPrinciplesResult = { ok: true, text }
+    const result: ConstitutionPrinciplesResult = { ok: true, text: extracted.text }
     resultCache.set(cacheKey, result)
     return result
   }
@@ -164,6 +165,20 @@ export function loadDecisionAuthorityPrinciples(
   candidatePaths: readonly string[] = DECISION_AUTHORITY_PATHS,
 ): ConstitutionPrinciplesResult {
   return loadNamedMarkdownSections(candidatePaths, DECISION_AUTHORITY_SECTION_LABELS)
+}
+
+/**
+ * 既に読み込んだ specs/22 本文（例: `git show <base>:specs/22...`）から Decision Authority excerpt を取り出す。
+ * ファイル経由の `loadDecisionAuthorityPrinciples()` と同じ section・上限で判定する。
+ */
+export function extractDecisionAuthorityPrinciples(
+  content: string,
+  source: string,
+): ConstitutionPrinciplesResult {
+  const extracted = extractNamedMarkdownSections(content, DECISION_AUTHORITY_SECTION_LABELS)
+  return extracted.ok
+    ? extracted
+    : { ok: false, reason: `${source}: ${extracted.reason}`, triedPaths: [source] }
 }
 
 export function decisionAuthorityPathForControlContextDir(controlContextDir: string): string {
