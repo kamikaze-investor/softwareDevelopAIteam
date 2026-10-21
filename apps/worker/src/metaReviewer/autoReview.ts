@@ -204,7 +204,7 @@ export function resolveMetaReviewOutcome<T extends GateableMetaReviewResult>(
           severity: 'critical',
           category: 'authority_change',
           message: `Human Decision Authority が必要と判定されたが、${reason}。authority の判定と CODEOWNERS がずれている。`,
-          suggestion: 'authority を定義・実装するファイルなら CODEOWNERS へ追加する。そうでなければ authority 判定を見直す。',
+          suggestion: 'Approval Tuple (a)〜(d) を実際に変える変更なら、対応する canonical rule の実質的な変更（または既承認 rule への exact implementation / activation binding）を同じ PR に含め、CODEOWNERS review に委ねる。Tuple 不変の enforcement-only 修正なら DA (2) 判定を見直す。Human Gate を得る目的だけで実装ファイルを CODEOWNERS へ追加しない。',
         },
       ],
     },
