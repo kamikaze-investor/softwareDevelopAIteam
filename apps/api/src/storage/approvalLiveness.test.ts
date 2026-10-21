@@ -120,3 +120,27 @@ describe('persistProviderTimeoutFailure — 最新承認による retry 抑止',
       .toMatchObject({ ok: true, retryJobCreated: false })
   })
 })
+
+describe('approveAndResumeJob — 読めない期限は承認しない（P2）', () => {
+  it('unparsable expiresAt → EXPIRED で拒否し、承認も Job も変えない', () => {
+    const { storage, projectId, taskId } = seedRunningTask()
+    const job = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, { status: 'running', startedAt: new Date().toISOString() })
+    const linked = storage.approvalRequests.createForJob({
+      taskId, requestedAction: 'git_commit', riskLevel: 'HIGH', targetBranch: 'ai/x', targetCommit: 'c',
+      targetDiffHash: 'd', changedFiles: [], triggeredRules: [], invalidIf: [],
+      status: 'WAITING_FOR_USER', expiresAt: 'not-a-date',
+    } as Parameters<IStorage['approvalRequests']['create']>[0], job.id)
+    if (!linked.ok) throw new Error(linked.reason)
+    storage.jobs.update(job.id, { status: 'blocked' })
+
+    const result = storage.approvalRequests.approveAndResumeJob(linked.approvalRequest.id, undefined, { credentialClass: 'admin' })
+
+    expect(result).toMatchObject({ ok: false, code: 'EXPIRED' })
+    expect(storage.approvalRequests.findById(linked.approvalRequest.id)?.status).toBe('WAITING_FOR_USER')
+    expect(storage.jobs.findById(job.id)?.status).toBe('blocked')
+  })
+})

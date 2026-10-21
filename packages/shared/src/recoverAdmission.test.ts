@@ -43,3 +43,20 @@ describe('evaluateRecoverAdmission', () => {
     }))).toEqual({ ok: true })
   })
 })
+
+// Codex review 361c19a（C-03）: recover は human-only route で、それ自体が新しい人の判断。
+// live WAITING の Task 単位 request は断らない（storage が同じ transaction で SUPERSEDED にする）。
+describe('evaluateRecoverAdmission — Task 単位の判断', () => {
+  const waiting = (requestedAction: string) => ({
+    status: 'WAITING_FOR_USER' as const, requestedAction, expiresAt: new Date(NOW + 60_000).toISOString(),
+  })
+
+  it('live WAITING の Task 単位 request があっても受け付ける', () => {
+    expect(evaluateRecoverAdmission(input({ approvals: [waiting('abort_task')] }))).toEqual({ ok: true })
+  })
+
+  it('live WAITING の command kind 承認は APPROVAL_WAITING のまま', () => {
+    expect(evaluateRecoverAdmission(input({ approvals: [waiting('git_commit')] })))
+      .toEqual({ ok: false, code: 'APPROVAL_WAITING' })
+  })
+})

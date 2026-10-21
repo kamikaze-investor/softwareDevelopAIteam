@@ -104,7 +104,6 @@ import {
 import type { AuditLogEntry } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
 import { isUsableAlignedEvidence } from '../designReviewEvidencePolicy'
-import { recordResumeActor } from '../designReview/resumeActor'
 import { RESUME_DESIGN_REVIEW_PENDING, resumeBlockedTaskWithDesignReview } from '../designReview/resumeBlockedTask'
 import {
   countPlTechnicalResumes,
@@ -370,6 +369,33 @@ export interface PlLoopDeps {
  */
 let inFlight = false
 
+/**
+ * **audit に試行を残せないときの、プロセス内の対象別試行カウンタ**（Codex round 3）。
+ *
+ * 試行回数と technical_exhausted は audit（SQLite）に残すのが正本だが、DB の書き込み経路そのものが
+ * 壊れている（インフラ障害）と、それも残せず同じ対象を毎 tick 無限に試すことになる。対象の処理が例外で
+ * 終わったら（＝書き込みに失敗した）ここで数え、同じ `PL_MAX_ATTEMPTS_PER_TARGET` で打ち切る。
+ * プロセス再起動でリセットされる（障害が直っていれば audit の正本に戻る）。正常時は増えない。
+ */
+const inProcessFailedAttempts = new Map<string, number>()
+const inProcessFallbackLogged = new Set<string>()
+
+function hasExhaustedInProcessAttempts(targetKey: string): boolean {
+  return (inProcessFailedAttempts.get(targetKey) ?? 0) >= PL_MAX_ATTEMPTS_PER_TARGET
+}
+
+function recordInProcessFailedAttempt(targetKey: string, error: unknown): void {
+  inProcessFailedAttempts.set(targetKey, (inProcessFailedAttempts.get(targetKey) ?? 0) + 1)
+  if (inProcessFallbackLogged.has(targetKey)) return
+  inProcessFallbackLogged.add(targetKey)
+  // 対象ごとに1回だけ。error の message だけを出す（payload / 秘密は載せない）。
+  console.error(
+    `[pl-loop] handling target ${targetKey} failed (audit/storage write may be failing); using the `
+    + `in-process attempt counter, bound=${PL_MAX_ATTEMPTS_PER_TARGET}: `
+    + `${error instanceof Error ? error.message : String(error)}`.slice(0, 500),
+  )
+}
+
 /** 直前の tick が Operator Request を処理したか（自律ループとの交互実行に使う）。 */
 let lastTickHandledOperatorRequest = false
 
@@ -447,6 +473,7 @@ function isActionableNow(storage: IStorage, item: AttentionItem): boolean {
     // 通知が鳴り続けることはない。
     && (!hasEscalated(storage, targetKeyOf(item)) || isRemediableConflict(storage, item))
     && !hasExhaustedTargetTechnicalRecovery(storage, item)
+    && !hasExhaustedInProcessAttempts(targetKeyOf(item))
     && hasStalledLongEnough(item)
   )
 }
@@ -856,7 +883,7 @@ async function actOnOperatorTarget(
     return { attempted: false, status: 'not_eligible', reason }
   }
 
-  const result = await handleTarget(storage, deps, item, state)
+  const result = await handleTargetBounded(storage, deps, item, state)
   return {
     attempted: true,
     status: result.status,
@@ -1553,6 +1580,15 @@ const PL_ACTION_EXECUTORS: Readonly<Record<string, PlActionExecutor>> = {
         task,
         deps.resumeInstruction ?? DEFAULT_RESUME_INSTRUCTION,
       ),
+      // **この経路は定義上 PL である。** PL は in-process で動き HTTP credential を持たない
+      // ので、route 側の認証では区別できない。ここで `pl` と記録しておくことで、
+      // repair budget の generation 境界がこの resume を跨がない（予算は再発行されない）。
+      // 記録は storage が resume Job の作成と同じ transaction で書く（G-01）。
+      resumedBy: {
+        actorClass: 'pl',
+        evidence: 'in_process_pl',
+        ...(technicalResume ? { technicalResume: true } : {}),
+      },
       ...(deps.coordinatorDeps !== undefined ? { coordinatorDeps: deps.coordinatorDeps } : {}),
     })
     // 判定がまだ出ていない Design Review は否定ではない。試行を消費せず、attention を残す。
@@ -1561,19 +1597,20 @@ const PL_ACTION_EXECUTORS: Readonly<Record<string, PlActionExecutor>> = {
     if (!resumed.ok && resumed.code === RESUME_DESIGN_REVIEW_PENDING) {
       return { ok: false, pending: true, summary: `resume pending: ${resumed.reason}` }
     }
+    // authority evidence が書けず resume ごと rollback された（何も変わっていない）。再試行は安全だが、
+    // 永続的な書き込み失敗なら毎 tick 黙って繰り返すことになる（Codex round 2）。pending にせず
+    // 技術的な失敗の試行として数え、既存の technical budget で止める（尽きれば technical_exhausted）。
+    if (!resumed.ok && resumed.code === 'RESUME_COMMIT_FAILED') {
+      return { ok: false, summary: `resume commit failed (technical; retried within the technical budget): ${resumed.reason}` }
+    }
+    // 生きた人の判断（APPROVED / WAITING の abort_task 等）がある。PL はそれを上書きしない。
+    // 正当な人の判断待ちなので試行を消費せず（idle）、escalation も起こさない。
+    if (!resumed.ok && resumed.code === 'HUMAN_DECISION_PENDING') {
+      return { ok: false, pending: true, summary: `resume waiting for a human decision: ${resumed.reason}` }
+    }
     if (!resumed.ok) {
       return { ok: false, summary: `resume refused: ${resumed.reason}` }
     }
-    // **この経路は定義上 PL である。** PL は in-process で動き HTTP credential を持たない
-    // ので、route 側の認証では区別できない。ここで `pl` と記録しておくことで、
-    // repair budget の generation 境界がこの resume を跨がない（予算は再発行されない）。
-    recordResumeActor(storage, {
-      jobId: resumed.job.id,
-      taskId: item.taskId,
-      actorClass: 'pl',
-      evidence: 'in_process_pl',
-      ...(technicalResume ? { technicalResume: true } : {}),
-    })
     return { ok: true, summary: `resume queued job ${resumed.job.id}` }
   },
 }
@@ -1696,9 +1733,30 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
       }
     }
 
-    return await handleTarget(storage, deps, item, before)
+    return await handleTargetBounded(storage, deps, item, before)
   } finally {
     inFlight = false
+  }
+}
+
+/**
+ * `handleTarget()` の唯一の呼び出し口（自律 tick と Operator Request の両方）。
+ *
+ * 例外は従来どおり呼び出し側へ返す。ただし audit に試行を残せていない可能性があるので、
+ * プロセス内で数えて同じ上限で打ち切る（DB 書き込み障害で無限に再試行しない。Codex round 3/4）。
+ * 上限に達した対象は `isActionableNow()` が外すので、どちらの経路からも再び選ばれない。
+ */
+async function handleTargetBounded(
+  storage: IStorage,
+  deps: PlLoopDeps,
+  item: AttentionItem,
+  before: SystemStateSnapshot,
+): Promise<PlTickResult> {
+  try {
+    return await handleTarget(storage, deps, item, before)
+  } catch (error: unknown) {
+    recordInProcessFailedAttempt(targetKeyOf(item), error)
+    throw error
   }
 }
 

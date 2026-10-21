@@ -197,8 +197,21 @@ export function repairFromStoredReview(
     .findByTaskId(task.id)
     .filter((request) => request.requestedAction === chain.expectedAction)
 
+  // **人が決めた承認だけを使える承認と数える**（Codex review / H-03）。
+  //  epoch は `approval_actor` = human の記録がある承認しか数えない
+  //  （`humanRecoveryAuthorityByImplementation()`）。証明できない承認を consume すると、
+  //  authority にならないまま承認だけが使い切られる。
+  //
+  //  以前は「未期限の APPROVED があるが human の記録が無い」とき `APPROVAL_ACTOR_NOT_HUMAN` で
+  //  拒否し、承認を残していた。しかしその行は APPROVED のまま期限まで残り、再 PATCH は 409、
+  //  ここも毎回拒否で、誰も新しい要求を作れなかった（決定と actor 記録が別書き込みだった頃の
+  //  クラッシュ窓・actor 記録が導入される前の承認）。そのような行は**使えない承認**として扱い、
+  //  下の `replaceActiveAndCreate()`（同 action の APPROVED を同じ transaction で SUPERSEDED にし、
+  //  supersede audit を残す）で置き換えて、CEO に改めて判断を求める。authority は増えない。
   const approved = existing.find(
-    (request) => request.status === 'APPROVED' && isUnexpired(request.expiresAt),
+    (request) => request.status === 'APPROVED'
+      && isUnexpired(request.expiresAt)
+      && readApprovalActorClass(storage, request.id) === 'human',
   )
 
   if (!approved) {
@@ -235,18 +248,6 @@ export function repairFromStoredReview(
       approvalRequestId: created.id,
       requestedAction: chain.expectedAction,
       reused: false,
-    }
-  }
-
-  // 6a. **人が決めた承認であることを、使い切る前に確かめる**（Codex review）。
-  //     epoch は `approval_actor` = human の記録がある承認しか数えない
-  //     （`humanRecoveryAuthorityByImplementation()`）。証明できない承認を consume すると、
-  //     authority にならないまま承認だけが使い切られる。consume せずに返し、承認は残す。
-  if (readApprovalActorClass(storage, approved.id) !== 'human') {
-    return {
-      status: 'rejected',
-      code: 'APPROVAL_ACTOR_NOT_HUMAN',
-      reason: `approval ${approved.id} has no record that a human (ADMIN credential) decided it`,
     }
   }
 

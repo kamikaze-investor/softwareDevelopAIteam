@@ -139,7 +139,7 @@ function park(storage: IStorage, taskId: string): void {
     changedFiles: [], triggeredRules: [], invalidIf: ['commit changes'],
     status: 'WAITING_FOR_USER', expiresAt: new Date(Date.now() + 3600_000).toISOString(),
   } as never)
-  storage.approvalRequests.updateStatus(request.id, 'APPROVED')
+  storage.approvalRequests.recordDecision(request.id, 'APPROVED', undefined, { credentialClass: 'admin' })
   const parked = abortTask(storage, { taskId, approvalRequestId: request.id, reason: 'parked' })
   if (!parked.ok || parked.status !== 'parked') throw new Error('fixture failed to park')
 }

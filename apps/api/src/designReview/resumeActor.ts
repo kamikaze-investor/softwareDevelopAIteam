@@ -128,6 +128,10 @@ export function classifyResumeActorFromRequest(req: FastifyRequest): {
  *
  * 落ちた場合の意味は決めてある: 読み側が `unknown` を返し、generation は跨がらない。
  * **記録の失敗は budget を増やす方向へは倒れない。**
+ *
+ * **authority evidence（`resume_actor` / `approval_actor`）には使わない**（G-01）。それらは状態変更と
+ * 同じ transaction で書き、失敗したら状態変更ごと rollback する。ここに残るのは判定に使われない
+ * 検証用の記録（`repair_generation`）だけである。
  */
 function recordWithoutFailingCaller(operation: string, write: () => void): void {
   try {
@@ -138,45 +142,60 @@ function recordWithoutFailingCaller(operation: string, write: () => void): void 
 }
 
 /**
- * resume actor を既存 audit へ記録する。
+ * resume を行った主体（credential / in-process PL の事実だけから決めたもの）。
+ * `storage.jobs.resumeBlockedTask({ resumedBy })` へ渡すと、resume Job の作成と**同じ transaction で**
+ * `resume_actor` 行が書かれる（G-01）。
+ */
+export interface ResumeActorEvidence {
+  actorClass: ResumeActorClass
+  evidence: ResumeAuthorizationEvidence
+  /** Rule 5.5 の review execution failure に対する PL Technical Resume。 */
+  technicalResume?: boolean
+  /**
+   * Human Resume が作られた時点で Task を止めていた Design Review run の id（R-4）。
+   * この run だけが、その Human Resume によって「答えられた」run になる（`readAnsweredRunIds()`）。
+   */
+  answeredRunId?: string
+}
+
+/**
+ * `resume_actor` audit 行の**唯一の形**。書き手（storage の resume transaction と `recordResumeActor()`）は
+ * どちらもここから行を作り、読み手（`resumeActorClassFromAudit()`）はこの形だけを読む。
+ */
+export function resumeActorAuditRecord(
+  input: { jobId: string; taskId: string } & ResumeActorEvidence,
+): Omit<AuditLogEntry, 'id' | 'createdAt'> {
+  return {
+    actor: 'api',
+    operation: RESUME_ACTOR_OPERATION,
+    entityType: 'job',
+    entityId: input.jobId,
+    result: input.actorClass,
+    detail: [
+      `task_id=${input.taskId}`,
+      `resume_actor=${input.actorClass}`,
+      `authorization_evidence=${input.evidence}`,
+      input.technicalResume === true ? TECHNICAL_RESUME_AUDIT_TOKEN : undefined,
+      input.actorClass === 'human' && input.answeredRunId !== undefined
+        ? `${ANSWERED_RUN_AUDIT_TOKEN}=${input.answeredRunId}`
+        : undefined,
+    ].filter((token) => token !== undefined).join(' '),
+  }
+}
+
+/**
+ * resume actor を既存 audit へ記録する（transaction の外で書く経路・テストの seed 用）。
  *
- * 記録が落ちた場合に何が起きるかは決めてある: 読み側が `unknown` を返し、
- * generation は跨がらない。つまり**記録の失敗は budget を増やす方向へ倒れない**。
+ * **失敗を握り潰さない**（G-01）。resume actor は repair budget の generation 境界を決める authority
+ * evidence であり、黙って欠けると本物の Human Resume が後から human_resume authority を失う。
+ * HTTP route と PL は `resumeBlockedTask({ resumedBy })` で resume と同じ transaction に書くので、
+ * この関数を経由しない。
  */
 export function recordResumeActor(
   storage: IStorage,
-  input: {
-    jobId: string
-    taskId: string
-    actorClass: ResumeActorClass
-    evidence: ResumeAuthorizationEvidence
-    /** Rule 5.5 の review execution failure に対する PL Technical Resume。 */
-    technicalResume?: boolean
-    /**
-     * Human Resume が作られた時点で Task を止めていた Design Review run の id（R-4）。
-     * この run だけが、その Human Resume によって「答えられた」run になる（`readAnsweredRunIds()`）。
-     */
-    answeredRunId?: string
-  },
+  input: { jobId: string; taskId: string } & ResumeActorEvidence,
 ): void {
-  recordWithoutFailingCaller(RESUME_ACTOR_OPERATION, () => {
-    storage.auditLog.record({
-      actor: 'api',
-      operation: RESUME_ACTOR_OPERATION,
-      entityType: 'job',
-      entityId: input.jobId,
-      result: input.actorClass,
-      detail: [
-        `task_id=${input.taskId}`,
-        `resume_actor=${input.actorClass}`,
-        `authorization_evidence=${input.evidence}`,
-        input.technicalResume === true ? TECHNICAL_RESUME_AUDIT_TOKEN : undefined,
-        input.actorClass === 'human' && input.answeredRunId !== undefined
-          ? `${ANSWERED_RUN_AUDIT_TOKEN}=${input.answeredRunId}`
-          : undefined,
-      ].filter((token) => token !== undefined).join(' '),
-    })
-  })
+  storage.auditLog.record(resumeActorAuditRecord(input))
 }
 
 /**
@@ -231,26 +250,38 @@ export const APPROVAL_ACTOR_AUDIT_OPERATION = 'approval_actor'
  * ところが `APPROVED` は legacy 単一 token でも書けるので、行の状態だけでは「人が決めた」ことの
  * 証明にならない。Human Resume と同じ規則（`resumeActorClassForCredential()`：ADMIN だけが human、
  * legacy / 不明は決して human にしない）で決めた種別を、承認 id に紐づけて 1 行残す。
- * 呼び出しは承認 PATCH route の担当（CODEOWNERS 保護のため別 unit が配線する）。
- * 記録の失敗は authority を増やす方向へは倒れない（読み側が `unknown` を返す）。
+ * 承認 PATCH route は storage の決定操作（`recordDecision` / `approveAndResumeJob`）へ credential 種別を渡し、
+ * storage が **状態変更と同じ transaction で** `approvalActorAuditRecord()` の行を書く（H-03）。
+ * この関数は transaction の外で後から書く経路（テストの seed 等）用で、行の形は同じ helper から作る。
+ * authority evidence なので**失敗を握り潰さない**（G-01）。
  */
 export function recordApprovalActor(
   storage: IStorage,
   approvalRequestId: string,
   credentialClass: CredentialClass | undefined,
 ): void {
+  storage.auditLog.record(approvalActorAuditRecord(approvalRequestId, credentialClass))
+}
+
+/**
+ * `approval_actor` audit 行の**唯一の形**。書き手（`recordApprovalActor()` と storage の決定 transaction）は
+ * どちらもここから行を作り、読み手（`readApprovalActorClass()`）はこの形だけを読む。
+ * 種別は credential だけから決める（`resumeActorClassForCredential()`：ADMIN だけが human）。
+ */
+export function approvalActorAuditRecord(
+  approvalRequestId: string,
+  credentialClass: CredentialClass | undefined,
+): Omit<AuditLogEntry, 'id' | 'createdAt'> {
   const actorClass = resumeActorClassForCredential(credentialClass)
   const evidence = resumeEvidenceForCredential(credentialClass)
-  recordWithoutFailingCaller(APPROVAL_ACTOR_AUDIT_OPERATION, () => {
-    storage.auditLog.record({
-      actor: 'api',
-      operation: APPROVAL_ACTOR_AUDIT_OPERATION,
-      entityType: 'approval_request',
-      entityId: approvalRequestId,
-      result: actorClass,
-      detail: `approval_actor=${actorClass} authorization_evidence=${evidence}`,
-    })
-  })
+  return {
+    actor: 'api',
+    operation: APPROVAL_ACTOR_AUDIT_OPERATION,
+    entityType: 'approval_request',
+    entityId: approvalRequestId,
+    result: actorClass,
+    detail: `approval_actor=${actorClass} authorization_evidence=${evidence}`,
+  }
 }
 
 /**

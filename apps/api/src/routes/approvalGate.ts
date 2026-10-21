@@ -38,7 +38,6 @@ import {
   type GitCommitHumanGateReason,
 } from '../gitCommitEvidence'
 import { getCredentialClass } from '../auth/credentialClass'
-import { recordApprovalActor } from '../designReview/resumeActor'
 import { designReviewEvidenceRoutes } from './designReviewEvidence'
 import { gateEvaluationRoutes } from './gateEvaluations'
 
@@ -1047,12 +1046,14 @@ export async function approvalGateRoutes(
 
   // PATCH /api/approval-requests/:id/status — 状態更新（人間が承認/拒否する口）
   //
-  // 決定の直後に「誰が決めたか」（credential 種別だけから導いた human / ai / unknown）を
-  // `approval_actor` audit へ残す。APPROVED は legacy 単一 token でも書けるため、行の状態だけでは
-  // 人の判断である証明にならない（b8d0fc5d: stored-review recovery の承認が repair budget を作り直す）。
-  // 決定と記録は同じ同期区間で連続して書く（間に await が無いので別 request は割り込まない）。
-  // 残る窓は 2 つの書き込みの間のプロセス停止だけで、そのとき行は「actor 記録の無い決定」になり、
-  // 読み側（`readApprovalActorClass()`）は unknown = 人ではない、と扱う（fail closed。authority は増えない）。
+  // 「誰が決めたか」（credential 種別だけから導いた human / ai / unknown）を `approval_actor` audit へ残す。
+  // APPROVED は行の状態だけでは人の判断である証明にならない（b8d0fc5d: stored-review recovery の承認が
+  // repair budget を作り直す）。credential 種別を storage の決定操作へ渡し、**状態変更（git_commit は
+  // Job 再 queue も）と同じ SQLite transaction で**書かせる（H-03）。以前は決定の後に別書き込みで残して
+  // おり、間でプロセスが止まると human evidence の無い APPROVED が残り、再 PATCH は 409、stored-review
+  // recovery は永久に拒否、という詰みになっていた。
+  //
+  // この route は `HUMAN_ONLY_ROUTES` に載る（C-02）: split credential mode の ADMIN でしか届かない。
   app.patch<{ Params: { id: string } }>('/approval-requests/:id/status', async (req, reply) => {
     const result = UpdateStatusBody.safeParse(req.body)
     if (!result.success) {
@@ -1070,14 +1071,17 @@ export async function approvalGateRoutes(
     }
 
     if (result.data.status === 'APPROVED' && request.requestedAction === 'git_commit') {
-      const approved = storage.approvalRequests.approveAndResumeJob(req.params.id, result.data.reason)
+      const approved = storage.approvalRequests.approveAndResumeJob(
+        req.params.id,
+        result.data.reason,
+        { credentialClass: getCredentialClass(req) },
+      )
       if (!approved.ok) {
         return reply.status(approved.code === 'NOT_FOUND' ? 404 : 409).send({
           error: approved.reason,
           ...(approved.approvalRequest ? { status: approved.approvalRequest.status } : {}),
         })
       }
-      recordApprovalActor(storage, req.params.id, getCredentialClass(req))
       return reply.send(approved.approvalRequest)
     }
 
@@ -1085,8 +1089,8 @@ export async function approvalGateRoutes(
       req.params.id,
       result.data.status as 'APPROVED' | 'REJECTED',
       result.data.reason,
+      { credentialClass: getCredentialClass(req) },
     )
-    if (updated) recordApprovalActor(storage, req.params.id, getCredentialClass(req))
     return reply.send(updated)
   })
 

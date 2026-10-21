@@ -17,6 +17,8 @@ import {
  * 失敗と受け取る。保存済み状態を読み直し、まだ判定が無ければ pending とする。
  */
 
+const PL_ACTOR = { actorClass: 'pl', evidence: 'in_process_pl' } as const
+
 // changedFiles [] の resume review で選ばれる focus（scope_simplicity）に合わせた ALIGNED。
 const ALIGNED = JSON.stringify({
   focusedReviewResults: [{ focus: 'scope_simplicity', decision: 'ALIGNED' }],
@@ -63,8 +65,8 @@ describe('resumeBlockedTaskWithDesignReview — 判定待ちと重なった要�
     })
 
     // 1本目は run を claim し、runner の完了待ちで止まる。
-    const first = resumeBlockedTaskWithDesignReview(storage, { task, instructionPrompt, coordinatorDeps: slow })
-    const second = await resumeBlockedTaskWithDesignReview(storage, { task, instructionPrompt, coordinatorDeps: slow })
+    const first = resumeBlockedTaskWithDesignReview(storage, { task, instructionPrompt, resumedBy: PL_ACTOR, coordinatorDeps: slow })
+    const second = await resumeBlockedTaskWithDesignReview(storage, { task, instructionPrompt, resumedBy: PL_ACTOR, coordinatorDeps: slow })
 
     expect(second).toMatchObject({ ok: false, code: RESUME_DESIGN_REVIEW_PENDING })
     expect(second).not.toMatchObject({ code: RESUME_DESIGN_REVIEW_FAILED })
@@ -96,7 +98,7 @@ describe('resumeBlockedTaskWithDesignReview — 判定待ちと重なった要�
     }
 
     const resumed = await resumeBlockedTaskWithDesignReview(storage, {
-      task, instructionPrompt, coordinatorDeps: coordinator(async () => { throw new Error('must not run') }),
+      task, instructionPrompt, resumedBy: PL_ACTOR, coordinatorDeps: coordinator(async () => { throw new Error('must not run') }),
     })
 
     expect(resumed.ok).toBe(true)

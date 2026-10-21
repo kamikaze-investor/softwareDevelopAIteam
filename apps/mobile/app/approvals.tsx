@@ -39,6 +39,7 @@ import {
   setCachedApprovals,
 } from '../lib/approvalsCache'
 import type { ApprovalWithProject } from '../lib/approvalsCache'
+import { formatApprovalDecisionErrorMessage } from '../lib/resumeErrorMessage'
 import { POLLING_INTERVAL_MS, usePolling } from '../lib/usePolling'
 
 type DecisionStatus = 'approved' | 'rejected'
@@ -508,7 +509,16 @@ export default function ApprovalsScreen(): ReactElement {
       )
 
       if (!response.ok) {
-        throw new Error(`Failed to update approval request: ${response.status}`)
+        // 403 HUMAN_ONLY_ROUTE_REQUIRES_SPLIT_CREDENTIALS 等は code ごとの文言で出す（C-02）。
+        let code: string | null = null
+        try {
+          const body = (await response.json()) as { code?: unknown }
+          code = typeof body.code === 'string' ? body.code : null
+        } catch {
+          code = null
+        }
+        Alert.alert('エラー', formatApprovalDecisionErrorMessage(code))
+        return
       }
 
       await loadApprovalRequests()

@@ -1,5 +1,7 @@
 import type { Task } from '@ai-team/shared'
 import type { IStorage, ResumeBlockedTaskResult } from '../storage/interface'
+import type { ResumeActorEvidence } from './resumeActor'
+import { designReviewRunAnsweredByHumanResume } from './repairFlow'
 import {
   buildDefaultCoordinatorDeps,
   createAndExecuteDesignReview,
@@ -29,21 +31,24 @@ export type ResumeBlockedTaskWithDesignReviewResult =
  * that the new instruction has no matching Design Review evidence, review exactly that prompt
  * before retrying once.
  *
- * This is the single recovery path used by both HTTP and the in-process PL. Actor attribution is
- * deliberately left to the callers because the HTTP route derives it from credentials while the
- * PL derives it from the in-process execution boundary.
+ * This is the single recovery path used by both HTTP and the in-process PL. The actor is decided by
+ * the callers (the HTTP route from credentials, the PL from the in-process execution boundary) and
+ * passed through as `resumedBy`; storage writes the `resume_actor` row in the same transaction that
+ * creates the resume Job (G-01), so a resume never commits without its authority evidence.
  */
 export async function resumeBlockedTaskWithDesignReview(
   storage: IStorage,
   input: {
     task: Pick<Task, 'id' | 'title'>
     instructionPrompt: string
+    resumedBy: ResumeActorEvidence
     coordinatorDeps?: CoordinatorDeps
   },
 ): Promise<ResumeBlockedTaskWithDesignReviewResult> {
   let resumed = storage.jobs.resumeBlockedTask({
     taskId: input.task.id,
     instructionPrompt: input.instructionPrompt,
+    resumedBy: withAnsweredRun(storage, input.task.id, input.resumedBy),
   })
 
   if (!resumed.ok && resumed.code === 'DESIGN_REVIEW_PRECONDITION_FAILED') {
@@ -80,8 +85,19 @@ export async function resumeBlockedTaskWithDesignReview(
     resumed = storage.jobs.resumeBlockedTask({
       taskId: input.task.id,
       instructionPrompt: input.instructionPrompt,
+      resumedBy: withAnsweredRun(storage, input.task.id, input.resumedBy),
     })
   }
 
   return resumed
+}
+
+/**
+ * Human Resume は、作成時点で Task を止めていた Design Review run を明示的に答える（R-4）。
+ * その id を resume_actor 行（resume Job と同じ transaction で書かれる）へ載せる。human 以外は何も答えない。
+ */
+function withAnsweredRun(storage: IStorage, taskId: string, resumedBy: ResumeActorEvidence): ResumeActorEvidence {
+  if (resumedBy.actorClass !== 'human') return resumedBy
+  const answeredRunId = designReviewRunAnsweredByHumanResume(storage, taskId)
+  return answeredRunId === undefined ? resumedBy : { ...resumedBy, answeredRunId }
 }
