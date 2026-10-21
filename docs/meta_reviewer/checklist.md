@@ -64,7 +64,8 @@ DA (1) はファイル名ではなく差分の意味で判定する。Goal / Pro
 DA trigger (1)〜(5) に当たっても、欠陥・弱体化・未解消の矛盾が無ければ `blocked` にしない。
 `requiresCeoApproval: true` を付け、人の判断は CODEOWNERS review に委ねる（`prompt.md`「Human Decision Authority のみ」）。
 canonical spec で承認済みの authority boundary を scope どおりに実装する変更は、人の承認を外す方向でも「Cage弱体化」に数えない。
-それが現行の Approval Tuple (a)〜(d) を実際に変える場合（例: git_commit Stage 1 で人の承認を外す）は A（`requiresCeoApproval: true`）のままで、欠陥が無ければ `blocked` にしない。Tuple を変えずに既存 boundary を正しく強制するだけの実装は B。
+Approval Tuple の変化は base branch の承認済み canonical rule（`approval_rules.md` / `specs/22`）を基準に測る。base rule が old→new Tuple を具体的に定義済みで実装が全 path で一致すれば B（`requiresCeoApproval: false`。2回目の CEO review は不要）。
+具体的な Tuple binding が無く原則としてのみ承認済みの boundary を実装して現行の Approval Tuple (a)〜(d) を実際に変える場合（例: git_commit Stage 1 で人の承認を外す。`approval_rules.md` に exact binding が無い）は A（`requiresCeoApproval: true`）のままで、欠陥が無ければ `blocked` にしない。Tuple を変えずに既存 boundary を正しく強制するだけの実装は B。
 「Cage弱体化」として `blocked` にするのは、承認済み scope の逸脱・無断の authority 拡大・意図しない bypass / fail-open・実装欠陥がある場合だけ。
 
 #### DA (2): Approval Tuple の意味確認
@@ -88,8 +89,10 @@ DA (2) はファイル名・ラベルではなく Approval Tuple の意味で判
 - [ ] Tuple不変のenforcement defectはB + blocked、Tupleを実際に変えるdefectはA + blockedとした
 - [ ] legacy / unknown を human と数える、exact diff hash binding を path 集合等へ緩める、TTL 延長・再延長、一部 path での check skip、unknown / default を approve にする変更は A + blocked とした
 - [ ] human-approval 対象 action の追加、承認 effect を自動 commit へ変える変更は A とした
-- [ ] canonical spec が承認済みの Tuple 変更（例: git_commit Stage 1）は A のままとし、欠陥が無ければ blocked にしていない
-- [ ] Tuple を実際に変える A は、対応する canonical rule（`approval_rules.md` / `specs/22`）の実質的な変更、または既承認 rule への exact implementation / activation binding を同じ PR に含め、CODEOWNERS review に委ねている
+- [ ] Tuple の変化を、コードの従来挙動ではなく base branch の承認済み canonical rule（`approval_rules.md` / `specs/22`）に対して測った
+- [ ] base canonical rule が old→new として具体的に定義済みの Tuple を全 path で一致させて実装する変更は B とし、不一致は A + blocked とした
+- [ ] 原則としてのみ承認済みで exact Tuple binding が無い Tuple 変更（例: git_commit Stage 1）は A のままとし、欠陥が無ければ blocked にしていない
+- [ ] base canonical rule に対して Tuple を実際に変える A は、対応する canonical rule（`approval_rules.md` / `specs/22`）の実質的な変更、または原則としてのみ承認済みの boundary への activation binding を同じ PR に含め、CODEOWNERS review に委ねている
 - [ ] 同じ PR の rule 変更を既承認の根拠や A→B の理由にしていない。rule と実装を一体の proposal として扱い、rule が old→new Tuple と scope・binding・effect・expiry / use / reset・failure default を定め、全 writer / reader / consume / retry / recovery / alternate path の実装と一致し、missing / legacy / unknown は fail closed であることを確認した
 - [ ] rule と code の不一致は A + blocked とし、CEO review で解除されるものとして扱っていない
 - [ ] Human Gate を得る目的だけの trivial・無関係・説明だけの保護対象編集は manipulation として blocked とした
