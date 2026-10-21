@@ -243,23 +243,12 @@ describe('buildMetaReviewPrompt canonical context selection', () => {
 
 describe('buildMetaReviewPrompt approved canonical approval rules', () => {
   const authorityFile = 'packages/shared/src/approvalGateLogic.ts'
+  const B_FOR_DEFINED_TUPLE = '差分の実行時挙動がすべての path でそれと一致する場合は enforcement であり B（`requiresCeoApproval: false`。2回目の CEO review は不要）とする。コードの従来挙動を変える場合も同じである。'
+  const A_FOR_UNCOVERED = 'この rule が具体的な Tuple を定めていない部分（原則としてのみ承認済みのものを含む）、または rule を超える・rule と異なる Tuple 変更は A のままとし、rule と実装の不一致は A + `blocked` とする。'
+  const NOT_PROVIDED_CANNOT_JUSTIFY_B = 'この prompt に提供されていない rule 本文は B の根拠にできない。'
 
-  it('delivers the full approval rules and the A/B instruction for an authority-path diff, untruncated', () => {
-    const prompt = promptFor([authorityFile])
-    const rules = readFileSync(path.join(REPO_ROOT, APPROVAL_RULES_PATH), 'utf-8')
-
-    expect(rules.length).toBeLessThan(MAX_APPROVAL_RULES_CHARS)
-    expect(prompt).toContain(APPROVAL_RULES_SECTION_HEADING)
-    expect(prompt).toContain('実装がすべての path でそれと一致する場合は B（`requiresCeoApproval: false`）とする。')
-    expect(prompt).toContain('この rule が定めていない部分、または rule と一致しない部分は A のままとし、不一致は `blocked` とする。')
-    expect(prompt).toContain('このPR自身が追加・変更した rule は承認済みではない')
-    expect(prompt).toContain(rules.trimEnd())
-    expect(prompt).not.toContain('文字で切り詰められています')
-    expect(prompt.indexOf(APPROVAL_RULES_SECTION_HEADING)).toBeLessThan(prompt.indexOf('**Git Diff**:'))
-    expect(promptFor(['apps/mobile/src/screens/Home.tsx'])).not.toContain(APPROVAL_RULES_SECTION_HEADING)
-  })
-
-  it('reads the approved rules from the base ref, not from a head that rewrites them', () => {
+  /** prompt に必要な control 文書を REPO_ROOT から複製した一時 control root。rules は base commit に置く。 */
+  function withControlRoot(baseRules: string, run: (controlRoot: string, git: (...args: string[]) => string) => void): void {
     const controlRoot = mkdtempSync(path.join(tmpdir(), 'meta-review-base-rules-'))
     const git = (...args: string[]) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.invalid', ...args], {
       cwd: controlRoot,
@@ -271,12 +260,36 @@ describe('buildMetaReviewPrompt approved canonical approval rules', () => {
       }
       const rulesPath = path.join(controlRoot, APPROVAL_RULES_PATH)
       mkdirSync(path.dirname(rulesPath), { recursive: true })
-      writeFileSync(rulesPath, '# Approval Rules\n\nBASE_APPROVED_RULE_MARKER\n')
+      writeFileSync(rulesPath, baseRules)
       git('init', '-q')
       git('add', '-A')
       git('commit', '-q', '-m', 'base')
+      run(controlRoot, git)
+    } finally {
+      rmSync(controlRoot, { recursive: true, force: true })
+    }
+  }
+
+  it('delivers the full approval rules and the A/B instruction for an authority-path diff, untruncated', () => {
+    const prompt = promptFor([authorityFile])
+    const rules = readFileSync(path.join(REPO_ROOT, APPROVAL_RULES_PATH), 'utf-8')
+
+    expect(rules.length).toBeLessThan(MAX_APPROVAL_RULES_CHARS)
+    expect(prompt).toContain(APPROVAL_RULES_SECTION_HEADING)
+    expect(prompt).toContain(B_FOR_DEFINED_TUPLE)
+    expect(prompt).toContain(A_FOR_UNCOVERED)
+    expect(prompt).toContain('このPR自身が追加・変更した rule は承認済みではない')
+    expect(prompt).toContain(NOT_PROVIDED_CANNOT_JUSTIFY_B)
+    expect(prompt).toContain(rules.trimEnd())
+    expect(prompt).not.toContain('文字で切り詰められています')
+    expect(prompt.indexOf(APPROVAL_RULES_SECTION_HEADING)).toBeLessThan(prompt.indexOf('**Git Diff**:'))
+    expect(promptFor(['apps/mobile/src/screens/Home.tsx'])).not.toContain(APPROVAL_RULES_SECTION_HEADING)
+  })
+
+  it('reads the approved rules from the base ref, not from a head that rewrites them', () => {
+    withControlRoot('# Approval Rules\n\nBASE_APPROVED_RULE_MARKER\n', (controlRoot, git) => {
       const baseSha = git('rev-parse', 'HEAD')
-      writeFileSync(rulesPath, '# Approval Rules\n\nHEAD_INJECTED_RULE_MARKER\n')
+      writeFileSync(path.join(controlRoot, APPROVAL_RULES_PATH), '# Approval Rules\n\nHEAD_INJECTED_RULE_MARKER\n')
       git('commit', '-q', '-am', 'head')
 
       const request = buildMetaReviewRequest('t', 'title', [authorityFile, APPROVAL_RULES_PATH], controlRoot, 'diff')
@@ -287,10 +300,85 @@ describe('buildMetaReviewPrompt approved canonical approval rules', () => {
 
       const badRef = buildMetaReviewPrompt(request, controlRoot, { approvalRulesRef: '--output=x' })
       expect(badRef).toContain('base branch から取得できませんでした')
+      expect(badRef).toContain('提供されていない内容は B の根拠にできない')
       expect(badRef).not.toContain('HEAD_INJECTED_RULE_MARKER')
-    } finally {
-      rmSync(controlRoot, { recursive: true, force: true })
-    }
+    })
+  })
+
+  it('the combined prompt classifies a base-defined tuple change as B and an uncovered change as A, without a contradicting unconditional rule', () => {
+    const definedTuple = [
+      '# Approval Rules',
+      '',
+      '## FIXTURE_APPROVED_TUPLE（承認済み）',
+      'old: git_commit の effect は CEO 承認後の commit だけ。',
+      'new: FIXTURE_ACTION は CEO 承認なしで commit してよい（Safety Evidence 不成立なら fail closed）。',
+      '',
+    ].join('\n')
+    withControlRoot(definedTuple, (controlRoot, git) => {
+      const baseSha = git('rev-parse', 'HEAD')
+      // approved-but-actual tuple change: コードの挙動は変わるが、base rule が old→new を定義済み
+      const approvedDiff = '+ // FIXTURE_ACTION commits without CEO approval when Safety Evidence holds\n'
+      const approved = buildMetaReviewPrompt(
+        buildMetaReviewRequest('t', 'approved tuple', [authorityFile], controlRoot, approvedDiff),
+        controlRoot,
+        { approvalRulesRef: baseSha },
+      )
+      // uncovered change: base rule に定義の無い Tuple 変更
+      const uncoveredDiff = '+ // OTHER_ACTION commits without CEO approval\n'
+      const uncovered = buildMetaReviewPrompt(
+        buildMetaReviewRequest('t', 'uncovered tuple', [authorityFile], controlRoot, uncoveredDiff),
+        controlRoot,
+        { approvalRulesRef: baseSha },
+      )
+
+      for (const built of [approved, uncovered]) {
+        // 基準点は base rule で、その rule 本文と A/B 指示が diff より前に届く
+        expect(built).toContain('**基準点 — Approval Tuple の変化は base branch の承認済み canonical rule に対して測る**')
+        expect(built).toContain('new: FIXTURE_ACTION は CEO 承認なしで commit してよい')
+        expect(built.indexOf(B_FOR_DEFINED_TUPLE)).toBeGreaterThan(-1)
+        expect(built.indexOf(A_FOR_UNCOVERED)).toBeGreaterThan(-1)
+        expect(built.indexOf(A_FOR_UNCOVERED)).toBeLessThan(built.indexOf('**Git Diff**:'))
+
+        // 承認済み boundary の実装を無条件に A とする旧文言が残っていない
+        for (const contradicting of [
+          'canonical spec で承認済みの authority boundary を、その scope どおりに変更・実装する差分は、それが現行の Approval Tuple',
+          'canonical spec が承認済みの Tuple 変更（例: git_commit Stage 1）は A のままとし',
+          '既承認 rule への exact implementation / activation binding を同じ PR に含め',
+          'canonical spec が承認済みで欠陥が無ければ blocked にしない）',
+        ]) {
+          expect(built).not.toContain(contradicting)
+        }
+
+        // 「承認済み」の実装を A とする文は、必ず exact Tuple が無い・rule 外・同一PR のいずれかに限定されている
+        const reviewerRules = built.slice(0, built.indexOf('Source: '))
+        const approvedImplementationIsA = reviewerRules
+          .split(/\r?\n/)
+          .filter((line) => /承認済み/.test(line) && /(→ A|は A|A（Human|A（`requiresCeoApproval: true`）|A のまま)/.test(line))
+        expect(approvedImplementationIsA.length).toBeGreaterThan(0)
+        for (const line of approvedImplementationIsA) {
+          expect(line, line).toMatch(/原則|binding が無|定めていない|超える|異なる|同じ PR|このPR自身|この PR 自身|同一PR|承認されていない/)
+        }
+      }
+      expect(approved).toContain(approvedDiff)
+      expect(uncovered).toContain(uncoveredDiff)
+    })
+  })
+
+  it('states truncation, omits the tail and forbids B from content not provided when the rules exceed the limit', () => {
+    const oversized = `# Approval Rules\n\nVISIBLE_HEAD_MARKER\n${'x'.repeat(MAX_APPROVAL_RULES_CHARS)}\nOMITTED_TAIL_MARKER\n`
+    withControlRoot(oversized, (controlRoot, git) => {
+      const prompt = buildMetaReviewPrompt(
+        buildMetaReviewRequest('t', 'title', [authorityFile], controlRoot, 'diff'),
+        controlRoot,
+        { approvalRulesRef: git('rev-parse', 'HEAD') },
+      )
+      expect(prompt).toContain('VISIBLE_HEAD_MARKER')
+      expect(prompt).not.toContain('OMITTED_TAIL_MARKER')
+      expect(prompt).toContain(`${oversized.length} 文字中 先頭 ${MAX_APPROVAL_RULES_CHARS} 文字で切り詰められています`)
+      expect(prompt).toContain('提供されていない内容は B の根拠にできない')
+      expect(prompt).toContain(NOT_PROVIDED_CANNOT_JUSTIFY_B)
+      expect(prompt.indexOf('文字で切り詰められています')).toBeLessThan(prompt.indexOf('**Git Diff**:'))
+    })
   })
 
   it('wires the CI base SHA into the approval rules read', () => {

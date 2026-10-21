@@ -264,17 +264,18 @@ function loadApprovalRules(controlRoot: string, ref: string | undefined): Approv
 
 function buildApprovalRulesSection(load: ApprovalRulesLoad): string {
   const instruction = [
-    '以下は base branch で既に承認済みの canonical approval rules である（このPRの変更は含まない）。DA (2) の判定では次のとおり扱う:',
-    '- 差分の Approval Tuple 変更がこの承認済み rule に定義されており、実装がすべての path でそれと一致する場合は B（`requiresCeoApproval: false`）とする。',
-    '- この rule が定めていない部分、または rule と一致しない部分は A のままとし、不一致は `blocked` とする。',
+    '以下は base branch で既に承認済みの canonical approval rules である（このPRの変更は含まない）。DA (2) の「基準点」はこの rule と `specs/22` であり、Approval Tuple の変化はコードの従来挙動ではなくこれに対して測る:',
+    '- この rule が old→new の Approval Tuple を具体的に定義しており、差分の実行時挙動がすべての path でそれと一致する場合は enforcement であり B（`requiresCeoApproval: false`。2回目の CEO review は不要）とする。コードの従来挙動を変える場合も同じである。',
+    '- この rule が具体的な Tuple を定めていない部分（原則としてのみ承認済みのものを含む）、または rule を超える・rule と異なる Tuple 変更は A のままとし、rule と実装の不一致は A + `blocked` とする。',
     '- このPR自身が追加・変更した rule は承認済みではない（同一PRの rule 変更を根拠に A を B にしない）。',
+    '- この prompt に提供されていない rule 本文は B の根拠にできない。',
   ]
   if (!load.ok) {
     return [
       APPROVAL_RULES_SECTION_HEADING,
       '',
       `【注意】承認済み canonical approval rules（${APPROVAL_RULES_PATH}）を base branch から取得できませんでした（${load.reason}）。`,
-      'この応答では既承認 rule を根拠に A を B にしないでください。',
+      'この応答では既承認 rule を根拠に A を B にしないでください（提供されていない内容は B の根拠にできない）。',
     ].join('\n')
   }
   const total = load.text.length
@@ -289,7 +290,7 @@ function buildApprovalRulesSection(load: ApprovalRulesLoad): string {
     '',
     body.trimEnd(),
     ...(truncated
-      ? ['', `【注意】上の rule 本文は ${total} 文字中 先頭 ${MAX_APPROVAL_RULES_CHARS} 文字で切り詰められています。提供されていない部分を承認済みの根拠にしないでください。`]
+      ? ['', `【注意】上の rule 本文は ${total} 文字中 先頭 ${MAX_APPROVAL_RULES_CHARS} 文字で切り詰められています（残り ${total - MAX_APPROVAL_RULES_CHARS} 文字は提供されていません）。提供されていない内容は B の根拠にできないので、切り詰められた部分に依拠する Tuple 変更は A として扱ってください。`]
       : []),
   ].join('\n')
 }
