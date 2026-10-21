@@ -1678,6 +1678,8 @@ const REPAIR_HANDOFF_REFUSAL_CODES: readonly RepairHandoffRefusalCode[] = [
   'TASK_DONE',
   'TASK_PARKED',
   'PROJECT_NOT_RUNNING',
+  // 別の live 連鎖が既に Task を動かしている（lifecycle repair C3 / D3-1）。escalation ではなく良性の skip。
+  'FOREIGN_LIVE_JOB',
 ]
 
 function isRepairHandoffRefusal(code: string): boolean {

@@ -185,19 +185,24 @@ describe('stale terminal resultが新しい確定stateを上書きしない', ()
     return { storage, jobId: job.id }
   }
 
-  /** PATCH経路と同じ判定でstatusを適用する（適用不可ならstatusを落とす）。 */
+  /**
+   * PATCH経路（Outbox 配送）と同じ判定で適用する: 適用できない遷移は **何も適用しない**。
+   *
+   * lifecycle repair C3 で変更した。以前は status だけを落として残り（stderr / commitHash / guardResult /
+   * failureMetadata）を確定済みの行へ重ねており、success の行が quarantined を持つような矛盾した行で
+   * 作業を隠していた（独立レビュー P2）。適用できない配送は event を記録するだけで payload を捨てる。
+   */
   function applyLateResult(
     storage: IStorage,
     jobId: string,
     update: Record<string, unknown>,
   ): Job {
     const existing = storage.jobs.findById(jobId)!
-    const next = { ...update }
-    const to = next.status as Job['status'] | undefined
+    const to = update.status as Job['status'] | undefined
     if (to !== undefined && to !== existing.status && !canApplyJobResultStatus(existing.status, to)) {
-      delete next.status
+      return existing
     }
-    return storage.jobs.update(jobId, next as never)!
+    return storage.jobs.update(jobId, update as never)!
   }
 
   it('success後に遅延failedが届いてもsuccessのまま', () => {
@@ -205,8 +210,8 @@ describe('stale terminal resultが新しい確定stateを上書きしない', ()
     const after = applyLateResult(storage, jobId, { status: 'failed', stderr: 'late failure' })
 
     expect(after.status).toBe('success')
-    // statusは守るが、他のフィールド（監査情報）は受理して記録できる
-    expect(after.stderr).toBe('late failure')
+    // 適用できない result の他のフィールドも重ねない（確定済みの行と矛盾する情報で上書きしない。C3）
+    expect(after.stderr).toBe('confirmed')
   })
 
   it('failed後に遅延successが届いてもfailedのまま', () => {

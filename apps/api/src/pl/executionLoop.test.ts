@@ -27,7 +27,7 @@ import {
 } from './executionLoop'
 import { findProposalDiagnostics, PL_MAX_ADOPTION_ATTEMPTS } from './adoptionStep'
 import { parseTriageAuditDetail, triageBlocked } from './blockedTriage'
-import { readResumeActorClasses } from '../designReview/resumeActor'
+import { readResumeActorClasses, recordApprovalActor } from '../designReview/resumeActor'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { prepareRepairFlow } from '../designReview/repairFlow'
 import type { JobRefusalMetadata } from '@ai-team/shared'
@@ -2632,6 +2632,8 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
       targetDiffHash: 'd', changedFiles: [], triggeredRules: [], invalidIf: [], status: 'APPROVED',
       expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
     } as Parameters<IStorage['approvalRequests']['create']>[0])
+    // 人（ADMIN）が決めた APPROVED だけが人の判断待ち（lifecycle repair C3）。
+    recordApprovalActor(storage, abortApproval.id, 'admin')
     const escalations: string[] = []
 
     const result = await runPlTick(storage, deps({
@@ -3384,6 +3386,58 @@ describe('approved-run blocked cause comes from the evidence the Worker sent', (
 })
 
 describe('a live task-scoped human decision is a human wait, not a blocked-job recovery target', () => {
+  it('a human-decided APPROVED abort_task also suppresses job_failed; an actorless one does not (lifecycle repair C3)', () => {
+    for (const decidedByHuman of [true, false]) {
+      const { storage, taskId, projectId } = seed()
+      storage.tasks.update(taskId, { status: 'blocked' })
+      storage.jobs.create({
+        taskId, projectId, agentRole: 'developer_ai', status: 'failed',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+        aiCliMode: 'implement', aiCliProvider: 'codex',
+      } as Parameters<IStorage['jobs']['create']>[0])
+      const abort = storage.approvalRequests.create({
+        taskId, requestedAction: 'abort_task', riskLevel: 'HIGH', targetBranch: 'b', targetCommit: 'c',
+        targetDiffHash: 'd', changedFiles: [], triggeredRules: [], invalidIf: [], status: 'APPROVED',
+        expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      } as Parameters<IStorage['approvalRequests']['create']>[0])
+      if (decidedByHuman) recordApprovalActor(storage, abort.id, 'admin')
+
+      const kinds = buildSystemState(storage, { now: () => NOW }).attention
+        .filter((a) => a.taskId === taskId).map((a) => a.kind)
+      expect(kinds).toEqual(decidedByHuman ? ['approval_waiting'] : ['job_failed'])
+    }
+  })
+
+  it('an APPROVED abort_task without a human approval_actor record does not hide job_blocked (lifecycle repair C3)', () => {
+    // 実行側（verifyAndConsumeTaskApproval）が authority として使わない行は、人の判断待ちではない。
+    const { storage, taskId, projectId } = seed()
+    storage.tasks.update(taskId, { status: 'blocked' })
+    const job = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+      aiCliMode: 'implement', aiCliProvider: 'codex',
+    } as Parameters<IStorage['jobs']['create']>[0])
+    const actorless = storage.approvalRequests.create({
+      taskId, requestedAction: 'abort_task', riskLevel: 'HIGH', targetBranch: 'b', targetCommit: 'c',
+      targetDiffHash: 'd', changedFiles: [], triggeredRules: [], invalidIf: [], status: 'APPROVED',
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    } as Parameters<IStorage['approvalRequests']['create']>[0])
+
+    const attention = buildSystemState(storage, { now: () => NOW }).attention.filter((a) => a.taskId === taskId)
+    expect(attention.map((a) => a.kind)).toEqual(['job_blocked'])
+    expect(attention[0].jobId).toBe(job.id)
+    // read-only な観測は行を書き換えない。
+    expect(storage.approvalRequests.findById(actorless.id)?.status).toBe('APPROVED')
+    // 人でない resume は HUMAN_DECISION_PENDING にならず、主体の無い APPROVED は approval_actor_not_human で置き換わる。
+    const resumed = storage.jobs.resumeBlockedTask({
+      taskId, instructionPrompt: 'resume', resumedBy: { actorClass: 'pl', evidence: 'in_process_pl' },
+    })
+    // （この fixture は Design Review evidence を持たないので resume 自体は後段で断られ得る。ここで確かめるのは
+    //   主体の無い APPROVED が人の判断待ちとして扱われないことだけ。）
+    expect(resumed.ok ? undefined : resumed.code).not.toBe('HUMAN_DECISION_PENDING')
+    expect(storage.approvalRequests.findById(actorless.id)?.status).toBe('SUPERSEDED')
+  })
+
   it('APPROVED abort_task + blocked Job: no job_blocked, one approval_waiting notification, no per-tick diagnosis', async () => {
     const { storage, taskId, projectId } = seed()
     storage.tasks.update(taskId, { status: 'blocked' })

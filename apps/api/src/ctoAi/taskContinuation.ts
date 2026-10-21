@@ -80,7 +80,10 @@ function failContinuation(
   // それは異常ではなく CEO が決めた結果であり、escalate する相手がいない。
   const parked = storage.tasks.isParked(taskId)
   const task = storage.tasks.findById(taskId)
-  if (!parked && task?.status !== 'blocked') storage.tasks.update(taskId, { status: 'blocked' })
+  // done の Task も blocked へ上げない（完了済みの成果を「止まった」に書き換えない。lifecycle repair C3）。
+  if (!parked && task !== undefined && task.status !== 'blocked' && task.status !== 'done') {
+    storage.tasks.update(taskId, { status: 'blocked' })
+  }
   storage.auditLog.record({
     actor: 'api',
     operation: 'task_continuation_failed',

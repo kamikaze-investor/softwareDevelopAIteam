@@ -1045,6 +1045,24 @@ describe('completeRepairHandoff: Job 作成直前の Task / Project 再確認', 
     expect(storage.tasks.findById(ids.taskId)?.status).not.toBe('blocked')
   })
 
+  // lifecycle repair C3 / D3-1: review の間に別の live Job（例: Human Resume の resume:）が作られたら、
+  // repair Job を足さない（1 Task に 2 本の live 連鎖を作らない）。escalation ではなく良性の skip。
+  it('source 以外の live Job が Task にあれば repair Job を作らず skipped（escalation しない）', async () => {
+    let foreignId = ''
+    const { outcome, created } = await runAlignedRepair((storage, ids) => {
+      storage.tasks.update(ids.taskId, { status: 'blocked' })
+      foreignId = storage.jobs.create({
+        taskId: ids.taskId, projectId: ids.projectId, agentRole: 'developer_ai', status: 'queued',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, workflowStepKey: 'resume:some-review:1',
+        aiCliProvider: 'codex', aiCliPrompt: 'resume', aiCliMode: 'implement',
+      } as Parameters<IStorage['jobs']['create']>[0]).id
+    })
+
+    expect(outcome.status).toBe('skipped')
+    if (outcome.status === 'skipped') expect(outcome.reason).toContain(foreignId)
+    expect(created).toBe(false)
+  })
+
   it('Task が blocked なだけでは断らない（Stored Review Recovery の正規 handoff）', async () => {
     const { outcome, created } = await runAlignedRepair((storage, ids) => {
       storage.tasks.update(ids.taskId, { status: 'blocked' })
