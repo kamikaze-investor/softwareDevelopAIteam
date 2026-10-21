@@ -30,8 +30,10 @@ import type { JobStatus } from '@ai-team/shared'
  *   - `persistProviderTimeoutFailure` は `source.status !== 'running'` のとき no-op を返す
  * 一般PATCH経路だけが terminal を上書きできる状態だったため、ここで揃える。
  *
- * 受理そのものは止めない。HTTPは200のままで、DBへ status を適用しないだけである
- * （at-least-once配送の正当な遅延・重複resultを失わない）。
+ * Outbox 配送（eventId 付き）の受理そのものは止めない。HTTPは200のままで、DBへ status を
+ * 適用しないだけである（at-least-once配送の正当な遅延・重複resultを失わない）。
+ * eventId の無い直接の遷移要求は、適用しないなら route が 409（JOB_TRANSITION_NOT_APPLICABLE、
+ * claim なら JOB_CLAIM_REFUSED）で断る（lifecycle repair C2）。
  *
  *   - `queued` からは running / terminal のどちらへも進める
  *     （running観測前の完了報告、API停止中に完了した結果のOutbox再送）

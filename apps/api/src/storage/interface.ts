@@ -119,7 +119,7 @@ export type ReconcileExternalCompletionResult =
   | { ok: true; task: Task; continuation: TaskContinuation }
   | {
       ok: false
-      code: 'TASK_NOT_FOUND' | 'JOB_NOT_FOUND' | 'ALREADY_DONE' | 'STORAGE_ERROR'
+      code: 'TASK_NOT_FOUND' | 'JOB_NOT_FOUND' | 'ALREADY_DONE' | 'TASK_HAS_BLOCKED_JOBS' | 'STORAGE_ERROR'
       reason: string
     }
 export type PersistProviderTimeoutFailureResult =

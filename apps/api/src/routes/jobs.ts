@@ -825,6 +825,32 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
     // Worker側のexecution FSMとは責務が異なるため同一化しない。
     // 同一statusの再送（from === to）はDB stateを変えないが、statusを削ると下流の
     // 判定（review approved等）まで変わってしまうため、そのまま通す。
+    //
+    // **200 + no-op は Outbox 配送（eventId 付き）にだけ使う。** at-least-once の遅延・重複 result は
+    // Worker の Outbox からしか来ない（`persistTerminalUpdate`）。eventId の無い要求は配送の再送では
+    // なく直接の遷移要求なので、適用しないなら 200 で「成功したように」見せず 409 で断る
+    // （例: operator の blocked→failed が 200 なのに何も変わらなかった。lifecycle repair C2）。
+    // eventId の無い claim（Worker の queued→running）が terminal 化済みの Job に届いた場合は、
+    // Worker が確定拒否として扱える既存の JOB_CLAIM_REFUSED で断る（200 を返すと Worker は claim
+    // 成功と取り違えて terminal な Job を実行しうる）。
+    if (
+      jobUpdate.status !== undefined &&
+      jobUpdate.status !== existing.status &&
+      !canApplyJobResultStatus(existing.status, jobUpdate.status) &&
+      outboxEvent === undefined
+    ) {
+      if (jobUpdate.status === 'running') {
+        return reply.status(409).send({
+          error: `Job claim refused: the job is already ${existing.status}`,
+          code: 'JOB_CLAIM_REFUSED',
+        })
+      }
+      return reply.status(409).send({
+        error: `Job transition ${existing.status} -> ${jobUpdate.status} is not applicable `
+          + `(applicable from ${existing.status}: ${describeApplicableJobStatuses(existing.status)})`,
+        code: 'JOB_TRANSITION_NOT_APPLICABLE',
+      })
+    }
     if (
       jobUpdate.status !== undefined &&
       jobUpdate.status !== existing.status &&

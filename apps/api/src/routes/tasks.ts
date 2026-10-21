@@ -16,7 +16,12 @@ import {
 } from '@ai-team/shared'
 import { buildResumeAiCliPrompt } from '../implementPrompt'
 import { authorizePlAction, PlActionBlockedError } from '../pl/actionGate'
-import { verifyExternalCompletion } from '../reconcile/externalCompletion'
+import {
+  blockedJobsReconcileRefusalReason,
+  findBlockedJobsPreventingReconcile,
+  TASK_HAS_BLOCKED_JOBS,
+  verifyExternalCompletion,
+} from '../reconcile/externalCompletion'
 import { repairFromStoredReview } from '../designReview/repairFromStoredReview'
 import { designReviewRunAnsweredByHumanResume } from '../designReview/repairFlow'
 import { getStorage } from '../storage'
@@ -141,7 +146,9 @@ const TASK_DONE_REFUSAL = {
   error:
     'A task cannot be marked done through this generic route. '
     + 'Completion is recorded by the git_commit job completion path, or by '
-    + 'POST /api/tasks/:id/reconcile-external-completion for work completed outside the loop',
+    + 'POST /api/tasks/:id/reconcile-external-completion for work completed outside the loop '
+    + '(a task that still has blocked jobs must first be parked with abort_task, which observes the '
+    + 'worktree and releases them, or be resumed)',
   code: 'TASK_DONE_USE_COMPLETION_ROUTE',
 } as const
 
@@ -264,7 +271,11 @@ export async function taskRoutes(
       return reply.status(404).send({ error: 'Project not found' })
     }
 
-    return reply.send(storage.tasks.findByProjectId(query.data.projectId))
+    // **各 Task に `parked` を載せる**（additive）。Worker は workspace 所有権の判定で shared の
+    // `isStaleBlockedJobCandidate()` にこれを渡し、API の claim guard と同じ意味で
+    // park された Task の stale blocked 行を扱う（lifecycle repair C2）。park 判定はここで再定義しない。
+    return reply.send(storage.tasks.findByProjectId(query.data.projectId)
+      .map((task) => ({ ...task, parked: storage.tasks.isParked(task.id) })))
   })
 
   app.get<{ Params: { id: string } }>('/:id', async (req, reply) => {
@@ -663,6 +674,16 @@ export async function taskRoutes(
       return reply.status(422).send({ error: verification.reason })
     }
 
+    // blocked Job が残る Task は取り込まない（storage の transaction でも同じ関数で再確認する）。
+    // Gate より前に断るのは、断られる操作のために承認を評価・消費させないため。
+    const blockedJobs = findBlockedJobsPreventingReconcile(storage, task.id)
+    if (blockedJobs.length > 0) {
+      return reply.status(409).send({
+        code: TASK_HAS_BLOCKED_JOBS,
+        error: blockedJobsReconcileRefusalReason(blockedJobs),
+      })
+    }
+
     // 2) Mandatory Gate。**Task completion を起こす正式操作なので必ず通す。**
     //    充足の根拠は seam が DB の実レコードで検証する（Gate 名の文字列では通らない）。
     try {
@@ -684,6 +705,9 @@ export async function taskRoutes(
       sourceJobId: parsed.data.sourceJobId,
     })
     if (!reconciled.ok) {
+      if (reconciled.code === 'TASK_HAS_BLOCKED_JOBS') {
+        return reply.status(409).send({ code: reconciled.code, error: reconciled.reason })
+      }
       return reply.status(reconciled.code === 'ALREADY_DONE' ? 409 : 400).send({ error: reconciled.reason })
     }
 
