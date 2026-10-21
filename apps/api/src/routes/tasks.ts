@@ -11,6 +11,7 @@ import {
   type Job,
   type PersistedTaskFailureExplanationV1,
   type Task,
+  type TaskDetail,
   type TaskFailureQuestionTurn,
 } from '@ai-team/shared'
 import { buildResumeAiCliPrompt } from '../implementPrompt'
@@ -271,7 +272,15 @@ export async function taskRoutes(
     if (!task) {
       return reply.status(404).send({ error: 'Task not found' })
     }
-    return reply.send(task)
+    // **Resume / Recover の前提判定に要る保存済みの事実を足す**（`TaskDetail`）。
+    // Mobile はこれを共有の `evaluateResumeAdmission()` / `evaluateRecoverAdmission()` へ渡し、
+    // API と同じ入力でボタンの表示を決める。park 判定・Project 状態をここで再定義しない。
+    const detail: TaskDetail = {
+      ...task,
+      parked: storage.tasks.isParked(task.id),
+      projectStatus: storage.projects.findById(task.projectId)?.status ?? null,
+    }
+    return reply.send(detail)
   })
 
   app.post<{ Params: { id: string } }>('/:id/failure-explanation', async (req, reply) => {
