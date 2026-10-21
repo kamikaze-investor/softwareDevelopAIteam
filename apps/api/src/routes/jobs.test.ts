@@ -1,6 +1,7 @@
 import cors from '@fastify/cors'
 import Fastify, { type FastifyInstance } from 'fastify'
-import { createHash } from 'node:crypto'
+import { setCredentialClass } from '../auth/credentialClass'
+import { createHash, randomUUID } from 'node:crypto'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { canonicalizeJobUpdate, type DesignReviewEvidence, type Job, type Project, type Task } from '@ai-team/shared'
 import { appendImplementContracts } from '../implementPrompt'
@@ -17,6 +18,11 @@ async function buildApp(): Promise<FastifyInstance> {
   resetStorage()
 
   const app = Fastify()
+  // C-1: the Worker's result delivery is authenticated as the Worker (apiTokenAuth sets the class in
+  // production). These route tests have no auth plugin, so stand in for it on the Worker's PATCH /api/jobs/:id.
+  app.addHook('onRequest', async (req) => {
+    if (req.method === 'PATCH' && /^\/api\/jobs\/[^/?]+(\?|$)/.test(req.url)) setCredentialClass(req, 'worker')
+  })
   app.register(cors, { origin: true })
   app.register(projectRoutes, { prefix: '/api/projects' })
   // Design Review runner を**必ず注入する**。既定の `buildDefaultCoordinatorDeps()` は
@@ -293,12 +299,12 @@ async function createAutomaticReviewJob(
   const implementResult = await app.inject({
     method: 'PATCH',
     url: `/api/jobs/${implement.id}`,
-    payload: {
+    payload: withOutbox({
       status: 'success',
       exitCode: 0,
       changedFiles: ['src/feature.ts'],
       guardResult: { permissionAllowed: true, fileChangeAllowed: true },
-    },
+    }, randomUUID()),
   })
   expect(implementResult.statusCode).toBe(200)
   const jobs = parseBody<Job[]>((await app.inject({
@@ -722,6 +728,106 @@ describe('Job API', () => {
         expect(replay.statusCode).toBe(200)
         expect(parseBody<OutboxJobResponse>(replay.body).outbox).toEqual({ eventId: 'evt-after-operator', deduplicated: true })
         expect(storage.jobs.findById(job.id)).toEqual(before)
+      })
+    })
+
+    // lifecycle repair final: 同じ status への配送も適用できない配送として受ける。以前は same-status を
+    // 除外していたため running-only の fingerprint 検査で 409 になり、再送が永久に 409 → Worker の intake 停止。
+    it.each(['failed'] as const)(
+      'operator ends a running Job as %s, then the Worker delivers the same status with a fingerprint: 200, nothing applied, event recorded',
+      async (status) => {
+        await withApp(async (app) => {
+          const { storage, job } = await storedJob('running')
+          const operator = await app.inject({
+            method: 'PATCH', url: `/api/jobs/${job.id}`, payload: { status, stderr: 'operator ended it' },
+          })
+          expect(operator.statusCode).toBe(200)
+          const before = storage.jobs.findById(job.id)
+          expect(before?.status).toBe(status)
+
+          const workerEvent = withOutbox({
+            status, exitCode: 1, stderr: 'worker result',
+            failureMetadata: { workspaceEndFingerprint: { mode: 'clean' as const, startCommitHash: '0805249b' } },
+          }, `evt-same-${status}`)
+          const first = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload: workerEvent })
+
+          expect(first.statusCode).toBe(200)
+          expect(parseBody<OutboxJobResponse>(first.body)).toMatchObject({
+            status, outbox: { eventId: `evt-same-${status}`, deduplicated: false },
+          })
+          expect(storage.jobs.findById(job.id)).toEqual(before)
+          expect(storage.jobs.findById(job.id)?.failureMetadata?.workspaceEndFingerprint).toBeUndefined()
+
+          // 完全な再送は deduplicated（acknowledge と同じ記録を見る）。
+          const replay = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload: workerEvent })
+          expect(replay.statusCode).toBe(200)
+          expect(parseBody<OutboxJobResponse>(replay.body).outbox).toEqual({ eventId: `evt-same-${status}`, deduplicated: true })
+          expect(storage.jobs.findById(job.id)).toEqual(before)
+        })
+      },
+    )
+
+    // R-FINAL-OPPATCH: success は Worker の結果配送（Outbox event）だけが書ける。operator の直接 success は
+    // 409 で断られ、何も変えない。その後に届く Worker の本物の success は通常どおり適用される
+    // （以前は operator の success が先に立ち、Worker の結果は ack されるだけで捨てられていた）。
+    it.each(['queued', 'running'] as const)(
+      'a direct success on a %s Job is refused with 409 JOB_SUCCESS_REQUIRES_WORKER_RESULT; the Worker delivery then applies',
+      async (from) => {
+        await withApp(async (app) => {
+          const { storage, job } = await storedJob('running')
+          if (from === 'queued') storage.jobs.update(job.id, { status: 'queued' })
+          const before = storage.jobs.findById(job.id)
+
+          const operator = await app.inject({
+            method: 'PATCH', url: `/api/jobs/${job.id}`, payload: { status: 'success', stderr: 'operator ended it' },
+          })
+          expect(operator.statusCode).toBe(409)
+          expect(parseBody<{ code: string }>(operator.body).code).toBe('JOB_SUCCESS_REQUIRES_WORKER_RESULT')
+          expect(storage.jobs.findById(job.id)).toEqual(before)
+
+          const fingerprint = { mode: 'clean' as const, startCommitHash: '0805249b' }
+          // end fingerprint は running → terminal にしか載らない（queued からの直行報告は fingerprint を持たない）。
+          const workerEvent = withOutbox({
+            status: 'success', exitCode: 0, stdout: 'worker result',
+            ...(from === 'running' ? { failureMetadata: { workspaceEndFingerprint: fingerprint } } : {}),
+          }, `evt-after-refused-${from}`)
+          const delivered = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload: workerEvent })
+          expect(delivered.statusCode).toBe(200)
+          const after = storage.jobs.findById(job.id)
+          expect(after?.status).toBe('success')
+          expect(after?.stdout).toBe('worker result')
+          if (from === 'running') expect(after?.failureMetadata?.workspaceEndFingerprint).toEqual(fingerprint)
+        })
+      },
+    )
+
+    // C-1 (Codex review): every success needs the Worker's Outbox delivery, even when the Job is already success.
+    it('a direct success write to an already-successful Job is refused and changes nothing', async () => {
+      await withApp(async (app) => {
+        const { storage, job } = await storedJob('success')
+        const before = storage.jobs.findById(job.id)
+        const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload: { status: 'success' } })
+        expect(res.statusCode).toBe(409)
+        expect(parseBody<{ code: string }>(res.body).code).toBe('JOB_SUCCESS_REQUIRES_WORKER_RESULT')
+        expect(storage.jobs.findById(job.id)).toEqual(before)
+      })
+    })
+
+    it('a legitimate running -> terminal Outbox delivery with a fingerprint still applies', async () => {
+      await withApp(async (app) => {
+        const { storage, job } = await storedJob('running')
+        const fingerprint = { mode: 'clean' as const, startCommitHash: '0805249b' }
+
+        const res = await app.inject({
+          method: 'PATCH', url: `/api/jobs/${job.id}`,
+          payload: withOutbox({ status: 'failed', exitCode: 1, stderr: 'worker result', failureMetadata: { workspaceEndFingerprint: fingerprint } }, 'evt-legit-terminal'),
+        })
+
+        expect(res.statusCode).toBe(200)
+        const after = storage.jobs.findById(job.id)
+        expect(after?.status).toBe('failed')
+        expect(after?.stderr).toBe('worker result')
+        expect(after?.failureMetadata?.workspaceEndFingerprint).toEqual(fingerprint)
       })
     })
 
@@ -1361,7 +1467,7 @@ describe('Job API', () => {
       const res = await app.inject({
         method: 'PATCH',
         url: `/api/jobs/${review.id}`,
-        payload: {
+        payload: withOutbox({
           status: 'success',
           exitCode: 0,
           reviewResult: {
@@ -1369,7 +1475,7 @@ describe('Job API', () => {
             summary: 'Manual recovery review passed.',
             findings: [],
           },
-        },
+        }, randomUUID()),
       })
 
       expect(res.statusCode).toBe(200)
@@ -1435,7 +1541,7 @@ describe('Job API', () => {
       const res = await app.inject({
         method: 'PATCH',
         url: `/api/jobs/${created.id}`,
-        payload: { status: 'success', failureMetadata: { workspaceEndFingerprint } },
+        payload: withOutbox({ status: 'success', failureMetadata: { workspaceEndFingerprint } }, randomUUID()),
       })
 
       expect(res.statusCode).toBe(200)
@@ -1475,7 +1581,7 @@ describe('Job API', () => {
         method: 'PATCH', url: `/api/jobs/${created.id}`, payload: { status: 'running' },
       })
       await app.inject({
-        method: 'PATCH', url: `/api/jobs/${created.id}`, payload: { status: 'success' },
+        method: 'PATCH', url: `/api/jobs/${created.id}`, payload: withOutbox({ status: 'success' }, randomUUID()),
       })
 
       const res = await app.inject({
@@ -1863,7 +1969,7 @@ describe('Job API', () => {
           await app.inject({
             method: 'PATCH',
             url: `/api/jobs/${created.id}`,
-            payload: { status },
+            payload: status === 'success' ? withOutbox({ status }, randomUUID()) : { status },
           })
         }
 
@@ -2296,7 +2402,7 @@ describe('Job API', () => {
       const first = await app.inject({
         method: 'PATCH',
         url: `/api/jobs/${implement.id}`,
-        payload: successfulResult,
+        payload: withOutbox(successfulResult, randomUUID()),
       })
       const resend = await app.inject({
         method: 'PATCH',
@@ -2305,7 +2411,8 @@ describe('Job API', () => {
       })
 
       expect(first.statusCode).toBe(200)
-      expect(resend.statusCode).toBe(200)
+      // C-1: a resend without the Worker's Outbox event cannot write success (even to a success Job).
+      expect(resend.statusCode).toBe(409)
       const jobsResponse = await app.inject({
         method: 'GET',
         url: `/api/jobs?taskId=${task.id}`,
@@ -2402,7 +2509,7 @@ describe('Job API', () => {
       const updateResponse = await app.inject({
         method: 'PATCH',
         url: `/api/jobs/${implement.id}`,
-        payload: resultPayload,
+        payload: resultPayload.status === 'success' ? withOutbox(resultPayload, randomUUID()) : resultPayload,
       })
 
       expect(updateResponse.statusCode).toBe(200)
@@ -2489,7 +2596,7 @@ describe('Job API', () => {
       const response = await app.inject({
         method: 'PATCH',
         url: `/api/jobs/${retry.id}`,
-        payload: successfulChangedImplementResult,
+        payload: withOutbox(successfulChangedImplementResult, randomUUID()),
       })
 
       expect(response.statusCode).toBe(200)
@@ -2521,7 +2628,7 @@ describe('Job API', () => {
       const response = await app.inject({
         method: 'PATCH',
         url: `/api/jobs/${retry.id}`,
-        payload: successfulChangedImplementResult,
+        payload: withOutbox(successfulChangedImplementResult, randomUUID()),
       })
 
       expect(response.statusCode).toBe(200)
@@ -2549,7 +2656,7 @@ describe('Job API', () => {
       const response = await app.inject({
         method: 'PATCH',
         url: `/api/jobs/${retry.id}`,
-        payload: { ...successfulChangedImplementResult, changedFiles: [] },
+        payload: withOutbox({ ...successfulChangedImplementResult, changedFiles: [] }, randomUUID()),
       })
 
       expect(response.statusCode).toBe(200)
@@ -2567,7 +2674,7 @@ describe('Job API', () => {
       const response = await app.inject({
         method: 'PATCH',
         url: `/api/jobs/${retry.id}`,
-        payload: successfulChangedImplementResult,
+        payload: withOutbox(successfulChangedImplementResult, randomUUID()),
       })
 
       expect(response.statusCode).toBe(200)
@@ -2596,7 +2703,7 @@ describe('Job API', () => {
       const response = await app.inject({
         method: 'PATCH',
         url: `/api/jobs/${retry.id}`,
-        payload: successfulChangedImplementResult,
+        payload: withOutbox(successfulChangedImplementResult, randomUUID()),
       })
 
       expect(response.statusCode).toBe(200)
@@ -3075,12 +3182,12 @@ describe('Job API', () => {
       const updateResponse = await app.inject({
         method: 'PATCH',
         url: `/api/jobs/${manual.id}`,
-        payload: {
+        payload: withOutbox({
           status: 'success',
           exitCode: 0,
           changedFiles: ['src/manual.ts'],
           guardResult: { permissionAllowed: true, fileChangeAllowed: true },
-        },
+        }, randomUUID()),
       })
 
       expect(updateResponse.statusCode).toBe(200)
@@ -3105,13 +3212,13 @@ describe('Job API', () => {
         const response = await app.inject({
           method: 'PATCH',
           url: `/api/jobs/${review.id}`,
-          payload: {
+          payload: withOutbox({
             status: 'success',
             exitCode: 0,
             changedFiles: ['src/feature.ts'],
             guardResult: { permissionAllowed: true, fileChangeAllowed: true },
             reviewResult: verdict,
-          },
+          }, randomUUID()),
         })
         expect(response.statusCode).toBe(200)
         expect(parseBody<Job>(response.body).status).toBe('success')
@@ -3193,7 +3300,7 @@ describe('Job API', () => {
         const response = await app.inject({
           method: 'PATCH',
           url: `/api/jobs/${review.id}`,
-          payload: {
+          payload: withOutbox({
             status: 'success',
             exitCode: 0,
             changedFiles: ['src/feature.ts'],
@@ -3203,7 +3310,7 @@ describe('Job API', () => {
               summary: 'CEO action is required.',
               findings: [{ severity: 'high', message: 'Blocking issue' }],
             },
-          },
+          }, randomUUID()),
         })
 
         expect(response.statusCode).toBe(200)
@@ -3230,12 +3337,177 @@ describe('Job API', () => {
       const response = await app.inject({
         method: 'PATCH',
         url: `/api/jobs/${review.id}`,
-        payload: { status: 'success', reviewResult },
+        payload: withOutbox({ status: 'success', reviewResult }, randomUUID()),
       })
 
       expect(response.statusCode).toBe(400)
       const { getStorage } = await import('../storage/index.js')
       expect(getStorage().reviewResults.findByTaskId(task.id)).toEqual([])
+    })
+  })
+})
+
+// R-FINAL-OPPATCH (Codex review r5): eventId / payloadHash are caller-computable, so the Outbox event alone
+// does not prove the Worker sent the result. Under split credentials only the WORKER credential's event-bearing
+// success is applied. `legacy` (one shared API_TOKEN for humans and the Worker) cannot tell the sender apart and
+// keeps accepting it. A request with no credential class (unauthenticated) is not Worker provenance (C-1).
+describe('event-bearing success provenance by credential class', () => {
+  async function withCredential(
+    credential: 'admin' | 'worker' | 'legacy' | undefined,
+    run: (app: FastifyInstance) => Promise<void>,
+  ): Promise<void> {
+    const [{ jobRoutes }, { resetStorage }, { setCredentialClass }] = await Promise.all([
+      import('./jobs.js'),
+      import('../storage/index.js'),
+      import('../auth/credentialClass.js'),
+    ])
+    resetStorage()
+    const app = Fastify()
+    app.addHook('preHandler', async (req) => {
+      if (credential !== undefined) setCredentialClass(req, credential)
+    })
+    app.register(jobRoutes, { prefix: '/api/jobs' })
+    await app.ready()
+    try {
+      await run(app)
+    } finally {
+      await app.close()
+    }
+  }
+
+  async function runningJob() {
+    const { getStorage } = await import('../storage/index.js')
+    const storage = getStorage()
+    const project = storage.projects.create({ name: 'P', goal: 'g', designPhilosophy: [], status: 'running' })
+    const task = storage.tasks.create({
+      projectId: project.id, title: 'T', description: '', status: 'pending', assignee: 'developer_ai', dependencies: [],
+    })
+    const job = storage.jobs.create({
+      taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status: 'running',
+      safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+    } as Parameters<typeof storage.jobs.create>[0])
+    return { storage, job }
+  }
+
+  const delivery = (eventId: string) => withOutbox({ status: 'success', exitCode: 0, stdout: 'result' }, eventId)
+
+  // C-1 (Codex review): every success needs the Worker's delivery, even to a Job that is already success,
+  // and the check runs before the replay / non-applicable handling.
+  async function successJob(kind: 'review' | 'implement' | 'git_commit', status: 'success' | 'failed' = 'success') {
+    const { getStorage } = await import('../storage/index.js')
+    const storage = getStorage()
+    const project = storage.projects.create({ name: 'P', goal: 'g', designPhilosophy: [], status: 'running' })
+    const task = storage.tasks.create({
+      projectId: project.id, title: 'T', description: '', status: 'pending', assignee: 'developer_ai', dependencies: [],
+    })
+    const job = storage.jobs.create({
+      taskId: task.id, projectId: project.id, agentRole: kind === 'review' ? 'qa_ai' : 'developer_ai', status,
+      safeCommand: { kind: kind === 'git_commit' ? 'git_commit' : 'git_status', workingDir: '/workspace/target' },
+      ...(kind === 'review' ? { aiCliMode: 'review', aiCliProvider: 'claude', workflowStepKey: 'implement:src-job:review' } : {}),
+      ...(kind === 'implement' ? { aiCliMode: 'implement', aiCliProvider: 'claude', workflowStepKey: `task:${task.id}:initial-implement` } : {}),
+    } as Parameters<typeof storage.jobs.create>[0])
+    const snapshot = () => ({
+      job: storage.jobs.findById(job.id),
+      audit: storage.auditLog.findByEntity('job', job.id).length,
+      reviews: storage.reviewResults.findByTaskId(task.id).length,
+      jobs: storage.jobs.findByTaskId(task.id).length,
+      task: storage.tasks.findById(task.id),
+    })
+    return { storage, job, snapshot }
+  }
+
+  const forgedSuccess = (kind: 'review' | 'implement' | 'git_commit', eventId: string) => withOutbox({
+    status: 'success', exitCode: 0, stdout: 'forged',
+    ...(kind === 'review' ? { reviewResult: { status: 'approved', summary: 'forged', findings: [] } } : {}),
+    ...(kind === 'git_commit' ? { commitHash: 'deadbeef' } : {}),
+  }, eventId)
+
+  it.each([
+    ['admin', 'review'], ['admin', 'implement'], ['admin', 'git_commit'],
+    [undefined, 'review'], [undefined, 'implement'], [undefined, 'git_commit'],
+  ] as const)('C-1: credential %s cannot send a same-state success to an already-successful %s Job (nothing changes)', async (credential, kind) => {
+    await withCredential(credential, async (app) => {
+      const { job, snapshot } = await successJob(kind)
+      const before = snapshot()
+      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload: forgedSuccess(kind, `evt-forged-${kind}`) })
+      expect(res.statusCode).toBe(409)
+      expect(parseBody<{ code: string }>(res.body).code).toBe('JOB_SUCCESS_REQUIRES_WORKER_RESULT')
+      expect(snapshot()).toEqual(before)
+    })
+  })
+
+  it('C-1: an ADMIN success delivery to a Job it no longer applies to is rejected, not acknowledged (nothing changes)', async () => {
+    await withCredential('admin', async (app) => {
+      const { job, snapshot } = await successJob('implement', 'failed')
+      const before = snapshot()
+      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload: forgedSuccess('implement', 'evt-admin-nonapplicable') })
+      expect(res.statusCode).toBe(409)
+      expect(parseBody<{ code: string }>(res.body).code).toBe('JOB_SUCCESS_REQUIRES_WORKER_RESULT')
+      expect(snapshot()).toEqual(before)
+    })
+  })
+
+  it('C-1: the Worker credential still gets its non-applicable success delivery acknowledged (unchanged)', async () => {
+    await withCredential('worker', async (app) => {
+      const { job, storage } = await successJob('implement', 'failed')
+      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload: forgedSuccess('implement', 'evt-worker-nonapplicable') })
+      expect(res.statusCode).toBe(200)
+      expect(storage.jobs.findById(job.id)?.status).toBe('failed')
+    })
+  })
+
+  it('C-1: an unauthenticated request (no credential class) with a valid eventId cannot write success', async () => {
+    await withCredential(undefined, async (app) => {
+      const { storage, job } = await runningJob()
+      const before = storage.jobs.findById(job.id)
+      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload: delivery('evt-none') })
+      expect(res.statusCode).toBe(409)
+      expect(parseBody<{ code: string }>(res.body).code).toBe('JOB_SUCCESS_REQUIRES_WORKER_RESULT')
+      expect(storage.jobs.findById(job.id)).toEqual(before)
+    })
+  })
+
+  it('ADMIN with a valid eventId + payloadHash cannot write success (409, nothing changes)', async () => {
+    await withCredential('admin', async (app) => {
+      const { storage, job } = await runningJob()
+      const before = storage.jobs.findById(job.id)
+      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload: delivery('evt-admin') })
+      expect(res.statusCode).toBe(409)
+      expect(parseBody<{ code: string }>(res.body).code).toBe('JOB_SUCCESS_REQUIRES_WORKER_RESULT')
+      expect(storage.jobs.findById(job.id)).toEqual(before)
+    })
+  })
+
+  it.each(['worker', 'legacy'] as const)(
+    'credential %s with an Outbox event applies success',
+    async (credential) => {
+      await withCredential(credential, async (app) => {
+        const { storage, job } = await runningJob()
+        const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload: delivery(`evt-${credential}`) })
+        expect(res.statusCode).toBe(200)
+        expect(storage.jobs.findById(job.id)?.status).toBe('success')
+      })
+    },
+  )
+
+  it.each(['admin', 'worker', 'legacy'] as const)(
+    'credential %s without an Outbox event cannot write success',
+    async (credential) => {
+      await withCredential(credential, async (app) => {
+        const { storage, job } = await runningJob()
+        const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload: { status: 'success' } })
+        expect(res.statusCode).toBe(409)
+        expect(storage.jobs.findById(job.id)?.status).toBe('running')
+      })
+    },
+  )
+
+  it('ADMIN can still end a running Job as failed', async () => {
+    await withCredential('admin', async (app) => {
+      const { storage, job } = await runningJob()
+      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${job.id}`, payload: { status: 'failed', stderr: 'stopped' } })
+      expect(res.statusCode).toBe(200)
+      expect(storage.jobs.findById(job.id)?.status).toBe('failed')
     })
   })
 })

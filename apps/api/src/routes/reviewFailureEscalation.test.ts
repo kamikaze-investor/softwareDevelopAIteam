@@ -16,6 +16,7 @@
 
 import cors from '@fastify/cors'
 import Fastify, { type FastifyInstance } from 'fastify'
+import { setCredentialClass } from '../auth/credentialClass'
 import { createHash } from 'node:crypto'
 import { beforeEach, describe, expect, it } from 'vitest'
 import { canonicalizeJobUpdate, type Job, type Project, type Task } from '@ai-team/shared'
@@ -29,6 +30,11 @@ async function buildApp(): Promise<FastifyInstance> {
   resetStorage()
 
   const app = Fastify()
+  // C-1: the Worker's result delivery is authenticated as the Worker (apiTokenAuth sets the class in
+  // production). These route tests have no auth plugin, so stand in for it on the Worker's PATCH /api/jobs/:id.
+  app.addHook('onRequest', async (req) => {
+    if (req.method === 'PATCH' && /^\/api\/jobs\/[^/?]+(\?|$)/.test(req.url)) setCredentialClass(req, 'worker')
+  })
   app.register(cors, { origin: true })
   app.register(projectRoutes, { prefix: '/api/projects' })
   app.register(jobRoutes, { prefix: '/api/jobs' })
@@ -291,7 +297,7 @@ describe('review-failure-escalation gap', () => {
 
       const res = await app.inject({
         method: 'PATCH', url: `/api/jobs/${review.id}`,
-        payload: { status: 'success', exitCode: 0 },
+        payload: withOutbox({ status: 'success', exitCode: 0 }, 'event-review-success-without-result'),
       })
 
       expect(res.statusCode).toBe(200)
@@ -369,11 +375,11 @@ describe('review-failure-escalation gap', () => {
 
       const res = await app.inject({
         method: 'PATCH', url: `/api/jobs/${review.id}`,
-        payload: {
+        payload: withOutbox({
           status: 'success',
           exitCode: 0,
           reviewResult: { status: 'approved', summary: 'ok', findings: [] },
-        },
+        }, 'event-review-approved'),
       })
 
       expect(res.statusCode).toBe(200)
@@ -396,14 +402,14 @@ describe('review-failure-escalation gap', () => {
 
       const res = await app.inject({
         method: 'PATCH', url: `/api/jobs/${review.id}`,
-        payload: {
+        payload: withOutbox({
           status: 'success',
           exitCode: 0,
           reviewResult: {
             status: 'changes_requested', summary: 'fix the format',
             findings: [{ severity: 'high', file: 'test.js', line: 1, message: 'wrong format', rule: 'acceptanceCriteria[0]' }],
           },
-        },
+        }, 'event-review-changes-requested'),
       })
 
       expect(res.statusCode).toBe(200)

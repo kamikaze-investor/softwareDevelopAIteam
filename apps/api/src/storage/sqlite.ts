@@ -18,7 +18,7 @@ import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IPrincipleApplicationStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReplaceActiveApprovalAndCreateResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, ConsumeApprovalForCommandJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult, RepairHandoffRefusalCode, CreateInitialImplementJobResult, CreateManualJobResult, AcknowledgeOutboxEventResult, TaskEscalationResult } from './interface'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IPrincipleApplicationStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReplaceActiveApprovalAndCreateResult, ReviewApprovalAndResumeJobResult, RecordApprovalDecisionResult, ConsumeApprovalForJobResult, ConsumeApprovalForCommandJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult, RepairHandoffRefusalCode, CreateInitialImplementJobResult, CreateManualJobResult, AcknowledgeOutboxEventResult, TaskEscalationResult } from './interface'
 import { DesignReviewRunContentionError, RecoveryApprovalSpentMarkerError } from './interface'
 import { storedReviewRecoverySpentAuditRecord } from '../designReview/repairRecoveryEpoch'
 import { isApprovalBlockingTechnicalAbort, isTaskScopedApprovalAction, computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS, evaluateRecoverAdmission, evaluateResumeAdmission, isSupervisedRunKind, isLiveApprovedApproval, isLiveWaitingApproval } from '@ai-team/shared'
@@ -5393,22 +5393,42 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
     recordDecision(id, status, reason, decidedBy) {
       if (decidedBy === undefined) throw new Error('recordDecision requires decidedBy (approval_actor evidence)')
-      const decisionTransaction = db.transaction((): ApprovalRequest | undefined => {
-        const updated = approvalRequests.updateStatus(id, status, reason)
-        if (updated) {
-          auditLog.record({
-            actor: 'api',
-            operation: status === 'APPROVED' ? 'approve' : 'reject',
-            entityType: 'approval_request',
-            entityId: id,
-            result: 'success',
-          })
-          // 決定と「誰が決めたか」は同じ transaction（H-03）。片方だけが commit される窓を残さない。
-          auditLog.record(approvalActorAuditRecord(id, decidedBy.credentialClass))
+      const operation = status === 'APPROVED' ? 'approve' : 'reject'
+      const decisionTransaction = db.transaction((): RecordApprovalDecisionResult => {
+        // **transaction の中で読み直す**: route の事前確認と決定の間に期限が切れた・別の決定が入った行を
+        // 決定しない。期限切れの WAITING は approveAndResumeJob と同じく EXPIRED へ進めて断る。
+        const existing = approvalRequests.findById(id)
+        if (!existing) return { ok: false, code: 'NOT_FOUND', reason: 'Approval request not found' }
+        if (existing.status !== 'WAITING_FOR_USER') {
+          return {
+            ok: false,
+            code: 'STATUS_CONFLICT',
+            reason: `Cannot update status: current status is '${existing.status}'`,
+            approvalRequest: existing,
+          }
         }
-        return updated
+        const decidedAt = now()
+        const isLive: boolean = isLiveWaitingApproval(existing, Date.parse(decidedAt))
+        if (!isLive) {
+          db.prepare(`
+            UPDATE approval_requests SET status = 'EXPIRED' WHERE id = ? AND status = 'WAITING_FOR_USER'
+          `).run(id)
+          auditLog.record({ actor: 'api', operation, entityType: 'approval_request', entityId: id, result: 'failure' })
+          return {
+            ok: false,
+            code: 'EXPIRED',
+            reason: 'Approval request has expired',
+            approvalRequest: { ...existing, status: 'EXPIRED' },
+          }
+        }
+        const updated = approvalRequests.updateStatus(id, status, reason)
+        if (!updated) return { ok: false, code: 'NOT_FOUND', reason: 'Approval request not found' }
+        auditLog.record({ actor: 'api', operation, entityType: 'approval_request', entityId: id, result: 'success' })
+        // 決定と「誰が決めたか」は同じ transaction（H-03）。片方だけが commit される窓を残さない。
+        auditLog.record(approvalActorAuditRecord(id, decidedBy.credentialClass))
+        return { ok: true, approvalRequest: updated }
       })
-      return decisionTransaction()
+      return decisionTransaction.immediate()
     },
   }
 

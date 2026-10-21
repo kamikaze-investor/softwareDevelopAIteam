@@ -1,4 +1,5 @@
 import Fastify from 'fastify'
+import { setCredentialClass } from '../auth/credentialClass'
 import { createHash } from 'node:crypto'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { canonicalizeJobUpdate } from '@ai-team/shared'
@@ -25,6 +26,11 @@ describe('git_commit durable continuation route', () => {
     storage.tasks.create({ projectId: project.id, title: 'Next', description: 'Implement next.', status: 'pending', assignee: 'developer_ai', dependencies: [source.id], roadmapActive: true, phase: 2 })
     const commit = storage.jobs.create({ taskId: source.id, projectId: project.id, agentRole: 'developer_ai', status: 'running', safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' } })
     const app = Fastify()
+    // C-1: the Worker's result delivery is authenticated as the Worker (apiTokenAuth sets the class in
+    // production). These route tests have no auth plugin, so stand in for it on the Worker's PATCH /api/jobs/:id.
+    app.addHook('onRequest', async (req) => {
+      if (req.method === 'PATCH' && /^\/api\/jobs\/[^/?]+(\?|$)/.test(req.url)) setCredentialClass(req, 'worker')
+    })
     app.register(jobRoutes, { prefix: '/api/jobs' })
     await app.ready()
     try {
@@ -57,6 +63,11 @@ describe('git_commit durable continuation route', () => {
     // Project can stay paused indefinitely.
     storage.projects.update(project.id, { status: 'paused' })
     const app = Fastify()
+    // C-1: the Worker's result delivery is authenticated as the Worker (apiTokenAuth sets the class in
+    // production). These route tests have no auth plugin, so stand in for it on the Worker's PATCH /api/jobs/:id.
+    app.addHook('onRequest', async (req) => {
+      if (req.method === 'PATCH' && /^\/api\/jobs\/[^/?]+(\?|$)/.test(req.url)) setCredentialClass(req, 'worker')
+    })
     app.register(jobRoutes, { prefix: '/api/jobs' })
     await app.ready()
     try {

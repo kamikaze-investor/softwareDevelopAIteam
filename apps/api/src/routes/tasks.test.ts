@@ -1,7 +1,9 @@
 import cors from '@fastify/cors'
 import Fastify, { type FastifyInstance } from 'fastify'
+import { setCredentialClass } from '../auth/credentialClass'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { ApprovalRequest, Job, Project, SafeCommand, Task, TaskDetail, TaskSummary } from '@ai-team/shared'
+import { createHash, randomUUID } from 'node:crypto'
+import { canonicalizeJobUpdate, type ApprovalRequest, type Job, type Project, type SafeCommand, type Task, type TaskDetail, type TaskSummary } from '@ai-team/shared'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { appendImplementContracts } from '../implementPrompt'
 import { buildSystemState } from '../state/systemState'
@@ -27,6 +29,11 @@ async function buildApp(taskRouteOptions: TaskRouteOptions = {}): Promise<Fastif
   resetStorage()
 
   const app = Fastify()
+  // C-1: the Worker's result delivery is authenticated as the Worker (apiTokenAuth sets the class in
+  // production). These route tests have no auth plugin, so stand in for it on the Worker's PATCH /api/jobs/:id.
+  app.addHook('onRequest', async (req) => {
+    if (req.method === 'PATCH' && /^\/api\/jobs\/[^/?]+(\?|$)/.test(req.url)) setCredentialClass(req, 'worker')
+  })
   app.register(cors, { origin: true })
   app.register(projectRoutes, { prefix: '/api/projects' })
   app.register(taskRoutes, { prefix: '/api/tasks', ...taskRouteOptions })
@@ -129,10 +136,14 @@ async function updateJob(
   jobId: string,
   body: Partial<Job>,
 ): Promise<Job> {
+  // `success` arrives only as the Worker's Outbox delivery; a direct write is refused (R-FINAL-OPPATCH).
+  const payload = body.status === 'success'
+    ? { ...body, eventId: randomUUID(), payloadHash: createHash('sha256').update(canonicalizeJobUpdate(body as Record<string, unknown>)).digest('hex') }
+    : body
   const res = await app.inject({
     method: 'PATCH',
     url: `/api/jobs/${jobId}`,
-    payload: body,
+    payload,
   })
 
   expect(res.statusCode).toBe(200)

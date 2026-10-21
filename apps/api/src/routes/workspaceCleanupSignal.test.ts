@@ -1,6 +1,8 @@
 import Fastify, { type FastifyInstance } from 'fastify'
+import { setCredentialClass } from '../auth/credentialClass'
 import { describe, expect, it } from 'vitest'
-import type { Job, Task } from '@ai-team/shared'
+import { createHash } from 'node:crypto'
+import { canonicalizeJobUpdate, type Job, type Task } from '@ai-team/shared'
 import { MAX_REPAIR_ATTEMPTS } from '../designReview/repairPolicy'
 
 /**
@@ -26,6 +28,11 @@ async function buildApp(): Promise<FastifyInstance> {
   resetStorage()
 
   const app = Fastify()
+  // C-1: the Worker's result delivery is authenticated as the Worker (apiTokenAuth sets the class in
+  // production). These route tests have no auth plugin, so stand in for it on the Worker's PATCH /api/jobs/:id.
+  app.addHook('onRequest', async (req) => {
+    if (req.method === 'PATCH' && /^\/api\/jobs\/[^/?]+(\?|$)/.test(req.url)) setCredentialClass(req, 'worker')
+  })
   app.register(jobRoutes, { prefix: '/api/jobs' })
   await app.ready()
   return app
@@ -124,10 +131,16 @@ describe('M1: PATCH /api/jobs/:id が workspace cleanup の開始条件を返す
       const task = await seedTask()
       const job = await createImplementJob(task, `task:${task.id}:initial-implement`, 'running')
 
+      // `success` arrives only as the Worker's Outbox delivery (R-FINAL-OPPATCH).
+      const success = { status: 'success', exitCode: 0, completedAt: new Date().toISOString() }
       const res = await app.inject({
         method: 'PATCH',
         url: `/api/jobs/${job.id}`,
-        payload: { status: 'success', exitCode: 0, completedAt: new Date().toISOString() },
+        payload: {
+          ...success,
+          eventId: 'cleanup-signal-success',
+          payloadHash: createHash('sha256').update(canonicalizeJobUpdate(success)).digest('hex'),
+        },
       })
       expect(res.statusCode).toBe(200)
       const body = parseBody<Job & { workspaceCleanupRequired?: boolean }>(res.body)
