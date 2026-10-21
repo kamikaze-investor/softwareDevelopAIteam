@@ -36,7 +36,9 @@ import {
   buildConstitutionPrinciplesPrompt,
   buildDecisionAuthorityPrinciplesPrompt,
   CONSTITUTION_PRINCIPLE_SECTION_LABELS,
+  type ConstitutionPrinciplesResult,
   DECISION_AUTHORITY_PRINCIPLE_IDS,
+  extractDecisionAuthorityPrinciples,
   formatConstitutionPrinciplesWarning,
   formatDecisionAuthorityPrinciplesWarning,
   loadConstitutionPrinciples,
@@ -219,16 +221,18 @@ function buildUntrustedPrBodySection(prBody: string | undefined): string {
 }
 
 export const APPROVAL_RULES_PATH = 'docs/project_memory/rules/approval_rules.md'
+export const DECISION_AUTHORITY_SPEC_PATH = 'specs/22_safety_approval_design_principle.md'
 /** approval_rules.md 全文（2026-10-21 時点 約43k文字）を収める上限。超えたら切り詰めを prompt に明示する。 */
 export const MAX_APPROVAL_RULES_CHARS = 80_000
 export const APPROVAL_RULES_SECTION_HEADING = '### 承認済み canonical approval rules (base branch)'
 
 export interface MetaReviewPromptOptions {
   /**
-   * 承認済み canonical approval rules を読む git ref（CI では PR の base SHA）。
-   * CI の checkout は PR の内容を含むため、作業ツリーから読むと PR が自分の「承認済み rule」を
-   * 注入できる。`readCodeOwnersRules()`（autoReview.ts）が CODEOWNERS を base から読むのと同じ理由で、
-   * 指定時は `git show <ref>:approval_rules.md` で base の内容だけを読む。
+   * 承認済み canonical rule（`approval_rules.md` と `specs/22` の Decision Authority excerpt）を読む
+   * git ref（CI では PR の base SHA）。DA (2) の「基準点」はこの2つである。
+   * CI の checkout は PR の内容を含むため、作業ツリーから読むと PR が自分の「承認済み rule」や
+   * Tuple を注入できる。`readCodeOwnersRules()`（autoReview.ts）が CODEOWNERS を base から読むのと
+   * 同じ理由で、指定時は `git show <ref>:<path>` で base の内容だけを読む。
    * 未指定時は `controlRoot` の作業ツリーから読む（Design Review の control context は PR を含まない）。
    */
   approvalRulesRef?: string
@@ -238,10 +242,11 @@ type ApprovalRulesLoad =
   | { ok: true; text: string; source: string }
   | { ok: false; reason: string }
 
-function loadApprovalRules(controlRoot: string, ref: string | undefined): ApprovalRulesLoad {
+/** canonical 文書を、ref があれば base の `git show` から、無ければ controlRoot の作業ツリーから読む。 */
+function loadCanonicalFile(controlRoot: string, relPath: string, ref: string | undefined): ApprovalRulesLoad {
   if (ref === undefined) {
     try {
-      return { ok: true, text: readFileSync(path.join(controlRoot, APPROVAL_RULES_PATH), 'utf-8'), source: `${APPROVAL_RULES_PATH} (control root)` }
+      return { ok: true, text: readFileSync(path.join(controlRoot, relPath), 'utf-8'), source: `${relPath} (control root)` }
     } catch (err: unknown) {
       return { ok: false, reason: err instanceof Error ? err.message : String(err) }
     }
@@ -249,17 +254,24 @@ function loadApprovalRules(controlRoot: string, ref: string | undefined): Approv
   // ref は argv の 1 要素として渡す（shell なし）。option として解釈され得る値は受け付けない。
   if (!/^[0-9a-f]{7,64}$/i.test(ref)) return { ok: false, reason: 'base ref is not a commit SHA' }
   try {
-    const text = execFileSync('git', ['show', `${ref}:${APPROVAL_RULES_PATH}`], {
+    const text = execFileSync('git', ['show', `${ref}:${relPath}`], {
       cwd: controlRoot,
       encoding: 'utf-8',
       shell: false,
       maxBuffer: 16 * 1024 * 1024,
       stdio: ['ignore', 'pipe', 'pipe'],
     })
-    return { ok: true, text, source: `${APPROVAL_RULES_PATH} @ base ${ref}` }
+    return { ok: true, text, source: `${relPath} @ base ${ref}` }
   } catch (err: unknown) {
     return { ok: false, reason: err instanceof Error ? err.message.split('\n')[0] : String(err) }
   }
+}
+
+function loadBaseDecisionAuthorityPrinciples(controlRoot: string, ref: string): ConstitutionPrinciplesResult {
+  const load = loadCanonicalFile(controlRoot, DECISION_AUTHORITY_SPEC_PATH, ref)
+  return load.ok
+    ? extractDecisionAuthorityPrinciples(load.text, load.source)
+    : { ok: false, reason: `${DECISION_AUTHORITY_SPEC_PATH} @ base ${ref}: ${load.reason}`, triedPaths: [DECISION_AUTHORITY_SPEC_PATH] }
 }
 
 function buildApprovalRulesSection(load: ApprovalRulesLoad): string {
@@ -315,11 +327,12 @@ export function buildMetaReviewPrompt(
   const constitutionWarning = formatConstitutionPrinciplesWarning(constitutionPrinciples)
   if (constitutionWarning) console.warn(constitutionWarning)
   const includeDecisionAuthority = hasDecisionAuthorityReviewFocus(request.changedFiles)
-  const decisionAuthorityPrinciples = includeDecisionAuthority
-    ? loadDecisionAuthorityPrinciples([
-        path.join(controlRoot, 'specs/22_safety_approval_design_principle.md'),
-      ])
-    : undefined
+  // specs/22 も DA (2) の基準点なので、approval_rules.md と同じく ref があれば base から読む
+  const decisionAuthorityPrinciples = !includeDecisionAuthority
+    ? undefined
+    : options.approvalRulesRef === undefined
+      ? loadDecisionAuthorityPrinciples([path.join(controlRoot, DECISION_AUTHORITY_SPEC_PATH)])
+      : loadBaseDecisionAuthorityPrinciples(controlRoot, options.approvalRulesRef)
   const decisionAuthorityWarning = decisionAuthorityPrinciples === undefined
     ? undefined
     : formatDecisionAuthorityPrinciplesWarning(decisionAuthorityPrinciples)
@@ -348,7 +361,7 @@ export function buildMetaReviewPrompt(
       ? []
       : [
           '', '### Decision Authority excerpt', '', buildDecisionAuthorityPrinciplesPrompt(decisionAuthorityPrinciples),
-          '', buildApprovalRulesSection(loadApprovalRules(controlRoot, options.approvalRulesRef)),
+          '', buildApprovalRulesSection(loadCanonicalFile(controlRoot, APPROVAL_RULES_PATH, options.approvalRulesRef)),
         ]),
   ].join('\n')
   const canonicalPrincipleIds = providedCanonicalPrincipleIds(request)
