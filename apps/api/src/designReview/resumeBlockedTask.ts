@@ -57,6 +57,8 @@ export async function resumeBlockedTaskWithDesignReview(
       taskTitle: input.task.title,
       designText: input.instructionPrompt,
       changedFiles: [],
+      // resume provenance: この review の判定を待つのは、いま resume しようとした Job である（C3-c）。
+      ...(resumed.sourceJobId !== undefined ? { resumeSourceJobId: resumed.sourceJobId } : {}),
     }, input.coordinatorDeps ?? buildDefaultCoordinatorDeps())
 
     // 判定がまだ無い（queued / 別の同一性の active run と競合 / 別 executor が実行中で読み直しても
@@ -82,10 +84,14 @@ export async function resumeBlockedTaskWithDesignReview(
       }
     }
 
+    // review を起票したときの resume 対象を固定する。待つ間に別の Job が最新になっていたら
+    // storage が RESUME_TARGET_CHANGED で拒否する（review が見ていない Job を resume しない）。
+    const reviewedSourceJobId = resumed.sourceJobId
     resumed = storage.jobs.resumeBlockedTask({
       taskId: input.task.id,
       instructionPrompt: input.instructionPrompt,
       resumedBy: withAnsweredRun(storage, input.task.id, input.resumedBy),
+      ...(reviewedSourceJobId !== undefined ? { expectedSourceJobId: reviewedSourceJobId } : {}),
     })
   }
 

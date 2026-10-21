@@ -202,11 +202,11 @@ describe('N2: HIGH-risk diff — git_commit needs a Job-linked human approval', 
    *           `apiPolicy === 'continue'` かつ local finalRiskLevel HIGH → `continue_safe_work_only`）が
    *           それを safe-work-only へ格下げし、git_commit は SAFE_WORK_ALLOWED_COMMAND_KINDS に無いので
    *           consume 前に `blocked` を返す（jobRunner.ts の safe_work_only 判定は consume より前）。
-   *           API 側は承認 APPROVED の Job への blocked を `jobs.update()`（storage/sqlite.ts
-   *           「Approval承認とWorkerのblocked結果保存が競合した場合…現在値を返す」）で黙って捨てるので、
-   *           Job は `running` のまま・承認は APPROVED のまま・Task は pending、attention は空、
-   *           Mobile/API の resume（LATEST_JOB_NOT_BLOCKED）も recover（TASK_NOT_BLOCKED）も不可 —
-   *           誰にも見えない行き止まりになる（実測: 本テストの途中状態）。
+   *           その blocked は現在は黙って捨てられない: API は Job を blocked として保存し、attention に
+   *           job_blocked（detail `approved_but_worker_blocked: approval … is APPROVED and unconsumed …`、
+   *           `approvedRunBlock.ts`）を出し、resume は admit される（行き止まりではない）。
+   *           ただし承認は APPROVED / 未 consume のまま commit は成立せず Task は done にならないので、
+   *           本テストは it.fails のまま（根本の格下げは gatePolicy.ts 側で、CEO 承認済みの変更が要る）。
    * Worker の unit test は resolvePolicy を mock しているため、この合成は未検証だった。
    */
   for (const { label, file } of HIGH_CASES) {

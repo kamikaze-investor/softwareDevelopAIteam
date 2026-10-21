@@ -54,9 +54,10 @@ async function buildApp(mode: AuthMode): Promise<FastifyInstance> {
     process.env.API_TOKEN = mode.token
   }
 
-  const [{ projectRoutes }, { taskRoutes }, { resetStorage }] = await Promise.all([
+  const [{ projectRoutes }, { taskRoutes }, { approvalRoutes }, { resetStorage }] = await Promise.all([
     import('../routes/projects.js'),
     import('../routes/tasks.js'),
+    import('../routes/approvals.js'),
     import('../storage/index.js'),
   ])
   resetStorage()
@@ -68,6 +69,7 @@ async function buildApp(mode: AuthMode): Promise<FastifyInstance> {
   })
   app.register(projectRoutes, { prefix: '/api/projects' })
   app.register(taskRoutes, { prefix: '/api/tasks' })
+  app.register(approvalRoutes, { prefix: '/api' })
   await app.ready()
   return app
 }
@@ -220,6 +222,75 @@ describe('legacy mode では Human Recovery を fail-closed にする', () => {
         method: 'PATCH', url: `/api/tasks/${taskId}`, payload: { title: 'renamed' },
       })).statusCode).toBe(200)
     })
+  })
+})
+
+/** 決定待ちの legacy CEO Approval を1件用意する（作成は human-only ではない）。 */
+async function seedPendingLegacyApproval(app: FastifyInstance, auth: Record<string, string>): Promise<string> {
+  const project = await app.inject({
+    method: 'POST', url: '/api/projects', headers: auth,
+    payload: { name: 'P', goal: 'g', designPhilosophy: [], status: 'running' },
+  })
+  const projectId = (JSON.parse(project.body) as { id: string }).id
+  const approval = await app.inject({
+    method: 'POST', url: `/api/projects/${projectId}/approvals`, headers: auth,
+    payload: { title: 't', reason: 'r', type: 'deployment' },
+  })
+  expect(approval.statusCode).toBe(201)
+  return (JSON.parse(approval.body) as { id: string }).id
+}
+
+// 2026-10-17 監査 P2: legacy CEO Approval の決定も人の判断そのものなので human-only にする。
+describe('legacy CEO Approval の決定（PATCH /api/approvals/:id）', () => {
+  it('split mode の ADMIN は決定できる', async () => {
+    await withApp({ kind: 'split' }, async (app) => {
+      const auth = { authorization: `Bearer ${ADMIN_TOKEN}` }
+      const approvalId = await seedPendingLegacyApproval(app, auth)
+
+      const res = await app.inject({
+        method: 'PATCH', url: `/api/approvals/${approvalId}`, headers: auth,
+        payload: { status: 'approved' },
+      })
+
+      expect(res.statusCode).toBe(200)
+      expect(res.json()).toMatchObject({ status: 'approved' })
+    })
+  })
+
+  it('legacy 単一 token では 403 で、承認は pending のまま', async () => {
+    await withApp({ kind: 'legacy', token: LEGACY_TOKEN }, async (app) => {
+      const auth = { authorization: `Bearer ${LEGACY_TOKEN}` }
+      const approvalId = await seedPendingLegacyApproval(app, auth)
+
+      const res = await app.inject({
+        method: 'PATCH', url: `/api/approvals/${approvalId}`, headers: auth,
+        payload: { status: 'approved' },
+      })
+
+      expect(res.statusCode).toBe(403)
+      expect(res.json()).toMatchObject({ code: 'HUMAN_ONLY_ROUTE_REQUIRES_SPLIT_CREDENTIALS' })
+      const { getStorage } = await import('../storage/index.js')
+      expect(getStorage().approvals.findById(approvalId)?.status).toBe('pending')
+    })
+  })
+
+  it('認証なしでも 403（主体が分からない）', async () => {
+    await withApp({ kind: 'legacy' }, async (app) => {
+      const approvalId = await seedPendingLegacyApproval(app, {})
+
+      const res = await app.inject({
+        method: 'PATCH', url: `/api/approvals/${approvalId}`, payload: { status: 'rejected' },
+      })
+
+      expect(res.statusCode).toBe(403)
+      const { getStorage } = await import('../storage/index.js')
+      expect(getStorage().approvals.findById(approvalId)?.status).toBe('pending')
+    })
+  })
+
+  it('表に route pattern で載っている', () => {
+    expect(isHumanOnlyRoute('PATCH', '/api/approvals/:id')).toBe(true)
+    expect(isHumanOnlyRoute('POST', '/api/projects/:projectId/approvals')).toBe(false)
   })
 })
 

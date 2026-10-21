@@ -24,7 +24,7 @@
  */
 
 import type { Job, JobRefusalMetadata, Task, ReviewResult, QAResult } from '@ai-team/shared'
-import type { IStorage, DesignReviewRun, RepairHandoffRefusalCode } from '../storage/interface'
+import type { IStorage, DesignReviewRun, RepairHandoffRefusalCode, TaskEscalationResult } from '../storage/interface'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import {
   buildDefaultCoordinatorDeps,
@@ -1375,64 +1375,40 @@ export function prepareRepairFlow(storage: IStorage, input: RepairFlowInput): Re
   }
 }
 
-/** Taskを既存のHuman escalation（blocked）へ入れる。呼び出し元から明示的に使う。 */
-export function escalateTaskToHuman(storage: IStorage, taskId: string, reason?: string): void {
-  // **park された Task を blocked へ上げない。**
-  //
-  // blocked は `roadmapActive` に関係なく project を占有する（`occupiesProject()`）ため、
-  // park した Task をここで上げると park が事実上取り消され、しかも
-  // `resumeBlockedTask()` は park を理由に拒否するので誰も解消できなくなる。
-  // park された Task について「人へ渡す」相手はもう居ない —— CEO が既に判断した結果である。
-  if (storage.tasks.isParked(taskId)) {
-    recordTaskEscalation(storage, taskId, 'not_moved_parked', reason)
-    return
-  }
-
-  const task = storage.tasks.findById(taskId)
-  if (!task) return
-  // **`done` の Task を blocked へ戻さない。** 完了は commit 済みの事実で、遅れて届いた
-  // repair / review の escalation が覆してよいものではない（b8d0fc5d 監査 L5）。
-  if (task.status === 'done') {
-    recordTaskEscalation(storage, taskId, 'not_moved_done', reason)
-    return
-  }
-  if (task.status !== 'blocked') {
-    storage.tasks.update(taskId, { status: 'blocked' })
-    recordTaskEscalation(storage, taskId, 'blocked', reason)
-    return
-  }
-  recordTaskEscalation(storage, taskId, 'already_blocked', reason)
+/**
+ * Taskを既存のHuman escalation（blocked）へ入れる。呼び出し元から明示的に使う。
+ *
+ * - **park された Task を blocked へ上げない。** blocked は `roadmapActive` に関係なく project を占有する
+ *   （`occupiesProject()`）ため、park した Task を上げると park が事実上取り消され、しかも
+ *   `resumeBlockedTask()` は park を理由に拒否するので誰も解消できなくなる。
+ * - **`done` の Task を blocked へ戻さない。** 完了は commit 済みの事実で、遅れて届いた
+ *   repair / review の escalation が覆してよいものではない（b8d0fc5d 監査 L5）。
+ * - **なぜ人へ渡ったかを残す**（L5）。既に blocked の Task へ届いた escalation も記録する。
+ *   記録の失敗で escalation 自体を失敗させない。
+ *
+ * 判定と書き込みは `storage.tasks.escalateToHuman()` の 1 つの IMMEDIATE transaction で行う
+ * （Codex review c3-b round 2: 読んでから無条件に update すると、その間に動いた Task を blocked にできた）。
+ * `precondition` は呼び出し側が precheck に使った事実を同じ transaction の中で読み直すためのもので、
+ * 崩れていれば何も書かずに `precondition_failed` を返す。
+ */
+export function escalateTaskToHuman(
+  storage: IStorage,
+  taskId: string,
+  reason?: string,
+  options: { precondition?: (task: Task) => string | undefined } = {},
+): TaskEscalationResult {
+  return storage.tasks.escalateToHuman({
+    taskId,
+    audit: {
+      operation: TASK_ESCALATED_TO_HUMAN_OPERATION,
+      detail: `reason=${(reason ?? 'unspecified').slice(0, 500)}`,
+    },
+    ...(options.precondition !== undefined ? { precondition: options.precondition } : {}),
+  })
 }
 
 /** escalation を記録する audit operation 名。新しい table は作らない。 */
 export const TASK_ESCALATED_TO_HUMAN_OPERATION = 'task_escalated_to_human'
-
-/**
- * **なぜ人へ渡ったかを残す**（L5）。以前は Task status が変わるだけで理由がどこにも無く、
- * 既に blocked の Task へ届いた escalation は痕跡すら残らなかった。
- * 記録の失敗で escalation 自体（呼び出し側の操作）を失敗させない。
- */
-function recordTaskEscalation(
-  storage: IStorage,
-  taskId: string,
-  result: 'blocked' | 'already_blocked' | 'not_moved_done' | 'not_moved_parked',
-  reason: string | undefined,
-): void {
-  try {
-    storage.auditLog.record({
-      actor: 'api',
-      operation: TASK_ESCALATED_TO_HUMAN_OPERATION,
-      entityType: 'task',
-      entityId: taskId,
-      result,
-      detail: `reason=${(reason ?? 'unspecified').slice(0, 500)}`,
-    })
-  } catch (error: unknown) {
-    console.warn(
-      `[repairFlow] failed to record the escalation of task ${taskId}: ${error instanceof Error ? error.message : String(error)}`,
-    )
-  }
-}
 
 /** Stage 2 admission skip を記録する audit operation 名（L4）。 */
 export const REPAIR_ADMISSION_SKIPPED_OPERATION = 'repair_admission_skipped'

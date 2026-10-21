@@ -105,3 +105,86 @@ describe('resumeBlockedTaskWithDesignReview — 判定待ちと重なった要�
     expect(storage.designReviewRuns.findById(run.id)?.status).toBe('succeeded')
   })
 })
+
+describe('resumeBlockedTaskWithDesignReview — resume 対象の固定（C3-c）', () => {
+  it('review を起票したときの Job を run に記録し、そのまま resume する', async () => {
+    const { storage, task } = seedBlockedTask()
+    const source = storage.jobs.findByTaskId(task.id)[0]!
+    const resumed = await resumeBlockedTaskWithDesignReview(storage, {
+      task, instructionPrompt: 'Resume with the reviewed plan.', resumedBy: PL_ACTOR,
+      coordinatorDeps: coordinator(async () => ({ ok: true, stdout: ALIGNED, timedOut: false })),
+    })
+    expect(resumed.ok).toBe(true)
+    if (resumed.ok) expect(resumed.job.workflowStepKey).toBe(`resume:${source.id}:1`)
+    expect(storage.designReviewRuns.findLatestByTaskId(task.id)?.resumeSourceJobId).toBe(source.id)
+  })
+
+  it('review を待つ間に別の blocked Job が最新になったら RESUME_TARGET_CHANGED で拒否し、何も作らない', async () => {
+    const { storage, task } = seedBlockedTask()
+    const source = storage.jobs.findByTaskId(task.id)[0]!
+    let inserted = ''
+    const resumed = await resumeBlockedTaskWithDesignReview(storage, {
+      task, instructionPrompt: 'Resume with the reviewed plan.', resumedBy: PL_ACTOR,
+      coordinatorDeps: coordinator(async () => {
+        // The review is still pending when a different blocked Job (B) appears on the Task.
+        inserted = storage.jobs.create({
+          taskId: task.id, projectId: source.projectId, agentRole: 'developer_ai', status: 'blocked',
+          safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+          aiCliProvider: 'codex', aiCliMode: 'implement', aiCliPrompt: 'another prompt',
+        } as Parameters<IStorage['jobs']['create']>[0]).id
+        return { ok: true, stdout: ALIGNED, timedOut: false }
+      }),
+    })
+
+    expect(resumed).toMatchObject({ ok: false, code: 'RESUME_TARGET_CHANGED' })
+    expect(storage.designReviewRuns.findLatestByTaskId(task.id)?.resumeSourceJobId).toBe(source.id)
+    const keys = storage.jobs.findByTaskId(task.id).map((job) => job.workflowStepKey)
+    expect(keys).not.toContain(`resume:${inserted}:1`)
+    expect(keys.some((key) => key?.startsWith('resume:'))).toBe(false)
+    expect(storage.jobs.findById(inserted)?.status).toBe('blocked')
+    expect(storage.jobs.findById(source.id)?.status).toBe('blocked')
+  })
+})
+
+describe('resumeBlockedTaskWithDesignReview — 対象変更は admission より先に返す（C3-c）', () => {
+  async function resumeWhileInserting(
+    replacement: (storage: IStorage, taskId: string, projectId: string) => string,
+  ) {
+    const { storage, task } = seedBlockedTask()
+    const source = storage.jobs.findByTaskId(task.id)[0]!
+    let inserted = ''
+    const resumed = await resumeBlockedTaskWithDesignReview(storage, {
+      task, instructionPrompt: 'Resume with the reviewed plan.', resumedBy: PL_ACTOR,
+      coordinatorDeps: coordinator(async () => {
+        inserted = replacement(storage, task.id, source.projectId)
+        return { ok: true, stdout: ALIGNED, timedOut: false }
+      }),
+    })
+    return { storage, task, source, inserted, resumed }
+  }
+
+  it('a replacement blocked Job without AI CLI metadata → RESUME_TARGET_CHANGED (not AI_CLI_MODE_MISSING)', async () => {
+    const { storage, task, inserted, resumed } = await resumeWhileInserting((storage, taskId, projectId) =>
+      storage.jobs.create({
+        taskId, projectId, agentRole: 'developer_ai', status: 'blocked',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+      } as Parameters<IStorage['jobs']['create']>[0]).id)
+
+    expect(resumed).toMatchObject({ ok: false, code: 'RESUME_TARGET_CHANGED' })
+    expect(storage.jobs.findById(inserted)?.status).toBe('blocked')
+    expect(storage.jobs.findByTaskId(task.id).some((job) => job.workflowStepKey?.startsWith('resume:'))).toBe(false)
+  })
+
+  it('a queued replacement Job → RESUME_TARGET_CHANGED (not LIVE_JOB_EXISTS)', async () => {
+    const { storage, task, inserted, resumed } = await resumeWhileInserting((storage, taskId, projectId) =>
+      storage.jobs.create({
+        taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+        aiCliProvider: 'codex', aiCliMode: 'implement', aiCliPrompt: 'another prompt',
+      } as Parameters<IStorage['jobs']['create']>[0]).id)
+
+    expect(resumed).toMatchObject({ ok: false, code: 'RESUME_TARGET_CHANGED' })
+    expect(storage.jobs.findById(inserted)?.status).toBe('queued')
+    expect(storage.jobs.findByTaskId(task.id).some((job) => job.workflowStepKey?.startsWith('resume:'))).toBe(false)
+  })
+})

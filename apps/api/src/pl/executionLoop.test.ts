@@ -31,6 +31,7 @@ import { readResumeActorClasses, recordApprovalActor } from '../designReview/res
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { prepareRepairFlow } from '../designReview/repairFlow'
 import type { JobRefusalMetadata } from '@ai-team/shared'
+import { advanceWallClock, passDesignReviewRetryCooldown } from '../designReview/retryCooldownTestClock'
 
 /**
  * ここで固定しているのは「PL が自分の権限で動かない」ことと「操作したら必ず確かめる」ことである。
@@ -110,6 +111,9 @@ function recordTargetAttempts(storage: IStorage, targetKey: string, count: numbe
 beforeEach(() => {
   resetPlLoopInFlightForTest()
 })
+
+// retry cooldown を明けさせるために壁時計を進めたテストの後始末（retryCooldownTestClock.ts）。
+afterEach(() => { vi.useRealTimers() })
 
 describe('PL resume prompt', () => {
   it('keeps the same Task Contract and adds the PL resume instruction', () => {
@@ -548,6 +552,8 @@ describe('runPlTick — Execute / Verify', () => {
     const { storage, runId } = seedIdleDesignReview()
     // 3 attempt すべて消費した状態にする
     for (let i = 0; i < 3; i += 1) {
+      // attempt の間の retry cooldown（retryCooldown.ts）を時計で明けさせる。
+      passDesignReviewRetryCooldown()
       const claim = storage.designReviewRuns.claim(runId, 3)
       if (claim.claimToken) storage.designReviewRuns.requeue(runId, claim.claimToken, 'timeout')
     }
@@ -2748,6 +2754,27 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     expect(queuedRun?.status).toBe('queued')
     expect(storage.jobs.findByTaskId(taskId).some((j) => j.workflowStepKey === `resume:${sourceJobId}:1`)).toBe(false)
 
+    // 判定の出なかった attempt の後の retry cooldown（retryCooldown.ts）中は、PL はその Task の
+    // job_blocked を選ばない: 何 tick 回しても provider 診断は 0 回、run も動かず attempt も増えない。
+    let coolingDiagnoses = 0
+    for (let i = 0; i < 5; i += 1) {
+      resetPlLoopInFlightForTest()
+      const cooling = await runPlTick(storage, deps({
+        diagnose: async () => {
+          coolingDiagnoses += 1
+          return JSON.stringify({ actionKind: 'resume_task', rationale: 'technical recovery', riskLevel: 'LOW' })
+        },
+        escalate: async (p) => { escalations.push(p.title); return DELIVERED },
+        coordinatorDeps: alignedCoordinatorDeps,
+      }))
+      expect(cooling.status).toBe('idle')
+    }
+    expect(coolingDiagnoses).toBe(0)
+    expect(escalations).toEqual([])
+    expect(countPriorAttempts(storage, `job_blocked:${sourceJobId}`)).toBe(0)
+    expect(storage.designReviewRuns.findById(queuedRun!.id)).toMatchObject({ status: 'queued', attemptCount: 1 })
+
+    passDesignReviewRetryCooldown()
     resetPlLoopInFlightForTest()
     const resumed = await runPlTick(storage, deps({
       diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: 'technical recovery', riskLevel: 'LOW' }),
@@ -2758,6 +2785,127 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     // 新しい run を引き直さず、同じ queued run が判定まで進んだ。
     expect(storage.designReviewRuns.findById(queuedRun!.id)?.status).toBe('succeeded')
     expect(storage.jobs.findByTaskId(taskId).filter((j) => j.workflowStepKey === `resume:${sourceJobId}:1`)).toHaveLength(1)
+  })
+
+  // C3-c independent review: the cooldown wait applies only to a Job whose recovery is proven to depend
+  // on the cooling run. Other stops on the same Task must stay actionable during the cooldown.
+  async function coolingPlResumeReview(storage: IStorage, taskId: string): Promise<string> {
+    const noJudgment = { ...alignedCoordinatorDeps, execute: async () => ({ ok: true as const, timedOut: false, stdout: 'null' }) }
+    const pending = await runPlTick(storage, deps({
+      diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: 'technical recovery', riskLevel: 'LOW' }),
+      coordinatorDeps: noJudgment,
+    }))
+    expect(pending.reason).toContain('resume pending')
+    const run = storage.designReviewRuns.findActiveByTaskId(taskId)!
+    expect(run).toMatchObject({ status: 'queued', attemptCount: 1 })
+    return run.id
+  }
+
+  function diagnoseCounter(): { count: () => number; diagnose: () => Promise<string> } {
+    let calls = 0
+    return {
+      count: () => calls,
+      diagnose: async () => {
+        calls += 1
+        return JSON.stringify({ actionKind: 'observe_state', rationale: 'look at it', riskLevel: 'LOW' })
+      },
+    }
+  }
+
+  function manualBlockedJob(storage: IStorage, taskId: string, projectId: string): string {
+    // A manual, non-implement Job (POST /api/jobs) on the same Task. It is not what the resume review is for.
+    return storage.jobs.create({
+      taskId,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'blocked',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0]).id
+  }
+
+  it('cooldown wait does not hide an unrelated blocked Job created on the same Task after the review', async () => {
+    const { storage, taskId, projectId } = seed()
+    const source = blockedAiCliJob(storage, taskId, projectId)
+    const runId = await coolingPlResumeReview(storage, taskId)
+    // The resume review records the Job it was requested for (identity, not timestamps).
+    expect(storage.designReviewRuns.findById(runId)?.resumeSourceJobId).toBe(source)
+    advanceWallClock(1_000)
+    const manual = manualBlockedJob(storage, taskId, projectId)
+
+    const counter = diagnoseCounter()
+    resetPlLoopInFlightForTest()
+    const tick = await runPlTick(storage, deps({ diagnose: counter.diagnose, coordinatorDeps: alignedCoordinatorDeps }))
+
+    // The source Job waits on the cooling run; the manual Job is acted on.
+    expect(tick.target?.key).toBe(`job_blocked:${manual}`)
+    expect(counter.count()).toBe(1)
+    expect(storage.designReviewRuns.findById(runId)).toMatchObject({ status: 'queued', attemptCount: 1 })
+  })
+
+  it('cooldown wait does not hide an unrelated Job inserted in the same millisecond as the review', async () => {
+    // Same createdAt and latest by rowid: timestamps and "latest Job" cannot tell it apart; identity can.
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-17T03:00:00.000Z'))
+    const { storage, taskId, projectId } = seed()
+    const source = blockedAiCliJob(storage, taskId, projectId)
+    const runId = await coolingPlResumeReview(storage, taskId)
+    const manual = manualBlockedJob(storage, taskId, projectId)
+    const run = storage.designReviewRuns.findById(runId)!
+    expect(storage.jobs.findById(manual)?.createdAt).toBe(run.createdAt)
+    expect(storage.jobs.findByTaskId(taskId)[0]?.id).toBe(manual)
+    expect(run.resumeSourceJobId).toBe(source)
+
+    const counter = diagnoseCounter()
+    resetPlLoopInFlightForTest()
+    const tick = await runPlTick(storage, deps({ diagnose: counter.diagnose, coordinatorDeps: alignedCoordinatorDeps }))
+
+    expect(tick.target?.key).toBe(`job_blocked:${manual}`)
+    expect(counter.count()).toBe(1)
+  })
+
+  it('cooldown wait does not hide the same Job when the PL would resume it with a different instruction', async () => {
+    const { storage, taskId, projectId } = seed()
+    const source = blockedAiCliJob(storage, taskId, projectId)
+    const noJudgment = { ...alignedCoordinatorDeps, execute: async () => ({ ok: true as const, timedOut: false, stdout: 'null' }) }
+    // The cooling review was requested for this Job with instruction A (e.g. another resume actor).
+    await runPlTick(storage, deps({
+      diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: 'technical recovery', riskLevel: 'LOW' }),
+      coordinatorDeps: noJudgment,
+      resumeInstruction: 'instruction A',
+    }))
+    const run = storage.designReviewRuns.findActiveByTaskId(taskId)!
+    expect(run).toMatchObject({ status: 'queued', attemptCount: 1, resumeSourceJobId: source })
+
+    // Same instruction: proven to wait on this run, so there is no diagnosis.
+    const same = diagnoseCounter()
+    resetPlLoopInFlightForTest()
+    await runPlTick(storage, deps({ diagnose: same.diagnose, coordinatorDeps: alignedCoordinatorDeps, resumeInstruction: 'instruction A' }))
+    expect(same.count()).toBe(0)
+
+    // Different instruction B: the PL's resume would not use this run, so the Job stays actionable.
+    const other = diagnoseCounter()
+    resetPlLoopInFlightForTest()
+    const tick = await runPlTick(storage, deps({ diagnose: other.diagnose, coordinatorDeps: alignedCoordinatorDeps, resumeInstruction: 'instruction B' }))
+    expect(tick.target?.key).toBe(`job_blocked:${source}`)
+    expect(other.count()).toBe(1)
+  })
+
+  it('cooldown wait does not hide an older blocked Job that the resume would not target', async () => {
+    const { storage, taskId, projectId } = seed()
+    const older = blockedAiCliJob(storage, taskId, projectId)
+    advanceWallClock(1_000)
+    const newer = blockedAiCliJob(storage, taskId, projectId)
+    await coolingPlResumeReview(storage, taskId)
+
+    const counter = diagnoseCounter()
+    resetPlLoopInFlightForTest()
+    const tick = await runPlTick(storage, deps({ diagnose: counter.diagnose, coordinatorDeps: alignedCoordinatorDeps }))
+
+    // The newer (latest) blocked Job is what the resume targets, so it waits; the older one does not.
+    expect(counter.count()).toBe(1)
+    expect(tick.target?.key).toBe(`job_blocked:${older}`)
+    expect(tick.target?.key).not.toBe(`job_blocked:${newer}`)
   })
 
   it('a CONFLICT re-review creates no resume Job and leaves the source blocked', async () => {

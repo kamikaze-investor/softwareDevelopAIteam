@@ -484,7 +484,16 @@ export default function ApprovalsScreen(): ReactElement {
       })
 
       if (!response.ok) {
-        throw new Error(`Failed to update approval: ${response.status}`)
+        // この route も HUMAN_ONLY_ROUTES（2026-10-17）。403 の code ごとの文言を出す。
+        let code: string | null = null
+        try {
+          const body = (await response.json()) as { code?: unknown }
+          code = typeof body.code === 'string' ? body.code : null
+        } catch {
+          code = null
+        }
+        Alert.alert('エラー', formatApprovalDecisionErrorMessage(code))
+        return
       }
 
       await loadPolicyApprovals()
