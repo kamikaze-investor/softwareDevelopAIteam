@@ -546,14 +546,20 @@ function humanResumesOf(storage: IStorage, resumeHops: readonly Job[]): Job[] {
  * 実装 Job ごとの **保存済み human authority の参照**（walker の `implementationAuthority`）。
  *
  * - `human_recovery`: consume 済み `repair_from_stored_review:<review>` 承認（既存 epoch と同じ根拠）
- * - `human_resume`  : 初回 implement（`task:<task>:initial-implement`）をレビューした review の
- *   resume lineage 上の Human Resume。対象は **保存済み verdict が `changes_requested` の review**
- *   だけ —— 修正対象の verdict を人が出し直させた、という事実に限る（b8d0fc5d）。
+ * - `human_resume`  : その実装をレビューした review の resume lineage 上で **最も近い** Human Resume。
+ *   対象は **保存済み verdict が `changes_requested` の review** だけ —— 修正対象の verdict を人が
+ *   出し直させた、という事実に限る（b8d0fc5d）。
  *
- * 初回 implement に限るのは、resume / repair successor は自分の stepKey lineage で既に
- * authority が決まっており、そこへ review 側の resume を足すと既存 shape の予算が変わるため。
+ * **実装 Job の stepKey 形では絞らない**（lifecycle repair C2 / A-01）。以前は初回 implement
+ * （`task:<task>:initial-implement`）だけに限っていたため、origin 根の `repair:<origin>:1` の review を
+ * CEO が Human Resume して修正要求が返っても、admission が「human-authorized generation ではない」と
+ * 落とし、正当な human authority があるのに Task が blocked のまま残った。authority は表現（stepKey）
+ * ではなく保存済みの事実（human と証明された resume 段）から導く —— 初回 implement / repair successor /
+ * resume successor のどれでも同じ規則である。実装の lineage 上のより上流に human 根があっても、
+ * review 側の Human Resume はこの実装 Job 自身を根にする（walker の「最も近い authority が勝つ」。
+ * 人がこの実装の verdict を見て続けさせた事実なので、予算はここで reset される）。
  * actor が human と証明できない resume（PL / AI / unknown）は何も与えない。同じ実装に両方あれば
- * 既存の epoch を優先する。
+ * 既存の human_recovery epoch を優先する。
  */
 function readImplementationAuthorities(
   storage: IStorage,
@@ -565,7 +571,6 @@ function readImplementationAuthorities(
     authorities.set(implementJobId, { kind: 'human_recovery', ...ref })
   }
 
-  const initialImplementStepKey = `task:${taskId}:initial-implement`
   const resumedReviews = taskJobs.filter((job) =>
     job.aiCliMode === 'review' && parseResumeSource(job.workflowStepKey ?? '') !== undefined)
   if (resumedReviews.length === 0) return authorities
@@ -578,7 +583,6 @@ function readImplementationAuthorities(
     if (!changesRequested.has(review.id)) continue
     const reviewed = resolveReviewedImplementation(storage, review.id)
     if (!reviewed.ok || reviewed.implementJob.taskId !== taskId) continue
-    if (reviewed.implementJob.workflowStepKey !== initialImplementStepKey) continue
     if (authorities.has(reviewed.implementJob.id)) continue
     // hops は review 側から近い順。最も近い human の段を authority にする。
     const humanHop = humanResumesOf(storage, reviewed.resumeHops)[0]

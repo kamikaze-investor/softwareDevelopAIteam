@@ -135,7 +135,7 @@ describe('previewPlActionPolicy — 見るだけで、許可ではない', () =>
 describe('authorizePlAction — 判定を必ず監査記録へ残す', () => {
   it('許可されたときも記録する（境界が効いているかを後から検証できるように）', () => {
     const { storage, taskId, jobId } = seed()
-    const approvalRequestId = addApprovalRequest(storage, taskId)
+    const approvalRequestId = addApprovalRequest(storage, taskId, { requestedAction: 'retry_job' })
 
     const { actionId } = authorizePlAction(storage, {
       proposal: { kind: 'retry_job' },
@@ -348,7 +348,7 @@ describe('authorizePlAction — レコードの状態を実際に読む', () => 
 
   it('期限切れの Approval Request は充足にならない', () => {
     const { storage, jobId, taskId } = seed()
-    const approvalRequestId = addApprovalRequest(storage, taskId, { expiresAt: PAST })
+    const approvalRequestId = addApprovalRequest(storage, taskId, { expiresAt: PAST, requestedAction: 'retry_job' })
 
     const blocked = expectBlocked(storage, {
       proposal: { kind: 'retry_job' },
@@ -361,7 +361,7 @@ describe('authorizePlAction — レコードの状態を実際に読む', () => 
 
   it('読めない期限値は「未失効」として通さない', () => {
     const { storage, jobId, taskId } = seed()
-    const approvalRequestId = addApprovalRequest(storage, taskId, { expiresAt: 'not-a-date' })
+    const approvalRequestId = addApprovalRequest(storage, taskId, { expiresAt: 'not-a-date', requestedAction: 'retry_job' })
 
     const blocked = expectBlocked(storage, {
       proposal: { kind: 'retry_job' },
@@ -538,10 +538,48 @@ describe('authorizePlAction — 対象スコープと Review 根拠の対応', (
   })
 })
 
+describe('authorizePlAction — approval_gate は PL action と同じ requestedAction の承認だけ (2026-10-16 RC6)', () => {
+  it.each(['retry_job', 'fail_stuck_job'] as const)(
+    '%s: 別 action（git_commit / git_status）の APPROVED は根拠にならず、同じ action の APPROVED は通る',
+    (kind) => {
+      const { storage, jobId, taskId } = seed()
+      for (const otherAction of ['git_commit', 'git_status']) {
+        const other = addApprovalRequest(storage, taskId, { requestedAction: otherAction })
+        const blocked = expectBlocked(storage, {
+          proposal: { kind },
+          target: { kind: 'job', jobId, taskId },
+          evidence: [{ gate: 'approval_gate', approvalRequestId: other }],
+        })
+        expect(blocked.missingGates).toEqual(['approval_gate'])
+        expect(blocked.rejectedEvidence.join(' ')).toContain(`approved "${otherAction}", not "${kind}"`)
+      }
+
+      const matching = addApprovalRequest(storage, taskId, { requestedAction: kind })
+      const authorization = authorizePlAction(storage, {
+        proposal: { kind },
+        target: { kind: 'job', jobId, taskId },
+        evidence: [{ gate: 'approval_gate', approvalRequestId: matching }],
+      })
+      expect(authorization.decision.requiredGates).toContain('approval_gate')
+    },
+  )
+
+  it('reconcile_external_completion も git_commit の承認では通らない', () => {
+    const { storage, taskId } = seed()
+    const gitCommitApproval = addApprovalRequest(storage, taskId, { requestedAction: 'git_commit' })
+
+    expect(() => authorizePlAction(storage, {
+      proposal: { kind: 'reconcile_external_completion' },
+      target: { kind: 'task', taskId },
+      evidence: [{ gate: 'approval_gate', approvalRequestId: gitCommitApproval }],
+    })).toThrow(PlActionBlockedError)
+  })
+})
+
 describe('authorizePlAction — 検証手段の無い Gate は充足できない', () => {
   it('safety_review を要求する操作は、根拠を積んでも通らない（fail-closed）', () => {
     const { storage, jobId, taskId } = seed()
-    const approvalRequestId = addApprovalRequest(storage, taskId)
+    const approvalRequestId = addApprovalRequest(storage, taskId, { requestedAction: 'clear_workspace_quarantine' })
 
     const blocked = expectBlocked(storage, {
       proposal: { kind: 'clear_workspace_quarantine' },
@@ -599,7 +637,7 @@ describe('reconcile_external_completion — 外部完了は Gate を通ってし
 
   it('APPROVED な承認があれば通る', () => {
     const { storage, taskId } = seed()
-    const approvalId = addApprovalRequest(storage, taskId)
+    const approvalId = addApprovalRequest(storage, taskId, { requestedAction: 'reconcile_external_completion' })
 
     const authorization = authorizePlAction(storage, {
       proposal: { kind: 'reconcile_external_completion' },

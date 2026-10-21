@@ -13,6 +13,35 @@ import type {
   RiskReviewResult,
 } from './types/approval_gate'
 import type { RiskLevel } from './types/safety_guard'
+import type { CommandKind } from './types/command'
+
+// ────────────────────────────────────────────────────────────
+// Safe work（HIGH の承認待ち中でも Worker が続けてよい操作）
+// ────────────────────────────────────────────────────────────
+
+/**
+ * HIGH の承認待ち（`continue_safe_work_only`）の間も実行してよい CommandKind。
+ * 読み取り・テスト・品質チェックだけで、コード変更・commit は含めない。
+ *
+ * API（`/gate/check` が承認依頼を作るかどうか）の正本。Worker の実行可否は
+ * `apps/worker/src/guards/gatePolicy.ts` の `SAFE_WORK_ALLOWED_COMMAND_KINDS`（AI 編集禁止の Control
+ * ファイルなので、ここを import させられない）が持ち、`apps/worker/src/safeWorkKindsDrift.test.ts` が
+ * 同じ集合であることを固定する。食い違うと、API が「誰も待たない承認依頼」を作り、Worker はそれを
+ * 無視して続行する食い違いが再発する（2026-10-16 b8d0fc5d: review Job の git_status が HIGH diff で
+ * WAITING を作り、resume / abort を塞いだ）。
+ */
+export const SAFE_WORK_COMMAND_KINDS: readonly CommandKind[] = [
+  'git_status',
+  'git_diff',
+  'git_log',
+  'typecheck',
+  'test',
+  'lint',
+] as const
+
+export function isSafeWorkCommandKind(kind: string): boolean {
+  return (SAFE_WORK_COMMAND_KINDS as readonly string[]).includes(kind)
+}
 
 // ────────────────────────────────────────────────────────────
 // Risk Review（ルールベース簡易実装）
@@ -38,10 +67,20 @@ export const RISK_RULES: RiskRule[] = [
   // ここを LOW / MEDIUM に落とすと、Gate 自身を弱める変更を Evidence だけで commit できてしまう。
   // git_commit Evidence が判定に使う lineage / Design Review / Candidate workspace の実装
   // （repairFlow・repairPolicy・designReviewEvidencePolicy・targetWorkingDir）も含める（独立レビュー A-1）。
-  { label: 'alignment / gate change',    pattern: /alignmentCheck|approvalGate|gateProcessor|gitCommitEvidence|actionGate|plActionPolicy|approvalLevelClassifier|approvalExplain\/(diffReader|changeManifest)|designReview\/(repairFlow|repairPolicy)\.ts$|designReviewEvidencePolicy|config\/targetWorkingDir/i, level: 'HIGH' },
+  //
+  // 2026-10-20 PL 判断: commitGate（`evaluateCommitGate()`）は spec 22 DA trigger (2) が名指しする authority 定義なので
+  // exact path で足す。**production の実ファイルだけ**（隣のテストまで HIGH にすると、テストを足すだけの変更まで
+  // Evidence の対象外になる）。それ以外の技術実装（storage・PL loop・停止判定・admission・recovery 等）は足さない:
+  // Risk Level は Evidence の強度を決めるだけで、ceo_required は DA trigger からのみ導出する（spec 22 1-2 / 14-2 / 14-3）。
+  // authority 変更の検出は promotion 時の Meta Review（Approval Tuple rule）が担う。
+  { label: 'alignment / gate change',    pattern: /alignmentCheck|approvalGate|gateProcessor|gitCommitEvidence|actionGate|plActionPolicy|approvalLevelClassifier|approvalExplain\/(diffReader|changeManifest)|designReview\/(repairFlow|repairPolicy)\.ts$|designReviewEvidencePolicy|config\/targetWorkingDir|(^|\/)apps\/worker\/src\/approvalLevel\/commitGate\.ts$/i, level: 'HIGH' },
   // 2026-10-02: Decision Authority / Safety policy の正本 docs。docs/ 配下は SAFE_ONLY で LOW に
   // 落ちるため、下の SAFE_ONLY 早期リターンより先に評価する（NEVER_SAFE_ONLY_RULES）。
-  { label: 'decision authority / safety policy doc', pattern: /(^|\/)specs\/(00_constitution|08_permissions|22_safety_approval_design_principle)\.md$|(^|\/)docs\/project_memory\/(goal|design_philosophy)\.md$|(^|\/)docs\/project_memory\/rules\/approval_rules\.md$|(^|\/)docs\/multi_ai_step_review_flow\.md$/i, level: 'HIGH' },
+  // 2026-10-16 監査: rules/ は approval_rules.md 以外も運用ルールの正本なので配下すべてを対象にする
+  // （CLAUDE.md 7 章の Operational Knowledge。spec 22 DA trigger (1) の Policy 文書）。
+  // 依存定義（package.json / pnpm-lock.yaml）は入れない: 依存の変更は Decision Authority 上の技術判断で、
+  // HIGH にすると該当する git_commit がすべて CEO 承認へ回る（PL 判断 2026-10-16）。
+  { label: 'decision authority / safety policy doc', pattern: /(^|\/)specs\/(00_constitution|08_permissions|22_safety_approval_design_principle)\.md$|(^|\/)docs\/project_memory\/(goal|design_philosophy)\.md$|(^|\/)docs\/project_memory\/rules\/.+|(^|\/)docs\/multi_ai_step_review_flow\.md$/i, level: 'HIGH' },
   // Codex P1: AI 指示ファイル（AGENTS.md / CLAUDE.md）は CRITICAL
   { label: 'AI instruction file',        pattern: /AGENTS\.md$|CLAUDE\.md$/i,                 level: 'CRITICAL' },
 ]

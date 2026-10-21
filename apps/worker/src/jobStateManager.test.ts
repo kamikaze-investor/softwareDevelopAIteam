@@ -189,6 +189,30 @@ describe('reconcileRunningJob', () => {
 })
 
 describe('recoverStaleJobs', () => {
+  it('Outbox に terminal update が未配送で残っている running Job には terminal 遷移を作らない（H-01）', async () => {
+    workspaceVerificationMocks.verifyWorkspaceAgainstBaseline.mockReturnValue({ verified: true })
+    fetchMock
+      .mockResolvedValueOnce(jsonResponse([{ id: 'project 1' }]))
+      .mockResolvedValueOnce(jsonResponse([{ id: 'task 1' }]))
+      .mockResolvedValueOnce(jsonResponse([runningJob('job-pending-result'), runningJob('job-orphan')]))
+      .mockResolvedValueOnce(jsonResponse({
+        updated: true,
+        currentStatus: 'failed',
+        job: { id: 'job-orphan', status: 'failed' },
+      }))
+    const hasPendingTerminalEvent = vi.fn((jobId: string) => jobId === 'job-pending-result')
+
+    const recovered = await recoverStaleJobs('http://api.test', {}, { hasPendingTerminalEvent })
+
+    expect(recovered).toBe(1)
+    expect(hasPendingTerminalEvent).toHaveBeenCalledWith('job-pending-result')
+    const failIfRunningUrls = fetchMock.mock.calls
+      .map(([url]) => String(url))
+      .filter((url) => url.endsWith('/fail-if-running'))
+    expect(failIfRunningUrls).toEqual(['http://api.test/api/jobs/job-orphan/fail-if-running'])
+    expect(verifyWorkspaceAgainstBaseline).toHaveBeenCalledTimes(1)
+  })
+
   it('reconciliationで実際にrunningからfailedへ遷移したJobだけを回収件数へ加算する', async () => {
     workspaceVerificationMocks.verifyWorkspaceAgainstBaseline.mockReturnValue({ verified: true })
 

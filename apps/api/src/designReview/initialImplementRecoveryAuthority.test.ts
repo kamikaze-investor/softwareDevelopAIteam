@@ -707,3 +707,60 @@ describe('step 7: 実装 lineage 上の Human Resume も run への回答にな�
     })
   })
 })
+
+describe('A-01: review lineage の Human Resume は実装の stepKey 形に依らず authority になる', () => {
+  /** origin 根の repair successor（`repair:<impl>:1`）が成功し、その review が修正を要求した形。 */
+  async function originRepairSuccessor(shape: Shape): Promise<{ repair: Job; rv: Job }> {
+    const repair = job(shape.storage, shape, { aiCliMode: 'implement', workflowStepKey: `repair:${shape.impl.id}:1` }, { status: 'success', exitCode: 0, changedFiles: [DOC] })
+    await tick()
+    const rv = job(shape.storage, shape, { agentRole: 'qa_ai', aiCliMode: 'review', workflowStepKey: `implement:${repair.id}:review` }, { status: 'failed', exitCode: 0 })
+    verdict(shape.storage, shape.taskId, rv.id)
+    await tick()
+    return { repair, rv }
+  }
+
+  it('origin 根の repair successor の review を Human Resume して修正要求が返ったら admit し、予算を reset する', async () => {
+    const shape = await b8d0fc5dShape()
+    const { repair, rv } = await originRepairSuccessor(shape)
+    const r1 = await resumedReview(shape, 'human', rv)
+
+    expect(prepareRepairFlow(shape.storage, { failedJob: repair, reviewJobId: r1.id })).toMatchObject({
+      action: 'queue',
+      stepKey: `repair:${repair.id}:1`,
+      generation: {
+        rootJobId: repair.id,
+        rootKind: 'human_resume',
+        depth: 0,
+        budgetReset: true,
+        authority: { kind: 'human_resume', resumeJobId: r1.id, resumedReviewJobId: rv.id },
+      },
+    })
+  })
+
+  it('PL Technical Resume の review は origin 根の repair successor に何も与えない', async () => {
+    const shape = await b8d0fc5dShape()
+    const { repair, rv } = await originRepairSuccessor(shape)
+    const r1 = await resumedReview(shape, 'pl', rv)
+
+    expect(prepareRepairFlow(shape.storage, { failedJob: repair, reviewJobId: r1.id })).toMatchObject({
+      action: 'skip',
+      reason: 'task is blocked (repair successor is not inside a human-authorized generation)',
+    })
+  })
+
+  it('Human Resume で admit されても allowedPaths 外の指摘は落とす（step 5 は不変）', async () => {
+    const shape = await b8d0fc5dShape()
+    const { repair, rv } = await originRepairSuccessor(shape)
+    const r1 = job(shape.storage, shape, { agentRole: 'qa_ai', aiCliMode: 'review', workflowStepKey: `resume:${rv.id}:1` }, { status: 'failed', exitCode: 0 })
+    recordResumeActor(shape.storage, { jobId: r1.id, taskId: shape.taskId, actorClass: 'human', evidence: 'admin_credential' })
+    shape.storage.reviewResults.create({
+      taskId: shape.taskId, jobId: r1.id, reviewer: 'qa_ai', status: 'changes_requested', summary: 's',
+      findings: [{ severity: 'medium', file: 'apps/api/src/routes/jobs.ts', message: 'outside' }],
+    } as never)
+
+    const result = prepareRepairFlow(shape.storage, { failedJob: repair, reviewJobId: r1.id })
+    expect(result).toMatchObject({ action: 'skip' })
+    if (result.action !== 'skip') return
+    expect(result.reason).toContain('outside allowedPaths')
+  })
+})

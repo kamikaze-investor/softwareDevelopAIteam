@@ -282,6 +282,27 @@ export type ConsumeApprovalForJobResult =
       linkedJobId?: string
     }
 
+/**
+ * `consumeForCommandJob()` の結果。git_commit 以外の、Job 実行が使う承認の consume。
+ * 失敗時の `approvalRequest` は遷移後（EXPIRED / STALE へ進めた場合はその状態）の行。
+ */
+export type ConsumeApprovalForCommandJobResult =
+  | { ok: true; approvalRequest: ApprovalRequest }
+  | {
+      ok: false
+      code:
+        | 'NOT_FOUND'
+        | 'GIT_COMMIT_NOT_ALLOWED'
+        | 'JOB_NOT_FOUND'
+        | 'TASK_MISMATCH'
+        | 'ACTION_MISMATCH'
+        | 'STATUS_CONFLICT'
+        | 'EXPIRED'
+        | 'STALE'
+      reason: string
+      approvalRequest?: ApprovalRequest
+    }
+
 export interface RoadmapSyncResult {
   ok: boolean
   createdTaskIds: string[]
@@ -449,6 +470,13 @@ export interface IJobStorage {
     outboxEvent?: OutboxEventInput,
     queueDesignReview?: QueuedDesignReviewRunInput,
   ): UpdateWithOutboxEventResult
+  /**
+   * Outbox event がこの Job に既に適用済みか（読み取りのみ。書き込み経路の dedup と同じ照合）。
+   * - `deduplicated`: 同じ eventId・同じ payloadHash が適用済み（完全な再送）
+   * - `conflict`: 同じ eventId が別の Job か別の payloadHash で適用済み
+   * - `new`: 未適用（または outboxEvent 無し）
+   */
+  classifyOutboxEvent(jobId: string, outboxEvent: OutboxEventInput | undefined): 'new' | 'deduplicated' | 'conflict'
   /** provider timeout結果の保存と、条件を満たす1回限りのretry Job作成を単一transactionで行う。 */
   persistCommitSuccessWithContinuation(input: {
     jobId: string
@@ -756,6 +784,25 @@ export interface IApprovalRequestStorage {
     currentCommit: string
     currentDiffHash: string
   }): ConsumeApprovalForJobResult
+  /**
+   * 誰も待っていない safe work の承認待ちを畳む（単一 transaction）。その Task・その requestedAction の
+   * WAITING_FOR_USER のうち、**保存 riskLevel が HIGH の行すべて**を SUPERSEDED にし、1 行ずつ
+   * `supersede` audit（reason=safe_work_no_waiter）を残す。CRITICAL の行には触れない。畳んだ id を返す。
+   */
+  supersedeUnwaitedSafeWorkRequests(taskId: string, requestedAction: string): string[]
+  /**
+   * git_commit 以外の承認を、それを使う **実在する Job** に束縛して一度だけ consume する（単一 transaction）。
+   * Job が同じ Task のもので、Job の command kind が承認の requestedAction と一致し、APPROVED・未失効・
+   * commit / diff 一致のときだけ CONSUMED にする。期限切れは EXPIRED、commit / diff 不一致は STALE へ進める。
+   * Task 単位の操作（abort_task・repair_from_stored_review:* 等）の承認は command kind を持つ Job が
+   * 存在しないので、ここでは決して consume できない（それぞれ `verifyAndConsumeForTaskAction` を使う）。
+   */
+  consumeForCommandJob(input: {
+    id: string
+    jobId: string
+    currentCommit: string
+    currentDiffHash: string
+  }): ConsumeApprovalForCommandJobResult
   /** preserveReviewMeta=true のとき reason/reviewedAt を上書きしない（consume 用） */
   updateStatus(id: string, status: ApprovalGateStatus, reason?: string, preserveReviewMeta?: boolean): ApprovalRequest | undefined
   /** 人間による APPROVED/REJECTED 決定を更新し、同一transactionでaudit_logへ記録する（PATCH /status 用） */

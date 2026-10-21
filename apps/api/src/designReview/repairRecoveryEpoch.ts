@@ -43,7 +43,7 @@
 
 import type { IStorage } from '../storage/interface'
 import type { AuditLogEntry, Job, ReviewResult } from '@ai-team/shared'
-import { APPROVAL_ACTOR_REQUIRED, readApprovalActorClass } from './resumeActor'
+import { readApprovalActorClass } from './resumeActor'
 
 /** `requestedAction` の接頭辞。**新しい承認種別ではなく、既存の自由文字列欄の値**である。 */
 export const REPAIR_RECOVERY_ACTION_PREFIX = 'repair_from_stored_review:'
@@ -165,8 +165,7 @@ export function humanRecoveryAuthorityByImplementation(
     // handoff が断られた承認は使い切られている（R-3）。恒久的な authority として再利用させない。
     if (isSpentStoredReviewRecoveryApproval(storage, request.id)) continue
     // 人が決めたと証明できない承認は authority ではない（Human Resume と同じ規則）。
-    // stack 暫定: 書き手（stack-06）が入るまで要求しない（`APPROVAL_ACTOR_REQUIRED`）。
-    if (APPROVAL_ACTOR_REQUIRED && readApprovalActorClass(storage, request.id) !== 'human') continue
+    if (readApprovalActorClass(storage, request.id) !== 'human') continue
 
     // 承認行の文字列を信じず、**Job 側から関連を引き直す**。
     const chain = resolveStoredReviewChain(storage, taskId, reviewJobId)
