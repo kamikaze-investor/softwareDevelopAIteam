@@ -52,7 +52,7 @@ Technical Safety Decision は、Risk に応じて Safety Evidence を強めて�
 DA trigger は以下の7項目である（正本: `specs/22_safety_approval_design_principle.md` §14-3）。
 
 - (1) Goal・事業上の Goal 優先順位・Product / Business 方針・Design Philosophy / Constitution の原則・Policy / Value の**意味の変更**
-- (2) authority 定義（Approval・Gate policy・`plActionPolicy`・permission・`guards/**`・commitGate）の変更。強化と弱体化を機械判定できない間は fail closed
+- (2) authority 定義（Approval・Gate policy・`plActionPolicy`・permission・`guards/**`・commitGate）の変更。強化と弱体化を機械判定できない間は fail closed。該当するかはファイル名・ラベルではなく、差分が実際に変える Approval Tuple (a)〜(d) で判定する（「DA trigger (2) — Authority / Approval boundary の意味で判定する」）
 - (3) 新しい外部 service・有償依存・公開範囲・公開 route
 - (4) 個人データ・保持・削除方針の変更
 - (5) 不可逆（diff 本文で判定する destructive migration・データ削除）
@@ -64,7 +64,36 @@ DA (1) はファイル名ではなく差分の意味で判定する。Goal / Pro
 DA trigger (1)〜(5) に当たっても、欠陥・弱体化・未解消の矛盾が無ければ `blocked` にしない。
 `requiresCeoApproval: true` を付け、人の判断は CODEOWNERS review に委ねる（`prompt.md`「Human Decision Authority のみ」）。
 canonical spec で承認済みの authority boundary を scope どおりに実装する変更は、人の承認を外す方向でも「Cage弱体化」に数えない。
+それが現行の Approval Tuple (a)〜(d) を実際に変える場合（例: git_commit Stage 1 で人の承認を外す）は A（`requiresCeoApproval: true`）のままで、欠陥が無ければ `blocked` にしない。Tuple を変えずに既存 boundary を正しく強制するだけの実装は B。
 「Cage弱体化」として `blocked` にするのは、承認済み scope の逸脱・無断の authority 拡大・意図しない bypass / fail-open・実装欠陥がある場合だけ。
+
+#### DA (2): Approval Tuple の意味確認
+
+DA (2) はファイル名・ラベルではなく Approval Tuple の意味で判定する（`prompt.md`「DA trigger (2) — Authority / Approval boundary の意味で判定する」）。Approval Tuple は (a) 承認者・credential class、(b) 人の承認が必要な action / decision、(c) 承認の binding、(d) 承認の effect・使用回数・TTL・失効 の4要素。
+
+- [ ] ファイル名・commit message・「強化」「hardening」「refactor」等のラベルではなく、実際の差分を見た
+- [ ] authority 関連ファイル名だけでは A にしていない
+- [ ] (a) approver / credential class が追加・削除・置換されていない
+- [ ] (b) 人の承認が必要なaction / decisionが追加・削除されていない
+- [ ] (c) Project / Task / Job / action / commit / exact diff / review identityへのbindingが変わっていない
+- [ ] (d) 承認effect、使用回数、TTL、失効・無効化、supersede、auto-executionが変わっていない
+- [ ] 拡大だけでなく縮小・置換もAとしている
+- [ ] canonical ruleの具体的箇所を引用した
+- [ ] 全writer / reader / consume / alternate route / default / expiry / retry pathを確認した
+- [ ] legacy / missing / unknown / contradiction / partial writeはfail closedになる
+- [ ] helper直接呼出しだけでなくproduction entrypointからのinvariant testがある
+- [ ] Tuple不変のenforcement-only repairはB（`requiresCeoApproval: false`）とした
+- [ ] unclearまたは証拠不足ならAへ倒した
+- [ ] technical statusとrequiresCeoApprovalを独立に決めた
+- [ ] Tuple不変のenforcement defectはB + blocked、Tupleを実際に変えるdefectはA + blockedとした
+- [ ] legacy / unknown を human と数える、exact diff hash binding を path 集合等へ緩める、TTL 延長・再延長、一部 path での check skip、unknown / default を approve にする変更は A + blocked とした
+- [ ] human-approval 対象 action の追加、承認 effect を自動 commit へ変える変更は A とした
+- [ ] canonical spec が承認済みの Tuple 変更（例: git_commit Stage 1）は A のままとし、欠陥が無ければ blocked にしていない
+- [ ] Tuple を実際に変える A は、対応する canonical rule（`approval_rules.md` / `specs/22`）の実質的な変更、または既承認 rule への exact implementation / activation binding を同じ PR に含め、CODEOWNERS review に委ねている
+- [ ] 同じ PR の rule 変更を既承認の根拠や A→B の理由にしていない。rule と実装を一体の proposal として扱い、rule が old→new Tuple と scope・binding・effect・expiry / use / reset・failure default を定め、全 writer / reader / consume / retry / recovery / alternate path の実装と一致し、missing / legacy / unknown は fail closed であることを確認した
+- [ ] rule と code の不一致は A + blocked とし、CEO review で解除されるものとして扱っていない
+- [ ] Human Gate を得る目的だけの trivial・無関係・説明だけの保護対象編集は manipulation として blocked とした
+- [ ] この確認を特定PR・特定ファイルに限定せず、authority の決定・記録・読取・消費・失効・実行effectに関わる差分すべてに適用した
 
 ### CLAUDE.md
 - [ ] Green Zone / Yellow Zone / Red Zone の内容が変更されていない（変更されていれば、欠陥が無い限り `requiresCeoApproval: true`）
