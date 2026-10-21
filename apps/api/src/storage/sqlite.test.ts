@@ -1833,6 +1833,8 @@ describe('SQLiteStorage', () => {
 
         // quarantine 中は resume を fail-closed で拒否する。所有権の推測ではなく
         // 「未検証 workspace へ再進入させない」ことが目的なので、理由も返す。
+        // （resume は running Project でしか受け付けないので、その前提を揃えてから確かめる）
+        storage.projects.update(projectId, { status: 'running' })
         const resumed = storage.jobs.resumeBlockedTask({
           taskId,
           instructionPrompt: 'try again please',
@@ -1988,6 +1990,8 @@ describe('SQLiteStorage', () => {
           expect(storage.jobs.findById(job.id)?.failureMetadata?.quarantined).toBe(true)
 
           // clearance 前は resume 拒否（既存の fail-closed 不変条件が保たれる）
+          // （resume は running Project でしか受け付けないので、その前提を揃えてから確かめる）
+          storage.projects.update(projectId, { status: 'running' })
           const refusedBefore = storage.jobs.resumeBlockedTask({
             taskId,
             instructionPrompt: 'try again please',

@@ -14,6 +14,7 @@ import type {
 } from '../pl/technicalAbortEvidence'
 import type { KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger } from '@ai-team/shared'
 import type { AiCliProvider, AiCliMode } from '@ai-team/shared'
+import type { ResumeAdmissionCode } from '@ai-team/shared'
 import type { PrincipleApplication, PrincipleApplicationInput, PrincipleAggregateQuery, PrincipleAggregateRow, PrincipleDisagreementRow, PrincipleVersionAggregateRow } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
 
@@ -37,6 +38,8 @@ export type ResumeBlockedTaskResult =
          */
         | 'REJECTED_COMMIT_SOURCE_UNRESOLVED'
         | 'GIT_COMMIT_RESUME_LINEAGE_INVALID'
+        /** 共有 `evaluateResumeAdmission()` の前提条件による拒否（Mobile と同じ code）。 */
+        | ResumeAdmissionCode
       reason: string
     }
 
@@ -289,7 +292,7 @@ export interface IProjectStorage {
  */
 export type RecoverFromBlockedResult =
   | { ok: true; task: Task }
-  | { ok: false; code?: 'APPROVAL_WAITING'; reason: string }
+  | { ok: false; code?: 'APPROVAL_WAITING' | 'PROJECT_NOT_RUNNING'; reason: string }
 
 export interface ITaskStorage {
   findByProjectId(projectId: string): Task[]
@@ -319,6 +322,7 @@ export interface ITaskStorage {
    *   3. park されていない
    *   4. 有効な承認待ちが無い（未期限の `WAITING_FOR_USER`。判定は
    *      `humanRecovery/recoveryAudit` の `hasActiveApprovalWaiting()` で precheck と共有）
+   *   5. Project が `running`（precheck と同じ `PROJECT_NOT_RUNNING`）
    *
    * 呼び出し側が持つのは**ここに無い政策判定だけ**（Project が archived か、
    * 自律ループから到達できるか、`nextDriver` は何か 等）。

@@ -40,7 +40,12 @@ import {
   RESUME_ACTOR_AUDIT_OPERATION,
   TECHNICAL_RESUME_AUDIT_TOKEN,
 } from '../pl/technicalResumePolicy'
-import { RESUME_STEP_PREFIX, jobsSupersededByHumanResume, type ResumeActorClass } from './repairPolicy'
+import {
+  RESUME_STEP_PREFIX,
+  jobsSupersededByHumanResume,
+  type GenerationAuthority,
+  type ResumeActorClass,
+} from './repairPolicy'
 
 /** resume actor を記録する audit operation 名。新 table は作らない。 */
 export const RESUME_ACTOR_OPERATION = RESUME_ACTOR_AUDIT_OPERATION
@@ -147,6 +152,11 @@ export function recordResumeActor(
     evidence: ResumeAuthorizationEvidence
     /** Rule 5.5 の review execution failure に対する PL Technical Resume。 */
     technicalResume?: boolean
+    /**
+     * Human Resume が作られた時点で Task を止めていた Design Review run の id（R-4）。
+     * この run だけが、その Human Resume によって「答えられた」run になる（`readAnsweredRunIds()`）。
+     */
+    answeredRunId?: string
   },
 ): void {
   recordWithoutFailingCaller(RESUME_ACTOR_OPERATION, () => {
@@ -161,6 +171,9 @@ export function recordResumeActor(
         `resume_actor=${input.actorClass}`,
         `authorization_evidence=${input.evidence}`,
         input.technicalResume === true ? TECHNICAL_RESUME_AUDIT_TOKEN : undefined,
+        input.actorClass === 'human' && input.answeredRunId !== undefined
+          ? `${ANSWERED_RUN_AUDIT_TOKEN}=${input.answeredRunId}`
+          : undefined,
       ].filter((token) => token !== undefined).join(' '),
     })
   })
@@ -180,6 +193,11 @@ export function recordRepairGeneration(
     previousGenerationRoot?: string
     budgetReset: boolean
     resetReason: string
+    /**
+     * generation を始めた保存済み authority への参照。reset の理由だけでは
+     * 「どの承認 / どの Human Resume で」が後から追えないので、id ごと残す（b8d0fc5d 修正）。
+     */
+    authority?: GenerationAuthority
   },
 ): void {
   const parts = [
@@ -189,6 +207,7 @@ export function recordRepairGeneration(
     `previous_generation_root=${input.previousGenerationRoot ?? 'none'}`,
     `budget_reset=${input.budgetReset ? 'yes' : 'no'}`,
     `reset_reason=${input.resetReason}`,
+    ...authorityAuditTokens(input.authority),
   ]
   recordWithoutFailingCaller(REPAIR_GENERATION_OPERATION, () => {
     storage.auditLog.record({
@@ -200,6 +219,88 @@ export function recordRepairGeneration(
       detail: parts.join(' '),
     })
   })
+}
+
+/** 承認を決定した主体を記録する audit operation 名。新 table は作らない。 */
+export const APPROVAL_ACTOR_AUDIT_OPERATION = 'approval_actor'
+
+/**
+ * **stack 分割の暫定措置（[lifecycle-repair] stack）。** canonical rule H-1/H-2（approval_rules.md）に従い、
+ * 読み側は書き手（承認 PATCH の `recordApprovalActor()`、stack-06）より前の層でも `approval_actor` = human を
+ * 要求する（fail closed）。書き手の無い層では stored-review 承認は authority にならない（liveness だけが後退し、
+ * 中間層は deploy しない）。stack-06 でこの定数ごと外す。
+ */
+export const APPROVAL_ACTOR_REQUIRED: boolean = true
+
+/**
+ * **ApprovalRequest を決定した主体の種別を、credential だけから決めて残す**（Codex review・b8d0fc5d）。
+ *
+ * consume 済みの `repair_from_stored_review:*` 承認は repair budget を作り直す authority になる。
+ * ところが `APPROVED` は legacy 単一 token でも書けるので、行の状態だけでは「人が決めた」ことの
+ * 証明にならない。Human Resume と同じ規則（`resumeActorClassForCredential()`：ADMIN だけが human、
+ * legacy / 不明は決して human にしない）で決めた種別を、承認 id に紐づけて 1 行残す。
+ * 呼び出しは承認 PATCH route の担当（CODEOWNERS 保護のため別 unit が配線する）。
+ * 記録の失敗は authority を増やす方向へは倒れない（読み側が `unknown` を返す）。
+ */
+export function recordApprovalActor(
+  storage: IStorage,
+  approvalRequestId: string,
+  credentialClass: CredentialClass | undefined,
+): void {
+  const actorClass = resumeActorClassForCredential(credentialClass)
+  const evidence = resumeEvidenceForCredential(credentialClass)
+  recordWithoutFailingCaller(APPROVAL_ACTOR_AUDIT_OPERATION, () => {
+    storage.auditLog.record({
+      actor: 'api',
+      operation: APPROVAL_ACTOR_AUDIT_OPERATION,
+      entityType: 'approval_request',
+      entityId: approvalRequestId,
+      result: actorClass,
+      detail: `approval_actor=${actorClass} authorization_evidence=${evidence}`,
+    })
+  })
+}
+
+/**
+ * 承認の決定主体を読む。規則は `resumeActorClassFromAudit()` と同じ:
+ * 記録が無い・矛盾する・`human` なのに `admin_credential` の根拠が無い → human ではない。
+ * 読めなかった場合も `unknown`（authority を増やす方向へは倒れない）。
+ */
+export function readApprovalActorClass(
+  storage: IStorage,
+  approvalRequestId: string,
+): 'human' | 'ai' | 'unknown' {
+  try {
+    const rows = storage.auditLog.findByEntity('approval_request', approvalRequestId)
+      .filter((entry) => entry.operation === APPROVAL_ACTOR_AUDIT_OPERATION)
+    const seen = new Set(rows.map((row) => row.result))
+    if (seen.size !== 1) return 'unknown'
+    const only = [...seen][0]
+    if (only === 'ai') return 'ai'
+    if (only !== 'human') return 'unknown'
+    return rows.every((row) => ADMIN_EVIDENCE_PATTERN.test(row.detail ?? '')) ? 'human' : 'unknown'
+  } catch (error: unknown) {
+    console.warn(
+      `[resumeActor] failed to read the approval actor of ${approvalRequestId}: ${error instanceof Error ? error.message : String(error)}`,
+    )
+    return 'unknown'
+  }
+}
+
+function authorityAuditTokens(authority: GenerationAuthority | undefined): string[] {
+  if (authority === undefined) return []
+  if (authority.kind === 'human_recovery') {
+    return [
+      'authority_kind=human_recovery',
+      `authority_approval_request_id=${authority.approvalRequestId}`,
+      `authority_review_job_id=${authority.reviewJobId}`,
+    ]
+  }
+  return [
+    'authority_kind=human_resume',
+    `authority_resume_job_id=${authority.resumeJobId}`,
+    `authority_resumed_review_job_id=${authority.resumedReviewJobId}`,
+  ]
 }
 
 /**
@@ -230,6 +331,38 @@ export function resumeActorClassFromAudit(entries: readonly AuditLogEntry[]): Re
   }
   if (only !== 'human') return 'unknown'
   return rows.every((row) => ADMIN_EVIDENCE_PATTERN.test(row.detail ?? '')) ? 'human' : 'unknown'
+}
+
+/** resume_actor の detail に載る、Human Resume が答えた Design Review run の token 名（R-4）。 */
+export const ANSWERED_RUN_AUDIT_TOKEN = 'answered_run'
+
+/**
+ * Human Resume ごとに、**作成時に明示的に記録された**「答えた Design Review run」の id を引く（R-4）。
+ *
+ * 時刻の前後からは推論しない。human と証明できない resume・記録の無い legacy resume・
+ * 行どうしで食い違う resume は何も答えない（fail closed）。
+ */
+export function readAnsweredRunIds(
+  storage: IStorage,
+  jobs: readonly Job[],
+): Map<string, string> {
+  const answered = new Map<string, string>()
+  for (const job of jobs) {
+    if (!job.workflowStepKey?.startsWith(RESUME_STEP_PREFIX)) continue
+    try {
+      const rows = storage.auditLog.findByEntity('job', job.id)
+        .filter((entry) => entry.operation === RESUME_ACTOR_OPERATION)
+      if (resumeActorClassFromAudit(rows) !== 'human') continue
+      const ids = new Set(rows.map((row) =>
+        new RegExp(`(?:^|\\s)${ANSWERED_RUN_AUDIT_TOKEN}=(\\S+)`).exec(row.detail ?? '')?.[1]))
+      if (ids.size !== 1) continue
+      const only = [...ids][0]
+      if (only !== undefined) answered.set(job.id, only)
+    } catch {
+      // 読めない記録は何も答えない。
+    }
+  }
+  return answered
 }
 
 /**

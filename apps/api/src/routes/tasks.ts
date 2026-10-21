@@ -17,6 +17,7 @@ import { buildResumeAiCliPrompt } from '../implementPrompt'
 import { authorizePlAction, PlActionBlockedError } from '../pl/actionGate'
 import { verifyExternalCompletion } from '../reconcile/externalCompletion'
 import { repairFromStoredReview } from '../designReview/repairFromStoredReview'
+import { designReviewRunAnsweredByHumanResume } from '../designReview/repairFlow'
 import { getStorage } from '../storage'
 import {
   answerTaskFailureQuestion,
@@ -547,13 +548,21 @@ export async function taskRoutes(
     if (!resumed.ok && resumed.code === RESUME_DESIGN_REVIEW_FAILED) {
       return reply.status(409).send({
         error: 'Resume instruction did not pass the pre-implementation Design Review',
+        code: resumed.code,
         reason: resumed.reviewError,
       })
     }
 
     if (!resumed.ok) {
-      if (resumed.code === 'WORKSPACE_QUARANTINED') {
-        return reply.status(409).send({ error: resumed.reason })
+      // **409 は必ず stable な code を添える。** Mobile と PL が reason 文字列で分岐しないため。
+      // done の Task と running でない Project は request の不備ではなく状態の衝突なので 409
+      // （b8d0fc5d 監査）。他の既存の拒否は status を変えず、code だけを足す。
+      if (
+        resumed.code === 'WORKSPACE_QUARANTINED'
+        || resumed.code === 'TASK_DONE'
+        || resumed.code === 'PROJECT_NOT_RUNNING'
+      ) {
+        return reply.status(409).send({ error: resumed.reason, code: resumed.code })
       }
       // **却下済み commit の出所を特定できなかったのは request の不備ではなく状態の問題**なので
       // 400 ではなく 409 を返す。code を添えるのは、呼び出し側が
@@ -565,7 +574,10 @@ export async function taskRoutes(
       ) {
         return reply.status(409).send({ error: resumed.reason, code: resumed.code })
       }
-      return reply.status(400).send({ error: resumed.reason })
+      return reply.status(400).send({
+        error: resumed.reason,
+        ...(resumed.code === undefined ? {} : { code: resumed.code }),
+      })
     }
 
     // **誰が再開したかを、この request の credential だけから決めて残す。**
@@ -574,11 +586,16 @@ export async function taskRoutes(
     // `ResumeTaskBody` が落とすうえ、ここは request の認証結果しか読まない。
     // repair budget の generation 境界はこの記録だけを根拠にする（`../designReview/resumeActor`）。
     const actor = classifyResumeActorFromRequest(req)
+    // Human Resume は、作成時点で Task を止めていた Design Review run を明示的に答える（R-4）。
+    const answeredRunId = actor.actorClass === 'human'
+      ? designReviewRunAnsweredByHumanResume(storage, task.id)
+      : undefined
     recordResumeActor(storage, {
       jobId: resumed.job.id,
       taskId: task.id,
       actorClass: actor.actorClass,
       evidence: actor.evidence,
+      ...(answeredRunId !== undefined ? { answeredRunId } : {}),
     })
 
     return reply.status(201).send(resumed.job)

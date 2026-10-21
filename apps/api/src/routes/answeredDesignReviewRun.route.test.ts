@@ -77,6 +77,23 @@ async function shape() {
   } as never)
   await tick()
 
+  /** 判定のある終端 run（RC3 以降、REVIEW_UNAVAILABLE は根拠にならないので CONFLICT で止める）。 */
+  const conflictRun = async (): Promise<string> => {
+    const designText = `repair plan ${Math.random()}`
+    const run = s.designReviewRuns.create({
+      taskId: task.id, taskTitle: 'VPS docs', designText, designTextHash: computeDesignTextHash(designText),
+      changedFiles: [DOC], repairSourceJobId: i1.id,
+    })
+    const claimed = s.designReviewRuns.claim(run.id, 3)
+    s.designReviewRuns.complete(run.id, claimed.claimToken!, 'succeeded', JSON.stringify({
+      reviewLoad: 'low', selectedFocuses: [], focusedReviewResults: [],
+      integrationReviewResult: { decision: 'CONFLICT', summary: 'CONFLICT', findings: [] },
+      finalDecision: 'CONFLICT',
+    }))
+    await tick()
+    return run.id
+  }
+
   const unavailableRun = async (): Promise<string> => {
     const designText = `repair plan ${Math.random()}`
     const run = s.designReviewRuns.create({
@@ -101,7 +118,7 @@ async function shape() {
     return r1
   }
 
-  return { s, taskId: task.id, i1, unavailableRun, humanResumedReview }
+  return { s, taskId: task.id, i1, unavailableRun, conflictRun, humanResumedReview }
 }
 
 const changesRequested = {
@@ -148,9 +165,9 @@ describe('D3: PATCH の review 分岐と Human Resume で回答済みの Design 
     const lines: LogLine[] = []
     const app = await buildApp(lines)
     try {
-      const { s, taskId, i1, unavailableRun, humanResumedReview } = await shape()
+      const { s, taskId, i1, conflictRun, humanResumedReview } = await shape()
       const r1 = await humanResumedReview()
-      const runId = await unavailableRun()
+      const runId = await conflictRun()
 
       const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${r1.id}`, payload: changesRequested })
 
@@ -160,11 +177,36 @@ describe('D3: PATCH の review 分岐と Human Resume で回答済みの Design 
       const warn = lines.find((line) => line.msg.includes('stage 2 skipped'))
       expect(warn).toMatchObject({
         level: 40,
-        reason: 'task is blocked (latest design review is REVIEW_UNAVAILABLE)',
+        reason: 'task is blocked (latest design review is CONFLICT)',
         sourceJobId: i1.id,
         reviewJobId: r1.id,
         runId,
       })
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('L4: blocked Task で skip したら repair_admission_skipped を audit に残し、Task は動かさない', async () => {
+    const lines: LogLine[] = []
+    const app = await buildApp(lines)
+    try {
+      const { s, taskId, i1, conflictRun, humanResumedReview } = await shape()
+      const r1 = await humanResumedReview()
+      const runId = await conflictRun()
+
+      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${r1.id}`, payload: changesRequested })
+
+      expect(res.statusCode).toBe(200)
+      const rows = s.auditLog.findByEntity('task', taskId)
+        .filter((entry) => entry.operation === 'repair_admission_skipped')
+      expect(rows).toHaveLength(1)
+      expect(rows[0]!.result).toBe('not_admitted')
+      expect(rows[0]!.detail).toContain('reason_code=not_admitted')
+      expect(rows[0]!.detail).toContain(`review_job_id=${r1.id}`)
+      expect(rows[0]!.detail).toContain(`implementation_job_id=${i1.id}`)
+      expect(rows[0]!.detail).toContain(`design_review_run_id=${runId}`)
+      expect(s.tasks.findById(taskId)?.status).toBe('blocked')
     } finally {
       await app.close()
     }
