@@ -88,9 +88,20 @@ Approval Tuple は次の4要素である。
 - (c) 承認が何に束縛されるか（Project / Task / Job / action / commit / exact diff / review identity 等）
 - (d) 承認が何を許可するか（effect、使用回数、TTL、失効・無効化条件、supersede、実行される操作）
 
-canonical な既存ruleに対して (a)〜(d) のいずれか、または Safety boundary の意味を追加・削除・拡大・縮小・置換する差分は、方向を問わず A とし、`requiresCeoApproval: true` を返す。これは「強化」と説明されていても同じである。特に、CEO承認の対象、承認者、承認対象・binding、承認effectの拡大と縮小はどちらも Human Decision Authority である。
+**基準点 — Approval Tuple の変化は base branch の承認済み canonical rule に対して測る**
 
-一方、canonical rule が既に定めた同一の Approval Tuple を、欠落・不整合・race・bypass候補の修正によって正しく強制するだけの変更は B である。authority関連ファイル、Gate、permission、guard、commitGate、actor provenance、expiry、invalidation等を変更するという理由だけでは A にしない。
+Approval Tuple が「変わる」かは、コードの従来挙動ではなく、base branch 上の最新の承認済み canonical rule（`docs/project_memory/rules/approval_rules.md` と `specs/22`。この PR 自身の変更を含まない）を基準に判定する。
+
+- base canonical rule が old→new の Approval Tuple を具体的に定義し承認済みで、差分の実行時挙動が全 path でその Tuple と一致する場合は enforcement であり B（`requiresCeoApproval: false`）とする。コードの従来挙動を変える場合も同じである。
+- base canonical rule を超える、またはそれと異なる Tuple 変更は A とする。rule と実装の不一致は A + blocked とする。
+- 原則・方針として散文で承認されただけで、具体的な Tuple（old→new）を定めていない boundary の実装は、基準となる Tuple が無いので A のままとする。
+- 同じ PR で追加・変更された rule は承認済みではない（基準点に含めず、A を B に変える根拠にもしない）。
+
+これにより、承認済み rule を正確に実装する差分には2回目の CEO review を求めない。CEO の判断は rule の承認時に済んでいるからである。
+
+基準点（base canonical rule）に対して (a)〜(d) のいずれか、または Safety boundary の意味を追加・削除・拡大・縮小・置換する差分は、方向を問わず A とし、`requiresCeoApproval: true` を返す。これは「強化」と説明されていても同じである。特に、CEO承認の対象、承認者、承認対象・binding、承認effectの拡大と縮小はどちらも Human Decision Authority である。
+
+一方、canonical rule が既に定めた同一の Approval Tuple を、欠落・不整合・race・bypass候補の修正によって正しく強制するだけの変更は B である。base canonical rule が old→new として定めた新しい Tuple を実装する変更も、実装がその Tuple と全 path で一致する限り同じく B である。authority関連ファイル、Gate、permission、guard、commitGate、actor provenance、expiry、invalidation等を変更するという理由だけでは A にしない。
 
 B とするには、少なくとも次を満たさなければならない。
 
@@ -101,7 +112,7 @@ B とするには、少なくとも次を満たさなければならない。
 
 差分が (a)〜(d) またはSafety boundaryを変えるか判定できない場合は A に倒す。ただし、Approval Tupleがcanonical ruleと同一であることは確定しており、その実装に技術欠陥がある場合、欠陥だけを理由にAへ変更しない。その場合は Bのまま技術statusを `blocked` または `changes_requested` とする。
 
-Decision Authority と技術statusは独立である。
+Decision Authority と技術statusは独立である。以下の「Tuple変更」は基準点（base canonical rule）に対する変更を指す。
 
 - Tuple変更あり、欠陥なし: A + approved / changes_requested
 - Tuple変更あり、bypass・fail-open・判定漏れあり: A + blocked
@@ -119,12 +130,13 @@ Decision Authority と技術statusは独立である。
 - unknown / default の判定を deny から approve に変える（未確定値の effect の変更）→ A + blocked
 - human-approval 対象の action を追加する（(b) の拡大）→ A（欠陥が無ければ blocked にしない）
 - 承認の effect を「commit 準備の許可」から自動 commit へ変える（(d) の変更）→ A（commitGate 等を迂回すれば A + blocked）
-- human-approval 対象から action を削除する（(b) の縮小）→ A（canonical spec が承認済みで欠陥が無ければ blocked にしない）
+- human-approval 対象から action を削除する（(b) の縮小）→ A（原則としてのみ承認済みで欠陥が無ければ blocked にしない。base canonical rule がその削除を old→new として具体的に定義済みで実装が一致するなら B）
+- base の `approval_rules.md` が old→new として具体的に定義済みの Tuple 変更を、全 writer・reader・consume・retry・recovery path で一致させて実装する（コードの従来挙動は変わる）→ B（不一致があれば A + blocked）
 - canonical な「ADMIN だけが human」を、writer・reader を揃えて正しく強制するだけの actor provenance 修正 → B（reader に対応する production writer が欠けて正規承認が成立しないなら B + blocked）
 
 **Approval Tuple を実際に変える変更（A）の出し方 — 実装が CODEOWNERS 外のファイルでも同じ**
 
-Approval Tuple (a)〜(d) を実際に変える変更（A）は、対応する canonical rule（`docs/project_memory/rules/approval_rules.md` または `specs/22`）の実質的な変更、または既承認 rule への exact implementation / activation binding を同じ PR に含め、CODEOWNERS review に委ねる。
+基準点（base canonical rule）に対して Approval Tuple (a)〜(d) を実際に変える変更（A）は、対応する canonical rule（`docs/project_memory/rules/approval_rules.md` または `specs/22`）の実質的な変更（old→new Tuple の定義）、または原則としてのみ承認済みの boundary に具体的な Tuple を与える activation binding を同じ PR に含め、CODEOWNERS review に委ねる。base canonical rule が exact Tuple を既に定めている実装はこれに当たらず、B である。
 
 同じ PR の canonical rule 変更は既承認の根拠として扱わない。ただし old→new Approval Tuple を具体的に定義し実装差分と一致する場合は、PR 全体を A として CODEOWNERS review へ委ねるための proposal として扱う。承認前は効力を持たず、実装欠陥・bypass・rule/code 不一致を解除しない。
 
@@ -149,8 +161,11 @@ DA trigger (1)〜(5) に当たるが、上記の欠陥・弱体化・未解消�
 
 - 例: `CLAUDE.md` の Green/Yellow/Red Zone の変更、`AgentPolicy` の権限拡大、Approval・Gate policy の意味の変更
 - Approval Tuple (a)〜(d) または Safety boundary の意味を実際に変える差分（DA (2)。強化か弱化かを機械判定できないものを含む）も、欠陥が無ければここに入る（fail closed は Human Gate が担う）。Tuple を変えずに既存 rule を正しく強制するだけの enforcement repair は DA (2) ではなく B（`requiresCeoApproval: false`）である
-- **canonical spec で承認済みの authority boundary を、その scope どおりに変更・実装する差分は、それが現行の Approval Tuple (a)〜(d) を実際に変える場合、人の承認を外す方向であっても A（Human Decision Authority）であり、Cage 弱体化 / Safety weakening として `blocked` にしない。** 承認済み scope 内か・bypass / fail-open / 判定漏れ / 実装欠陥が無いかを技術的に評価して status に反映する
-  - 例: `specs/22` §14-3 が承認した git_commit Stage 1（LOW / MEDIUM かつ定義済み Safety Evidence が全て成立する場合だけ人の承認なしで進め、それ以外は fail closed）を、その条件どおりに実装する変更。git_commit から人の承認を外すので (b) が変わり A のまま、欠陥が無ければ `blocked` にしない
+- **canonical spec で承認済みの authority boundary を実装する差分の扱いは、base canonical rule が具体的な Tuple を定めているかで決まる（DA trigger (2) の「基準点」）。**
+  - base の `approval_rules.md` / `specs/22` が old→new の Approval Tuple を具体的に定義・承認しており、実装が全 path でそれと一致する場合は B（`requiresCeoApproval: false`。2回目の CEO review は不要）
+  - 原則・方針としての散文承認だけで具体的な Tuple binding が無い boundary を実装し、現行の Approval Tuple (a)〜(d) を実際に変える場合は、人の承認を外す方向であっても A（Human Decision Authority）であり、Cage 弱体化 / Safety weakening として `blocked` にしない
+  - どちらの場合も、承認済み scope 内か・bypass / fail-open / 判定漏れ / 実装欠陥が無いかを技術的に評価して status に反映する
+  - 例: `specs/22` §14-3 が承認した git_commit Stage 1（LOW / MEDIUM かつ定義済み Safety Evidence が全て成立する場合だけ人の承認なしで進め、それ以外は fail closed）を、その条件どおりに実装する変更。§14-3 は境界を定めるが `approval_rules.md` に exact Tuple binding が無いので、git_commit から人の承認を外す実装は (b) が変わり A のまま、欠陥が無ければ `blocked` にしない
   - Tuple を変えずに、既に canonical な boundary を正しく強制するだけの実装（欠落した check・writer・invalidation の補修等）は A ではなく B である
 - authority を広げる変更であること自体は `blocked` の理由にならない。`blocked` にするのは、承認済み scope の逸脱・無断の authority 拡大・実装欠陥がある場合だけである
 - この PR 自身が canonical spec / rule を変更している場合、その変更を根拠に自分の scope を正当化しない（既承認の authority として扱わず、A を B に変える根拠にもしない。spec / rule の変更自体が Human Decision Authority であり、`requiresCeoApproval: true`）。ただし rule 変更と実装を同じ PR に一体として含め、PR 全体を A として CODEOWNERS review の判断に委ねることはできる（「DA trigger (2)」節の5点確認に従う）
