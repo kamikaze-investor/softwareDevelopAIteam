@@ -204,7 +204,7 @@ export function resolveMetaReviewOutcome<T extends GateableMetaReviewResult>(
           severity: 'critical',
           category: 'authority_change',
           message: `Human Decision Authority が必要と判定されたが、${reason}。authority の判定と CODEOWNERS がずれている。`,
-          suggestion: 'Approval Tuple (a)〜(d) を実際に変える変更なら、対応する canonical rule の実質的な変更（または既承認 rule への exact implementation / activation binding）を同じ PR に含め、CODEOWNERS review に委ねる。Tuple 不変の enforcement-only 修正なら DA (2) 判定を見直す。Human Gate を得る目的だけで実装ファイルを CODEOWNERS へ追加しない。',
+          suggestion: 'base の canonical rule（approval_rules.md / specs/22）が定めていない Approval Tuple (a)〜(d) の変更なら、対応する canonical rule の変更を同じ PR に含め、CODEOWNERS review に委ねる。base の canonical rule が定める Tuple をそのとおりに実装する変更（Tuple 不変の enforcement-only 修正を含む）は B なので、DA (2) 判定を見直す。Human Gate を得る目的だけで実装ファイルを CODEOWNERS へ追加しない。',
         },
       ],
     },
@@ -315,7 +315,8 @@ async function main(): Promise<void> {
     gitDiff,
     prBody,
   )
-  const prompt = buildMetaReviewPrompt(request)
+  // 承認済み approval rules は PR の checkout ではなく base SHA から読む（CODEOWNERS と同じ理由）
+  const prompt = buildMetaReviewPrompt(request, undefined, { approvalRulesRef: baseSha })
   const providedPrincipleIds = providedCanonicalPrincipleIds(request)
 
   // --- レビューを依頼（Gemini API → Gemini CLI → Copilot CLI） ---
