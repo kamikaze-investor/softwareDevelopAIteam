@@ -349,10 +349,16 @@ describe('Job API', () => {
         },
       } as Parameters<typeof storage.jobs.create>[0])
 
+      // Worker は拒否でも carrier の現在の cleanup generation を名指す。
+      const cleanupGeneration = {
+          abortCleanupRequestedAt: '2026-10-08T00:00:00.000Z',
+          abortTechnicalEvidenceId: 'evidence-1',
+          abortTechnicalStateFingerprint: 'fingerprint-1',
+        }
       const first = await app.inject({
         method: 'POST',
         url: `/api/jobs/${job.id}/abort-cleanup-result`,
-        payload: { refusalCode: 'CLEANUP_EXECUTION_FAILED' },
+        payload: { refusalCode: 'CLEANUP_EXECUTION_FAILED', cleanupGeneration },
       })
       expect(first.statusCode).toBe(409)
       expect(storage.jobs.findById(job.id)?.failureMetadata).toMatchObject({
@@ -365,12 +371,112 @@ describe('Job API', () => {
       const second = await app.inject({
         method: 'POST',
         url: `/api/jobs/${job.id}/abort-cleanup-result`,
-        payload: { refusalCode: 'CLEANUP_EXECUTION_FAILED' },
+        payload: { refusalCode: 'CLEANUP_EXECUTION_FAILED', cleanupGeneration },
       })
       expect(second.statusCode).toBe(409)
       expect(storage.auditLog.findByEntity('task', task.id).filter(
         (entry) => entry.operation === 'technical_abort_refused',
       )).toHaveLength(1)
+    })
+  })
+
+  // Codex review 57f2cf6: 遅れて届いた generation 1 の拒否が generation 2 を退役・quarantine させない。
+  it('a delayed refusal of an older generation is GENERATION_MISMATCH and leaves the current generation intact', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id, { status: 'blocked', roadmapActive: true })
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const generation2 = {
+        abortCleanupRequestedAt: '2026-10-09T00:00:00.000Z',
+        abortTechnicalEvidenceId: 'evidence-2',
+        abortTechnicalStateFingerprint: 'fingerprint-2',
+        abortTechnicalRootCauseClass: 'protected_path',
+        abortTechnicalAttentionKind: 'job_failed',
+      }
+      const job = storage.jobs.create({
+        taskId: task.id,
+        projectId: project.id,
+        agentRole: 'developer_ai',
+        status: 'failed',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        workspaceBaseline: { mode: 'clean', startCommitHash: '0805249b' },
+        failureMetadata: generation2,
+      } as Parameters<typeof storage.jobs.create>[0])
+
+      for (const payload of [
+        { refusalCode: 'CLEANUP_EXECUTION_FAILED', cleanupGeneration: {
+          abortCleanupRequestedAt: '2026-10-08T00:00:00.000Z',
+          abortTechnicalEvidenceId: 'evidence-1',
+          abortTechnicalStateFingerprint: 'fingerprint-1',
+        } },
+        { refusalCode: 'CLEANUP_EXECUTION_FAILED' },
+      ]) {
+        const response = await app.inject({
+          method: 'POST',
+          url: `/api/jobs/${job.id}/abort-cleanup-result`,
+          payload,
+        })
+        expect(response.statusCode).toBe(409)
+        expect(parseBody<{ code: string }>(response.body).code).toBe('GENERATION_MISMATCH')
+      }
+      expect(storage.jobs.findById(job.id)?.failureMetadata).toEqual(generation2)
+      expect(storage.auditLog.findByEntity('task', task.id).filter(
+        (entry) => entry.operation === 'technical_abort_refused',
+      )).toHaveLength(0)
+    })
+  })
+
+  it('a Technical Abort cleanup result naming another generation is refused as GENERATION_MISMATCH without quarantine', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app)
+      const task = await createTask(app, project.id, { status: 'blocked', roadmapActive: true })
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const metadata = {
+        abortCleanupRequestedAt: '2026-10-08T00:00:00.000Z',
+        abortTechnicalEvidenceId: 'evidence-2',
+        abortTechnicalStateFingerprint: 'fingerprint-2',
+        abortTechnicalRootCauseClass: 'protected_path',
+        abortTechnicalAttentionKind: 'job_failed',
+      }
+      const job = storage.jobs.create({
+        taskId: task.id,
+        projectId: project.id,
+        agentRole: 'developer_ai',
+        status: 'failed',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        workspaceBaseline: { mode: 'clean', startCommitHash: '0805249b' },
+        failureMetadata: metadata,
+      } as Parameters<typeof storage.jobs.create>[0])
+      const observation = { mode: 'clean', startCommitHash: '0805249b' }
+      const knownGood = {
+        gitOperationMarkers: [], worktreeClean: true, indexClean: true, headValid: true, blindSpotsAbsent: true,
+      }
+
+      for (const cleanupGeneration of [
+        { abortCleanupRequestedAt: '2026-10-07T00:00:00.000Z', abortTechnicalEvidenceId: 'evidence-1', abortTechnicalStateFingerprint: 'fingerprint-1' },
+        undefined,
+      ]) {
+        const response = await app.inject({
+          method: 'POST',
+          url: `/api/jobs/${job.id}/abort-cleanup-result`,
+          payload: {
+            observation,
+            knownGood,
+            preCleanupObservation: observation,
+            cleanupSummary: { changedPathCount: 0, restoredPathCount: 0, removedPathCount: 0 },
+            ...(cleanupGeneration !== undefined ? { cleanupGeneration } : {}),
+          },
+        })
+        expect(response.statusCode).toBe(409)
+        expect(parseBody<{ code: string }>(response.body).code).toBe('GENERATION_MISMATCH')
+      }
+      // 何も変えていない: 現在の generation も残り、quarantine もしない。
+      expect(storage.jobs.findById(job.id)?.failureMetadata).toEqual(metadata)
+      expect(storage.auditLog.findByEntity('task', task.id).filter(
+        (entry) => entry.operation === 'technical_abort_refused',
+      )).toHaveLength(0)
     })
   })
 

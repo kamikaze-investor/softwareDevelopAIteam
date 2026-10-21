@@ -215,7 +215,9 @@ export function repairFromStoredReview(
       }
     }
 
-    const created = storage.approvalRequests.create({
+    // Task あたり active request は高々1件。別 action の承認や期限切れの行が残っていれば、
+    // 新しい要求と同じ transaction で SUPERSEDED にする（2026-10-16 監査）。
+    const { approvalRequest: created } = storage.approvalRequests.replaceActiveAndCreate({
       taskId: task.id,
       ...describeTarget(chain.implementJob.id, chain.reviewJob.id),
       riskLevel: 'HIGH',

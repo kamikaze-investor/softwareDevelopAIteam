@@ -196,11 +196,17 @@ function insertJob(
   )
 }
 
-function insertApproval(db: Database.Database, id: string, taskId: string, status: ApprovalGateStatus): void {
+function insertApproval(
+  db: Database.Database,
+  id: string,
+  taskId: string,
+  status: ApprovalGateStatus,
+  expiresAt = '2026-10-02T00:00:00.000Z',
+): void {
   db.prepare(`
     INSERT INTO approval_requests (id, task_id, target_branch, target_commit, target_diff_hash, risk_level, requested_action, status, expires_at, created_at)
-    VALUES (?, ?, 'main', 'c0ffee', 'd1ff', 'LOW', 'git_commit', ?, '2026-10-02T00:00:00.000Z', ?)
-  `).run(id, taskId, status, CREATED_AT)
+    VALUES (?, ?, 'main', 'c0ffee', 'd1ff', 'LOW', 'git_commit', ?, ?, ?)
+  `).run(id, taskId, status, expiresAt, CREATED_AT)
 }
 
 /** failed な source（approval 付き）と、その exact な resume 後継を1件置く。 */
@@ -429,14 +435,15 @@ describe('startup reconciliation — 終端化済み source に紐づいたま�
     const dbPath = tempDbPath()
     seedRaw(dbPath, (db) => {
       insertTask(db, 'live')
-      insertApproval(db, 'approval-live', 'live', 'WAITING_FOR_USER')
+      // 期限内の WAITING だけが source を pin する（期限切れ WAITING は第1段が終端化する）。
+      insertApproval(db, 'approval-live', 'live', 'WAITING_FOR_USER', new Date(Date.now() + 60_000).toISOString())
       insertJob(db, { id: 'source-live', taskId: 'live', status: 'blocked', approvalId: 'approval-live' })
       insertJob(db, { id: 'successor-live', taskId: 'live', status: 'queued', workflowStepKey: 'resume:source-live:1' })
     })
 
     const storage = createSQLiteStorage(dbPath)
 
-    // 既存の第1段は WAITING に紐づく blocked source を終端化しない（変わらない挙動）
+    // 既存の第1段は期限内の WAITING に紐づく blocked source を終端化しない（変わらない挙動）
     expect(storage.jobs.findById('source-live')?.status).toBe('blocked')
     expect(approvalStatusOf(storage, 'approval-live')).toBe('WAITING_FOR_USER')
   })

@@ -37,6 +37,17 @@ import type { ApprovalRequest, Job, Task, Project } from '@ai-team/shared'
  * expiry 解釈の正本は `@ai-team/shared` の `isLiveWaitingApproval`（approvalLiveness.ts）。
  * Job 起点（ここ）と Task 起点（`approval_waiting` attention）は同じ関数を使う。
  */
+/**
+ * Task の request を**全件**見て、live な WAITING（新しい順で最初の1件）を返す。
+ *
+ * 最新の active 行1件だけで判定すると、新しい APPROVED（別 action の人の判断は SUPERSEDED に
+ * されず残る）や legacy の複数 active 行の陰に、古い live WAITING が隠れる（Codex review 84fe348）。
+ */
+function findLiveWaitingApproval(storage: IStorage, taskId: string, nowMs: number): ApprovalRequest | undefined {
+  return storage.approvalRequests.findByTaskId(taskId)
+    .find((request) => isLiveWaitingApproval(request, nowMs))
+}
+
 function isWaitingOnLiveApproval(storage: IStorage, job: Job, nowMs: number): boolean {
   if (job.approvalId === undefined) return false
   return isLiveWaitingApproval(storage.approvalRequests.findById(job.approvalId), nowMs)
@@ -321,7 +332,9 @@ export function buildSystemState(
     continuationsPendingTotal += continuationsPending
 
     const waitingForProject = tasks.filter(
-      (task) => storage.approvalRequests.findActiveByTaskId(task.id)?.status === 'WAITING_FOR_USER',
+      // attention の `approval_waiting` と同じ意味で数える（期限切れ WAITING は誰も待っていない）。
+      // status だけで数えると、attention には出ないのに「承認待ち N 件」と表示される（2026-10-16 監査 A2）。
+      (task) => findLiveWaitingApproval(storage, task.id, nowMs) !== undefined,
     ).length
     approvalsWaitingTotal += waitingForProject
 
@@ -537,8 +550,9 @@ export function buildSystemState(
       // 期限切れは「人の判断待ち」ではないので、ここでは出さない —— その Job は
       // `isWaitingOnLiveApproval()` が false を返すことで `job_blocked` 側に現れ、
       // 復旧経路は従来どおり残る。**行そのものは書き換えない**（lazy expiry を壊さない）。
-      const approval = storage.approvalRequests.findActiveByTaskId(task.id)
-      if (isLiveWaitingApproval(approval, nowMs)) {
+      // 最新の active 行ではなく、実際に live な WAITING 行を referenceId に使う。
+      const approval = findLiveWaitingApproval(storage, task.id, nowMs)
+      if (approval !== undefined) {
         attention.push({
           kind: 'approval_waiting',
           projectId: project.id,

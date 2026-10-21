@@ -969,7 +969,9 @@ export async function pollJobs(): Promise<never> {
         // 対象 Job は所有権を保持しているので、どのみち `fetchQueuedJob()` は何も返さない。
         // 先に観測を報告して所有権を解放できるようにしておく。
         const reported = await reportAbortCleanupObservations()
-        if (reported) {
+        // 「何も扱わなかった」と「technical cleanup の報告が配送待ち」を区別する。配送待ちの間は
+        // queued Job を取らない（観測と再送の間に別 Job が workspace を変えないように）。
+        if (reported || hasPendingAbortCleanupSubmissions()) {
           await sleep(POLL_INTERVAL_MS)
           continue
         }
@@ -1013,19 +1015,251 @@ export async function pollJobs(): Promise<never> {
  * transaction 内で project の live Job 不在を再確認する。**新しい lock は足していない。**
  * 成功後は Task が pending / roadmapActive=false になるので、次の poll から通常どおり進める。
  */
+/**
+ * **Technical Abort cleanup の報告を、同じ証拠のまま再送するための保留。**（process 内・bounded）
+ *
+ * dirty な technical cleanup では Worker 自身が revert で workspace を変える。報告が再試行可能な理由
+ * （API の STORAGE_BUSY / 5xx / 通信失敗）で届かなかったとき、次の poll で観測し直すと、clean になった
+ * workspace が永続化済みの dirty な end fingerprint と一致せず PRE_CLEANUP_BASELINE_MISMATCH →
+ * quarantine になる（Codex review ba0cdae）。そこで同じ carrier + cleanup generation に対しては
+ * 保留中の payload（pre-cleanup 観測・post-cleanup 観測・cleanup summary）を**そのまま**再送し、
+ * 保留がある間は観測も cleanup もやり直さない。
+ *
+ * 既存の Outbox（data/outbox.db）は JobUpdate を `PATCH /api/jobs/:id` へ eventId / payloadHash 付きで
+ * 送る専用の表で、job_id が主キーかつ未配送行があると Job intake を止める。abort-cleanup-result を
+ * 載せるには表と再送経路を足す必要があり新しい仕組みになるため、ここは in-process に留める。
+ * **残余: Worker process が再起動すると保留は失われ、次の観測で上記の mismatch になりうる。**
+ */
+interface PendingAbortCleanupSubmission {
+  generationKey: string
+  body: string
+  attempts: number
+  /** sweep 用: どの Task / Project の列挙で carrier を確かめられるか。 */
+  taskId: string
+  projectId: string
+}
+
+const MAX_ABORT_CLEANUP_RESUBMISSIONS = 20
+const pendingAbortCleanupSubmissions = new Map<string, PendingAbortCleanupSubmission>()
+
+/** テスト用: 保留中の再送を全て捨てる。 */
+export function clearPendingAbortCleanupSubmissions(): void {
+  pendingAbortCleanupSubmissions.clear()
+}
+
+/**
+ * technical cleanup の報告が配送待ちか。pollJobs() はこの間 queued Job を取らない（Codex review cf8a33e）:
+ * clean な terminal carrier は所有者として数えられないため、観測と再送の間に別 Job が同じ workspace で
+ * 走ると、再送する証拠が古くなり拒否→quarantine になりうる。受理・確定拒否・取り消し・上限到達で解ける。
+ */
+export function hasPendingAbortCleanupSubmissions(): boolean {
+  return pendingAbortCleanupSubmissions.size > 0
+}
+
+/** テスト用: 保留中の carrier Job id。 */
+export function pendingAbortCleanupSubmissionJobIds(): string[] {
+  return [...pendingAbortCleanupSubmissions.keys()]
+}
+
+/** この poll で API から**確かに**読めた事実。読めなかった範囲の保留は消さない（fail closed）。 */
+interface AbortCleanupEnumeration {
+  projectStatuses?: Map<string, string>
+  taskIdsByProject: Map<string, Set<string>>
+  jobsFetchedForTask: Set<string>
+  liveGenerations: Map<string, string>
+  /** この poll の列挙経路で既に再送した（または破棄した）保留。独立再送で二重に送らない。 */
+  handledPending: Set<string>
+}
+
+/**
+ * generation が消えた保留を捨てる（marker 除去・project 停止・commit 済みで応答だけ失われた等）。
+ * 消すのは、その carrier を含む範囲を API から読めたうえで、同じ generation の要求が見当たらないときだけ。
+ * 列挙に失敗した範囲の保留は残し、intake も止めたままにする。
+ */
+function sweepPendingAbortCleanupSubmissions(seen: AbortCleanupEnumeration): void {
+  for (const [jobId, entry] of pendingAbortCleanupSubmissions) {
+    const projectStatus = seen.projectStatuses?.get(entry.projectId)
+    const projectGone = seen.projectStatuses !== undefined
+      && (projectStatus === undefined || projectStatus !== 'running')
+    const taskIds = seen.taskIdsByProject.get(entry.projectId)
+    const taskGone = taskIds !== undefined && !taskIds.has(entry.taskId)
+    const generationGone = seen.jobsFetchedForTask.has(entry.taskId)
+      && seen.liveGenerations.get(jobId) !== entry.generationKey
+    if (projectGone || taskGone || generationGone) {
+      pendingAbortCleanupSubmissions.delete(jobId)
+      console.warn(`[Worker] Job ${jobId} の abort cleanup 保留を破棄します（API にその generation の要求がありません）`)
+    }
+  }
+}
+
+function abortCleanupGenerationKey(job: Job): string {
+  const metadata = job.failureMetadata
+  return [
+    job.id,
+    metadata?.abortCleanupRequestedAt ?? '',
+    metadata?.abortTechnicalEvidenceId ?? '',
+    metadata?.abortTechnicalStateFingerprint ?? '',
+  ].join('|')
+}
+
+type AbortCleanupSubmissionOutcome =
+  | { kind: 'accepted' }
+  | { kind: 'refused'; status: number }
+  | { kind: 'retryable'; status?: number; reason: string }
+
+/**
+ * abort-cleanup-result を1回送る。STORAGE_BUSY（別 connection との lock 競合）・5xx・通信失敗は
+ * 再試行可能、それ以外の非 2xx は API の判定（再送しない）として返す。
+ */
+async function submitAbortCleanupResult(jobId: string, body: string): Promise<AbortCleanupSubmissionOutcome> {
+  let response: Response
+  try {
+    response = await fetch(
+      `${API_BASE}/api/jobs/${encodeURIComponent(jobId)}/abort-cleanup-result`,
+      {
+        method: 'POST',
+        headers: { ...buildApiAuthHeaders(), 'Content-Type': 'application/json' },
+        body,
+      },
+    )
+  } catch (err: unknown) {
+    return { kind: 'retryable', reason: formatUnknownError(err) }
+  }
+  if (response.ok) return { kind: 'accepted' }
+  if (response.status >= 500) {
+    return { kind: 'retryable', status: response.status, reason: `HTTP ${response.status}` }
+  }
+  let code: unknown
+  try {
+    code = ((await response.json()) as { code?: unknown } | null)?.code
+  } catch {
+    code = undefined
+  }
+  if (response.status === 409 && code === 'STORAGE_BUSY') {
+    return { kind: 'retryable', status: response.status, reason: 'STORAGE_BUSY' }
+  }
+  return { kind: 'refused', status: response.status }
+}
+
+/** 再試行可能な失敗を保留へ積む（technical cleanup のときだけ）。上限に達したら諦めて警告する。 */
+async function keepPendingAbortCleanupSubmission(
+  carrier: Pick<Job, 'id' | 'taskId' | 'projectId'>,
+  generationKey: string,
+  body: string,
+  previousAttempts: number,
+  reason: string,
+): Promise<void> {
+  const jobId = carrier.id
+  const attempts = previousAttempts + 1
+  if (attempts >= MAX_ABORT_CLEANUP_RESUBMISSIONS) {
+    pendingAbortCleanupSubmissions.delete(jobId)
+    console.warn(
+      `[Worker] Job ${jobId} の abort cleanup 報告を ${attempts} 回送っても届きませんでした（${reason}）。`
+      + '保留を破棄します（次の観測は永続化済み fingerprint と一致しない可能性があります）',
+    )
+    // 黙って諦めない: 保留の破棄で intake が再開し、次の観測は mismatch → quarantine になりうるので
+    // 既存の notifier で一度だけ CEO へ知らせる（Codex review 44ddd0f）。
+    await notifyAbortCleanupDeliveryAbandoned(jobId, attempts, reason)
+    return
+  }
+  pendingAbortCleanupSubmissions.set(jobId, {
+    generationKey, body, attempts, taskId: carrier.taskId, projectId: carrier.projectId,
+  })
+  console.warn(
+    `[Worker] Job ${jobId} の abort cleanup 報告は再試行可能な理由で届きませんでした（${reason}）。`
+    + '次の poll で同じ観測・summary をそのまま再送します',
+  )
+}
+
+async function notifyAbortCleanupDeliveryAbandoned(jobId: string, attempts: number, reason: string): Promise<void> {
+  try {
+    await sendAlert({
+      severity: 'critical',
+      title: 'Technical Abort cleanup report could not be delivered',
+      body:
+        `The Worker could not deliver the Technical Abort cleanup report for Job ${jobId} after ${attempts} attempts `
+        + `(${reason}). The pending report was dropped and Job intake resumes; the next observation may not match `
+        + 'the persisted workspace fingerprint, which quarantines the carrier.',
+      sourceType: 'job_persistence',
+      sourceId: `abort_cleanup:${jobId}`,
+    })
+  } catch (err: unknown) {
+    console.error(`[Worker] CRITICAL通知エラー: ${formatUnknownError(err)}`)
+  }
+}
+
+/**
+ * discovery（projects / tasks / jobs の列挙）で扱えなかった保留を、列挙と独立に再送する。
+ *
+ * 列挙が失敗し続けると保留は再送されず、上限も進まず、sweep も（fail closed で）消さないので、
+ * intake が黙って止まり続ける（Codex review 44ddd0f）。ここで毎 poll 必ず1回送り、受理・確定拒否・
+ * 取り消し（API が generation を確かめて NOT_REQUESTED 等を返す）で消し、再試行可能な失敗は上限へ数える。
+ */
+async function resubmitUnhandledPendingAbortCleanups(handled: ReadonlySet<string>): Promise<boolean> {
+  let accepted = false
+  for (const [jobId, entry] of [...pendingAbortCleanupSubmissions]) {
+    if (handled.has(jobId)) continue
+    const resent = await submitAbortCleanupResult(jobId, entry.body)
+    if (resent.kind === 'accepted') {
+      pendingAbortCleanupSubmissions.delete(jobId)
+      accepted = true
+      continue
+    }
+    if (resent.kind === 'refused') {
+      pendingAbortCleanupSubmissions.delete(jobId)
+      console.warn(`[Worker] Job ${jobId} の abort cleanup（再送）は成立しませんでした: HTTP ${resent.status}`)
+      continue
+    }
+    await keepPendingAbortCleanupSubmission(
+      { id: jobId, taskId: entry.taskId, projectId: entry.projectId },
+      entry.generationKey,
+      entry.body,
+      entry.attempts,
+      resent.reason,
+    )
+  }
+  return accepted
+}
+
 export async function reportAbortCleanupObservations(): Promise<boolean> {
+  const seen: AbortCleanupEnumeration = {
+    taskIdsByProject: new Map(),
+    jobsFetchedForTask: new Set(),
+    liveGenerations: new Map(),
+    handledPending: new Set(),
+  }
+  let reported = false
+  try {
+    reported = await reportAbortCleanupObservationsOnce(seen)
+    // sweep は列挙が例外なく終わったときだけ（例外で途切れた列挙は authoritative とみなさず保留を残す）。
+    sweepPendingAbortCleanupSubmissions(seen)
+  } catch (err: unknown) {
+    // fetchJson() は通信失敗や JSON 破損で throw する。ここで poll を抜けると独立再送に届かず、上限も
+    // 進まず intake が黙って止まり続ける（Codex review 57f2cf6）。列挙の失敗として扱い、再送は続ける。
+    console.warn(`[Worker] abort cleanup の列挙に失敗しました（保留は残します）: ${formatUnknownError(err)}`)
+  }
+  // 新しい cleanup が受理された poll でも、列挙で扱わなかった保留を必ず再送する。受理が続くと
+  // 別 generation の保留が再送されず上限も進まないまま intake が止まり続けるため（Codex review 35a1784）。
+  const resubmitted = await resubmitUnhandledPendingAbortCleanups(seen.handledPending)
+  return reported || resubmitted
+}
+
+async function reportAbortCleanupObservationsOnce(seen: AbortCleanupEnumeration): Promise<boolean> {
   const projects = await fetchJson<Project[]>('/api/projects')
   if (!projects) return false
+  seen.projectStatuses = new Map(projects.map((project) => [project.id, project.status]))
 
   for (const project of projects) {
     if (project.status !== 'running') continue
 
     const tasks = await fetchJson<Task[]>(`/api/tasks?projectId=${encodeURIComponent(project.id)}`)
     if (!tasks) continue
+    seen.taskIdsByProject.set(project.id, new Set(tasks.map((task) => task.id)))
 
     for (const task of tasks) {
       const jobs = await fetchJson<Job[]>(`/api/jobs?taskId=${encodeURIComponent(task.id)}`)
       if (!jobs) continue
+      seen.jobsFetchedForTask.add(task.id)
 
       // `/api/jobs` は storage と同じ created_at DESC, rowid DESC。terminal-blocked 形では
       // 最新 Job だけを候補にし、resume 後の古い mark を報告しない。
@@ -1046,6 +1280,33 @@ export async function reportAbortCleanupObservations(): Promise<boolean> {
           && job.failureMetadata?.abortCleanupRequestedAt !== undefined
         ))
       if (!requested) continue
+      seen.liveGenerations.set(requested.id, abortCleanupGenerationKey(requested))
+
+      // 同じ carrier + generation の保留があれば、観測も cleanup もやり直さず同じ payload を再送する。
+      const generationKey = abortCleanupGenerationKey(requested)
+      const pending = pendingAbortCleanupSubmissions.get(requested.id)
+      if (pending !== undefined) seen.handledPending.add(requested.id)
+      if (pending !== undefined && pending.generationKey !== generationKey) {
+        // API が generation を取り消した / 作り直した。古い証拠は使わない。
+        pendingAbortCleanupSubmissions.delete(requested.id)
+      } else if (pending !== undefined) {
+        const resent = await submitAbortCleanupResult(requested.id, pending.body)
+        if (resent.kind === 'accepted') {
+          pendingAbortCleanupSubmissions.delete(requested.id)
+          return true
+        }
+        if (resent.kind === 'refused') {
+          // API の判定（HUMAN_DECISION_CONFLICT / CLEANUP_SUPERSEDED 等）。再送をやめる。
+          pendingAbortCleanupSubmissions.delete(requested.id)
+          console.warn(
+            `[Worker] Job ${requested.id} の abort cleanup（再送）は成立しませんでした: HTTP ${resent.status}`,
+          )
+          continue
+        }
+        await keepPendingAbortCleanupSubmission(requested, generationKey, pending.body, pending.attempts, resent.reason)
+        if (resent.status === undefined) return false
+        continue
+      }
 
       const observed = observeWorkspace(requested.safeCommand.workingDir)
       if (!observed.observation) {
@@ -1077,7 +1338,7 @@ export async function reportAbortCleanupObservations(): Promise<boolean> {
           || baseline === undefined
           || !workspaceObservationMatchesBaseline(baseline, observed.observation)
         ) {
-          await reportAbortCleanupRefusal(requested.id, 'PRE_CLEANUP_BASELINE_MISMATCH')
+          await reportAbortCleanupRefusal(requested, 'PRE_CLEANUP_BASELINE_MISMATCH')
           continue
         }
         if (baseline.mode === 'dirty') {
@@ -1096,11 +1357,11 @@ export async function reportAbortCleanupObservations(): Promise<boolean> {
               [],
             )
           } catch {
-            await reportAbortCleanupRefusal(requested.id, 'CLEANUP_EXECUTION_FAILED')
+            await reportAbortCleanupRefusal(requested, 'CLEANUP_EXECUTION_FAILED')
             continue
           }
           if (cleanupWarning !== undefined) {
-            await reportAbortCleanupRefusal(requested.id, 'CLEANUP_INCOMPLETE')
+            await reportAbortCleanupRefusal(requested, 'CLEANUP_INCOMPLETE')
             continue
           }
         } else {
@@ -1118,7 +1379,7 @@ export async function reportAbortCleanupObservations(): Promise<boolean> {
           || !afterCleanup.knownGood.headValid
           || !afterCleanup.knownGood.blindSpotsAbsent
         ) {
-          await reportAbortCleanupRefusal(requested.id, 'POST_CLEANUP_NOT_CLEAN_AT_HEAD')
+          await reportAbortCleanupRefusal(requested, 'POST_CLEANUP_NOT_CLEAN_AT_HEAD')
           continue
         }
         finalObservation = afterCleanup.observation
@@ -1126,39 +1387,42 @@ export async function reportAbortCleanupObservations(): Promise<boolean> {
       }
 
       console.log(`[Worker] Job ${requested.id} の workspace を観測し、abort cleanup 結果を報告します`)
-      try {
-        const response = await fetch(
-          `${API_BASE}/api/jobs/${encodeURIComponent(requested.id)}/abort-cleanup-result`,
-          {
-            method: 'POST',
-            headers: { ...buildApiAuthHeaders(), 'Content-Type': 'application/json' },
-            // 観測と一緒に採った構造的事実も送る。**判定は API が行う。**
-            // Worker 側で「安全だ」と判断して送る材料を絞ると、API は
-            // 進行中の git 操作や観測に出ない変更を見られなくなる。
-            body: JSON.stringify({
-              observation: finalObservation,
-              knownGood: finalKnownGood,
-              ...(technicalCleanup
-                ? {
-                    preCleanupObservation: observed.observation,
-                    cleanupSummary,
-                  }
-                : {}),
-            }),
-          },
-        )
-        if (!response.ok) {
-          // 不一致なら API が fail-closed で拒否する。所有権は保持されたままで、これは正常な結果。
-          console.warn(
-            `[Worker] Job ${requested.id} の abort cleanup は成立しませんでした: HTTP ${response.status}`,
-          )
-          // 成立しなかった poll では intake を飛ばさない。403（allowlist 漏れ等）や
-          // 恒久的な不一致が続いても、Worker 全体は止まらない。
-          continue
+      // 観測と一緒に採った構造的事実も送る。**判定は API が行う。**
+      // Worker 側で「安全だ」と判断して送る材料を絞ると、API は
+      // 進行中の git 操作や観測に出ない変更を見られなくなる。
+      const body = JSON.stringify({
+        observation: finalObservation,
+        knownGood: finalKnownGood,
+        ...(technicalCleanup
+          ? {
+              preCleanupObservation: observed.observation,
+              cleanupSummary,
+              // この証拠がどの cleanup generation のものか。API は carrier の現在の marker と一致しない
+              // 報告（取り消し後に新しい generation が出た後の古い証拠の再送）を GENERATION_MISMATCH で拒否する。
+              cleanupGeneration: technicalCleanupGenerationOf(requested),
+            }
+          : {}),
+      })
+      const submitted = await submitAbortCleanupResult(requested.id, body)
+      if (submitted.kind === 'retryable') {
+        if (technicalCleanup) {
+          // technical cleanup は workspace を変えているので、同じ証拠で再送する（観測し直さない）。
+          seen.handledPending.add(requested.id)
+          await keepPendingAbortCleanupSubmission(requested, generationKey, body, 0, submitted.reason)
+        } else {
+          console.warn(`[Worker] abort cleanup 報告エラー: ${submitted.reason}`)
         }
-      } catch (err: unknown) {
-        console.warn(`[Worker] abort cleanup 報告エラー: ${formatUnknownError(err)}`)
-        return false
+        if (submitted.status === undefined) return false
+        continue
+      }
+      if (submitted.kind === 'refused') {
+        // 不一致なら API が fail-closed で拒否する。所有権は保持されたままで、これは正常な結果。
+        console.warn(
+          `[Worker] Job ${requested.id} の abort cleanup は成立しませんでした: HTTP ${submitted.status}`,
+        )
+        // 成立しなかった poll では intake を飛ばさない。403（allowlist 漏れ等）や
+        // 恒久的な不一致が続いても、Worker 全体は止まらない。
+        continue
       }
       return true
     }
@@ -1173,15 +1437,30 @@ type AbortCleanupRefusalCode =
   | 'CLEANUP_INCOMPLETE'
   | 'POST_CLEANUP_NOT_CLEAN_AT_HEAD'
 
+/** carrier の現在の technical cleanup generation（報告・拒否がどの generation のものかを名指す）。 */
+function technicalCleanupGenerationOf(job: Job): {
+  abortCleanupRequestedAt: string | undefined
+  abortTechnicalEvidenceId: string | undefined
+  abortTechnicalStateFingerprint: string | undefined
+} {
+  return {
+    abortCleanupRequestedAt: job.failureMetadata?.abortCleanupRequestedAt,
+    abortTechnicalEvidenceId: job.failureMetadata?.abortTechnicalEvidenceId,
+    abortTechnicalStateFingerprint: job.failureMetadata?.abortTechnicalStateFingerprint,
+  }
+}
+
 async function reportAbortCleanupRefusal(
-  jobId: string,
+  carrier: Job,
   refusalCode: AbortCleanupRefusalCode,
 ): Promise<void> {
   try {
-    await fetch(`${API_BASE}/api/jobs/${encodeURIComponent(jobId)}/abort-cleanup-result`, {
+    await fetch(`${API_BASE}/api/jobs/${encodeURIComponent(carrier.id)}/abort-cleanup-result`, {
       method: 'POST',
       headers: { ...buildApiAuthHeaders(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ refusalCode }),
+      // 拒否もどの generation のものかを名指す。API は carrier の現在の marker と一致しない（遅れて届いた
+      // 古い generation の）拒否を GENERATION_MISMATCH で捨て、新しい generation を退役させない。
+      body: JSON.stringify({ refusalCode, cleanupGeneration: technicalCleanupGenerationOf(carrier) }),
     })
   } catch (err: unknown) {
     // refusal の delivery 失敗は黙らせない。request marker は残るので次 poll でも再試行される。

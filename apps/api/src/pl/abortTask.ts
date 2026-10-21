@@ -51,6 +51,7 @@ import {
   getBaseRoadmapId,
   holdsWorkspaceWhenBlocked,
   isLiveJob,
+  isLiveWaitingApproval,
   isStaleBlockedJobCandidate,
   occupiesProject,
 } from '@ai-team/shared'
@@ -67,7 +68,9 @@ import {
   recordTechnicalAbortEvidence,
   recordTechnicalAbortRefusal,
   technicalAbortStateFingerprint,
+  technicalCleanupGenerationMatches,
   type AbortAuthorization,
+  type TechnicalAbortCleanupGeneration,
   type TechnicalAbortCleanupSummary,
 } from './technicalAbortEvidence'
 
@@ -389,7 +392,19 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
 
 export type CompleteAbortCleanupResult =
   | { ok: true; taskId: string; jobId: string }
-  | { ok: false; code: 'NOT_REQUESTED' | 'NOT_FOUND' | 'VERIFICATION_FAILED' | 'PRECONDITION_FAILED'; reason: string }
+  | {
+    ok: false
+    code:
+      | 'NOT_REQUESTED'
+      | 'NOT_FOUND'
+      | 'VERIFICATION_FAILED'
+      | 'PRECONDITION_FAILED'
+      | 'HUMAN_DECISION_CONFLICT'
+      | 'CLEANUP_SUPERSEDED'
+      | 'STORAGE_BUSY'
+      | 'GENERATION_MISMATCH'
+    reason: string
+  }
 
 function recordManualRejectedGitCommitRefusal(
   storage: IStorage,
@@ -456,6 +471,8 @@ export function completeAbortCleanup(
     /** technical cleanup が deletion 前に観測した exact dirty/clean baseline。 */
     preCleanupObservation?: JobWorkspaceBaseline
     cleanupSummary?: TechnicalAbortCleanupSummary
+    /** technical cleanup の報告で必須: 報告が名指す cleanup generation。 */
+    cleanupGeneration?: TechnicalAbortCleanupGeneration
     /** Worker が cleanup 前に拒否した場合。API は refusal audit だけを残し、状態を変えない。 */
     refusalCode?: string
   },
@@ -503,15 +520,27 @@ export function completeAbortCleanup(
       reason: `job ${input.jobId}'s abort cleanup request has no verifiable authorization`,
     }
   }
+  // 古い generation の報告（取り消し後に同じ carrier へ新しい technical request が出た後の再送や、
+  // 遅れて届いた拒否）は現在の generation のものとして扱わない。cleanup の失敗ではないので
+  // quarantine も refusal 記録もせず、現在の generation はそのまま残す。結果の報告だけでなく
+  // Worker の拒否（refusalCode）も対象: 古い拒否が新しい generation を退役・quarantine させない
+  // （Codex review 57f2cf6）。退役させる書き込み自体も storage で同じ一致を atomic に再確認する。
+  if (
+    authorization.kind === 'technical_evidence'
+    && !technicalCleanupGenerationMatches(metadata, input.cleanupGeneration)
+  ) {
+    return generationMismatch(input.jobId)
+  }
   if (input.refusalCode !== undefined) {
     if (authorization.kind === 'technical_evidence') {
+      const retired = retireTechnicalAbortCleanupForGeneration(storage, job, input.cleanupGeneration, input.refusalCode)
+      if (!retired) return generationMismatch(input.jobId)
       recordTechnicalAbortRefusal(storage, {
         taskId: job.taskId,
         evidenceId: authorization.evidenceId,
         code: input.refusalCode,
         stage: 'worker_cleanup',
       })
-      retireTechnicalAbortCleanup(storage, job, input.refusalCode)
     } else {
       recordManualRejectedGitCommitRefusal(storage, job, input.refusalCode)
     }
@@ -519,13 +548,14 @@ export function completeAbortCleanup(
   }
   if (input.observation === undefined) {
     if (authorization.kind === 'technical_evidence') {
+      const retired = retireTechnicalAbortCleanupForGeneration(storage, job, input.cleanupGeneration, 'FINAL_OBSERVATION_MISSING')
+      if (!retired) return generationMismatch(input.jobId)
       recordTechnicalAbortRefusal(storage, {
         taskId: job.taskId,
         evidenceId: authorization.evidenceId,
         code: 'FINAL_OBSERVATION_MISSING',
         stage: 'worker_cleanup',
       })
-      retireTechnicalAbortCleanup(storage, job, 'FINAL_OBSERVATION_MISSING')
     } else {
       recordManualRejectedGitCommitRefusal(storage, job, 'FINAL_OBSERVATION_MISSING')
     }
@@ -546,19 +576,47 @@ export function completeAbortCleanup(
       ? { preCleanupObservation: input.preCleanupObservation }
       : {}),
     ...(input.cleanupSummary !== undefined ? { cleanupSummary: input.cleanupSummary } : {}),
+    ...(input.cleanupGeneration !== undefined ? { cleanupGeneration: input.cleanupGeneration } : {}),
   }
   const released = task?.status === 'blocked'
     ? storage.jobs.parkBlockedTaskWithTerminalJobs(releaseInput)
     : storage.jobs.releaseBlockedJobAndParkTask(releaseInput)
   if (!released.ok) {
+    if (released.code === 'GENERATION_MISMATCH') {
+      // transaction 内で generation が変わっていた。何も変えていない（quarantine しない）。
+      return { ok: false, code: 'GENERATION_MISMATCH', reason: released.reason }
+    }
+    if (released.code === 'STORAGE_BUSY') {
+      // 別 connection の write（人の承認・後続 Job など）と lock 競合しただけで、transaction は何も変えていない。
+      // 再試行可能なので cleanup generation はそのまま残し、quarantine も refusal 記録もしない
+      // （Codex review 527668d: 競合した人の判断が quarantine を引き起こさないように）。
+      return { ok: false, code: 'STORAGE_BUSY', reason: released.reason }
+    }
+    if (released.code === 'HUMAN_DECISION_CONFLICT' || released.code === 'CLEANUP_SUPERSEDED') {
+      // 人の判断（live WAITING / APPROVED / 後から CONSUMED）または後続の Job が先にある。cleanup 自体の
+      // 失敗ではないので retireTechnicalAbortCleanup() で carrier を quarantine しない —— quarantine すると
+      // その判断に続く人の abort / resume / repair まで塞ぐ（Codex review cb1f2db / 84fe348）。
+      // この cleanup generation は storage が同じ transaction で取り消し済み（再送は NOT_REQUESTED）。
+      // ここでは拒否の事実だけを audit に残す。
+      if (authorization.kind === 'technical_evidence') {
+        recordTechnicalAbortRefusal(storage, {
+          taskId: job.taskId,
+          evidenceId: authorization.evidenceId,
+          code: released.code,
+          stage: 'final_transaction',
+        })
+      }
+      return { ok: false, code: released.code, reason: released.reason }
+    }
     if (authorization.kind === 'technical_evidence') {
+      const retired = retireTechnicalAbortCleanupForGeneration(storage, job, input.cleanupGeneration, released.code)
+      if (!retired) return generationMismatch(input.jobId)
       recordTechnicalAbortRefusal(storage, {
         taskId: job.taskId,
         evidenceId: authorization.evidenceId,
         code: released.code,
         stage: 'final_transaction',
       })
-      retireTechnicalAbortCleanup(storage, job, released.code)
     } else {
       recordManualRejectedGitCommitRefusal(storage, job, released.code)
     }
@@ -570,6 +628,32 @@ export function completeAbortCleanup(
   }
 
   return { ok: true, taskId: job.taskId, jobId: job.id }
+}
+
+function generationMismatch(jobId: string): CompleteAbortCleanupResult {
+  return {
+    ok: false,
+    code: 'GENERATION_MISMATCH',
+    reason: `job ${jobId}'s report names a different technical cleanup generation`,
+  }
+}
+
+/**
+ * completeAbortCleanup() の退役（marker 削除 + quarantine）。報告の generation が carrier の現在の
+ * marker と一致するときだけ、storage の単一 transaction で書く。一致しなければ false（何も変えない）。
+ */
+function retireTechnicalAbortCleanupForGeneration(
+  storage: IStorage,
+  job: Job,
+  generation: TechnicalAbortCleanupGeneration | undefined,
+  refusalCode: string,
+): boolean {
+  if (generation === undefined) return false
+  return storage.jobs.retireTechnicalAbortCleanupForGeneration({
+    jobId: job.id,
+    generation,
+    quarantineReason: `technical abort cleanup refused (${refusalCode})`,
+  })
 }
 
 function retireTechnicalAbortCleanup(storage: IStorage, job: Job, refusalCode: string): void {
@@ -717,7 +801,13 @@ export function requestTechnicalAbort(
       reason: `Worker does not service ${task.status} Task + ${latestJob.status} Job cleanup carriers`,
     }
   }
-  const activeApproval = storage.approvalRequests.findActiveByTaskId(task.id)
+  // 止めるのは「人の判断が生きている」request だけ: 期限内の WAITING（判断待ち）と APPROVED
+  // （下された人の判断。技術的 cleanup で上書きしない）。期限切れ WAITING は誰も待っておらず
+  // 承認もできないので、ここで拒否すると Technical Abort が恒久的に塞がる（2026-10-16 監査 A2）。
+  // 期限解釈は shared `isLiveWaitingApproval` に一本化する。最新1件ではなく全行を見るのは、
+  // 新しい期限切れ WAITING の陰に古い APPROVED が残る legacy 状態でも人の判断を見落とさないため。
+  const activeApproval = storage.approvalRequests.findByTaskId(task.id)
+    .find((request) => request.status === 'APPROVED' || isLiveWaitingApproval(request))
   if (activeApproval !== undefined) {
     recordTechnicalAbortRefusal(storage, {
       taskId: task.id,
