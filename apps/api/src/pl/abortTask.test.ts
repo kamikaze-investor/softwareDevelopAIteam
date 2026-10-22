@@ -3119,8 +3119,9 @@ describe('abortTask — manual abort after an operator revert to the bound start
     storage: IStorage,
     projectStatus: 'draft' | 'paused' | 'archived',
     taskStatus: 'pending' | 'blocked' | 'in_progress' | 'done',
-    jobStatus: 'queued' | 'blocked' | 'failed',
+    jobStatus: 'queued' | 'running' | 'blocked' | 'failed',
     roadmapActive = true,
+    quarantined = false,
   ): void {
     // archive は live Job / blocked 所有者があると拒否されるので、Production の legacy 行と同じ形を
     // 最初からその status の Project として作る。
@@ -3135,6 +3136,7 @@ describe('abortTask — manual abort after an operator revert to the bound start
       taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status: jobStatus,
       safeCommand: { kind: 'test', workingDir: '/workspace/target' }, workspaceBaseline: BASELINE,
       workflowStepKey: `repair:${task.id}:1`,
+      ...(quarantined ? { failureMetadata: { quarantined: true, quarantineReason: 'legacy' } } : {}),
     } as Parameters<IStorage['jobs']['create']>[0])
   }
 
@@ -3245,13 +3247,115 @@ describe('abortTask — manual abort after an operator revert to the bound start
     expect(fx.storage.approvalRequests.findById(approvalRequestId)?.status).toBe('APPROVED')
   })
 
-  it('Technical Abort is unchanged: archived-Project leftovers on the workspace still block its park', () => {
+  /**
+   * Production の取り残しと同じく、この Task の Job より前の時刻で作る。同じミリ秒に作ると Technical Abort の
+   * 履歴窓（clean baseline〜carrier の間に別 Task が workspace を使ったか。所有者判定とは別の証明）に入る。
+   */
+  function backdated(seedRows: () => void): void {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(Date.now() - 60_000)
+    try {
+      seedRows()
+    } finally {
+      vi.useRealTimers()
+    }
+  }
+
+  /** Production の archived 取り残し: 3 queued + blocked 行（全て同じ workingDir）。 */
+  function seedProductionArchivedLeftovers(storage: IStorage): void {
+    backdated(() => {
+      seedOtherProjectUser(storage, 'archived', 'pending', 'queued')
+      seedOtherProjectUser(storage, 'archived', 'pending', 'queued')
+      seedOtherProjectUser(storage, 'archived', 'in_progress', 'queued')
+      seedOtherProjectUser(storage, 'archived', 'blocked', 'blocked')
+      seedOtherProjectUser(storage, 'archived', 'blocked', 'blocked')
+    })
+  }
+
+  /** requestTechnical() と同じ要求。結果をそのまま返す（stage 1 の拒否を見るため）。 */
+  function requestTechnicalRaw(fx: ReturnType<typeof seedTechnicalAbort>): ReturnType<typeof requestTechnicalAbort> {
+    const attention = buildSystemState(fx.storage).attention.find((item) => item.taskId === fx.taskId)
+    if (attention === undefined) throw new Error('technical attention missing')
+    return requestTechnicalAbort(fx.storage, { taskId: fx.taskId, attention, readLedger: () => TECHNICAL_LEDGER })
+  }
+
+  it('Technical Abort: the Production archived-leftover shape (3 queued + blocked rows) no longer blocks request or park', () => {
     const fx = seedTechnicalAbort()
-    requestTechnical(fx)
-    seedOtherProjectUser(fx.storage, 'archived', 'pending', 'queued')
-    expect(finishTechnical(fx)).toMatchObject({ ok: false })
-    expect(fx.storage.tasks.findById(fx.taskId)?.roadmapActive).toBe(true)
-    expect(fx.storage.tasks.isParked(fx.taskId)).toBe(false)
+    seedProductionArchivedLeftovers(fx.storage)
+    const requested = requestTechnicalRaw(fx)
+    expect(requested, JSON.stringify(requested)).toMatchObject({ ok: true, status: 'cleanup_requested' })
+    // Rows that appear in archived Projects between the request and the report do not block the final transaction.
+    seedOtherProjectUser(fx.storage, 'archived', 'pending', 'running')
+    expect(finishTechnical(fx)).toMatchObject({ ok: true })
+    expect(fx.storage.tasks.findById(fx.taskId)).toMatchObject({ status: 'pending', roadmapActive: false })
+  })
+
+  it.each([
+    ['a queued repair Job in a paused Project', 'paused', 'pending', 'queued'],
+    ['a running Job in a draft Project', 'draft', 'pending', 'running'],
+    ['a workspace-owning blocked row in a paused Project', 'paused', 'blocked', 'blocked'],
+  ] as const)('Technical Abort: a live (non-archived) user still blocks — %s', (_label, projectStatus, taskStatus, jobStatus) => {
+    // Stage 1 (technicalOwnershipFailure).
+    const early = seedTechnicalAbort()
+    backdated(() => seedOtherProjectUser(early.storage, projectStatus, taskStatus, jobStatus, false))
+    const refused = requestTechnicalRaw(early)
+    expect(refused).toMatchObject({ ok: false, code: 'OWNERSHIP_UNPROVEN' })
+    expect(refused.ok ? '' : refused.reason).toContain('currently owns or uses /workspace/target')
+    expect(early.storage.tasks.isParked(early.taskId)).toBe(false)
+
+    // Final transaction (findWorkspaceUserAnywhere), when the user appears after the request.
+    const late = seedTechnicalAbort()
+    requestTechnical(late)
+    seedOtherProjectUser(late.storage, projectStatus, taskStatus, jobStatus, false)
+    const result = finishTechnical(late)
+    expect(result).toMatchObject({ ok: false })
+    expect(result.ok ? '' : result.reason).toContain('owns or uses /workspace/target')
+    expect(late.storage.tasks.isParked(late.taskId)).toBe(false)
+  })
+
+  /**
+   * quarantine は claim guard と同じ扱い: claim guard（jobs.update queued→running の choke point）は別 Task の
+   * quarantine blocked 行を所有者と数えるが、archived Project の行は見ない。abort の park（manual pending /
+   * manual blocked / Technical）も同じ結果になることを、同じ行で claim と並べて確かめる。
+   */
+  it.each([
+    ['paused', true],
+    ['archived', false],
+  ] as const)('quarantined blocked row of a done Task in a %s Project: claim guard and every abort park agree (blocks=%s)', (projectStatus, blocks) => {
+    // Claim guard.
+    const claim = seed()
+    const claimJob = claim.storage.jobs.create({
+      taskId: claim.taskId, projectId: claim.projectId, agentRole: 'developer_ai', status: 'queued',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, workflowStepKey: `repair:${claim.taskId}:1`,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    seedOtherProjectUser(claim.storage, projectStatus, 'done', 'blocked', true, true)
+    claim.storage.jobs.update(claimJob.id, { status: 'running' })
+    expect(claim.storage.jobs.findById(claimJob.id)?.status === 'queued').toBe(blocks)
+
+    // Manual pending path.
+    const pending = seedDirtyPending()
+    seedOtherProjectUser(pending.storage, projectStatus, 'done', 'blocked', true, true)
+    expect(completeAbortCleanup(pending.storage, {
+      jobId: pending.jobId, observation: CLEAN_AT_START, knownGood: KNOWN_GOOD,
+    }).ok).toBe(!blocks)
+
+    // Manual blocked-terminal path.
+    const terminal = seedB8dShape()
+    seedOtherProjectUser(terminal.storage, projectStatus, 'done', 'blocked', true, true)
+    expect(completeAbortCleanup(terminal.storage, {
+      jobId: terminal.latestJobId, observation: CLEAN_AT_START, knownGood: KNOWN_GOOD,
+    }).ok).toBe(!blocks)
+
+    // Technical Abort: stage 1 and the final transaction.
+    const technical = seedTechnicalAbort()
+    backdated(() => seedOtherProjectUser(technical.storage, projectStatus, 'done', 'blocked', true, true))
+    const requested = requestTechnicalRaw(technical)
+    expect(requested.ok, JSON.stringify(requested)).toBe(!blocks)
+    if (!blocks) expect(finishTechnical(technical).ok).toBe(true)
+    const technicalLate = seedTechnicalAbort()
+    requestTechnical(technicalLate)
+    seedOtherProjectUser(technicalLate.storage, projectStatus, 'done', 'blocked', true, true)
+    expect(finishTechnical(technicalLate).ok).toBe(!blocks)
   })
 
   it('Technical Abort is unchanged: a clean pre-cleanup observation does not stand in for a dirty Task baseline', () => {

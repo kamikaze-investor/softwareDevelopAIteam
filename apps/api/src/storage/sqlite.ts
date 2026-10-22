@@ -1101,26 +1101,23 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   }
 
   /**
-   * Technical Abort は Project 境界を越えて同じ physical workspace の利用を拒否する。
+   * abort の park（manual / Technical とも）は Project 境界を越えて同じ physical workspace の利用を拒否する。
    *
-   * `excludeArchivedProjects` は manual abort（人の `abort_task`）の park が使う。claim guard の所有者述語
-   * （`anotherTaskHoldsWorkspace()`）と同じく archived Project の行を数えない。archived Project は Worker が
-   * claim せず（running Project だけを走査する）、archive は blocked 所有者・live Job があると拒否されるので、
-   * そこに残る queued / blocked 行は legacy の取り残しであって workspace を使っていない。数えると、Production の
-   * archived Project に残る行（全て同じ workingDir）が manual park を永久に塞ぐ。
-   * Technical Abort の呼び出しは引数を渡さず、従来どおり全 Project を数える（挙動は変えていない）。
+   * 範囲は claim guard の所有者述語（`anotherTaskHoldsWorkspace()`）と同じく **archived Project の行を数えない**
+   * （quarantine 行も含めて。claim guard も archived の行を見ない）。archived Project は Worker が claim せず
+   * （running Project だけを走査する）、archive は blocked 所有者・live Job があると拒否されるので、そこに残る
+   * queued / running / blocked 行は legacy の取り残しであって workspace を使っていない。数えると、Production の
+   * archived Project に残る行（全て同じ workingDir）が manual / Technical の park を永久に塞ぐ（Codex review P2）。
+   * Technical Abort の stage 1（`technicalOwnershipFailure()`）も同じ範囲を使う。
    */
   function findWorkspaceUserAnywhere(
     workingDir: string,
     excludeTaskId: string,
-    options: { excludeArchivedProjects?: boolean } = {},
   ): { job: Job; task: Task } | undefined {
-    const rows = (options.excludeArchivedProjects === true
-      ? db.prepare(
-          'SELECT j.* FROM jobs j JOIN tasks t ON t.id = j.task_id JOIN projects p ON p.id = t.project_id '
-          + "WHERE p.status != 'archived' ORDER BY j.created_at DESC, j.rowid DESC",
-        )
-      : db.prepare('SELECT * FROM jobs ORDER BY created_at DESC, rowid DESC')).all() as any[]
+    const rows = db.prepare(
+      'SELECT j.* FROM jobs j JOIN tasks t ON t.id = j.task_id JOIN projects p ON p.id = t.project_id '
+      + "WHERE p.status != 'archived' ORDER BY j.created_at DESC, j.rowid DESC",
+    ).all() as any[]
     for (const row of rows) {
       const job = deserializeJob(row)
       if (job.taskId === excludeTaskId || job.safeCommand?.workingDir !== workingDir) continue
@@ -4053,12 +4050,9 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           }
           {
             // 他 Project を含め、同じ workspace を使う別 Task が居れば park しない（approval_rules
-            // 「他 Project を含む workspace 所有者不在」）。manual は claim guard と同じく archived Project を数えない。
-            const workspaceUser = findWorkspaceUserAnywhere(
-              workingDir,
-              task.id,
-              technical ? {} : { excludeArchivedProjects: true },
-            )
+            // 「他 Project を含む workspace 所有者不在」）。manual / Technical とも claim guard と同じく
+            // archived Project を数えない（findWorkspaceUserAnywhere の注記）。
+            const workspaceUser = findWorkspaceUserAnywhere(workingDir, task.id)
             if (workspaceUser) {
               return {
                 ok: false as const,
@@ -4424,16 +4418,12 @@ export function createSQLiteStorage(dbPath: string): IStorage {
                 + 'refusing to park',
             }
           }
-          // 他 Project を含め、同じ workspace を使う別 Task が居れば park しない。Technical Abort は従来どおり
-          // 全 Project を数える。manual abort（rejected git_commit に限らず全て）は claim guard と同じく
-          // archived Project を数えない（findWorkspaceUserAnywhere の注記）。manual の clean 観測は、他 Task の
-          // 差分が operator の revert で消された後でも成立してしまうので、所有者不在をここで証明する。
+          // 他 Project を含め、同じ workspace を使う別 Task が居れば park しない（Technical Abort と manual abort
+          // の全て。rejected git_commit に限らない）。範囲は claim guard と同じく archived Project を数えない
+          // （findWorkspaceUserAnywhere の注記）。manual の clean 観測は、他 Task の差分が operator の revert で
+          // 消された後でも成立してしまうので、所有者不在をここで証明する。
           if (workingDir !== undefined) {
-            const workspaceUser = findWorkspaceUserAnywhere(
-              workingDir,
-              task.id,
-              input.authorization.kind === 'technical_evidence' ? {} : { excludeArchivedProjects: true },
-            )
+            const workspaceUser = findWorkspaceUserAnywhere(workingDir, task.id)
             if (workspaceUser) {
               return {
                 ok: false as const,
