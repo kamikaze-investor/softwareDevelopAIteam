@@ -34,7 +34,7 @@ pnpm --filter @ai-team/worker audit:gate
 - 1タスク = 1コミット
 - 大きいタスクは 1サブタスク = 1コミット
 - コミットメッセージ形式: `[task-xxx] 変更内容の要約`
-- mainブランチへ直接pushしない
+- masterブランチへ直接pushしない
 - 作業ブランチ: `ai/task-xxx`
 
 ## 実装ルール
@@ -112,11 +112,11 @@ CEO から中止の指示を受けた。該当箇所は `configured` 表記へ�
 
 ## 禁止事項
 
-- Control Repository (`apps/api/`, `apps/worker/`, `sandbox/`) の改変
+- Control Repository の改変、および Candidate 内でも編集してはならないものの改変（定義の正本: `AGENTS.md` §1-1）
 - `.env` / secret filesの読み書き
 - secret の値・長さ・形式を AI 出力へ載せること（上記参照）
 - `sudo`, `rm -rf /`, `curl | sh` などの危険コマンド
-- mainへの直接push
+- masterへの直接push
 
 ---
 

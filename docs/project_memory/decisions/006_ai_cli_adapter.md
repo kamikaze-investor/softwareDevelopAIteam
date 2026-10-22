@@ -29,6 +29,8 @@ AI CLI Adapter（共通インターフェース）
 
 ## 確定した役割分担
 
+（2026-10-22 注: 当時の表。現行の Role→Model 割当は `AGENTS.md` §3-2、`AiCliProvider` は `claude_code`/`codex`/`gemini`/`copilot` の4種（`packages/shared/src/types/ai_cli.ts`）、Codex の実 argv は `exec --sandbox <mode>`（`apps/worker/src/aiCli/codexAdapter.ts`）。Meta Reviewer の現行 provider 順序は下記「Meta Reviewer AIはAPIを使い続ける」の注を参照）
+
 | AI役割 | プロバイダー | 使用形式 | 使う状況 |
 |---|---|---|---|
 | **Developer AI（メイン）** | Claude Code | CLI | 新機能・複雑実装・CLAUDE.mdの自律遵守が必要 |
@@ -114,6 +116,8 @@ APIと違いCLIは出力フォーマットが変わることがある。
 ### Meta Reviewer AIはAPIを使い続ける
 
 Meta Reviewer AI（Gemini）は、CLIではなくAPIを使う（autoReview.ts の callGeminiForReview()）。
+
+（2026-10-22 注: 当時の判断。現行は API 専用ではなく、`apps/worker/src/metaReviewer/geminiRouter.ts` が CLI と API の多段 fallback を行い（順序は `preferCli` に依存）、PR Meta Review（`autoReview.ts`）は `preferCli: true` で CLI 優先。`callGeminiForReview()` は `geminiClient.ts` にあり API 段として使われる。Copilot fallback は `metaReviewFallbackRouter.ts`）
 
 理由:
 - 安全審査は結果の再現性・一貫性が最重要
