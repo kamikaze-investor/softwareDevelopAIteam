@@ -1167,6 +1167,11 @@ function technicalOwnershipFailure(
   }
 
   for (const project of storage.projects.findAll()) {
+    // claim guard（`anotherTaskHoldsWorkspace()`）と同じ所有者の範囲: archived Project の行は数えない
+    // （quarantine 行も含めて。claim guard も archived の行を見ない）。archived Project は Worker が claim せず、
+    // archive は live Job / blocked 所有者があると拒否されるので、残る行は legacy の取り残しである。
+    // 最終 transaction（storage の findWorkspaceUserAnywhere）も同じ範囲を使う（Codex review P2）。
+    if (project.status === 'archived') continue
     for (const otherTask of storage.tasks.findByProjectId(project.id)) {
       if (otherTask.id === task.id) continue
       for (const job of storage.jobs.findByTaskId(otherTask.id)) {

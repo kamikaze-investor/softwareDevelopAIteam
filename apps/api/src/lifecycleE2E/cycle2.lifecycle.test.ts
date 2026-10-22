@@ -213,7 +213,11 @@ async function blockedTaskWithExternalCompletion(id: string, shape: 'guard' | 'r
 }
 
 /** reconcile 拒否 → abort → 本物の Worker cleanup 報告 → park → reconcile、の一連（両 shape 共通の期待）。 */
-async function refuseAbortParkReconcile(fx: Awaited<ReturnType<typeof blockedTaskWithExternalCompletion>>): Promise<void> {
+async function refuseAbortParkReconcile(
+  fx: Awaited<ReturnType<typeof blockedTaskWithExternalCompletion>>,
+  /** Worker の観測の前に operator が行う操作（D4: backup 後に worktree を開始 commit へ戻す）。 */
+  beforeWorkerReport?: () => Promise<void>,
+): Promise<void> {
   const { task, carrier, reconcileApproval, reconcileBody } = fx
 
   // Operation 1: reconcile. Expected: 409 TASK_HAS_BLOCKED_JOBS before the Gate (approval not consumed).
@@ -231,6 +235,7 @@ async function refuseAbortParkReconcile(fx: Awaited<ReturnType<typeof blockedTas
 
   // Operation 3: the real Worker abort-cleanup step observes the worktree and reports (manual abort: no revert).
   // Expected: accepted, blocked row released (failed), Task parked.
+  await beforeWorkerReport?.()
   bridge = installFetchBridge(env)
   await reportAbortCleanupObservations()
   const reports = bridge.calls.filter((call) => call.path.endsWith('/abort-cleanup-result'))
@@ -264,25 +269,36 @@ describe('External completion of a Task with a blocked row: refused → abort/pa
   })
 
   /**
-   * DEFECT D4（dirty baseline の blocked 行は manual abort で park できない）。
+   * D4（dirty baseline の blocked 行を manual abort で park する）。
    *
    * Start:     git_commit を CEO が REJECT した Task（blocked 行の baseline は dirty — git_commit は
    *            未 commit の変更を抱えた worktree で claim される）。同じ作業は canonical master で完了済み。
-   * Expected:  reconcile 409 → abort_task → Worker の報告で park → reconcile 200 / done
-   *            （reconcile の拒否文が「abort で blocked 行を片付けてから取り込め」と案内している経路）。
-   * Actual:    manual abort の完了（`storage/sqlite.ts` の abort cleanup transaction、
-   *            「観測の再検証。ここだけが所有権解放の根拠である」の節）は
-   *            (1) 観測が carrier の baseline と一致すること と (2) `knownGood.worktreeClean`（manifest が空）
-   *            の**両方**を要求する。baseline が dirty だと (1) と (2) は同時に成立しない。Worker の manual 経路
-   *            （`reportAbortCleanupObservations()`）は revert しない（revert は technical cleanup だけ）。
-   *            実測: 変更が残ったままの報告は `worktreeClean=false` で 409 VERIFICATION_FAILED、人が worktree を
-   *            掃除した後の報告は「observed workspace does not match job's baseline」で 409。どちらも所有権は保持され、
-   *            外部完了は TASK_HAS_BLOCKED_JOBS のまま取り込めない。
-   *            unit test（`pl/abortTask.test.ts` の rejected git_commit 系）は carrier に clean baseline を与えているため
-   *            この形を通っていない。
+   * Operation: reconcile 409 → abort_task → 変更が残ったままの Worker 報告 → operator が（backup の後に）
+   *            worktree を carrier の開始 commit へ戻す → Worker 報告 → reconcile。
+   * Expected:  変更が残ったままの報告は 409（所有権保持・park しない。Worker の manual 経路は revert しない）。
+   *            clean 観測（HEAD = carrier baseline の startCommitHash、knownGood 全項目）で park し、
+   *            reconcile 200 / done（approval_rules「CEO が REJECT した git_commit の解放」: operator revert →
+   *            clean 観測と knownGood）。
    */
-  it.fails('DEFECT D4 rejected git_commit (dirty baseline): abort parks the Task and the external completion is reconciled', async () => {
-    await refuseAbortParkReconcile(await blockedTaskWithExternalCompletion('reconcile-d4', 'rejected_commit', ['docs/reconcile-d4/done.md']))
+  it('D4 rejected git_commit (dirty baseline): abort parks after an operator revert to the start commit, then the external completion is reconciled', async () => {
+    const fx = await blockedTaskWithExternalCompletion('reconcile-d4', 'rejected_commit', ['docs/reconcile-d4/done.md'])
+    const startCommit = fx.carrier.workspaceBaseline!.startCommitHash
+    await refuseAbortParkReconcile(fx, async () => {
+      // With the Task's changes still present the manual report cannot release anything.
+      expect(git(['status', '--porcelain']).trim()).not.toBe('')
+      const dirtyBridge = installFetchBridge(env)
+      await reportAbortCleanupObservations()
+      const dirtyReports = dirtyBridge.calls.filter((call) => call.path.endsWith('/abort-cleanup-result'))
+      dirtyBridge.restore()
+      expect(dirtyReports.map((call) => call.status)).toEqual([409])
+      expect(env.storage.jobs.findById(fx.carrier.id)?.status).toBe('blocked')
+      expect(env.storage.tasks.isParked(fx.task.id)).toBe(false)
+      // Operator (after a restore-verified backup): revert the worktree to the carrier's start commit.
+      expect(git(['rev-parse', 'HEAD']).trim()).toBe(startCommit)
+      git(['checkout', '--', '.'])
+      git(['clean', '-fdq'])
+      expect(git(['status', '--porcelain']).trim()).toBe('')
+    })
   })
 })
 

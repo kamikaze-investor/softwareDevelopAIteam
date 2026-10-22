@@ -3075,3 +3075,384 @@ describe('abortTask — directly linked rejected git_commit observation-only rel
     })
   })
 })
+
+// D4（roadmap abort-blocked-dirty-baseline-cannot-complete）: manual abort は operator が worktree を
+// Job の開始 commit へ戻した後の clean 観測で park できる。他 Project を含め同じ workspace を使う別 Task が
+// 居れば park しない（archived Project の取り残しは claim guard と同じく数えない）。Technical Abort と T-2 は不変。
+describe('abortTask — manual abort after an operator revert to the bound start commit (D4)', () => {
+  const START = BASELINE.startCommitHash
+  const ENTRY_A = { path: 'docs/a.md', kind: 'modified', xyStatus: '.M', worktreeHash: 'sha256:a' } as const
+  const ENTRY_B = { path: 'docs/b.md', kind: 'added', xyStatus: '??', worktreeHash: 'sha256:b' } as const
+  const DIRTY_AT_START: JobWorkspaceBaseline = { mode: 'dirty', startCommitHash: START, entries: [ENTRY_A, ENTRY_B] }
+  const PARTIALLY_CLEAN: JobWorkspaceBaseline = { mode: 'dirty', startCommitHash: START, entries: [ENTRY_A] }
+  const CLEAN_AT_START: JobWorkspaceBaseline = { mode: 'clean', startCommitHash: START }
+  const DIRTY_KNOWN_GOOD = { ...KNOWN_GOOD, worktreeClean: false }
+
+  /** pending + roadmapActive Task、dirty baseline の blocked carrier（D4 の形）。cleanup 要求済み。 */
+  function seedDirtyPending(): Fixture & { approvalRequestId: string } {
+    const fx = seed({ kind: 'git_commit', workingDir: '/workspace/target' })
+    fx.storage.jobs.update(fx.jobId, { workspaceBaseline: DIRTY_AT_START })
+    const approvalRequestId = approve(fx.storage, fx.taskId)
+    const requested = abortTask(fx.storage, { taskId: fx.taskId, approvalRequestId, reason: 'completed outside the loop' })
+    if (!requested.ok || requested.status !== 'cleanup_requested') {
+      throw new Error(`expected cleanup_requested, got ${JSON.stringify(requested)}`)
+    }
+    return { ...fx, approvalRequestId }
+  }
+
+  function expectNotParked(fx: Fixture, approvalRequestId: string, blockedJobId = fx.jobId): void {
+    expect(fx.storage.jobs.findById(blockedJobId)?.status).toBe('blocked')
+    expect(fx.storage.tasks.findById(fx.taskId)).toMatchObject({ status: 'pending', roadmapActive: true })
+    expect(fx.storage.tasks.isParked(fx.taskId)).toBe(false)
+    expect(fx.storage.approvalRequests.findById(approvalRequestId)?.status).toBe('APPROVED')
+  }
+
+  function expectParked(fx: Fixture, approvalRequestId: string): void {
+    expect(fx.storage.jobs.findById(fx.jobId)?.status).toBe('failed')
+    expect(fx.storage.tasks.findById(fx.taskId)).toMatchObject({ status: 'pending', roadmapActive: false })
+    expect(fx.storage.tasks.isParked(fx.taskId)).toBe(true)
+    expect(fx.storage.approvalRequests.findById(approvalRequestId)?.status).toBe('CONSUMED')
+  }
+
+  /** 別 Project（status 指定）に、同じ workingDir の Job を持つ Task を作る。 */
+  function seedOtherProjectUser(
+    storage: IStorage,
+    projectStatus: 'draft' | 'paused' | 'archived',
+    taskStatus: 'pending' | 'blocked' | 'in_progress' | 'done',
+    jobStatus: 'queued' | 'running' | 'blocked' | 'failed',
+    roadmapActive = true,
+    quarantined = false,
+  ): void {
+    // archive は live Job / blocked 所有者があると拒否されるので、Production の legacy 行と同じ形を
+    // 最初からその status の Project として作る。
+    const project = storage.projects.create({
+      name: `other ${projectStatus}`, goal: 'g', designPhilosophy: [], status: projectStatus,
+    })
+    const task = storage.tasks.create({
+      projectId: project.id, title: 'other user', description: '', status: taskStatus,
+      assignee: 'developer_ai', dependencies: [], roadmapActive,
+    } as Parameters<IStorage['tasks']['create']>[0])
+    storage.jobs.create({
+      taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status: jobStatus,
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, workspaceBaseline: BASELINE,
+      workflowStepKey: `repair:${task.id}:1`,
+      ...(quarantined ? { failureMetadata: { quarantined: true, quarantineReason: 'legacy' } } : {}),
+    } as Parameters<IStorage['jobs']['create']>[0])
+  }
+
+  it('pending path: a clean, known-good observation at the carrier start commit parks a dirty-baseline carrier', () => {
+    const fx = seedDirtyPending()
+    expect(completeAbortCleanup(fx.storage, {
+      jobId: fx.jobId, observation: CLEAN_AT_START, knownGood: KNOWN_GOOD,
+    })).toMatchObject({ ok: true })
+    expectParked(fx, fx.approvalRequestId)
+  })
+
+  it('pending path: while the Task changes are still present the report is refused, and a later clean report parks', () => {
+    const fx = seedDirtyPending()
+    expect(completeAbortCleanup(fx.storage, {
+      jobId: fx.jobId, observation: DIRTY_AT_START, knownGood: DIRTY_KNOWN_GOOD,
+    })).toMatchObject({ ok: false, code: 'VERIFICATION_FAILED' })
+    expectNotParked(fx, fx.approvalRequestId)
+    // The marker stays, so the Worker's next poll after the operator revert completes the abort.
+    expect(completeAbortCleanup(fx.storage, {
+      jobId: fx.jobId, observation: CLEAN_AT_START, knownGood: KNOWN_GOOD,
+    })).toMatchObject({ ok: true })
+    expectParked(fx, fx.approvalRequestId)
+  })
+
+  it.each([
+    ['clean observation at a different HEAD', { mode: 'clean', startCommitHash: 'other-head' }, KNOWN_GOOD],
+    ['partially cleaned (a subset is still dirty)', PARTIALLY_CLEAN, DIRTY_KNOWN_GOOD],
+    ['partially cleaned, reported known-good', PARTIALLY_CLEAN, KNOWN_GOOD],
+    ['clean observation with a merge in progress', CLEAN_AT_START, { ...KNOWN_GOOD, gitOperationMarkers: ['MERGE_HEAD'] }],
+    ['clean observation with the index not clean', CLEAN_AT_START, { ...KNOWN_GOOD, indexClean: false }],
+    ['clean observation with blind spots', CLEAN_AT_START, { ...KNOWN_GOOD, blindSpotsAbsent: false }],
+  ] as Array<[string, JobWorkspaceBaseline, typeof KNOWN_GOOD]>)('pending path refuses: %s', (_label, observation, knownGood) => {
+    const fx = seedDirtyPending()
+    expect(completeAbortCleanup(fx.storage, { jobId: fx.jobId, observation, knownGood }))
+      .toMatchObject({ ok: false, code: 'VERIFICATION_FAILED' })
+    expectNotParked(fx, fx.approvalRequestId)
+  })
+
+  it('pending path: a blocked sibling with a dirty baseline at the same start commit is released too; one at another HEAD refuses', () => {
+    const same = seedDirtyPending()
+    const sameSibling = same.storage.jobs.create({
+      taskId: same.taskId, projectId: same.projectId, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, workspaceBaseline: DIRTY_AT_START,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    expect(completeAbortCleanup(same.storage, {
+      jobId: same.jobId, observation: CLEAN_AT_START, knownGood: KNOWN_GOOD,
+    })).toMatchObject({ ok: true })
+    expect(same.storage.jobs.findById(sameSibling.id)?.status).toBe('failed')
+    expect(same.storage.jobs.findById(same.jobId)?.status).toBe('failed')
+
+    const mixed = seedDirtyPending()
+    const mixedSibling = mixed.storage.jobs.create({
+      taskId: mixed.taskId, projectId: mixed.projectId, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      workspaceBaseline: { ...DIRTY_AT_START, startCommitHash: 'other-head' } as JobWorkspaceBaseline,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    expect(completeAbortCleanup(mixed.storage, {
+      jobId: mixed.jobId, observation: CLEAN_AT_START, knownGood: KNOWN_GOOD,
+    })).toMatchObject({ ok: false, code: 'VERIFICATION_FAILED' })
+    expectNotParked(mixed, mixed.approvalRequestId)
+    expect(mixed.storage.jobs.findById(mixedSibling.id)?.status).toBe('blocked')
+  })
+
+  it.each([
+    ['a blocked row of a blocked Task in a paused Project', 'paused', 'blocked', 'blocked', true],
+    ['a queued repair Job in a draft Project', 'draft', 'pending', 'queued', false],
+    ['an occupying (in_progress) Task with only a failed Job in a draft Project', 'draft', 'in_progress', 'failed', true],
+  ] as const)('pending path refuses when another Task uses the workspace: %s', (_label, projectStatus, taskStatus, jobStatus, active) => {
+    const fx = seedDirtyPending()
+    seedOtherProjectUser(fx.storage, projectStatus, taskStatus, jobStatus, active)
+    const result = completeAbortCleanup(fx.storage, {
+      jobId: fx.jobId, observation: CLEAN_AT_START, knownGood: KNOWN_GOOD,
+    })
+    expect(result).toMatchObject({ ok: false, code: 'PRECONDITION_FAILED' })
+    expect(result.ok ? '' : result.reason).toContain('owns or uses /workspace/target')
+    expectNotParked(fx, fx.approvalRequestId)
+  })
+
+  it('pending path: leftover queued / blocked rows in an ARCHIVED Project do not block the park (claim guard semantics)', () => {
+    const fx = seedDirtyPending()
+    seedOtherProjectUser(fx.storage, 'archived', 'blocked', 'blocked')
+    seedOtherProjectUser(fx.storage, 'archived', 'pending', 'queued')
+    seedOtherProjectUser(fx.storage, 'archived', 'in_progress', 'failed')
+    expect(completeAbortCleanup(fx.storage, {
+      jobId: fx.jobId, observation: CLEAN_AT_START, knownGood: KNOWN_GOOD,
+    })).toMatchObject({ ok: true })
+    expectParked(fx, fx.approvalRequestId)
+  })
+
+  it('pending path: a non-occupying (parked / done) Task with terminal Jobs on the workspace does not block the park', () => {
+    const fx = seedDirtyPending()
+    seedOtherProjectUser(fx.storage, 'draft', 'pending', 'failed', false)
+    seedOtherProjectUser(fx.storage, 'paused', 'done', 'failed', true)
+    expect(completeAbortCleanup(fx.storage, {
+      jobId: fx.jobId, observation: CLEAN_AT_START, knownGood: KNOWN_GOOD,
+    })).toMatchObject({ ok: true })
+    expectParked(fx, fx.approvalRequestId)
+  })
+
+  it('T-2 is unchanged: no carrier + dirty end escalates to blocked instead of parking', () => {
+    const fx = seed({ kind: 'git_commit', workingDir: '/workspace/target' })
+    fx.storage.jobs.update(fx.jobId, { status: 'failed', failureMetadata: { workspaceEndFingerprint: DIRTY_AT_START } })
+    const approvalRequestId = approve(fx.storage, fx.taskId)
+    expect(abortTask(fx.storage, { taskId: fx.taskId, approvalRequestId, reason: 'r' })).toMatchObject({
+      ok: false, code: 'UNATTRIBUTED_DIRTY_WORKSPACE', details: { escalatedTaskStatus: 'blocked' },
+    })
+    expect(fx.storage.tasks.isParked(fx.taskId)).toBe(false)
+    expect(fx.storage.approvalRequests.findById(approvalRequestId)?.status).toBe('APPROVED')
+  })
+
+  /**
+   * Production の取り残しと同じく、この Task の Job より前の時刻で作る。同じミリ秒に作ると Technical Abort の
+   * 履歴窓（clean baseline〜carrier の間に別 Task が workspace を使ったか。所有者判定とは別の証明）に入る。
+   */
+  function backdated(seedRows: () => void): void {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(Date.now() - 60_000)
+    try {
+      seedRows()
+    } finally {
+      vi.useRealTimers()
+    }
+  }
+
+  /** Production の archived 取り残し: 3 queued + blocked 行（全て同じ workingDir）。 */
+  function seedProductionArchivedLeftovers(storage: IStorage): void {
+    backdated(() => {
+      seedOtherProjectUser(storage, 'archived', 'pending', 'queued')
+      seedOtherProjectUser(storage, 'archived', 'pending', 'queued')
+      seedOtherProjectUser(storage, 'archived', 'in_progress', 'queued')
+      seedOtherProjectUser(storage, 'archived', 'blocked', 'blocked')
+      seedOtherProjectUser(storage, 'archived', 'blocked', 'blocked')
+    })
+  }
+
+  /** requestTechnical() と同じ要求。結果をそのまま返す（stage 1 の拒否を見るため）。 */
+  function requestTechnicalRaw(fx: ReturnType<typeof seedTechnicalAbort>): ReturnType<typeof requestTechnicalAbort> {
+    const attention = buildSystemState(fx.storage).attention.find((item) => item.taskId === fx.taskId)
+    if (attention === undefined) throw new Error('technical attention missing')
+    return requestTechnicalAbort(fx.storage, { taskId: fx.taskId, attention, readLedger: () => TECHNICAL_LEDGER })
+  }
+
+  it('Technical Abort: the Production archived-leftover shape (3 queued + blocked rows) no longer blocks request or park', () => {
+    const fx = seedTechnicalAbort()
+    seedProductionArchivedLeftovers(fx.storage)
+    const requested = requestTechnicalRaw(fx)
+    expect(requested, JSON.stringify(requested)).toMatchObject({ ok: true, status: 'cleanup_requested' })
+    // Rows that appear in archived Projects between the request and the report do not block the final transaction.
+    seedOtherProjectUser(fx.storage, 'archived', 'pending', 'running')
+    expect(finishTechnical(fx)).toMatchObject({ ok: true })
+    expect(fx.storage.tasks.findById(fx.taskId)).toMatchObject({ status: 'pending', roadmapActive: false })
+  })
+
+  it.each([
+    ['a queued repair Job in a paused Project', 'paused', 'pending', 'queued'],
+    ['a running Job in a draft Project', 'draft', 'pending', 'running'],
+    ['a workspace-owning blocked row in a paused Project', 'paused', 'blocked', 'blocked'],
+  ] as const)('Technical Abort: a live (non-archived) user still blocks — %s', (_label, projectStatus, taskStatus, jobStatus) => {
+    // Stage 1 (technicalOwnershipFailure).
+    const early = seedTechnicalAbort()
+    backdated(() => seedOtherProjectUser(early.storage, projectStatus, taskStatus, jobStatus, false))
+    const refused = requestTechnicalRaw(early)
+    expect(refused).toMatchObject({ ok: false, code: 'OWNERSHIP_UNPROVEN' })
+    expect(refused.ok ? '' : refused.reason).toContain('currently owns or uses /workspace/target')
+    expect(early.storage.tasks.isParked(early.taskId)).toBe(false)
+
+    // Final transaction (findWorkspaceUserAnywhere), when the user appears after the request.
+    const late = seedTechnicalAbort()
+    requestTechnical(late)
+    seedOtherProjectUser(late.storage, projectStatus, taskStatus, jobStatus, false)
+    const result = finishTechnical(late)
+    expect(result).toMatchObject({ ok: false })
+    expect(result.ok ? '' : result.reason).toContain('owns or uses /workspace/target')
+    expect(late.storage.tasks.isParked(late.taskId)).toBe(false)
+  })
+
+  /**
+   * quarantine は claim guard と同じ扱い: claim guard（jobs.update queued→running の choke point）は別 Task の
+   * quarantine blocked 行を所有者と数えるが、archived Project の行は見ない。abort の park（manual pending /
+   * manual blocked / Technical）も同じ結果になることを、同じ行で claim と並べて確かめる。
+   */
+  it.each([
+    ['paused', true],
+    ['archived', false],
+  ] as const)('quarantined blocked row of a done Task in a %s Project: claim guard and every abort park agree (blocks=%s)', (projectStatus, blocks) => {
+    // Claim guard.
+    const claim = seed()
+    const claimJob = claim.storage.jobs.create({
+      taskId: claim.taskId, projectId: claim.projectId, agentRole: 'developer_ai', status: 'queued',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, workflowStepKey: `repair:${claim.taskId}:1`,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    seedOtherProjectUser(claim.storage, projectStatus, 'done', 'blocked', true, true)
+    claim.storage.jobs.update(claimJob.id, { status: 'running' })
+    expect(claim.storage.jobs.findById(claimJob.id)?.status === 'queued').toBe(blocks)
+
+    // Manual pending path.
+    const pending = seedDirtyPending()
+    seedOtherProjectUser(pending.storage, projectStatus, 'done', 'blocked', true, true)
+    expect(completeAbortCleanup(pending.storage, {
+      jobId: pending.jobId, observation: CLEAN_AT_START, knownGood: KNOWN_GOOD,
+    }).ok).toBe(!blocks)
+
+    // Manual blocked-terminal path.
+    const terminal = seedB8dShape()
+    seedOtherProjectUser(terminal.storage, projectStatus, 'done', 'blocked', true, true)
+    expect(completeAbortCleanup(terminal.storage, {
+      jobId: terminal.latestJobId, observation: CLEAN_AT_START, knownGood: KNOWN_GOOD,
+    }).ok).toBe(!blocks)
+
+    // Technical Abort: stage 1 and the final transaction.
+    const technical = seedTechnicalAbort()
+    backdated(() => seedOtherProjectUser(technical.storage, projectStatus, 'done', 'blocked', true, true))
+    const requested = requestTechnicalRaw(technical)
+    expect(requested.ok, JSON.stringify(requested)).toBe(!blocks)
+    if (!blocks) expect(finishTechnical(technical).ok).toBe(true)
+    const technicalLate = seedTechnicalAbort()
+    requestTechnical(technicalLate)
+    seedOtherProjectUser(technicalLate.storage, projectStatus, 'done', 'blocked', true, true)
+    expect(finishTechnical(technicalLate).ok).toBe(!blocks)
+  })
+
+  it('Technical Abort is unchanged: a clean pre-cleanup observation does not stand in for a dirty Task baseline', () => {
+    // Same setup as 'Task-owned dirty paths can be cleaned and parked without an active approval'.
+    const fx = seedTechnicalAbort()
+    const dirty: JobWorkspaceBaseline = {
+      mode: 'dirty',
+      startCommitHash: START,
+      entries: [{ path: 'apps/worker/src/index.ts', kind: 'modified', xyStatus: '.M', worktreeHash: 'sha256:task-owned' }],
+    }
+    fx.storage.jobs.update(fx.latestJobId, {
+      workspaceBaseline: dirty,
+      changedFiles: ['apps/worker/src/index.ts'],
+      failureMetadata: { workspaceEndFingerprint: dirty },
+    })
+    const older = fx.storage.jobs.findByTaskId(fx.taskId)[1]
+    if (older === undefined) throw new Error('older job missing')
+    fx.storage.jobs.update(older.id, { failureMetadata: { workspaceEndFingerprint: dirty } })
+    requestTechnical(fx)
+    // A clean pre-cleanup observation at the start commit (which the manual path accepts after a revert)
+    // does not prove the Technical Abort's pre-cleanup state.
+    expect(finishTechnical(fx, { preCleanupObservation: CLEAN_AT_START })).toMatchObject({ ok: false })
+    expect(fx.storage.tasks.isParked(fx.taskId)).toBe(false)
+  })
+
+  /**
+   * b8d0fc5d の形: blocked Task、implement success（baseline clean@X）、最新 git_status failed
+   * （baseline dirty@X、終了 fingerprint dirty）。全 Job terminal なので parkBlockedTaskWithTerminalJobs へ行く。
+   */
+  function seedB8dShape(): TerminalBlockedFixture & { approvalRequestId: string } {
+    const storage = createSQLiteStorage(':memory:')
+    const project = storage.projects.create({ name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running' })
+    const task = storage.tasks.create({
+      projectId: project.id, title: 'sweep', description: 'd', status: 'blocked',
+      assignee: 'developer_ai', dependencies: [], roadmapActive: true, roadmapTaskKey: 'sweep-item',
+      allowedPaths: ['docs'], acceptanceCriteria: ['x'],
+    } as Parameters<IStorage['tasks']['create']>[0])
+    const implement = storage.jobs.create({
+      taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status: 'success',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, workspaceBaseline: CLEAN_AT_START,
+      failureMetadata: { workspaceEndFingerprint: DIRTY_AT_START },
+    } as Parameters<IStorage['jobs']['create']>[0])
+    const gitStatus = storage.jobs.create({
+      taskId: task.id, projectId: project.id, agentRole: 'developer_ai', status: 'failed',
+      safeCommand: { kind: 'git_status', workingDir: '/workspace/target' }, workspaceBaseline: DIRTY_AT_START,
+      failureMetadata: { workspaceEndFingerprint: DIRTY_AT_START },
+    } as Parameters<IStorage['jobs']['create']>[0])
+    const fx = { storage, projectId: project.id, taskId: task.id, jobId: implement.id, latestJobId: gitStatus.id }
+    return { ...fx, approvalRequestId: requestTerminalBlocked(fx) }
+  }
+
+  function expectB8dNotParked(fx: ReturnType<typeof seedB8dShape>): void {
+    expect(fx.storage.tasks.findById(fx.taskId)).toMatchObject({ status: 'blocked', roadmapActive: true })
+    expect(fx.storage.tasks.isParked(fx.taskId)).toBe(false)
+    expect(fx.storage.approvalRequests.findById(fx.approvalRequestId)?.status).toBe('APPROVED')
+  }
+
+  it('blocked path (b8d0fc5d shape): refused while dirty, parks after a clean observation at the shared start commit', () => {
+    const fx = seedB8dShape()
+    expect(completeAbortCleanup(fx.storage, {
+      jobId: fx.latestJobId, observation: DIRTY_AT_START, knownGood: DIRTY_KNOWN_GOOD,
+    })).toMatchObject({ ok: false, code: 'VERIFICATION_FAILED' })
+    expectB8dNotParked(fx)
+    expect(completeAbortCleanup(fx.storage, {
+      jobId: fx.latestJobId, observation: { mode: 'clean', startCommitHash: 'other-head' }, knownGood: KNOWN_GOOD,
+    })).toMatchObject({ ok: false, code: 'VERIFICATION_FAILED' })
+    expectB8dNotParked(fx)
+
+    expect(completeAbortCleanup(fx.storage, {
+      jobId: fx.latestJobId, observation: CLEAN_AT_START, knownGood: KNOWN_GOOD,
+    })).toMatchObject({ ok: true })
+    expect(fx.storage.tasks.findById(fx.taskId)).toMatchObject({ status: 'pending', roadmapActive: false })
+    expect(fx.storage.tasks.isParked(fx.taskId)).toBe(true)
+    expect(fx.storage.approvalRequests.findById(fx.approvalRequestId)?.status).toBe('CONSUMED')
+    // Terminal Job rows are left as they are.
+    expect(fx.storage.jobs.findById(fx.latestJobId)?.status).toBe('failed')
+    expect(fx.storage.jobs.findById(fx.jobId)?.status).toBe('success')
+  })
+
+  it('blocked path (manual, not a rejected git_commit) refuses when another Task in another Project uses the workspace', () => {
+    const fx = seedB8dShape()
+    seedOtherProjectUser(fx.storage, 'paused', 'blocked', 'blocked')
+    const result = completeAbortCleanup(fx.storage, {
+      jobId: fx.latestJobId, observation: CLEAN_AT_START, knownGood: KNOWN_GOOD,
+    })
+    expect(result).toMatchObject({ ok: false, code: 'PRECONDITION_FAILED' })
+    expect(result.ok ? '' : result.reason).toContain('owns or uses /workspace/target')
+    expectB8dNotParked(fx)
+  })
+
+  it('blocked path (manual): leftover rows in an ARCHIVED Project do not block the park', () => {
+    const fx = seedB8dShape()
+    seedOtherProjectUser(fx.storage, 'archived', 'blocked', 'blocked')
+    seedOtherProjectUser(fx.storage, 'archived', 'pending', 'queued')
+    expect(completeAbortCleanup(fx.storage, {
+      jobId: fx.latestJobId, observation: CLEAN_AT_START, knownGood: KNOWN_GOOD,
+    })).toMatchObject({ ok: true })
+    expect(fx.storage.tasks.isParked(fx.taskId)).toBe(true)
+  })
+})

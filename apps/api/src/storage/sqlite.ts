@@ -1100,12 +1100,24 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     return verifyAndConsumeTaskApproval(taskId, approvalRequestId, 'abort_task')
   }
 
-  /** Technical Abort は Project 境界を越えて同じ physical workspace の利用を拒否する。 */
+  /**
+   * abort の park（manual / Technical とも）は Project 境界を越えて同じ physical workspace の利用を拒否する。
+   *
+   * 範囲は claim guard の所有者述語（`anotherTaskHoldsWorkspace()`）と同じく **archived Project の行を数えない**
+   * （quarantine 行も含めて。claim guard も archived の行を見ない）。archived Project は Worker が claim せず
+   * （running Project だけを走査する）、archive は blocked 所有者・live Job があると拒否されるので、そこに残る
+   * queued / running / blocked 行は legacy の取り残しであって workspace を使っていない。数えると、Production の
+   * archived Project に残る行（全て同じ workingDir）が manual / Technical の park を永久に塞ぐ（Codex review P2）。
+   * Technical Abort の stage 1（`technicalOwnershipFailure()`）も同じ範囲を使う。
+   */
   function findWorkspaceUserAnywhere(
     workingDir: string,
     excludeTaskId: string,
   ): { job: Job; task: Task } | undefined {
-    const rows = db.prepare('SELECT * FROM jobs ORDER BY created_at DESC, rowid DESC').all() as any[]
+    const rows = db.prepare(
+      'SELECT j.* FROM jobs j JOIN tasks t ON t.id = j.task_id JOIN projects p ON p.id = t.project_id '
+      + "WHERE p.status != 'archived' ORDER BY j.created_at DESC, j.rowid DESC",
+    ).all() as any[]
     for (const row of rows) {
       const job = deserializeJob(row)
       if (job.taskId === excludeTaskId || job.safeCommand?.workingDir !== workingDir) continue
@@ -3883,10 +3895,26 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             }
           }
           const ownershipObservation = technical ? input.preCleanupObservation : input.observation
-          if (
-            ownershipObservation === undefined
-            || !baselineEqualsObservation(job.workspaceBaseline, ownershipObservation)
-          ) {
+          // manual abort（人の `abort_task`）だけ: operator が backup を取って worktree を Job の開始 commit へ
+          // 戻した後の **clean 観測**も、その Job の baseline を証明したものとして受け付ける
+          // （approval_rules「CEO が REJECT した git_commit の解放」: operator revert → clean 観測と knownGood）。
+          // dirty baseline の manifest 一致を要求すると、knownGood（worktreeClean）と同時には成立せず、
+          // manual abort が永久に完了しない（D4）。clean であること・HEAD が baseline の開始 commit と同じこと・
+          // knownGood 全項目・他 Task の workspace 利用が無いこと（下の findWorkspaceUserAnywhere）で束縛する。
+          // blocked Task 経路（parkBlockedTaskWithTerminalJobs）が既に使っている証明と同じ形。
+          // Technical Abort は従来どおり pre-cleanup 観測の baseline 完全一致だけを受け付ける。
+          const provesBaseline = (baseline: JobWorkspaceBaseline): boolean => (
+            ownershipObservation !== undefined
+            && (
+              baselineEqualsObservation(baseline, ownershipObservation)
+              || (
+                !technical
+                && ownershipObservation.mode === 'clean'
+                && ownershipObservation.startCommitHash === baseline.startCommitHash
+              )
+            )
+          )
+          if (!provesBaseline(job.workspaceBaseline)) {
             return {
               ok: false as const,
               code: 'VERIFICATION_FAILED' as const,
@@ -3968,7 +3996,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             : blockedSiblings.find((sibling) => (
                 sibling.safeCommand?.workingDir !== workingDir
                 || !sibling.workspaceBaseline
-                || !baselineEqualsObservation(sibling.workspaceBaseline, input.observation)
+                // manual なので ownershipObservation は input.observation（上の provesBaseline と同じ証明）
+                || !provesBaseline(sibling.workspaceBaseline)
               ))
           if (unproven) {
             return {
@@ -4019,7 +4048,10 @@ export function createSQLiteStorage(dbPath: string): IStorage {
                 + 'refusing to park',
             }
           }
-          if (technical) {
+          {
+            // 他 Project を含め、同じ workspace を使う別 Task が居れば park しない（approval_rules
+            // 「他 Project を含む workspace 所有者不在」）。manual / Technical とも claim guard と同じく
+            // archived Project を数えない（findWorkspaceUserAnywhere の注記）。
             const workspaceUser = findWorkspaceUserAnywhere(workingDir, task.id)
             if (workspaceUser) {
               return {
@@ -4386,10 +4418,11 @@ export function createSQLiteStorage(dbPath: string): IStorage {
                 + 'refusing to park',
             }
           }
-          if (
-            (input.authorization.kind === 'technical_evidence' || rejectedGitCommitException)
-            && workingDir !== undefined
-          ) {
+          // 他 Project を含め、同じ workspace を使う別 Task が居れば park しない（Technical Abort と manual abort
+          // の全て。rejected git_commit に限らない）。範囲は claim guard と同じく archived Project を数えない
+          // （findWorkspaceUserAnywhere の注記）。manual の clean 観測は、他 Task の差分が operator の revert で
+          // 消された後でも成立してしまうので、所有者不在をここで証明する。
+          if (workingDir !== undefined) {
             const workspaceUser = findWorkspaceUserAnywhere(workingDir, task.id)
             if (workspaceUser) {
               return {
