@@ -61,6 +61,13 @@ import {
 } from '../../lib/taskWorkflow'
 import { formatResumeErrorMessage, RESUME_ERROR_MESSAGE_FALLBACK } from '../../lib/resumeErrorMessage'
 import { readApiRejection, submitTaskRecovery } from '../../lib/taskRecovery'
+import {
+  ABORT_REQUEST_CONFIRM_MESSAGE,
+  abortActionView,
+  canShowAbortUI,
+  createAbortApprovalRequest,
+  submitTaskAbort,
+} from '../../lib/taskAbort'
 import { POLLING_INTERVAL_MS, usePolling } from '../../lib/usePolling'
 
 const RESUME_INSTRUCTION_MAX_LENGTH = 2000
@@ -982,6 +989,71 @@ function StoredReviewRecoverySection({
   )
 }
 
+interface AbortSectionProps {
+  isSubmitting: boolean
+  jobs: Job[]
+  /** 直前の操作結果（作成した承認依頼 id・実行結果）。画面を離れるまで表示する */
+  lastResult: string | null
+  onCreateRequest: () => void
+  onExecute: (approvalRequestId: string) => void
+  task: TaskDetail
+}
+
+/**
+ * 既存の manual abort（park）経路。表示条件は `canShowAbortUI()`、ボタン状態は `abortActionView()`。
+ * **承認はこの画面ではしない**（承認一覧の human-only PATCH のまま）。
+ */
+function AbortSection({
+  isSubmitting,
+  jobs,
+  lastResult,
+  onCreateRequest,
+  onExecute,
+  task,
+}: AbortSectionProps): ReactElement | null {
+  if (!canShowAbortUI(task, jobs)) return null
+  const view = abortActionView(task.humanTaskDecisions)
+  const approval = view.approval
+
+  return (
+    <View style={styles.section}>
+      <Text style={styles.sectionTitle}>Task を中止（park）</Text>
+      <View style={styles.resumeBox}>
+        <Text style={styles.resumeHelpText}>{view.note}</Text>
+        <TouchableOpacity
+          disabled={isSubmitting || !view.canCreateRequest}
+          onPress={onCreateRequest}
+          style={[
+            styles.resumeSubmitButton,
+            styles.recoverButton,
+            (isSubmitting || !view.canCreateRequest) && styles.resumeSubmitButtonDisabled,
+          ]}
+        >
+          <Text style={styles.resumeSubmitButtonText}>中止の承認依頼を作成</Text>
+        </TouchableOpacity>
+        <TouchableOpacity
+          disabled={isSubmitting || approval.kind !== 'approved'}
+          onPress={() => { if (approval.kind === 'approved') onExecute(approval.approvalRequestId) }}
+          style={[
+            styles.resumeSubmitButton,
+            styles.recoverButton,
+            styles.abortExecuteButton,
+            (isSubmitting || !view.canExecute) && styles.resumeSubmitButtonDisabled,
+          ]}
+        >
+          {isSubmitting && (
+            <ActivityIndicator color="#fff" size="small" />
+          )}
+          <Text style={styles.resumeSubmitButtonText}>承認済みの中止を実行</Text>
+        </TouchableOpacity>
+        {lastResult !== null && (
+          <Text style={[styles.resumeHelpText, styles.abortResultText]}>{lastResult}</Text>
+        )}
+      </View>
+    </View>
+  )
+}
+
 interface ResumeInstructionSectionProps {
   approvalRequests: ApprovalRequest[]
   instruction: string
@@ -1435,6 +1507,8 @@ export default function TaskDetailScreen(): ReactElement {
   const [isSubmittingResumeInstruction, setIsSubmittingResumeInstruction] =
     useState(false)
   const [isSubmittingRecovery, setIsSubmittingRecovery] = useState(false)
+  const [isSubmittingAbort, setIsSubmittingAbort] = useState(false)
+  const [lastAbortResult, setLastAbortResult] = useState<string | null>(null)
 
   const loadTaskDetail = useCallback(async (): Promise<void> => {
     if (taskId === null || taskId.length === 0) {
@@ -1609,6 +1683,60 @@ export default function TaskDetailScreen(): ReactElement {
     )
   }, [isSubmittingRecovery, submitRecovery])
 
+  // 中止（park）: 起票と実行は別操作。**起票の後に承認・実行を連鎖させない**（承認は承認一覧で人が行う）。
+  const submitAbortRequest = useCallback(async (): Promise<void> => {
+    if (taskId === null || taskId.length === 0) return
+    setIsSubmittingAbort(true)
+    try {
+      const result = await createAbortApprovalRequest(taskId)
+      if (!result.ok) {
+        setLastAbortResult(result.message)
+        Alert.alert('承認依頼の作成失敗', result.message)
+        return
+      }
+      const message = `中止の承認依頼 ${result.approvalRequestId} を作成しました。`
+        + '承認一覧で承認したあと、この画面に戻って「承認済みの中止を実行」を押してください。'
+      setLastAbortResult(message)
+      Alert.alert('中止の承認依頼を作成', message)
+    } finally {
+      await loadTaskDetail()
+      setIsSubmittingAbort(false)
+    }
+  }, [loadTaskDetail, taskId])
+
+  const handleCreateAbortRequest = useCallback((): void => {
+    if (isSubmittingAbort) return
+    Alert.alert('中止の承認依頼を作成', ABORT_REQUEST_CONFIRM_MESSAGE, [
+      { style: 'cancel', text: 'キャンセル' },
+      { onPress: () => { void submitAbortRequest() }, text: '作成' },
+    ])
+  }, [isSubmittingAbort, submitAbortRequest])
+
+  const submitAbort = useCallback(async (approvalRequestId: string): Promise<void> => {
+    if (taskId === null || taskId.length === 0) return
+    setIsSubmittingAbort(true)
+    try {
+      const result = await submitTaskAbort(taskId, approvalRequestId)
+      setLastAbortResult(result.message)
+      Alert.alert(result.ok ? 'Task を中止（park）' : '中止失敗', result.message)
+    } finally {
+      await loadTaskDetail()
+      setIsSubmittingAbort(false)
+    }
+  }, [loadTaskDetail, taskId])
+
+  const handleExecuteAbort = useCallback((approvalRequestId: string): void => {
+    if (isSubmittingAbort) return
+    Alert.alert(
+      '承認済みの中止を実行',
+      'このTaskを完了扱いにせず中止（park）しますか？Roadmapの残作業は消えません。',
+      [
+        { style: 'cancel', text: 'キャンセル' },
+        { onPress: () => { void submitAbort(approvalRequestId) }, style: 'destructive', text: '実行' },
+      ],
+    )
+  }, [isSubmittingAbort, submitAbort])
+
   const handleSubmitResumeInstruction = useCallback((): void => {
     const trimmedInstruction = resumeInstruction.trim()
 
@@ -1710,6 +1838,14 @@ export default function TaskDetailScreen(): ReactElement {
             onSubmit={handleStoredReviewRecovery}
             qaResults={data.qaResults}
             reviews={data.reviews}
+            task={data.task}
+          />
+          <AbortSection
+            isSubmitting={isSubmittingAbort}
+            jobs={data.jobs}
+            lastResult={lastAbortResult}
+            onCreateRequest={handleCreateAbortRequest}
+            onExecute={handleExecuteAbort}
             task={data.task}
           />
           <JobHistorySection jobs={data.jobs} />
@@ -2081,6 +2217,13 @@ const styles = StyleSheet.create({
   },
   recoverButton: {
     justifyContent: 'center',
+    marginTop: 12,
+  },
+  abortExecuteButton: {
+    backgroundColor: '#b91c1c',
+  },
+  abortResultText: {
+    marginBottom: 0,
     marginTop: 12,
   },
   resumeBox: {
