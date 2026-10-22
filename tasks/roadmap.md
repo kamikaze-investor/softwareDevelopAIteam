@@ -10372,6 +10372,11 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - `provider-outage-burns-attempt-budget`（planned）は transient 障害が attempt 予算を
         食い潰す話で、予算の数え方であって停止保証ではない
 
+      **進捗（2026-10-22 promotion）**: Tier A Task（Candidate `bdb877d4`）の read-only 監査記録
+      `docs/project_memory/decisions/termination_guarantee_audit_2026_10_16.md` が master へ到達した
+      （経路一覧・各経路の停止根拠・欠陥 D1〜D5）。**AC は未達のため planned のまま**: 経路一覧は本 ledger ではなく
+      記録ファイルにあり、D1〜D5 は別項目として未登録、mutation は推論で未実測、PL loop 配下の await は未列挙（同記録 §6）。
+
 
 <!-- roadmap:id=monitoring-tiering-watchdog-monitor-pl state=planned -->
 3. [ ] **監視責務の段階分離（Deterministic Watchdog → Lightweight Monitor → VPS PL）— VPS PL 完成後の最適化** — 2026-09-14登録。
