@@ -67,7 +67,7 @@ Worker のジョブ実行ルール:
 **実装状況**:
 - ✅ `AiCliRequest.requiresFreshContextPack?: boolean` を型に追加済み
 - ✅ `AiCliRequest.contextPackGeneratedAt?: string` を型に追加済み
-- ⏳ Worker が前Jobのコミット時刻と比較して自動セットする処理は task-009 で実装
+- ❌ 型のみ。production で上記2フィールドを設定・参照する呼び出し元はない（2026-10-22 時点、未配線）
 
 ---
 
@@ -119,7 +119,8 @@ Claude Codeが失敗したとき、いつCodexに切り替えるか？
 **実装状況**:
 - ✅ `AiCliRequest.fallbackPolicy?: FallbackPolicy` を型に追加済み
 - ✅ `shouldFallback()` ヘルパー関数を `@ai-team/shared` に追加済み
-- ⏳ Worker が `shouldFallback()` を呼び出して自動切り替えする処理は task-009 で実装
+- ✅ `BaseCliAdapter.run()`（`apps/worker/src/aiCli/adapter.ts`）が `fallbackPolicy` 指定時に `shouldFallback()` を評価し、別 provider で1回だけ再実行する
+- ❌ production で `fallbackPolicy` を設定する呼び出し元はない（2026-10-22 時点、未配線）
 
 ---
 

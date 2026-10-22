@@ -156,6 +156,4 @@ read-onlyで必要な範囲まで自力調査してよい（Rule-015の「探索
 既存Architectureや再利用可能な機構を理解しないまま立てたRoadmapは、
 後段のreviewでは修復できないためである。
 
-**現時点の状態（2026-09-07）**: これはpolicyであり、現行のruntimeを述べたものではない。
-**この時点ではRoadmap生成はまだCodex経路ではない。** Codex Roadmap Generatorの
-provider topology cutoverは別途行い、その時点でこのpolicyが実際に適用される。
+**実装**: `apps/api/src/ctoAi/roadmapGenerator.ts`（適用済み。runtime 値は上記ルール本文のとおり）。

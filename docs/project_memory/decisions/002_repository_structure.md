@@ -27,6 +27,7 @@ AIが自分の制御システムを改変できないよう、物理的に分離
 ## Implication
 
 - `apps/api/`, `apps/worker/` はAI編集禁止
+  （2026-10-22 注: 当時の記述。現行の境界定義は `AGENTS.md` §1-1（2026-09-13）で、Control Repository は稼働中 Stable インスタンスの code/DB/Outbox/env を指し、隔離された Candidate clone は編集可。`ai-team-backend/`・`target-project/` というディレクトリは実在しない）
 - `sandbox/` のDocker設定はAI編集禁止
 - ユーザーがターゲットプロジェクトを作成する際は別リポジトリを使用
 

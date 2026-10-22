@@ -122,8 +122,9 @@ id_ed25519.pub
 *.db-shm
 ```
 
-実装箇所（予定）: `contextManager.ts > buildContextPack()` でファイル収集時に除外フィルタを追加。  
-現状: allowedPaths に上記ファイルを含めないことを API 呼び出し側の責任として運用する。
+実装: `apps/api/src/ctoAi/contextManager.ts` の `isWithheldPath()` が Context Pack のファイル収集時に除外する（dotfile / dot ディレクトリ配下、File Change Guard の `ALWAYS_FORBIDDEN_PATTERNS`、`*.p12`/`*.pfx`/`*.keystore`/`*.jks`/`credentials.json`。`.db`/`.db-wal`/`.db-shm` は拡張子で読まない）。
+
+現状: `*credential*`/`*token*` の部分一致は機械除外されないため、allowedPaths に含めないことは引き続き API 呼び出し側の責任として運用する。
 
 ---
 
@@ -137,7 +138,7 @@ Codex の呼び出しデフォルトは必ず codex exec -s read-only とする�
 review / analyze 目的の呼び出しは常に -s read-only を使う。
 ```
 
-`codexAdapter.ts` の `buildArgv()` でモードに応じて切り替え:
+`codexAdapter.ts` の `buildArgv()` でモードに応じて切り替え（実 argv は `exec --sandbox <mode> … -C <workingDir> --ephemeral -`。`-s` は `--sandbox` の短縮形）:
 
 | `request.mode` | Codex sandbox | 説明 |
 |---|---|---|
