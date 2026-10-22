@@ -72,6 +72,8 @@ packages/shared/src/types/
 
 **Meta Reviewer AI のモデル: Gemini（Google）**
 
+（2026-10-22 注: 当時の記述。現行の provider 順序の正本は `apps/worker/src/metaReviewer/geminiRouter.ts` 冒頭コメント（Gemini CLI/API の順は呼び出し側の `preferCli` に依存し、両段が quota 起因で失敗した場合のみ Antigravity/Claude へ）と `metaReviewFallbackRouter.ts`（quota/transient の場合のみ Copilot CLI、それ以外は fail-closed）。PR Meta Review（`autoReview.ts`）は `preferCli: true`）
+
 | AI役割 | 採用モデル | 理由 |
 |---|---|---|
 | Developer AI | Claude Code | 実装品質・コード生成能力が高い |

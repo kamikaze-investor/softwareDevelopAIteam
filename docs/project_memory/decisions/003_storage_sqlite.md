@@ -40,6 +40,7 @@ apps/api/src/storage/
 ```
 
 DBファイル配置: `/srv/ai-team/data/ai-team.db`
+（2026-10-22 注: 当時の予定。現行は production で `DB_PATH` 必須（未設定・ファイル不在なら例外、`apps/api/src/storage/index.ts` `resolveStorageDbPath()`）。production の実パスは `AGENTS.md` §1-1）
 
 ---
 
