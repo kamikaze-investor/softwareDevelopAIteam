@@ -112,6 +112,43 @@ export function formatRecoverErrorMessage(code: string | null): string {
   return messageForCode(RECOVER_ERROR_MESSAGE_BY_CODE, code) ?? RECOVER_ERROR_MESSAGE_FALLBACK
 }
 
+export const ABORT_ERROR_MESSAGE_FALLBACK =
+  '中止（park）に失敗しました。画面を更新して状態を確認し、時間をおいて再度お試しください。'
+
+export const ABORT_APPROVAL_REQUEST_ERROR_MESSAGE_FALLBACK =
+  '中止の承認依頼を作成できませんでした。時間をおいて再度お試しください。'
+
+/**
+ * `POST /api/tasks/:id/abort` の拒否 `code`（`apps/api/src/pl/abortTask.ts` の `AbortTaskResult`）ごとの文言。
+ * HTTP は TASK_NOT_FOUND=404 / NOT_AUTHORIZED=403 / それ以外=409。
+ */
+const ABORT_ERROR_MESSAGE_BY_CODE: Readonly<Record<string, string>> = {
+  TASK_NOT_FOUND: '対象のTaskが見つかりませんでした。',
+  TASK_ALREADY_DONE: 'このTaskは既に完了しているため、中止できません。',
+  TASK_NOT_PARKABLE:
+    'このTaskは今の状態では中止できません（実行中、未完了の作業が残っている、作業履歴の無い停止など）。'
+    + '作業が1件も無い停止中のTaskは、先に「復旧（再開待ちに戻す）」を使ってください。',
+  TASK_NOT_ACTIVE: 'このTaskは現在のRoadmapの対象ではないため、中止するものがありません。',
+  LIVE_JOB_PRESENT: 'Projectに実行中・待機中の作業があるため、中止できませんでした。作業が終わってから再度実行してください。',
+  FOREIGN_BLOCKED_JOB: '別のTaskの停止中の作業が作業場所を保持しているため、中止できませんでした。AI開発チームに確認を依頼してください。',
+  JOB_QUARANTINED: '安全のため隔離された作業があるため、中止できませんでした。AI開発チーム側で作業領域の復旧が必要です。',
+  OWNERSHIP_UNPROVEN: '作業場所の所有者を確認できなかったため、中止しませんでした。AI開発チームに確認を依頼してください。',
+  // T-2: 承認は consume されず、Task は Human Resume 用に blocked へ上がる。
+  UNATTRIBUTED_DIRTY_WORKSPACE:
+    '作業場所に誰の変更か分からない差分が残っているため、中止しませんでした（承認は使われていません）。'
+    + '「追加指示を出す」で再開するか、AI開発チームに確認を依頼してください。',
+  TASK_STATE_CHANGED: '確認の途中でTaskの状態が変わったため、中止しませんでした。画面を更新して状態を確認してください。',
+  TECHNICAL_EVIDENCE_INELIGIBLE: '中止の前提となる記録が条件を満たさないため、中止できませんでした。AI開発チームに確認を依頼してください。',
+  NOT_AUTHORIZED:
+    '有効な中止の承認が見つかりませんでした（期限切れ・別の依頼に置き換え済み・人の承認の記録が無いなど）。'
+    + '承認依頼を作り直し、承認一覧で承認してください。',
+  PARK_FAILED: '中止の記録に失敗しました。画面を更新して状態を確認し、必要なら再度実行してください。',
+}
+
+export function formatAbortErrorMessage(code: string | null): string {
+  return messageForCode(ABORT_ERROR_MESSAGE_BY_CODE, code) ?? ABORT_ERROR_MESSAGE_FALLBACK
+}
+
 export const APPROVAL_DECISION_ERROR_MESSAGE_FALLBACK = '操作に失敗しました'
 
 /**
