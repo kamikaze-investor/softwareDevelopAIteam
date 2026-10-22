@@ -1266,6 +1266,8 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       新attempt自動生成（1回まで）／2回目の状態不明でfail-closed停止し、CEO承認を要求せず
       既存のJob/Task失敗可視化経路にそのまま乗ること／replay-safeでないJob（既存
       `CommandKindSchema`に無い外部作用を伴うJob）は本メカニズムの対象にしないこと。
+
+      (2026-10-22 roadmap integrity audit: 「本項目の完了をもって自律連続実行を有効化する」は登録時の記録で、自律連続実行は Production で既に有効（PL loop `PL_LOOP_ENABLED`、Tier A 自己開発）。本項目は有効化スイッチではなく、上記シナリオを現在の lifecycle（C-1 Worker Outbox 経由の success だけ・S-1〜S-5）に対して検証する項目として読む)
 <!-- roadmap:id=project-auto-completion-detection state=done -->
 9. [x] Project全体の完了判定 — **完了（2026-09-11 の棚卸しで実態を確認。実装は MOB-001 系で
       到達済みだったが ledger が追随していなかった）**。全Task完了をもってProject完了とみなす判定。
@@ -1395,6 +1397,8 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       **今回実装しないもの（明記）**: 新しい Reporting 基盤 / AIteamOS 専用 Report システム /
       新しい log・telemetry・metrics 基盤 / cost 計測 / 新しい review 基盤 / 新しい queue・daemon /
       Milestone planning entity / Task 単位の詳細 Report。本追記は設計方針と着手順の確定まで。
+
+      (2026-10-22 roadmap integrity audit: 「Approval Gate の再利用」を通知に使わない: Approval（A・B）は決定の記録で、Task の WAITING は1件に置換される（`approval_rules.md` §A・B-5）。Milestone 通知は既存 `notifier`・`summaryEngine.ts` だけで行い、承認行を作らない)
 <!-- roadmap:id=project-auto-meta-review-hardening state=done -->
 11. [x] **Meta Review MVP Hardening — Strategic Alignment / Review Load Distribution**（2026-08-13
       foundation実装完了。2026-08-14、残り3 Acceptance Criteria全件を実production経路への
@@ -1922,6 +1926,8 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       DA trigger 7（未解決の review 不一致）の開示を追加した。verdict の再抽選そのものは本項目の範囲のまま未解決だが、
       失敗 review の resume による再抽選は `review_resumed` 経由で引き続き fail-closed に止まる。
 
+      (2026-10-22 roadmap integrity audit: 本文の「REJECT が Human Resume で洗浄される」は修正済み: REJECTED な git_commit への Human Resume は source implement へ戻る（`apps/api/src/storage/sqlite.ts:2178` 以降、`approval_rules.md`「CEO が REJECT した git_commit から修正へ戻る経路」2026-10-15）。残る範囲は同じ差分への verdict の揺れそのもの（本文 2026-10-15 の追加実測）だけ)
+
 <!-- roadmap:id=project-auto-worker-core-split state=deferred -->
 1. [ ] **Worker安全コアの物理分離** — CONTROL REPOSITORY保護対象を「安全コア」単位へ縮小する。
       実行・Approval・Risk Scan・fail-closedは保護対象として残し、Context Pack構築・Task選定・
@@ -2138,6 +2144,8 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       分析→Improvement Proposal生成→CEO週次提出、のend-to-endが最小構成で機能すること。既存
       Telemetry/Team Health/Self Diagnosis/Improvement Planner/CEO Proposal/Experiment/
       Evolutionの責務定義（本ファイル944-1030行）と重複する独立実装を作っていないこと
+
+      (2026-10-22 roadmap integrity audit: 「改善案は CEO Proposal → CEO 承認」は Decision Authority Principle（2026-10-02、`specs/22` 1-2・1-3）より前の記述。CEO へ上げるのは DA trigger に当たる改善（Goal・Policy・authority 等）だけで、技術的な改善は Evidence を伴う通常の Task 経路で扱う。CEO Proposal を Approval Gate の行で運ばない（`approval_rules.md` §A・B-5: Task の承認待ちは1件で、新しい起票は既存の WAITING を置換する）。着手時にこの差分を整合させる)
 **統合設計確定（2026-09-01、CEO承認。項目6・7・8・9の関係を以下に固定する）**:
 Natural-language Project Definition → AI structured constraints → Readiness → Roadmap
 generation → deterministic constraint validation → whole-roadmap independent Design
@@ -2402,8 +2410,8 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 
       **完了条件**: 防止方式（生成時制約／生成後検出／両方）の採択、Design Review側で検出する場合の
       チェックリスト・focus設計方針がCEOに採択されていること。実装着手はCEO承認後
-<!-- roadmap:id=roadmap-generation-constraint-compliance state=in_progress -->
-9. [~] **Roadmap Generation Constraint Compliance**（2026-09-01登録。Phase 1c 2回目の試行
+<!-- roadmap:id=roadmap-generation-constraint-compliance state=done -->
+9. [x] **Roadmap Generation Constraint Compliance**（2026-09-01登録。Phase 1c 2回目の試行
       `phase 1c v2`（Project ID `4a55dd0f-6b2f-4ad6-8864-f699d586d9b4`）で、1回目とは独立に再現。
       調査・roadmap登録のみ。Phase 1cのscopeへは混ぜない。今回専用の「タスク数が1でなければreject」
       というハードコードはしない）。
@@ -2620,6 +2628,8 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 
       Roadmap regeneration・Design Review CONFLICT Recoveryは項目7として引き続き別管理・
       未着手。
+
+      (2026-10-22 roadmap integrity audit: done — deterministic constraint 検証 `validateRoadmapConstraints()`（`apps/api/src/storage/roadmapTaskValidation.ts:404`）と Whole-Roadmap Design Review の pre-sync 接続（`createAndExecuteRoadmapReview()`、`apps/api/src/ctoAi/projectInitialization.ts:58,321`）が master d7b3ee15 にあり、Phase 1c 再検証も本文どおり完了済み。Roadmap regeneration / CONFLICT Recovery は本文どおり項目7の責務で、本項目の完了条件ではない)
 <!-- roadmap:id=project-pause-continuation-gap state=done -->
 10. [x] **Project Pause / Continuation-Control Gap — 完了**（2026-09-01登録・同日実装完了。
       `phase 1c v2`のregression evidence保持作業中に発見。Phase 1cへは混ぜていない）。
@@ -2811,7 +2821,7 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    **やること**: authoritativeの判定をTask行の存在だけに依存させず、
    「acceptedなevidenceがある」段階もrecoveryが認識できるようにする。
    新しいstatus体系を作らず、既存のevidence行とstart_stageで表現できるかをまず検討する。
-<!-- roadmap:id=review-substage-progress-reporting state=planned -->
+<!-- roadmap:id=review-substage-progress-reporting state=deferred -->
 0. [ ] **Whole-Roadmap Reviewのsub-stageをAPIへ報告する**（2026-09-08登録。PR Cのscope判断から派生）。
 
    **2026-09-13 追記**: 本項目は `cross-project-state-api`（Review 状態の横断読み出し）に
@@ -2836,6 +2846,8 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 
    **やらないこと**: 新しいQueue/Daemon/進捗専用DBを作らない。
    既存の`design_review_runs`行やrunnerのstdout契約の拡張で足りるかをまず検討すること。
+
+   (2026-10-22 roadmap integrity audit: deferred — 本文 2026-09-13 追記どおり `cross-project-state-api`（in_progress）の受入条件として扱い、単独では着手しない。そのため PL の採用候補（`planned` のみ）から外す)
 <!-- roadmap:id=pl-review-process-supervision state=planned priority=high -->
 0. [ ] **workflow progressionをblockするbackground taskを、進捗・完了監視なしで走らせない**
    （2026-09-08登録、**高優先度**。CEO判断: 運用上の欠陥として扱う。
@@ -3582,6 +3594,8 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    増えないこと、REJECTED では queued へ戻らないこと、未承認なら blocked のままであることを
    固定した。**M3 の production E2E で「手動 resume なし」を実測して最終確認する。**
 
+   (2026-10-22 roadmap integrity audit: 前提「`git_commit` は riskLevel に関わらず無条件で CEO 承認必須」は廃止済み（`specs/22` 14-1 項3、`apps/api/src/routes/approvalGate.ts:759`）。機能面の解消記録は有効のまま。state は変えない)
+
 <!-- roadmap:id=workspace-dirty-leakage-cleanup state=done -->
 0. [x] **terminal 失敗が dirty worktree を共有 workspace に残し、掃除する actor がいない**
    — **完了（2026-09-11, PR #148 / commit `2759a76`）。予防側のみで、治療側は別項目。**
@@ -4101,6 +4115,8 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    `quarantined-dirty-task-generic-recovery`（quarantine 済み Task の復旧）。
    3項目は**別 Finding として分離したまま**扱い、まとめて1つの機構にしない。
 
+   (2026-10-22 roadmap integrity audit: Tier B のみ — 修正点の `resolveWorkspaceOwnership()` は `apps/worker/src/index.ts:343` にあり、このファイルは protected path（`ALWAYS_FORBIDDEN_PATTERNS` の `^apps/worker/src/index.ts$`）なので Tier A では採用できない)
+
 <!-- roadmap:id=workspace-ownership-content-identity state=deferred -->
 0. [ ] **fallback workspace ownership は content identity を証明しない（CEO受容済みの既知制約）**
    **【2026-09-13 注記】`project-workspace-isolation` は本項目を閉じない。** 分離後も
@@ -4167,6 +4183,8 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    Task の受入条件に現れる検証コマンドを implement Job の判定に反映できないか検討する。
    最小案としては「受入条件に実行可能なコマンドが含まれる場合、それを SafeCommand として
    実行し、失敗したら Job を success にしない」。
+
+   (2026-10-22 roadmap integrity audit: typecheck を implement Job の検証へ入れる修正は PR #355（verificationProfile + `verify:implement`）で、2026-10-22 時点で OPEN・master d7b3ee15 に未 merge（root `package.json` に `verify:implement` が無い）。採用前に #355 の状態を確認して重複実装しない。deploy 前に Candidate がこの script を持つことも要る)
 
 <!-- roadmap:id=outbox-blocked-critical-false-alarm state=planned -->
 0. [ ] **正常な continuation 中に `Worker Outbox resend is blocked` の CRITICAL が誤発報する**
@@ -4279,7 +4297,7 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    `apps/api/src/routes/jobs.ts` に**2つ別々に定義されている**。今回は worker 側が正規化してから
    送るので API 側は素通りするが、契約が2箇所にある以上ずれうる。統合するかは別途判断が要る。
 
-<!-- roadmap:id=continuation-reconcile-nonblocking-followups state=planned -->
+<!-- roadmap:id=continuation-reconcile-nonblocking-followups state=deferred -->
 0. [ ] **continuation reconcile の非blocking指摘2件（Independent Review NON-BLOCKING）**
    （2026-09-10登録。PR #136 のIndependent Reviewで指摘。
    **MVP完了を阻害しないため延期**。CEO方針: MVPスコープを広げない）。
@@ -4369,6 +4387,8 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
    #132 の CI 実測で `runContainedCommand.test.ts` は **20 tests / 13 skipped**
    （`isContainmentAvailable()` gate）。開発機の WSL も cgroup v1 hybrid で作成不可。
    よって cgroup 側の Acceptance は **production でしか検証できない**前提で計画すること。
+
+   (2026-10-22 roadmap integrity audit: deferred — 指摘2（catch の握り潰し）は修正済み（`apps/api/src/ctoAi/taskContinuation.ts:46-50` が識別子付きの1行を残す）。残る指摘1（毎 cycle の全 Project 走査）は「性能上の実測問題が出るまで新 query を追加しない」CEO 方針により保留)
 
 <!-- roadmap:id=codex-sandbox-off-deprecated-landlock state=planned priority=high -->
 0. [ ] **Codex sandboxをdeprecated Landlockに依存しない経路へ移行する**（2026-09-07登録、
@@ -5387,6 +5407,8 @@ merge 後は Candidate clone を canonical master へ同期してから次の自
       **依存**: 「正式Production起動方式の確定」（本ファイル VPS 常駐運用化の節）と整合させる。
       1ユニット=1インスタンス強制の議論はそちらが正本。
 
+      (2026-10-22 roadmap integrity audit: Tier B のみ — 本項目は protected path を要する変更の扱いそのもので、isolated workspace・権限分離は Worker の claim / 実行経路（`apps/worker/src/index.ts`・`apps/worker/src/jobRunner.ts`、protected path）と Production 構成に触れるので、Tier A では採用できない)
+
 **Multi-Project との関係（同一マイルストーンにしない。CEO 指示）**:
 自己開発移行は Candidate 分離が成立した時点で先に開始する。
 Project #2 の並行開始は別途、`project-workspace-isolation` / Project 内 claim isolation /
@@ -5708,7 +5730,9 @@ deploy canary は全 PASS だった。
          legacy 同士の root 共有という受容事項が、解除後も破られないようにするため
       **上記が全て満たされるまで interlock は維持する（CEO 指示）。**
 
-<!-- roadmap:id=execution-runtime-harness-bakeoff state=planned -->
+      (2026-10-22 roadmap integrity audit: S3 は Tier B のみ — S3 が変える `apps/worker/src/guards/permissionGuard.ts`・`apps/worker/src/aiCli/adapter.ts`・`apps/worker/src/utils/pathUtils.ts`・`apps/worker/src/index.ts` は protected path（`ALWAYS_FORBIDDEN_PATTERNS`）で、Tier A では採用できない。S1・S2 はこの制約を受けない)
+
+<!-- roadmap:id=execution-runtime-harness-bakeoff state=deferred -->
 1. [ ] **Harness Bake-off / Execution Runtime Evaluation（CEO HOLD: 明示解除まで着手しない）** —
       High-priority Recovery修正が一段落した後、
       **新規機能を増やす前に**実施する評価項目。第一候補としてOpenHands等のvendor-neutral /
@@ -5792,7 +5816,9 @@ deploy canary は全 PASS だった。
       本項目はRoadmapへの将来方針と評価条件の記録のみであり、着手可否は既存High-priority Repair
       完了後に判断する。
 
-<!-- roadmap:id=containment-adversarial-escape-threat-model state=planned -->
+      (2026-10-22 roadmap integrity audit: deferred — title の CEO HOLD（明示解除まで着手しない）を state に反映しただけで、CEO 判断は変えていない。本文の「`deferred` でも採用は妨げられない／この抑止のためだけに state を変更しない」は 2026-09-15 時点の記述で、現在の採用は `planned` のみの allowlist（`apps/api/src/pl/adoptionStep.ts` `readAdoptionCandidates()`、本ファイル冒頭）なので、HOLD を機械的に守るには `deferred` が正しい。CEO が HOLD を解除したら `planned` に戻す)
+
+<!-- roadmap:id=containment-adversarial-escape-threat-model state=deferred -->
 2. [ ] **Containment adversarial escape（cgroup migration / git external helper）— security Finding** —
       2026-09-07、P1 Phase 2（async per-job cgroup containment）のCodex独立設計レビューで指摘。
       **Phase 2の対象外としてCEO判断済み**であり、本項目は記録のみ。
@@ -5839,7 +5865,9 @@ deploy canary は全 PASS だった。
       **今回実装しないもの（明記）**: non-migration enforcement / git設定のhardening /
       新sandbox基盤 / attestation。本項目はFinding記録のみ。
 
-<!-- roadmap:id=worker-cgroup-delegation-contract state=planned -->
+      (2026-10-22 roadmap integrity audit: deferred — 本文どおり Phase 2 の対象外として CEO 判断済みの記録のみの項目で、PL が採用して実装する対象ではない)
+
+<!-- roadmap:id=worker-cgroup-delegation-contract state=deferred -->
 3. [ ] **Worker unit の cgroup delegation を明示契約にする（systemd contract hardening・低〜中優先）** —
       2026-09-08、P1 Phase 2 完了時に記録。**今すぐ unit file を変更しない。**
 
@@ -5872,6 +5900,8 @@ deploy canary は全 PASS だった。
 
       **今回実装しないもの（明記）**: unit file の変更 / delegation 構成の変更 /
       新しい supervision 方式の導入。本項目は記録のみ。
+
+      (2026-10-22 roadmap integrity audit: deferred — 本文どおり記録のみ（今は unit file・delegation 構成を変えない）。Production の systemd unit は Tier A の Candidate 作業では変えられない)
 
 <!-- roadmap:id=containment-cleanup-ebusy-quarantine state=done -->
 3. [x] **cleanup だけが失敗した containment が Job を quarantine させる — 完了（2026-09-14, PR #167 / #168）**
@@ -5998,7 +6028,7 @@ deploy canary は全 PASS だった。
       cancel 応答性を損なわない短い bounded deadline を使う。deadline 到達は placement 成功では
       ないので、到達後は kill したうえで従来どおり fail-closed に分類する。
 
-<!-- roadmap:id=containment-success-path-observability state=planned -->
+<!-- roadmap:id=containment-success-path-observability state=deferred -->
 4. [ ] **Containment success path の可観測性（低優先 hardening）** — 2026-09-08、P1 Phase 1/2
       Operational E2E の完走後に記録。**Phase 1/2 を reopen する必要は無い。動作は正常。**
 
@@ -6024,6 +6054,8 @@ deploy canary は全 PASS だった。
 
       **今回実装しないもの（明記）**: metrics backend / トレーシング / 新しいログ基盤。
       本項目は記録のみ。
+
+      (2026-10-22 roadmap integrity audit: deferred — 本文 2026-09-13 追記どおり `cross-project-state-api` に包含され、単独では着手しない記録のみの項目)
 
 
 <!-- roadmap:id=failure-explanation-pregeneration state=planned -->
@@ -6711,7 +6743,7 @@ shell）・Deterministic（validator / test runner / linter）等を含める。
 Shadow結果の自動反映／CEO承認なしの予算上限超過／Model Registryの自動インターネット更新／
 プロダクションコードの変更。
 
-<!-- roadmap:id=project-auto-gemini-worker-eligibility state=planned -->
+<!-- roadmap:id=project-auto-gemini-worker-eligibility state=deferred -->
 1. [ ] **Gemini 3.7 Flash Free Tier Worker適合性調査** — 2026-08-14、CEO指示により新規登録。本節の
       Static/Dynamic Model Routing・Data Sensitivity Policy・Model Registry Lite・Quota Policyの
       枠組みを、具体的な1 Providerへ最初に適用する調査。新しい独立Provider評価の仕組みは作らない。
@@ -6810,6 +6842,8 @@ Codex/他Providerとの比較。継続/役割縮小/Paid利用/Freeのみ利用/
 Unknown分類） (5) Default Denyが成立 (6) 最小Provider統合完了 (7) quota/fallback動作確認 (8) 実績
 計測可能 (9) 既存Providerへの回帰可能。**ただし調査の結果Gemini追加が不適切と判断された場合は
 「追加しない」という判断でも本項目は正常終了（done）とする**。
+
+(2026-10-22 roadmap integrity audit: deferred — 本文の着手条件「MVP直後のCritical bug/Safety issue/運用安定化より優先しない」が現在満たされない（`b8d0fc5d` の出口の無い停止と Candidate 未同期が未解決）。それらが解消したら `planned` に戻すかを判断する)
 
 ### VPS App Runtime Standard v1: /health and last-run reporting（VPS自作アプリ標準稼働仕様 v1）
 
@@ -6933,6 +6967,10 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
    実効行為と揃っていない。`REJECTED` の safe-work 対象 action が read-only で動き続けうる点も同じ決定点の話であり、
    本項目で一緒に直す（新しい項目は作らない）。`state` は `planned` のまま。
 
+   (2026-10-22 roadmap integrity audit: Tier B のみ — 修正点の `apps/worker/src/guards/gatePolicy.ts` と `apps/worker/src/jobRunner.ts` は `ALWAYS_FORBIDDEN_PATTERNS`（`apps/worker/src/guards/fileChangeGuard.ts:38-70`）に当たる protected path で、Tier A では採用できない)
+
+   (2026-10-22 roadmap integrity audit: 正本との差分: `approval_rules.md` B-7 は `test` を含む HIGH の safe work を「読み取り・検証だけ」として承認待ちを作らないが、implement Job は `kind:'test'` でコードを書く。挙動は修復前からで commit は引き続き Gate される（P2）。B-7 の正本文言の修正（CODEOWNERS 対象・K-1）と合わせて扱う)
+
 <!-- roadmap:id=review-gate-layers-implemented-but-unwired state=planned priority=high -->
 0. [ ] **実装済みと記録されているレビュー / Gate 層が Job 経路に配線されておらず、うち1つは gate 緩和の理由になった** — 2026-09-15 監査（Confirmed / P1）。個別の未配線ではなく **1 つの問題**として扱う。
 
@@ -7010,6 +7048,8 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
    - (3) を配線する場合、`commitGate.ts` の必須成果物を戻せるかまで含めて判断する
    - (4) は既存 `observationLog` へフィールドを足すだけにする。**新しい telemetry 基盤を作らない**
    - (5) は「残す（理由を再確認）」「消す」のどちらかを明示的に決め、宙吊りにしない
+
+   (2026-10-22 roadmap integrity audit: Tier B のみ — (1)(3)(4) の修正点 `apps/worker/src/jobRunner.ts` は protected path（`ALWAYS_FORBIDDEN_PATTERNS`）で、Tier A では採用できない。(2) の `apps/api/src/routes/approvalGate.ts` は CODEOWNERS 対象、(3) の `commitGate.ts` は K-2 で HIGH)
 
 <!-- roadmap:id=allowed-paths-empty-disables-file-change-guard state=planned priority=high -->
 0. [ ] **`allowedPaths` が空配列だと File Change Guard の範囲チェックが丸ごと無効になる** — 2026-09-15 監査（Confirmed / P1。**#212 が close した `task-allowed-paths-not-normalized` とは失敗方向が逆の別 Finding**）。
@@ -7466,7 +7506,7 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
 
 ### 優先度 4: implementation ↔ docs 不一致
 
-<!-- roadmap:id=governance-and-spec-docs-current-truth-sweep state=planned -->
+<!-- roadmap:id=governance-and-spec-docs-current-truth-sweep state=deferred -->
 0. [ ] **governance / spec / decision 文書の Current Truth 一括更新（実装は変更しない）** — 2026-09-15 監査（Confirmed / P2）。個別 item 化せず 1 回の sweep として扱う。`current-truth-dual-record-prevention` (A) を最初に適用する対象でもある。
 
    **本 sweep が扱わないもの（重複回避）**: 憲法の共通行動原則の範囲表記
@@ -7546,6 +7586,12 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
    量が多いため、AI へ注入される 4 件（`multi_ai_step_review_flow.md` / `design_philosophy.md` /
    `AGENTS.md` §4 / Review Level 1）を先に片付けること。
 
+   (2026-10-22 roadmap integrity audit: deferred — `b8d0fc5d` が本項目を持ったまま出口の無い blocked になっている間、PL が本項目を再採用しないよう deferred にする。`b8d0fc5d` が正規の経路で終わったら、下記の範囲修正を反映したうえで `planned` に戻す)
+
+   (2026-10-22 roadmap integrity audit: 範囲の修正: `docs/project_memory/goal.md`・`design_philosophy.md` は直接編集しない（正本は Project レコードで、2ファイルは View。`CLAUDE.md` §7）。Goal・Design Philosophy の変更は DA trigger 1。`CLAUDE.md`・`AGENTS.md` など CODEOWNERS 対象ファイルは Tier A の範囲外（外部セッション + CEO code-owner review）で、`docs/project_memory/rules/` 配下は K-1 で HIGH。Tier A で扱える docs 部分と CODEOWNERS 部分に分け、#380（承認ルールの正本化、K-1 を含む）以降の正本へ基準を合わせ直す)
+
+   (2026-10-22 roadmap integrity audit: `b8d0fc5d` の Candidate 出力（`docs/project_memory/` 配下の未 commit 34 ファイル）はそのまま受け入れない（CEO 2026-10-22）。有用な意味は別途あらためて適用する)
+
 <!-- roadmap:id=project-completion-badge-wording-correction state=done -->
 0. [x] **`done` item の中に埋もれた 2026-09-13 の訂正が未実施のまま、生成ブロックからも見えない**
    — **完了（2026-09-18, Candidate `ea3141c`）**。VPS PL による Tier A 自己開発。
@@ -7591,7 +7637,7 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
 
 ### 優先度 5-6: dead / orphan / obsolete と単純 cleanup
 
-<!-- roadmap:id=audit-2026-09-15-low-priority-cleanup state=planned -->
+<!-- roadmap:id=audit-2026-09-15-low-priority-cleanup state=deferred -->
 0. [ ] **2026-09-15 監査由来の低優先 cleanup（P3 一括。単独で着手せず、近くを触る通常開発のついでに片付ける）** — Confirmed / P3。
 
    **重要**: 以下はすべて**現時点で実害が確認されていない**。
@@ -7693,6 +7739,8 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
      **CLAUDE.md §8 を実態（roadmap.md が正本）へ合わせるか、両者に history ラベルを付けるか**を決める
 
    **本項目では新しい仕組みを一切作らない。**
+
+   (2026-10-22 roadmap integrity audit: deferred — title どおり単独では着手せず、近くを触る作業のついでに片付ける P3 一括で、単独で採用する対象ではない)
 
 ---
 
@@ -7876,8 +7924,8 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
 - 将来着手する際も、**まず隔離環境でPoCしてから統合する**
 - 外部サービス追加・課金・認証・本番公開に該当する判断はYellow Zone（CEO承認必須）
 
-<!-- roadmap:id=mandatory-gate-policy state=in_progress -->
-0. [~] **Mandatory Gate Policy — PLは判断するが、自分の権限とGateの要否を決めない** — 2026-09-14登録。
+<!-- roadmap:id=mandatory-gate-policy state=done -->
+0. [x] **Mandatory Gate Policy — PLは判断するが、自分の権限とGateの要否を決めない** — 2026-09-14登録。
       **【2026-09-14 進捗: Policy Engine と enforcement seam を実装。残りは PL ループからの配線】**
       `resolvePlActionPolicy()`（`packages/shared/src/plActionPolicy.ts`）と
 `authorizePlAction()` / `previewPlActionPolicy()`（`apps/api/src/pl/actionGate.ts`）を追加した。
@@ -8038,6 +8086,10 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
 
       **Role / Provider / Model Routing との関係**: 独立 Review の provider 分離等の必須制約は
       **PL より上位の Policy として強制**する（`role-model-registry` から PL が緩められないようにする）。
+
+      (2026-10-22 roadmap integrity audit: done — 残作業とされた PL ループからの配線は完了している: `authorizePlAction()` は `apps/api/src/pl/adoptionStep.ts:83`・`apps/api/src/pl/abortTask.ts:333`・`apps/api/src/pl/executionLoop.ts:2069`・`apps/api/src/routes/tasks.ts:725` から呼ばれる)
+
+      (2026-10-22 roadmap integrity audit: 本文の「HIGH/CRITICAL・Mechanical Gate hit → ceo_approval」「rollback_commit の CEO 判断」は旧前提。Risk は Evidence の強さを決め、誰が決めるかは決めない（`specs/22` 14-3）。file-risk 由来や `rollback_commit` 等の `ceo_approval` はコードに残るが、外す段階の正本は `specs/22` 14-2 の表（段階1・3）。方針承認は PL action を通さない（`approval_rules.md` §A、棚卸し L11-2）。Gate の技術停止は CEO escalation ではなく `technical_exhausted`（T-3）)
 
 <!-- roadmap:id=review-class-b-enhanced-ai-review state=deferred -->
 4. [ ] **Review Class B（強化AIレビュー）: 通常AI判断とCEO必須判断の中間を埋める（Tier Bとは別概念・CEO承認が着手条件）** —
@@ -8204,6 +8256,8 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
 
       したがって本項目の `state=deferred` は**意図の記録であると同時に実効的な停止**でもある。
       着手には上記手順 3（`state=planned` への変更）が必要で、その前に CEO の境界表承認が要る。
+
+      (2026-10-22 roadmap integrity audit: 本項目が待つ「具体例つき境界表の CEO 承認」は `specs/22` 14-3（Priority 2 境界表、2026-10-07 CEO 承認）で与えられた。本文の「DB migration は Class C」のような操作名による分類は旧前提で、区分は意味・影響で決め（`specs/22` 1-1）、CEO へ上げるのは DA trigger 1〜7 だけ。残る実装範囲は M1 / M2 / M3（`high-git-commit-pass-on-strengthened-safety-evidence` / `risk-rules-substring-false-positives` / `da-triggers-345-deterministic-detectors`）と M8 が持つので、本項目の Class 枠組みをそれらと並行して採用しない。state は deferred のまま)
 
 <!-- roadmap:id=vps-pl-execution-loop state=done -->
 1. [x] **VPS 上で PL 判断ループを動かす（PL 不在の単一障害点を除去）** — 2026-09-14登録。**最優先級**。
@@ -8413,8 +8467,10 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       **本項目より先に着手しない。** 本項目の実運用データ（PL 起動頻度・rule だけで閉じる異常の割合）を
       見てから具体化する。効果検証に必要な記録の要件は当該項目に記載した。
 
-<!-- roadmap:id=lowrisk-candidate-commit-auto-approval-evaluation state=planned -->
-2. [ ] **十分に制約された LOW-risk Candidate commit を自動承認してよいかを評価する（評価のみ。今は緩和しない）** —
+      (2026-10-22 roadmap integrity audit: 本文の「同一対象への試行2回で打ち切り → CEO Escalation」は旧い意味づけ: 停止回数は CEO escalation 条件にしない（`specs/22` 14-3）。技術的な枯渇は見える技術停止（`technical_exhausted`、T-3）で、CEO へ上げるのは DA trigger のときだけ。state は変えない)
+
+<!-- roadmap:id=lowrisk-candidate-commit-auto-approval-evaluation state=done -->
+2. [x] **十分に制約された LOW-risk Candidate commit を自動承認してよいかを評価する（評価のみ。今は緩和しない）** —
       2026-09-15登録（CEO 指示）。**本項目は評価であり、実装でも Policy 変更でもない。**
       **既存 Safety Policy は今この時点では一切変更しない。**
 
@@ -8453,6 +8509,8 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - 効果検証可能性（Design Philosophy 8）: 自動承認した commit と CEO 承認した commit を
         後から区別・比較できる記録経路を同時に設計する
       - 撤回可能性: 自動承認を止めたいとき、**設定1つで即座に全件 CEO 承認へ戻せる**こと
+
+      (2026-10-22 roadmap integrity audit: done（superseded）— 前提の「全 `git_commit` が risk に関係なく CEO 承認必須」は廃止済みで、git_commit は Safety Evidence が成立しないときだけ人の承認を要する（`apps/api/src/routes/approvalGate.ts:759`、`specs/22` 14-1 項3・14-3 git_commit 行）。「AI が自動承認する」という枠組みは最重要原則（AI承認は無効、`approval_rules.md`）と両立しないので評価対象として残さない。残る拡張は M1 `high-git-commit-pass-on-strengthened-safety-evidence` が evidence-based execution として持つ)
 
 <!-- roadmap:id=approval-qa-leaks-internal-representation state=done -->
 3. [x] **承認画面の「AIに質問する」が内部表現（tool call・検索用プロンプト）をCEOへ表示した** —
@@ -8505,6 +8563,8 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - 「この画面内だけ」という現在の契約を変えるなら、履歴を保存しない前提が崩れないか
       - 効果検証可能性（Design Philosophy 8）: hold で終わった質問がどれだけあり、
         そのうち何件が PL へ届いたかを後から数えられること
+
+      (2026-10-22 roadmap integrity audit: 「CEO がスマホから PL へ正式に問い合わせる経路が無い」は解消済み: Operator Request（`POST・GET /api/operator-requests`、`apps/api/src/routes/operatorRequests.ts`）と Mobile 画面 `apps/mobile/app/operator.tsx`（`operator-chat-mobile`）がある。本文の `POST /api/tasks/:id/failure-questions` は実在しない（実在は `POST /api/tasks/:id/failure-ask`）。残る範囲は hold になった承認画面の質問をこの interface へ渡すことだけで、新しい問い合わせ口は作らない)
 
 <!-- roadmap:id=reconcile-evidence-not-fully-machine-verified state=planned -->
 5. [ ] **external completion reconcile の根拠2つが、まだ機械照合になっていない** —
@@ -8594,8 +8654,8 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - 効果検証可能性（Design Philosophy 8）: 誤読による調査時間が減ったことを、
         Guard block 後の再質問回数などで後から見られるか
 
-<!-- roadmap:id=no-status-for-closing-a-task-without-implementing state=planned -->
-7. [ ] **採用した Task を「実装せずに閉じる」正式な状態が無い** — 2026-09-15登録（実運用で詰まった）。
+<!-- roadmap:id=no-status-for-closing-a-task-without-implementing state=done -->
+7. [x] **採用した Task を「実装せずに閉じる」正式な状態が無い** — 2026-09-15登録（実運用で詰まった）。
 
       **事象**: PL が自律採用した Task `21d69075` は、調査の結果**実装すべきでない**と判明した
       （対象の Roadmap 項目が既に PR #144 で解決済みだった）。しかし `TaskStatus` は
@@ -8644,6 +8704,8 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - 自律運用では**誰が取り下げを決めるか**。PL の統合判断で足りるのか、CEO 承認が要るのか
       - 取り下げた Task が後から再開されうるか。されるなら履歴をどう残すか
       - 効果検証可能性（Design Philosophy 8）: 取り下げ件数とその理由を後から数えられること
+
+      (2026-10-22 roadmap integrity audit: done（superseded）— 新しい status を足さずに、park（承認済み `abort_task` → `storage.jobs.parkTask()`、`apps/api/src/pl/abortTask.ts:461`）と承認済み外部完了の取り込み（`reconcile_external_completion`、`apps/api/src/reconcile/externalCompletion.ts`・`apps/api/src/routes/tasks.ts:726`、X-1）で表現されている。Roadmap item 自体を捨てる判断は Decision Authority（`specs/22` 14-3 Abort / Park 行）。dirty baseline で abort が完了しない残りは `abort-blocked-dirty-baseline-cannot-complete` が持つ)
 
 <!-- roadmap:id=task-design-review-conflict-has-no-recovery-route state=deferred -->
 8. [ ] **adopt 済み Task が task-kind Design Review で CONFLICT し Job が 0 件のとき、訂正して再レビューする正式な経路が無い** —
@@ -8806,6 +8868,8 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
         その検査が使う記録そのものが足りていない話**
       - `independent-review-verdict-instability`: 判定が揺れること自体。本項目は**揺れた履歴を
         残せていない**こと
+
+      (2026-10-22 roadmap integrity audit: 「read は `findLatestByTaskId()` しか無い」は古い: run 履歴を全件返す `findByTaskId()` がある（`apps/api/src/storage/interface.ts:1229`）。R-5・R-6 も既に全 run を見る。残る範囲は adoption と #255 remediation が共有する canonical rejection identity の記録だけ)
 
 <!-- roadmap:id=adoption-path-has-no-material-difference-check state=deferred -->
 8. [ ] **採用経路に「却下済みと実質同じ提案か」の検査が無く、同じ設計を何度でも再審査させられる** —
@@ -8985,6 +9049,8 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
         そのまま自動化候補になる母集団である
       3. `byRootCause` の `protected_path` 件数 —— Maintenance Lane v0 の投資対効果の実測値
       4. `recurringRootCauses` —— 同じ原因が繰り返すなら、レーンではなく上流（採用時の scope 検証）の問題
+
+      (2026-10-22 roadmap integrity audit: 表の「それ以外は CEO Escalation」（試行枯渇・原因不明・技術 lane 不在）は旧い意味づけで、それ自体は CEO の判断ではない（`specs/22` 1-3・14-3）。6.8 / 6.9 は T-3 で技術停止へ移り、残りの rule は M6 `blocked-triage-technical-lane` が持つ。state は変えない)
 <!-- roadmap:id=adoption-does-not-check-implementation-feasibility state=planned -->
 8. [ ] **採用も Design Review も通るのに、allowedPaths 内では実装不能だと実装段階で初めて分かる** —
       2026-09-15登録（production 実測）。CEO 指示により**既存 adoption / Design Review /
@@ -9389,6 +9455,8 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       **関連**: `workspace-dirty-leakage-cleanup`（done）が escalate 時の掃除を入れた項目。
       本項目はその**適用範囲外**（blocked のまま残った Job）を扱う。重複実装しないこと。
 
+      (2026-10-22 roadmap integrity audit: deferred 理由の「DB migration は Class C」は旧前提。区分は操作名ではなく意味・影響で決め（`specs/22` 1-1・14-3）、jobs への additive な列追加は Technical Safety Decision（B）で、要るのは Production snapshot での rehearsal と rollback の Evidence。CEO が要るのは DA trigger 5（不可逆・destructive な migration）に当たるときだけ。state はこの監査では変えず、同じ材料を要する `abort-blocked-dirty-baseline-cannot-complete` と合わせて採否を決める)
+
 <!-- roadmap:id=approval-gate-evidence-not-action-bound state=deferred -->
 12. [ ] **`approval_gate` evidence は action へ束縛されず、Gate 経路では使い切られない** —
       2026-09-17登録（#235 の独立レビュー Finding 3 から分離）。**本項目は Finding であり、まだ実装しない。**
@@ -9437,7 +9505,9 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       `approval_gate` を要求する action 一覧の変更 / 本 Finding を根拠に
       Yellow Zone・Safety Boundary を動かすこと。
 
-<!-- roadmap:id=control-repository-header-vs-enforced-guard state=planned -->
+      (2026-10-22 roadmap integrity audit: 前半（action へ束縛されない）は解消済み: 全 PL action で requestedAction の完全一致を要求する（`approval_rules.md` B-1、`apps/api/src/pl/actionGate.ts` `requiredApprovalRequestAction()` 297-313 行）。残るのは Gate 経路での1回限りの消費だけで、M4 `approval-consume-invariants` へ寄せる。本項目は記録として deferred のまま)
+
+<!-- roadmap:id=control-repository-header-vs-enforced-guard state=deferred -->
 10. [ ] **`⚠️ CONTROL REPOSITORY — AI編集禁止` 注記と、実際に強制される保護範囲が一致していない** —
       2026-09-15登録（CEO の承認画面での指摘が発端）。
 
@@ -9546,6 +9616,8 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       （CODEOWNERS の対象追加のみ CEO 承認事項）。
       **AI 側が自分の権限を広げる形で解決してはならない**という既存の制約を全項目へ適用する。
 
+      (2026-10-22 roadmap integrity audit: deferred — 解消には `CLAUDE.md`・`AGENTS.md`・`docs/meta_reviewer/`・`.github/CODEOWNERS`（いずれも CODEOWNERS 対象）と Safety Boundary の正本の一本化が要り、外部セッション + CEO code-owner review の作業で Tier A では採用できない。CODEOWNERS は 2026-10-08 に一部拡張されたので、本文の「未保護」一覧は着手時に再確認する)
+
 <!-- roadmap:id=job-failure-metadata-outlives-its-run state=planned -->
 9. [ ] **Job の `failureMetadata` が実行をまたいで残り、前の失敗の印が次の実行に付いたままになる** —
       2026-09-21登録（独立レビュー指摘 + コード実測）。**本項目は Finding であり、まだ実装しない。**
@@ -9620,8 +9692,8 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       **使う**側の項目で、本項目（印の寿命そのもの）とは別。ただし本項目が解決すると、
       あちらが前提にできる材料の確からしさが上がる。
 
-<!-- roadmap:id=pl-escalation-blames-the-wrong-cause state=planned -->
-11. [ ] **CEO / PL に届く停止理由が、実際の原因を指していない** —
+<!-- roadmap:id=pl-escalation-blames-the-wrong-cause state=done -->
+11. [x] **CEO / PL に届く停止理由が、実際の原因を指していない** —
       2026-09-15登録（production 実測）。**機構ではなく、届く情報の品質の問題。**
 
       **【2026-09-15 追記】原因側は大きく改善した。残っているのは attention の detail。**
@@ -9661,6 +9733,8 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
         （`guard-block-message-omits-allowed-paths` と同じ情報源）
       - **新しい診断機構は作らない。** 渡す context の作り方（`buildContext()`）の改善で足りるか
       - 効果検証可能性: 誤った Escalation が何件あったかを後から数えられること
+
+      (2026-10-22 roadmap integrity audit: done — attention の `detail` は `stopReason()` が stderr 先頭の `[jobRunner] ` 注記を優先し、無ければ従来どおり末尾を使う（`apps/api/src/state/systemState.ts:296-316`、601・641 行で使用）。本文の最小案（新しいフィールド・抽出機構を作らない）どおり)
 
 <!-- roadmap:id=human-resume-superseded-job-hides-new-failure state=done -->
 14. [x] **Human Resume 後も古い blocked Job が Attention を占有し、後継の新しい失敗が PL に見えない（D2）** —
@@ -9805,8 +9879,8 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - 1ホップ規則と履歴・Approval・Evidence の整合を保つ最小修正
       - 効果検証可能性: git_commit 側 resume 段数の分布と、REJECT 後に再実装へ到達できた件数を数えられること
 
-<!-- roadmap:id=review-preflight-refusal-reaches-no-reimplementation state=planned priority=high -->
-0. [ ] **review Job が実装内容のせいで送信前チェック（Secret Scan）に拒否されると、resume も repair も再実装へ届かず Task が恒久的に止まる**
+<!-- roadmap:id=review-preflight-refusal-reaches-no-reimplementation state=done priority=high -->
+0. [x] **review Job が実装内容のせいで送信前チェック（Secret Scan）に拒否されると、resume も repair も再実装へ届かず Task が恒久的に止まる**
       — 2026-10-02 production 実測で登録（CEO 指示: 24時間自律運転の阻害要因）。
       `resumed-review-changes-requested-reaches-no-repair`（verdict が `changes_requested` の場合）の
       **隣接ケース**で、verdict が出る前に adapter が拒否する場合である。
@@ -9831,6 +9905,8 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - 送信前拒否の種類（workingDir 外 / Secret Scan / その他）のうち、実装差分で解消できるものだけを対象にする
       - repair 後の review でも同じ fixture を作り直さないよう、repair prompt に拒否パターンの種類（値ではなく）を示す
       - 効果検証可能性: 「review 送信前拒否で blocked」になった件数と、repair で解消した件数を数えられること
+
+      (2026-10-22 roadmap integrity audit: done — implementation-owned な Secret Scan 送信前拒否を既存 repair flow へ渡す経路が `apps/api/src/designReview/repairFlow.ts:639-658`（`refusal.kind === 'secret_scan'`）と 985-998 行（`eligibleRefusalRecovery`）にある（#324 / #326、`specs/22` 14-3 Repair admission 行）)
 
 <!-- roadmap:id=answered-design-review-run-blocks-repair-admission state=done -->
 15. [x] **Human Resume で回答済みの repair Design Review run が「最新だから」という理由で repair admission を止め続ける（D3）** —
@@ -9947,8 +10023,8 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       テストも別々に固定してある（`lineage walk — 意味側` / `lineage walk — 停止側`）。
 
 
-<!-- roadmap:id=auth-empty-token-hash-accepted state=in_progress priority=high -->
-0. [~] **未設定値から作った credential hash が「形式上正しいもの」として通り、空 token を受理する** —
+<!-- roadmap:id=auth-empty-token-hash-accepted state=done priority=high -->
+0. [x] **未設定値から作った credential hash が「形式上正しいもの」として通り、空 token を受理する** —
       2026-09-22 登録（read-only 確認）。**concrete な authority boundary の欠陥であり、
       `split-credential-migration` の cutover 前 blocker である。**
 
@@ -10001,9 +10077,11 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       一切伴わないので**独立して着手できる**。両方を 1 項目にすると、コードで塞げる欠陥が
       CEO 判断待ちに巻き込まれて永久に着手できなくなる。
 
+      (2026-10-22 roadmap integrity audit: done — 空 token 由来 hash の 503 拒否（`apps/api/src/auth/apiToken.ts:15-18` `EMPTY_TOKEN_SHA256`）と regression test（`apps/api/src/auth/emptyTokenHash.test.ts`）は master d7b3ee15 に入り Production で稼働中。Production の設定値は split cutover（2026-09-22）の際に値を開示せず「空でない・`sha256("")` でない」と確認済みで、2026-10-22 の read-only 確認でも API 応答は 200 / 202 だけ（503 なし）)
 
-<!-- roadmap:id=split-credential-migration state=deferred -->
-0. [ ] **legacy `API_TOKEN` → ADMIN / WORKER split credential cutover の正式 owner（CEO / Operator 判断）** —
+
+<!-- roadmap:id=split-credential-migration state=done -->
+0. [x] **legacy `API_TOKEN` → ADMIN / WORKER split credential cutover の正式 owner（CEO / Operator 判断）** —
       2026-09-22 登録。**deferred は低優先の意味ではない。** production cutover（計画停止を伴う）と
       production env の操作を含むため、PL が自律採用してよい範囲に無い、という意味である。
 
@@ -10039,6 +10117,8 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       `unknown` 扱いで repair budget を再発行しない、という安全側に閉じたまま動く。
 
       **blocker**: `auth-empty-token-hash-accepted`（planned / high）。
+
+      (2026-10-22 roadmap integrity audit: done — Production は 2026-09-22 から split credential mode（legacy token は 401）。2026-10-22 の read-only 確認で `authorization_evidence=admin_credential` の resume が 14 件（最新 10-16）、legacy の evidence は 0 件。本文の「CEO / Operator 判断」は同じ authority の中の credential 置換で、Decision Authority ではない（`specs/22` 1-5・1-8）)
 
 
 <!-- roadmap:id=provider-outage-burns-attempt-budget state=planned -->
@@ -10292,6 +10372,11 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - `provider-outage-burns-attempt-budget`（planned）は transient 障害が attempt 予算を
         食い潰す話で、予算の数え方であって停止保証ではない
 
+      **進捗（2026-10-22 promotion）**: Tier A Task（Candidate `bdb877d4`）の read-only 監査記録
+      `docs/project_memory/decisions/termination_guarantee_audit_2026_10_16.md` が master へ到達した
+      （経路一覧・各経路の停止根拠・欠陥 D1〜D5）。**AC は未達のため planned のまま**: 経路一覧は本 ledger ではなく
+      記録ファイルにあり、D1〜D5 は別項目として未登録、mutation は推論で未実測、PL loop 配下の await は未列挙（同記録 §6）。
+
 
 <!-- roadmap:id=monitoring-tiering-watchdog-monitor-pl state=planned -->
 3. [ ] **監視責務の段階分離（Deterministic Watchdog → Lightweight Monitor → VPS PL）— VPS PL 完成後の最適化** — 2026-09-14登録。
@@ -10529,8 +10614,8 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       **関連**: `operator-chat-mobile`（同じ interface を Mobile 側から使う）。
       **両者で別々の操作システムを作らない**（CEO 指示・2026-09-14）。
 
-<!-- roadmap:id=operator-chat-mobile state=planned -->
-2. [ ] **Mobile 内の運用指示窓口（Operator Chat）** — 2026-09-14登録。
+<!-- roadmap:id=operator-chat-mobile state=done -->
+2. [x] **Mobile 内の運用指示窓口（Operator Chat）** — 2026-09-14登録。
       **【制約: 従量課金APIを新しい標準経路にしない（CEO 指示・2026-09-14）】**
       会話処理や PL への指示伝達のために、OpenAI API / Anthropic API 等の従量課金 API を
       **新たな標準経路として導入しない**。既存の provider abstraction と CLI 実行経路を再利用する。
@@ -10598,6 +10683,8 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
 
       **Explainer との関係**: 回答文の平易化は `failure-explanation-pregeneration`（Explainer 責務）
       が担う。本項目は**事実の取得と、既存の安全な操作の呼び出し**に徹する。
+
+      (2026-10-22 roadmap integrity audit: done — MVP は 2026-09-29 に実機 E2E を完了（CEO 判断、本文記載）。画面 `apps/mobile/app/operator.tsx`・`apps/mobile/lib/operatorChat.ts`、API `apps/api/src/routes/operatorRequests.ts`、bounded provider retry（`apps/api/src/aiExplain/cheapAiClient.ts` `retryTransientOnce`）が master にある。再試行の実観測は運用上の観測で、本項目の完了条件ではない)
 
 <!-- roadmap:id=failed-job-produces-no-attention state=done -->
 3. [x] **`failed` な Job は `attention` に出ないため、Task が止まったまま PL から見えない** —
@@ -10798,6 +10885,8 @@ grep が 0 件であることによる）。
       **着手前に確認すること**: `rollback_commit` が既に CEO gate である以上、
       本項目が実際に減らすリスクは何かを先に言語化する。名前を言えない失敗のために制約を足さない
       （`specs/21` standard-design-frame）。
+
+      (2026-10-22 roadmap integrity audit: 本文の「`rollback_commit` が既に CEO gate」は安定した前提ではない: `specs/22` 14-2 の段階3が外す対象として挙げており、14-3 Production Deploy 行は失敗時の自動 rollback を Evidence（B+C）として要求する。本項目が減らすリスクはこれに照らして言い直す)
 
 <!-- roadmap:id=dry-run-does-not-simulate state=deferred -->
 2. [ ] **dry-run が「実行を飛ばす」だけで simulation になっていない** — 2026-09-17登録。
@@ -11485,7 +11574,7 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       fixture / isolated 環境で上記 Acceptance Criteria を固定し、**自然な CONFLICT が出た時に
       production E2E へ進む**。
 
-<!-- roadmap:id=remediation-attempt-admission-not-atomic state=planned -->
+<!-- roadmap:id=remediation-attempt-admission-not-atomic state=deferred -->
 5. [ ] **Remediation の試行受付が原子的でない（複数 API プロセス前提でのみ問題になる）** —
       2026-09-18登録（`independent-remediation-design-review-conflict` の Independent Review 指摘）。
       **本項目は Finding であり、いま実装しない。**
@@ -11521,6 +11610,8 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       **重複しない境界**: `project-workspace-isolation`（planned）は複数 Project の同時実行を扱う。
       本項目は**同一 Task に対する同一 role の同時実行**であり別物。ただし単一プロセス前提を
       やめる判断は共通なので、**着手する場合は同時に扱う**。
+
+      (2026-10-22 roadmap integrity audit: deferred — 本文どおり Finding で、いま実装しない。単一 API プロセス前提をやめる判断（`project-workspace-isolation` と共通）が先)
 
 <!-- roadmap:id=system-one-decision-layer-generalization state=deferred -->
 6. [ ] **System One Decision Layer の一般化（Principle 以外の Question category / 外部 Decision Engine 評価）** —
@@ -11743,6 +11834,8 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       **作らなかったもの**: 汎用 event replay subsystem / event bus / 新 status・Gate・workflow /
       新しい `PlActionKind` / 新しい dedup 機構 / 別の repair budget アルゴリズム /
       route 独自の budget override / `MAX_REPAIR_ATTEMPTS` の変更。
+
+      (2026-10-22 roadmap integrity audit: 本文の authority の根拠（「autonomous PL loop では作れない外部 approval 経路を通った」）は H-1 / H-2 で置き換わった: 人の承認として数えるのは `approval_actor=human`（split-credential ADMIN）の記録だけで、legacy の承認は数えない（`approval_rules.md` H-1・H-2・R-1〜R-3）。復旧経路そのものは有効。state は変えない)
 
 <!-- roadmap:id=repair-handoff-overwrites-terminal-result state=done -->
 8. [x] **repair handoff が、成功した source Job の結果を `failed` へ書き換えていた** —
@@ -12002,6 +12095,8 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       - git_commit Approval で DA trigger 7 が開示される
       - `typecheck` / `tests` / `roadmap:check` が PASS
 
+      (2026-10-22 roadmap integrity audit: in_progress のまま。受入条件「出口の無い停止が残らない」は `b8d0fc5d` の形（最新 Job が失敗した SafeCommand。`abort-blocked-dirty-baseline-cannot-complete` 参照）で反証されているので、それが解消するまで done にしない)
+
 <!-- roadmap:id=lifecycle-consume-commit-crash-recovery state=deferred -->
 12. [ ] **Approval の consume と `git commit` の間でクラッシュすると、復旧が repair（新しい Approval 要求）にしか無い** —
       2026-10-17登録（Lifecycle 一括修復 `lifecycle-semantic-integrity-batch-repair` と独立監査
@@ -12018,6 +12113,8 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       「commit が既にできているか」を照合して復旧できるか。**新しい Approval status は作らない。**
 
       **やらないこと**: 新しい status / queue / daemon。Approval の再利用範囲を広げること（承認は元の判断にだけ効く）。
+
+      (2026-10-22 roadmap integrity audit: (a) で求められるのは「CEO の同じ判断のやり直し」ではなく、人（split-credential ADMIN）による exact な Task / Job 承認の新規発行であり（`approval_rules.md` B-2・H-1・G-1）、CEO Decision Authority の問いではない（`specs/22` 1-8）。D2 / G-1 で承認済みの HIGH / CRITICAL commit も atomic consume の後に実行されるようになったので、(a) の窓はすべての承認済み commit に及ぶ)
 
 <!-- roadmap:id=high-git-commit-pass-on-strengthened-safety-evidence state=deferred -->
 13. [ ] **M1: HIGH の技術的 git_commit を、強化した Safety Evidence（ベンダー分離の独立レビュー）で通す** —
@@ -12068,6 +12165,8 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
 
       **やらないこと**: 新しい Approval status。
 
+      (2026-10-22 roadmap integrity audit: `approval-gate-evidence-not-action-bound` の残り（`approval_gate` を要求する PL action で、Gate 経路の承認を1回限りで消費すること）も本項目が持つ)
+
 <!-- roadmap:id=pre-commit-branch-recheck-and-binding-failure state=deferred -->
 17. [ ] **M5: commit 直前に branch を再確認し、resulting-commit binding が失敗したら Task を完了させない** —
       2026-10-17登録（独立監査 M5。`deferred`）。
@@ -12087,6 +12186,8 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
 
       **関連**: `blockedTriage` は `apps/api/src/pl/blockedTriage.ts`。M8 の CEO 判断（`review-disagreement-ceo-routing-decision`）と整合させる。
 
+      (2026-10-22 roadmap integrity audit: 「技術的・自動再開なし・CEO 判断なし」の見える停止は既にある: rule 6.8 / 6.9 は T-3 により技術 lane のまま `technical_exhausted` になる（`apps/api/src/pl/blockedTriage.ts` `technicalStop`、`apps/api/src/pl/executionLoop.ts`）。本項目の範囲は残りの rule（provider 汚染・原因不明・review attempt 枯渇）をこの既存の形へ寄せることだけで、6.8 / 6.9 は作り直さない。停止回数は CEO escalation 条件にしない（`specs/22` 14-3）)
+
 <!-- roadmap:id=review-disagreement-ceo-routing-decision state=deferred -->
 19. [ ] **M8: レビュー不一致・安全方向の判定不能・Meta Review UNCERTAIN だけを理由に CEO へ回してよいか — 【CEO 判断待ち】** —
       2026-10-17登録（独立監査 M8。`deferred`）。**CEO の決定を待っている。決定前に適用しない。**
@@ -12096,6 +12197,8 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       **適用前に必要なこと**: `specs/22` §1-2 / §14-3 と CLAUDE.md §9 の差分を CEO に提示する（Authority 文書の変更のため）。
 
       **関連**: `blocked-triage-technical-lane`（M6）。
+
+      (2026-10-22 roadmap integrity audit: 正本で既に決まっている部分: provider 失敗・判定の無い run は不一致ではなく技術扱い（`approval_rules.md` R-7、`specs/22` 1-3）、「Review verdict の不一致が未解消」は DA trigger 7 で CEO 候補（`specs/22` 14-3）。推奨案③を文字どおり適用すると未解消の verdict 不一致まで技術 lane へ移り DA trigger 7 を外すことになるので、その部分は CEO による DA trigger 7 の変更としてだけ扱う。CEO 判断待ちであることは変えない)
 
 <!-- roadmap:id=reopened-promoted-id-stays-awaiting-promotion state=deferred -->
 20. [ ] **Promotion 済みの roadmap id を `planned` に戻すと、恒久的に「promotion 待ち」のままになる** —
@@ -12127,6 +12230,8 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
 
       **確認された事実**: CEO は API の `approval_waiting` attention を通してしか知れない。
 
+      (2026-10-22 roadmap integrity audit: G-1 以降、承認済み HIGH / CRITICAL commit を Worker がローカルの risk で止めることは無く、Gate の技術停止（T-3 / G-2）では Worker の運用上の警告が従来どおり出る。未承認の HIGH commit が人の判断を待つ状態は `approval_waiting` attention（R-10）が正規の通知経路である。採用前に「Worker 側にも警告が要る具体的な欠落」を言い直し、言い直せなければ閉じる)
+
 <!-- roadmap:id=abort-blocked-dirty-baseline-cannot-complete state=deferred -->
 24. [ ] **dirty baseline を持つ blocked 行（例: reject された git_commit）の手動 abort が完了しない** —
       2026-10-17登録（Lifecycle 一括修復。`deferred`）。
@@ -12135,6 +12240,55 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
 
       **やらないこと**: abort の自動化（Candidate の作業内容を捨ててしまうため）。
 
+      (2026-10-22 roadmap integrity audit: 事実の訂正と統合（新規項目 `escalated-safecommand-latest-job-has-no-lawful-exit` は立てずにここへ寄せる）: 「出口は Human Resume」は最新 Job が AI CLI でない SafeCommand のとき成り立たない。`b8d0fc5d`（`governance-and-spec-docs-current-truth-sweep`）は最新 Job が escalate 後に失敗した `git_status` で、Human Resume は `AI_CLI_MODE_MISSING`（`packages/shared/src/resumeAdmission.ts:122-125`）、Recover は `TASK_HAS_JOBS`（`packages/shared/src/recoverAdmission.ts:47`）、一方 b8d0fc5d は blocked Task で全 Job が終端なので、manual abort は本項目（pending Task の `releaseBlockedJobAndParkTask`）ではなく `parkBlockedTaskWithTerminalJobs`（`storage/sqlite.ts` ~4117-4477）を通り、carrier baseline との一致は求めない。operator が worktree を共有 start commit（bdb877d）で clean に戻せば park できる（コード変更なし・Class B・既存 approval_rules.md 213-226 の手順どおり）。b8d0fc5d の終了はこの既存経路で行う（CEO 2026-10-22 方針: 34 ファイルは採用しない・精査後に正規終了）)
+
+      (2026-10-22 roadmap integrity audit: 本項目（pending Task 経路）の修正案: manual approval に限り「carrier の start commit で clean な known-good 観測」を受け入れ、`findWorkspaceUserAnywhere` を併用する。canonical rule（`approval_rules.md` 213-226: operator revert の後の clean 観測）が既に要求する手順を満たせるようにするだけなので Approval Tuple は変わらず Class B 候補（実装時に Codex Independent Review）。D4 の `it.fails`（`lifecycleE2E/cycle2.lifecycle.test.ts:284`）を反転し、拒否系（HEAD 違い・部分 clean・他 Task の workspace 使用・technical 経路不変・T-2 不変）を固定する。blocked 経路の manual abort は現状 `findWorkspaceUserAnywhere` を見ないので、他 Project の workspace 使用を同じ修正で併せて確認する)
+
+<!-- roadmap:id=candidate-sync-after-lifecycle-repair state=deferred -->
+25. [ ] **Candidate を Lifecycle 一括修復後の master へ同期する（`b8d0fc5d` が正規の経路で終わった後）** —
+      2026-10-22登録（roadmap integrity audit。P0。`deferred`: 前提条件が満たされるまで PL は採用しない）。
+
+      **確認された事実**: Candidate（`/workspace/target`、branch `candidate/self-dev`）の HEAD `bdb877d` は
+      master `8477586`（#319・#320 まで）から分かれており、#321〜#393（master `d7b3ee15`、Production で稼働中）を含まない。
+      さらに `b8d0fc5d` の未 commit 出力（`docs/project_memory/` 配下 34 ファイル）で dirty である。
+
+      **順序（省略しない）**: (1) `b8d0fc5d` を正規の経路で終える（`abort-blocked-dirty-baseline-cannot-complete`）。
+      dirty 差分の扱いは CEO 判断（2026-10-22: そのまま受け入れない）に従い、本項目では捨てない
+      (2) Candidate Freeze（未決の approval 無し・Candidate を占有する Task 無し）を確認する
+      (3) master へ同期し、`pnpm install --frozen-lockfile` を実行して、前後で HEAD・tracked files・lockfile・未 commit 差分が
+      変わらないことを確認する (4) `roadmap:check`。
+      手順の正本は本ファイル「Promotion の完了条件」節と `specs/22` 14-3 Candidate Sync 行で、新しい手順は作らない。
+
+      **やらないこと**: `b8d0fc5d` が終わる前の同期。帰属を確認できない dirty 差分の破棄。
+
+<!-- roadmap:id=technical-abort-text-timestamp-comparisons state=deferred -->
+26. [ ] **abort の帰属判定が Job の作成時刻を文字列のまま比べている** —
+      2026-10-22登録（roadmap integrity audit。Lifecycle 一括修復の受容済みの残り。`deferred`）。
+
+      **確認された事実**: `apps/api/src/pl/abortTask.ts` の `findUnattributedDirtyEnd()`（138 行）と、clean baseline 以降の
+      他 Task の Job の探索（1121-1122 行）が `createdAt`（`string`）を `>` / `>=` / `<=` で比べる。
+      T-1 は human の CONSUMED の時刻を数値として比べる（`approval_rules.md` T-1）が、こちらは文字列比較のまま。
+      形式の揃った ISO 文字列なら順序は一致するが、形式が揺れると帰属判定（T-2）が誤る。
+
+      **方向**: 数値として比べ、読めない時刻は fail closed（帰属不明として park しない側）に倒す。
+
+      **やらないこと**: 新しい時刻列・新しい status。
+
+<!-- roadmap:id=risk-rank-table-consolidation state=deferred -->
+27. [ ] **RiskLevel の順位表が複数箇所に重複している** —
+      2026-10-22登録（roadmap integrity audit。Lifecycle 一括修復の受容済みの残り。`deferred`）。
+
+      **確認された事実**: `{ LOW: 0, MEDIUM: 1, HIGH: 2, CRITICAL: 3 }` 相当の表が
+      `packages/shared/src/approvalGateLogic.ts`（163・271 行）、`apps/api/src/routes/approvalGate.ts:567`、
+      `apps/worker/src/guards/gatePolicy.ts:187`、`apps/worker/src/guards/gateProcessor.ts:29`、
+      `apps/worker/src/guards/safetyAuditor.ts:103` に別々にある。S-5（risk の下限）と G-2（`risk_rule_skew`）は
+      順位の比較に依存するので、表が食い違うと承認の効果が変わる。
+
+      **方向**: `packages/shared` の1つの表へ寄せる。順位の値は変えない。
+
+      **Tier B のみ**: 対象の多くは protected path（`apps/worker/src/guards/**`、`ALWAYS_FORBIDDEN_PATTERNS`）または
+      CODEOWNERS 対象で、Tier A では採用できない。
+
 ---
 
-*Updated: 2026-09-28*
+*Updated: 2026-10-22*
