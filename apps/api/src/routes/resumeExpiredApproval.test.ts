@@ -1,4 +1,5 @@
 import Fastify, { type FastifyInstance } from 'fastify'
+import { setCredentialClass } from '../auth/credentialClass.js'
 import { describe, expect, it, vi } from 'vitest'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { buildResumeAiCliPrompt } from './tasks'
@@ -36,6 +37,15 @@ async function buildApp(taskRouteOptions?: TaskRouteOptions): Promise<FastifyIns
   resetStorage()
 
   const app = Fastify()
+  // production では PATCH /approval-requests/:id/status は HUMAN_ONLY_ROUTES（split mode の ADMIN だけが届く）。
+  // このテスト app は認証 hook を持たないので、その境界だけを模して ADMIN として記録する
+  // （consume は approval_actor=human を要求する。D2 hardening 2026-10-17）。
+  app.addHook('preHandler', async (req) => {
+    const path = req.url.split('?')[0]!
+    if (req.method === 'PATCH' && path.startsWith('/api/approval-requests/') && path.endsWith('/status')) {
+      setCredentialClass(req, 'admin')
+    }
+  })
   app.register(approvalGateRoutes, { prefix: '/api' })
   app.register(taskRoutes, { ...(taskRouteOptions ?? {}), prefix: '/api/tasks' })
   app.register(jobRoutes, { prefix: '/api/jobs' })
@@ -502,6 +512,9 @@ describe('POST /api/tasks/:id/resume — expired WAITING_FOR_USER approval', () 
         payload: { status: 'APPROVED' },
       })
       expect(approveRes.statusCode).toBe(200)
+      // 承認（approveAndResumeJob）で Job は queued に戻る。Worker は claim（running）してから gate/check・consume する
+      // （consume は running の Job だけを受け付ける。D2 hardening 2026-10-17）。
+      await app.inject({ method: 'PATCH', url: `/api/jobs/${resumedJob.id}`, payload: { status: 'running' } })
 
       const afterApproval = await app.inject({
         method: 'POST',
@@ -800,15 +813,16 @@ describe('POST /api/tasks/:id/resume — expired WAITING_FOR_USER approval', () 
     })
   })
 
-  // B'. 2段以上の resume: traversal は許さない。
+  // B'. 2段以上の git_commit resume: も遡り、元の review:<id>:git-commit から修正へ戻す
+  //     （CEO 判断・2026-10-15。PL の daily resume で段が伸びても REJECT 後に修正へ進めるようにする）。
   //
   // 3段目にも **自分の REJECTED git_commit 承認を紐づける** ——  そうしないと
   // linked Approval が無いので REJECTED recovery 分岐自体に入らず、この性質を試せない。
-  it('7b-iii. a second resume: hop is not traversed', async () => {
+  it('7b-iii. a second git_commit resume: hop is traversed back to the reviewed commit', async () => {
     await withApp(async (app) => {
       const project = await createProject()
       const task = await createTask(project.id)
-      const { latestJob } = await createRejectedGitCommitChain(task, { withResumeHop: true })
+      const { latestJob } = await createRejectedGitCommitChain(task, { withResumeHop: true, alignedEvidenceFor: '修正指示' })
       const { getStorage } = await import('../storage/index.js')
       const storage = getStorage()
       // もう1段積む（`resume: → resume: → ...`）。
@@ -842,10 +856,12 @@ describe('POST /api/tasks/:id/resume — expired WAITING_FOR_USER approval', () 
 
       const { statusCode, body } = await resumeTask(app, task.id, '修正指示')
 
-      // 1ホップ正規化した先が `resume:` なので `review:<id>:git-commit` に一致せず fail-closed。
-      expect(statusCode).toBe(409)
-      expect((body as { code?: string }).code).toBe('REJECTED_COMMIT_SOURCE_UNRESOLVED')
-      expect(storage.jobs.findByTaskId(task.id)).toHaveLength(before)
+      expect(statusCode).toBe(201)
+      const created = body as Job
+      expect(created.safeCommand.kind).not.toBe('git_commit')
+      expect(created.aiCliMode).toBe('implement')
+      expect(created.workflowStepKey).toBe(`resume:${secondHop.id}:1`)
+      expect(storage.jobs.findByTaskId(task.id)).toHaveLength(before + 1)
     })
   })
 

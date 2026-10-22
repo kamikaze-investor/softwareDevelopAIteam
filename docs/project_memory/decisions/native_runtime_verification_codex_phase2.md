@@ -3,7 +3,7 @@
 ## 1. 実装変更点（ファイル別、diffの要約）
 
 - `apps/worker/src/aiCli/adapter.ts`
-  - `provider === 'codex'` かつ `request.expectJson === true` の初回実行だけ、`workingDir` 直下に `.codex-last-message-<taskId>-...json` 形式の一時ファイルパスを生成するようにした。
+  - `provider === 'codex'` かつ `request.expectJson === true` の初回実行だけ、`workingDir` 直下に `.codex-last-message-<taskId>-...json` 形式の一時ファイルパスを生成するようにした。（2026-10-22 注: 当時の配置。現行は OS temp 配下に `mkdtemp` で作る — `apps/worker/src/aiCli/adapter.ts` `createCodexOutputCapture()`、roadmap `codex-last-message-temp-file-in-target-repo`）
   - 生成したパスは共有型 `AiCliRequest` には追加せず、adapter 内のローカル拡張プロパティ `codexOutputLastMessagePath` として `buildArgv()` に渡す。
   - CLI 実行後の `finally` で last-message file を読み、`tryParseJson()` に成功した場合は `parsedOutput` として採用する。読み取り後は同じ `finally` 経路で削除する。
   - last-message file が無い、または parse できない場合は、既存の `tryParseJson(stdout)` + `maxRetries` 回の stdout retry にフォールバックする。既存 retry ロジックは削除していない。
@@ -81,7 +81,7 @@
 
 - E2E は Codex credentials 不在と reachability fail により、モデル応答後の last-message file 生成までは確認できなかった。
 - `--output-last-message` の schema 違反時挙動、timeout 時に file が部分生成されるか、stderr/stdout/exitCode の関係は未検証。
-- 一時ファイルは `workingDir` 直下に作る。通常は `finally` で削除されるが、OS レベルでプロセスが強制終了された場合は残留しうる。その場合も既存 File Guard が検出する。
+- 一時ファイルは `workingDir` 直下に作る。通常は `finally` で削除されるが、OS レベルでプロセスが強制終了された場合は残留しうる。その場合も既存 File Guard が検出する。（2026-10-22 注: 当時の配置。現行は OS temp — 上記1章の注を参照）
 - `summary` 抽出は従来どおり stdout ベースのまま。今回の変更は `parsedOutput` の抽出経路に限定した。
 - process 残留の厳密確認は、現環境で Win32 process command line の取得権限がなく未確定。
 

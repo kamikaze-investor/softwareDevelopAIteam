@@ -1,10 +1,4 @@
 import type { Job, Task } from '@ai-team/shared'
-import {
-  buildDesignContract,
-  loadEngineeringPrinciples,
-  selectPrincipleSlugs,
-} from '@ai-team/shared/src/engineeringPrinciples.js'
-import { mapFileToFocuses } from '@ai-team/worker/src/approvalLevel/focusSelector.js'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
 import {
   buildDefaultCoordinatorDeps,
@@ -12,14 +6,21 @@ import {
   type CoordinatorDeps,
 } from '../designReview/designReviewCoordinator'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
-import { buildTaskContract } from '../implementPrompt'
+import { buildTaskContract, buildTaskDesignContract } from '../implementPrompt'
 import type { IStorage } from '../storage/interface'
 
 export type InitialImplementWorkflowResult =
   | { taskId: string; status: 'created'; job: Job }
   | { taskId: string; status: 'skipped'; reason: string; retryable?: boolean }
 
-function initialWorkflowStepKey(taskId: string): string {
+/**
+ * 初回 workflow Job が既に在るために作らなかったときの skipped reason。呼び出し側が
+ * 「既に在る」を他の skip と区別する唯一の根拠なので、文字列を書き写さずこの定数を使う。
+ */
+export const INITIAL_WORKFLOW_JOB_EXISTS = 'initial workflow job already exists'
+
+/** 初回 workflow Job の canonical な workflowStepKey。 */
+export function initialWorkflowStepKey(taskId: string): string {
   return `task:${taskId}:initial-implement`
 }
 
@@ -27,15 +28,7 @@ export function buildInitialImplementAiCliPrompt(task: Pick<
   Task,
   'description' | 'acceptanceCriteria' | 'expectedOutputs' | 'allowedPaths' | 'forbiddenPaths'
 >): string {
-  const principles = loadEngineeringPrinciples()
-  const designContract = buildDesignContract({
-    slugs: selectPrincipleSlugs({
-      predictedFocuses: (task.allowedPaths ?? []).flatMap(mapFileToFocuses),
-    }, principles),
-    principles,
-  })
-
-  return `${task.description}\n\n${buildTaskContract(task)}\n\n${designContract}`
+  return `${task.description}\n\n${buildTaskContract(task)}\n\n${buildTaskDesignContract(task)}`
 }
 
 /**
@@ -77,7 +70,7 @@ export async function createInitialImplementWorkflow(
 
   const stepKey = initialWorkflowStepKey(task.id)
   if (storage.jobs.findByTaskId(task.id).some((job) => job.workflowStepKey === stepKey)) {
-    return { taskId, status: 'skipped', reason: 'initial workflow job already exists' }
+    return { taskId, status: 'skipped', reason: INITIAL_WORKFLOW_JOB_EXISTS }
   }
 
   // Job Gateは常に実行する。すでに同一Task・同一prompt hashのALIGNED evidenceがあれば、
@@ -107,33 +100,39 @@ export async function createInitialImplementWorkflow(
         taskId,
         status: 'skipped',
         reason: `design review did not align (${review.status})`,
-        retryable: review.status === 'requeued' || review.status === 'not_claimable' || review.status === 'stale',
+        retryable: review.status === 'requeued' || review.status === 'contended'
+          || review.status === 'not_claimable' || review.status === 'stale',
       }
     }
     gate = checkImplementJobDesignReviewEvidence(jobInput, storage.designReviewEvidence)
   }
   if (!gate.ok) return { taskId, status: 'skipped', reason: gate.reason }
 
-  // **Job を作る直前に Task をもう一度読む。**
+  // **Job を作る直前に、Task と Project を同じ storage transaction の中で確かめ直す**（lifecycle repair C3）。
   //
-  // Design Review を待っている間に `abort_task` がこの Task を park しうる。
-  // 待つ前の判定のまま queued Job を作ると、Worker は Task の状態を見ずにそれを拾うので、
-  // park が黙って取り消される。park の解除は CEO の判断であり、
-  // 待ち時間の長さで決まってよいものではない。
-  const current = storage.tasks.findById(task.id)
-  if (!current || !isInitialWorkflowTarget(current)) {
-    return { taskId, status: 'skipped', reason: 'task is no longer an initial workflow target' }
-  }
-  if (storage.tasks.isParked(current.id)) {
-    return { taskId, status: 'skipped', reason: 'task was parked by abort_task' }
-  }
-
+  // Design Review を await している間に `abort_task` がこの Task を park したり、Project が archive / draft /
+  // pause されたりしうる。待つ前の判定のまま queued Job を作ると、Worker は Task の状態を見ずにそれを拾う
+  // （park が黙って取り消される）か、archived Project に誰も claim できない queued Job が残る。
+  // 読み直しと INSERT を別々に行うと、その間にまた状態が変わりうるので、storage の 1 transaction で行う。
+  //
+  // 断った場合は **retryable な skip** にする: continuation は pending のまま残り、次の試行の先頭の
+  // 判定（project unavailable / not running / not a target / parked）が通常の扱いを決める。
+  // ここで非 retryable にすると、待っている間の状態変化だけを理由に次 Task が blocked になる。
   try {
-    return { taskId, status: 'created', job: storage.jobs.create(jobInput) }
+    const created = storage.jobs.createInitialImplementJob(jobInput)
+    if (!created.ok) {
+      return {
+        taskId,
+        status: 'skipped',
+        reason: `initial implement job was not created after the design review: ${created.reason} (${created.code})`,
+        retryable: true,
+      }
+    }
+    return { taskId, status: 'created', job: created.job }
   } catch (error: unknown) {
     // unique index衝突は並行した同一producerによる既存Jobとして扱う。
     if (storage.jobs.findByTaskId(task.id).some((job) => job.workflowStepKey === stepKey)) {
-      return { taskId, status: 'skipped', reason: 'initial workflow job already exists' }
+      return { taskId, status: 'skipped', reason: INITIAL_WORKFLOW_JOB_EXISTS }
     }
     throw error
   }

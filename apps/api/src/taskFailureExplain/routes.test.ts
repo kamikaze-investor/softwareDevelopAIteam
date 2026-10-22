@@ -733,7 +733,15 @@ describe('Task failure explanation routes', () => {
         url: `/api/tasks/${task.id}`,
       })
       expect(taskResponse.statusCode).toBe(200)
-      expect(taskResponse.json<Task>()).toEqual(before)
+      // GET /api/tasks/:id は Task に `parked` / `projectStatus` を足した TaskDetail を返す（lifecycle repair W6）。
+      // ここで確かめたいのは「AI 生成の失敗が Task 本体を変えない」ことなので、追加欄は分けて見る。
+      // humanTaskDecisions は lifecycle repair C3 で足した追加欄（人の判断の事実）。
+      const { parked, projectStatus, humanTaskDecisions, repairDesignReviewInFlight, ...taskBody } = taskResponse.json<Task & { parked: boolean, projectStatus: string | null, humanTaskDecisions: unknown[], repairDesignReviewInFlight: boolean }>()
+      expect(taskBody).toEqual(before)
+      expect(parked).toBe(false)
+      expect(humanTaskDecisions).toEqual([])
+      expect(repairDesignReviewInFlight).toBe(false)
+      expect(projectStatus).toBe(storage.projects.findById(task.projectId)?.status ?? null)
 
       const instruction = 'Retry after reviewing the failure.'
       storage.designReviewEvidence.create({
@@ -743,6 +751,8 @@ describe('Task failure explanation routes', () => {
         decision: 'ALIGNED',
         independentReviewRequired: false,
       })
+      // resume は running Project でしか受け付けない（PROJECT_NOT_RUNNING）。
+      storage.projects.update(task.projectId, { status: 'running' })
       const resumeResponse = await app.inject({
         method: 'POST',
         url: `/api/tasks/${task.id}/resume`,

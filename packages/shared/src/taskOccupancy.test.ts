@@ -1,5 +1,29 @@
 import { describe, expect, it } from 'vitest'
-import { occupiesProject, OCCUPIES_PROJECT_SQL } from './taskOccupancy'
+import { holdsWorkspaceWhenBlocked, isStaleBlockedJobCandidate, occupiesProject, OCCUPIES_PROJECT_SQL } from './taskOccupancy'
+
+describe('isStaleBlockedJobCandidate / holdsWorkspaceWhenBlocked — done と park は同じ扱い（lifecycle repair C2）', () => {
+  const blocked = { status: 'blocked' }
+  const quarantined = { status: 'blocked', failureMetadata: { quarantined: true } }
+
+  it('a non-quarantined blocked row on a done or parked Task is a stale candidate, not an owner', () => {
+    for (const task of [{ status: 'done' }, { status: 'pending', parked: true }]) {
+      expect(isStaleBlockedJobCandidate(task, blocked)).toBe(true)
+      expect(holdsWorkspaceWhenBlocked(task, blocked)).toBe(false)
+    }
+  })
+
+  it('a quarantined row stays an owner on a done or parked Task', () => {
+    for (const task of [{ status: 'done' }, { status: 'pending', parked: true }]) {
+      expect(isStaleBlockedJobCandidate(task, quarantined)).toBe(false)
+      expect(holdsWorkspaceWhenBlocked(task, quarantined)).toBe(true)
+    }
+  })
+
+  it('without parked (or parked=false) a non-done Task row is an owner (fail-closed default)', () => {
+    expect(holdsWorkspaceWhenBlocked({ status: 'pending' }, blocked)).toBe(true)
+    expect(holdsWorkspaceWhenBlocked({ status: 'blocked', parked: false }, blocked)).toBe(true)
+  })
+})
 
 describe('occupiesProject — 既存 currentTask と同じ意味', () => {
   it('in_progress / blocked は roadmapActive に関係なく占有する', () => {

@@ -17,6 +17,7 @@ import {
   buildApprovalRequest,
   RISK_RULES,
   APPROVAL_REQUEST_TTL_MINUTES,
+  isSafeWorkCommandKind,
   type ApprovalGateInput,
 } from '@ai-team/shared'
 import {
@@ -30,7 +31,13 @@ import { computeChangeManifestHash } from '../approvalExplain/changeManifestIden
 import { buildWorktreeChangeManifest } from '../approvalExplain/changeManifestReader'
 import type { GateEvaluationEvidence } from '../storage/interface'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
-import { evaluateGitCommitEvidence, type GitCommitEvidenceResult, type GitCommitHumanGateReason } from '../gitCommitEvidence'
+import {
+  evaluateGitCommitEvidence,
+  hasReviewVerdictDisagreement,
+  type GitCommitEvidenceResult,
+  type GitCommitHumanGateReason,
+} from '../gitCommitEvidence'
+import { getCredentialClass } from '../auth/credentialClass'
 import { designReviewEvidenceRoutes } from './designReviewEvidence'
 import { gateEvaluationRoutes } from './gateEvaluations'
 
@@ -40,7 +47,14 @@ import { gateEvaluationRoutes } from './gateEvaluations'
  */
 // v2（2026-10-02 Decision Authority Principle Stage 1）: git_commit の一律人間承認を、
 // Safety Evidence が全て成立する LOW / MEDIUM に限って外した（`gitCommitEvidence.ts`）。
-const GATE_POLICY_VERSION = 'gate-policy-v2'
+// v3（2026-10-16 監査 RC4/RC6）: 承認を requestedAction 単位に束縛し、SAFE_WORK の HIGH には承認依頼を
+// 作らず、RISK_RULES の HIGH 対象に commitGate.ts（K-2）と docs/project_memory/rules/**（K-1）だけを足した。
+// 2026-10-17 の authority・admission・recovery 定義ファイルへの拡張は Risk と Authority の混同として取り下げた。
+// v2 の evidence を読む側（roadmapAdoption の Candidate commit 証明）は v2 / v3 の両方を受け付ける。
+export const GATE_POLICY_VERSION = 'gate-policy-v3'
+
+/** 承認 PATCH が期限切れの WAITING を決定しなかったときの 409 `code`（Mobile が文言へ写す）。 */
+const APPROVAL_EXPIRED_CODE = 'APPROVAL_EXPIRED'
 
 function computeDiffHash(diffText: string): string {
   return createHash('sha256').update(diffText, 'utf-8').digest('hex')
@@ -56,10 +70,18 @@ const GIT_COMMIT_HUMAN_GATE_LABELS: Record<GitCommitHumanGateReason, string> = {
   human_decision_authority: 'git_commit human gate: human_decision_authority',
   insufficient_safety_evidence: 'git_commit human gate: insufficient_safety_evidence',
 }
+/**
+ * spec 22 §14-3 DA trigger (7)（未解決の review 判定不一致）の開示ラベル。
+ * 同じ実装に対する review が changes_requested を返した後、resume で再実行した review が approved を返した
+ * git_commit に付ける（2026-10-09 b6d4097a: 同一 diff の指摘が再実行で消え、そのまま承認依頼になった）。
+ * 判定は既に Safety Evidence 側で fail closed しているので、これは CEO へ「判断が割れている」ことを見せるだけ。
+ */
+const REVIEW_VERDICT_DISAGREEMENT_LABEL = 'review verdict disagreement'
 const SAFE_RISK_RULE_LABELS = new Set([
   ...RISK_RULES.map(rule => rule.label),
   GIT_COMMIT_EVIDENCE_VERIFIED_LABEL,
   ...Object.values(GIT_COMMIT_HUMAN_GATE_LABELS),
+  REVIEW_VERDICT_DISAGREEMENT_LABEL,
 ])
 const DIFF_SECRET_LABEL_PATTERN = /^diff:secret\([^)]*\)$/
 
@@ -121,27 +143,46 @@ interface GateCheckResponse {
 }
 
 /**
- * 同一 commit / diff の却下済み Approval を探す。
+ * 同一 commit / diff の却下済み Approval を探す。**必ず `requestedAction` で先に絞る。**
  *
- * `requestedAction` を渡すと**先に action で絞る**。渡さないときは従来どおり action を見ない。
- *
- * **git_commit では必ず絞ること。** 絞らないと、同じ commit/diff に対して
- * 「新しい REJECTED(action=test)」と「古い REJECTED(action=git_commit)」が並んだとき、
- * 先に test 側を拾い、後段の `existingReqForOutcome` が action 不一致で捨てた結果
- * **git_commit の却下を再探索しないまま新しい Approval を作れてしまう**。
+ * Approval は「その action をしてよいか」への判断であり、却下も同じ action にしか効かない。
+ * - git_commit で絞らないと、同じ commit/diff に「新しい REJECTED(action=test)」と
+ *   「古い REJECTED(action=git_commit)」が並んだとき test 側を拾い、git_commit の却下を
+ *   再探索しないまま新しい Approval を作れてしまう
+ * - git_commit 以外で絞らないと、ある action の却下が同じ diff の**別 action の Job を全部止める**
+ *   （2026-10-16 監査 RC4: review Job の git_status 向けに勝手に作られた行が REJECTED になると、
+ *   同じ diff の無関係な Job まで REJECTED 扱いになっていた）
  */
 function findRelevantRejectedRequest(
   requests: ApprovalRequest[],
   currentCommit: string,
   currentDiffHash: string,
-  requestedAction?: string,
+  requestedAction: string,
 ): ApprovalRequest | undefined {
   const rejectedRequests = requests.filter(request =>
-    request.status === 'REJECTED'
-    && (requestedAction === undefined || request.requestedAction === requestedAction))
+    request.status === 'REJECTED' && request.requestedAction === requestedAction)
   return rejectedRequests.find(request =>
     request.targetCommit === currentCommit && request.targetDiffHash === currentDiffHash
   ) ?? rejectedRequests[0]
+}
+
+/**
+ * git_commit 以外の Gate が再利用してよい active（WAITING / APPROVED）な Approval。
+ * **同じ `requestedAction` の最新行だけ**を返す。
+ *
+ * 以前は Task の最新 active 行を action を見ずに使っていたため、ある action 向けの APPROVED が
+ * 同じ diff の**別 action** に `call_consume` で使い切られ、別 action の WAITING を自分の承認待ちと
+ * 取り違えていた（2026-10-16 監査 RC4。approval-20261016-f73df27a）。
+ * git_commit は従来どおり jobs.approval_id で結び付いた行だけを使う（ここは通らない）。
+ */
+function findActiveRequestForAction(
+  requests: ApprovalRequest[],
+  requestedAction: string,
+): ApprovalRequest | undefined {
+  // findByTaskId は created_at の新しい順なので、最初の一致が最新。
+  return requests.find(request =>
+    (request.status === 'WAITING_FOR_USER' || request.status === 'APPROVED')
+    && request.requestedAction === requestedAction)
 }
 
 // Zod スキーマ
@@ -198,6 +239,7 @@ function computeNextAction(
   requiresApprovalByPolicy: boolean,
   newRequestId?: string,
   gitCommitEvidenceVerified = false,
+  noRequestReason?: 'safe_work' | 'evaluation_only',
 ): NextAction {
   switch (outcome.decision) {
     case 'ALLOW':
@@ -234,6 +276,21 @@ function computeNextAction(
       }
 
     case 'BLOCKED':
+      if (noRequestReason === 'safe_work') {
+        // requestId は付けない（作っていない）。Worker は requestId 無しの wait_for_approval を受理し、
+        // HIGH → continue_safe_work_only で safe work だけを続ける。
+        return {
+          action: 'wait_for_approval',
+          message: 'HIGH リスク変更を含みますが、この操作は safe work のため承認リクエストは作成しません。safe work のみ継続してください。',
+        }
+      }
+      if (noRequestReason === 'evaluation_only') {
+        // Job の無い評価は実行の許可にならない。承認依頼も作らず、requestId も付けない。
+        return {
+          action: 'wait_for_approval',
+          message: 'jobId の無い評価のため、承認リクエストは作成しません（実行を許可する応答ではありません）。',
+        }
+      }
       return {
         action: 'wait_for_approval',
         requestId: newRequestId,
@@ -247,7 +304,8 @@ function computeNextAction(
     case 'STALE':
       return {
         action: 're_check',
-        message: '承認が無効化されました（commit/diff が変化）。再度 /api/gate/check を呼び出して新しい承認フローを開始してください。',
+        // 無効化の理由は outcome.reason がそのまま持つ（commit / diff の変化・承認時より高いリスク）。
+        message: `承認が無効化されました: ${outcome.reason} 再度 /api/gate/check を呼び出して新しい承認フローを開始してください。`,
       }
   }
 }
@@ -482,6 +540,20 @@ export async function approvalGateRoutes(
         }
         linkedGitCommitApproval = linkedApproval
       }
+    } else if (jobId !== undefined) {
+      // 非 git_commit でも、jobId を名乗るなら実在する同じ Task の、同じ kind の Job でなければならない
+      // （2026-10-16 Codex review）。名乗った Job と別物の評価を gate_evaluations へ残さず、
+      // その応答の call_consume を別 Task / 別 action の Job に使わせない。
+      // jobId 無しの呼び出しは下の evaluation-only（評価だけを残し、承認を作らず call_consume も返さない）。
+      const job = storage.jobs.findById(jobId)
+      if (!job) {
+        return reply.status(404).send({ error: 'Job not found' })
+      }
+      if (job.taskId !== taskId || job.safeCommand.kind !== requestedAction) {
+        return reply.status(409).send({
+          error: 'Job task or requested action does not match the gate check',
+        })
+      }
     }
 
     // Risk Review（changedFiles ベース）
@@ -511,9 +583,68 @@ export async function approvalGateRoutes(
     // アクティブな承認リクエストを取得
     // 同一Taskには複数の正当なJobが存在し得る。git_commitはTask単位の最新Approvalではなく、
     // jobs.approval_idでこのJobに結び付いたApprovalだけを再利用する。
+    // それ以外の action は、同じ requestedAction の active 行だけを再利用する（承認は自 action にしか効かない）。
+    //
+    // **jobId の無い非 git_commit の評価は evaluation-only**（2026-10-16 Codex review round 2）。
+    // 承認は「それを評価した Job」に結び付かなければならないが、Job の無い評価で承認を作る・再利用する・
+    // call_consume を返すと、後から同じ Task・同じ kind の任意の Job がそれを使い切れる。
+    // production の呼び出し元は Worker の callGateCheck だけで、常に jobId を送る（GateCheckParams.jobId は必須）。
+    // よって Job の無い評価は gate_evaluations だけを残し、active な承認を読まず・作らず・call_consume を出さない。
+    // 却下済み（REJECTED）の参照は実行を許可しないので従来どおり行う（fail closed 側の情報）。
+    const evaluationOnly = !isGitCommitPolicyAction && jobId === undefined
     let existingReq = isGitCommitPolicyAction
       ? linkedGitCommitApproval
-      : storage.approvalRequests.findActiveByTaskId(taskId)
+      : evaluationOnly
+        ? undefined
+        : findActiveRequestForAction(storage.approvalRequests.findByTaskId(taskId), requestedAction)
+
+    // HIGH の SAFE_WORK（Worker は承認を待たずに continue_safe_work_only で走る）に残っている
+    // **同じ action の** WAITING は、誰も待っていない行である（この修正以前に作られた git_status 等の行。
+    // 2026-10-16 b8d0fc5d の approval-20261016-f73df27a）。PENDING_APPROVAL として返し続けると Task が
+    // 承認待ちに見え続けるので、SUPERSEDED にして無い前提で判定し直す（下で新しい依頼も作らない）。
+    // - 最新 1 行だけでなく、**保存 riskLevel が HIGH の同 action WAITING をすべて** 1 transaction で畳む
+    //   （Codex review round 3: 古い legacy 行が残ると resume / Mobile を塞ぎ続ける）
+    // - CRITICAL として作られた行は Worker が block_until_approved で待っていた判断なので残す（round 2）
+    // - その後は **1 つのループ**で同 action の active 行を新しい順に見る（round 4 / round 5）:
+    //   期限切れ APPROVED → EXPIRED、commit / diff が古い WAITING → SUPERSEDED、古い APPROVED → STALE
+    //   （いずれも既存の終端状態・既存の side effect）。どれでもない行で止まり、それで判定する。
+    //   個別の掃除を順に並べると、新しい側の行を片付けた時点で古い current-ref の CRITICAL WAITING を
+    //   選び直さず continue_safe_work_only / re_check を返していた。生き残った CRITICAL は PENDING_APPROVAL（fail closed）
+    // - 1 回ごとに active 行が 1 行減るので、ループは必ず止まる
+    // - 別 action の行、Job の無い evaluation-only、今回の評価が CRITICAL の場合は触れない（従来どおり 1 回だけの処理）
+    const safeWorkCleanup =
+      !isGitCommitPolicyAction
+      && !evaluationOnly
+      && riskReview.riskLevel === 'HIGH'
+      && isSafeWorkCommandKind(requestedAction)
+    const isStaleRef = (request: ApprovalRequest): boolean =>
+      request.targetCommit !== targetCommit || request.targetDiffHash !== targetDiffHash
+    if (safeWorkCleanup) {
+      const supersededIds = storage.approvalRequests.supersedeUnwaitedSafeWorkRequests(taskId, requestedAction)
+      for (const supersededId of supersededIds) {
+        sideEffects.push({ type: 'SUPERSEDED_APPROVAL_REQUEST', requestId: supersededId })
+      }
+      for (;;) {
+        existingReq = findActiveRequestForAction(storage.approvalRequests.findByTaskId(taskId), requestedAction)
+        if (existingReq === undefined) break
+        if (existingReq.status === 'APPROVED' && new Date(existingReq.expiresAt) < new Date()) {
+          console.warn(`[gate/check] expired APPROVED detected: id=${existingReq.id}. Updating to EXPIRED.`)
+          storage.approvalRequests.updateStatus(existingReq.id, 'EXPIRED', undefined, true)
+          continue
+        }
+        if (existingReq.status === 'WAITING_FOR_USER' && isStaleRef(existingReq)) {
+          storage.approvalRequests.updateStatus(existingReq.id, 'SUPERSEDED')
+          sideEffects.push({ type: 'SUPERSEDED_APPROVAL_REQUEST', requestId: existingReq.id })
+          continue
+        }
+        if (existingReq.status === 'APPROVED' && isStaleRef(existingReq)) {
+          storage.approvalRequests.updateStatus(existingReq.id, 'STALE', undefined, true)
+          sideEffects.push({ type: 'MARKED_STALE', requestId: existingReq.id })
+          continue
+        }
+        break
+      }
+    }
 
     // P2-followup: expired APPROVED cleanup
     // findActiveByTaskId は expiresAt を見ないため期限切れ APPROVED が返ることがある。
@@ -525,12 +656,10 @@ export async function approvalGateRoutes(
     }
 
     // WAITING_FOR_USER + ref 変化 → SUPERSEDE（decideGateOutcome に渡す前に処理）
-    if (existingReq?.status === 'WAITING_FOR_USER') {
-      if (existingReq.targetCommit !== targetCommit || existingReq.targetDiffHash !== targetDiffHash) {
-        storage.approvalRequests.updateStatus(existingReq.id, 'SUPERSEDED')
-        sideEffects.push({ type: 'SUPERSEDED_APPROVAL_REQUEST', requestId: existingReq.id })
-        existingReq = undefined
-      }
+    if (existingReq?.status === 'WAITING_FOR_USER' && isStaleRef(existingReq)) {
+      storage.approvalRequests.updateStatus(existingReq.id, 'SUPERSEDED')
+      sideEffects.push({ type: 'SUPERSEDED_APPROVAL_REQUEST', requestId: existingReq.id })
+      existingReq = undefined
     }
 
     // **却下済み判定の探索は git_commit でも行う。**
@@ -544,17 +673,14 @@ export async function approvalGateRoutes(
     // 戻ってきた。守るべき不変条件は
     // **「CEO が REJECT したのと同一 diff を、そのまま新しい ApprovalRequest に置き換えない」**。
     //
-    // `requestedAction` 違いの誤再利用は下の `existingReqForOutcome` が従来どおり弾くので、
-    // ここは探索を通すだけでよい。**`jobs.ts` 側へ diff hash 判定を重複実装しない** ——
-    // diff identity の正本はこの Gate にある。
+    // **`jobs.ts` 側へ diff hash 判定を重複実装しない** —— diff identity の正本はこの Gate にある。
+    // 却下は action ごと（2026-10-16 監査 RC4。`findRelevantRejectedRequest` 参照）。
     if (!existingReq) {
       existingReq = findRelevantRejectedRequest(
         storage.approvalRequests.findByTaskId(taskId),
         targetCommit,
         targetDiffHash,
-        // policy 対象（git_commit）のときだけ action で絞る。
-        // HIGH/CRITICAL の既存パスは従来どおり action を見ない（対象外）。
-        isGitCommitPolicyAction ? requestedAction : undefined,
+        requestedAction,
       )
     }
 
@@ -632,25 +758,66 @@ export async function approvalGateRoutes(
     // git_commit で Safety Evidence が成立しなかったときだけ、人間承認を必須にする。
     const requiresApprovalByPolicy = isGitCommitPolicyAction && !gitCommitEvidenceVerified
 
-    // policy対象（git_commit）では、commit/diffHashが偶然一致しても
-    // 無関係なrequestedAction向けに発行された既存Approval Requestを再利用しない
-    // （例: 'test' への承認が偶然同じcommit/diffHashの'git_commit'を通過させない）。
-    // 既存のHIGH/CRITICALパス（git_commit 以外）はrequestedActionを
-    // 見ない従来どおりの挙動を維持する（対象外）。
+    // commit/diffHashが偶然一致しても、無関係なrequestedAction向けに発行された既存Approval Requestを
+    // 再利用しない（例: 'test' への承認が同じcommit/diffHashの'git_commit'や別 action を通過させない）。
+    // 上の探索がすでに action で絞っているので、ここは二重の防御（2026-10-16 監査 RC4 で全 action に拡大）。
     const existingReqForOutcome =
-      isGitCommitPolicyAction && existingReq && existingReq.requestedAction !== requestedAction
+      existingReq && existingReq.requestedAction !== requestedAction
         ? undefined
         : existingReq
 
     // Gate 判定（純粋関数）
-    const outcome = decideGateOutcome(riskReview, existingReqForOutcome, targetCommit, targetDiffHash, {
+    let outcome = decideGateOutcome(riskReview, existingReqForOutcome, targetCommit, targetDiffHash, {
       requiresApprovalByPolicy,
     })
+
+    // **git_commit Job の承認枠は 1 Job につき 1 つ**（`createForJob` は job.approvalId がある Job を
+    // JOB_ALREADY_LINKED で拒否する）。linked approval がもう使えない状態（APPROVED のまま期限切れ →
+    // 上で EXPIRED にした行・EXPIRED・STALE・SUPERSEDED・CONSUMED・別 diff の REJECTED 等）で人間承認が
+    // 要る判定（BLOCKED）になったとき、ここで新しい依頼を作ろうとすると 409 になり、Worker はそれを
+    // failTechnical として Job を failed にしていた（2026-10-17 F-1）。failed の Job は resume
+    // （LATEST_JOB_NOT_BLOCKED）も recover（TASK_NOT_BLOCKED）も受け付けず、abort しか残らない。
+    //
+    // 既存の STALE 応答（re_check）で返し、Worker に blocked を報告させる。以後は期限切れ WAITING と同じ
+    // 出口（既存 resume が `resume:<job>:N` の新しい git_commit Job を作り、そこで Job-linked 承認を新規発行）
+    // に乗る。linked 行は書き換えない（APPROVED 期限切れは上で EXPIRED 済み。終端状態はそのまま）。
+    // createForJob での付け替え（relink）は選ばない: 承認と Job の 1:1 束縛を崩し、旧承認の audit 上の
+    // 対象 Job を曖昧にするため。
+    const linkedApprovalSpent =
+      isGitCommitPolicyAction
+      && outcome.decision === 'BLOCKED'
+      && gitCommitJob?.approvalId !== undefined
+    if (linkedApprovalSpent) {
+      outcome = {
+        decision: 'STALE',
+        requestId: gitCommitJob!.approvalId!,
+        reason:
+          'この Job に結び付いた承認は期限切れ・無効のため使えません。Job は blocked になります。'
+          + 'resume で新しい git_commit Job と承認依頼を作成してください。',
+      }
+    }
+    const continuationPolicy = computeContinuationPolicy(riskReview.riskLevel, outcome.decision, requiresApprovalByPolicy)
+
+    // **誰も待たない承認依頼を作らない。** HIGH の BLOCKED は Worker 側で continue_safe_work_only になり、
+    // safe work の kind（git_status / test 等）はそのまま実行される。ここで依頼を作ると、Worker は
+    // 承認を待たずに走り終えるのに Task には WAITING が残り、resume / abort を塞ぎ、APPROVED になれば
+    // 同じ diff の別 action に使われ、REJECTED になれば別 Job を止めていた
+    // （2026-10-16 b8d0fc5d: review Job の git_status が approval-20261016-f73df27a を作った）。
+    // Gate 評価（gate_evaluations）は従来どおり残す。CRITICAL は block_until_approved なので対象外。
+    const safeWorkWithoutRequest =
+      outcome.decision === 'BLOCKED'
+      && continuationPolicy === 'continue_safe_work_only'
+      && isSafeWorkCommandKind(requestedAction)
 
     // storage 副作用
     // Evidence が成立した git_commit は ApprovalRequest を一切使わない。探索で拾った
     // 別 diff の REJECTED 等を応答に載せると「ALLOW なのに REJECTED が付く」不整合になるので載せない。
-    let approvalRequest: ApprovalRequest | undefined = gitCommitEvidenceVerified ? undefined : existingReq
+    // 依頼を作らない safe work も同様（期限切れ行などを「今回の依頼」に見せない）。
+    // evaluation-only でも REJECTED はそのまま返す（実行を許可しない事実なので隠さない）。
+    let approvalRequest: ApprovalRequest | undefined =
+      gitCommitEvidenceVerified || safeWorkWithoutRequest || (evaluationOnly && outcome.decision !== 'REJECTED')
+        ? undefined
+        : existingReq
     let newRequestId: string | undefined
 
     // ApprovalRequest / gate_evaluations に残す git_commit の判定理由ラベル
@@ -658,15 +825,25 @@ export async function approvalGateRoutes(
       ? []
       : gitCommitEvidence.passed
         ? [GIT_COMMIT_EVIDENCE_VERIFIED_LABEL]
-        : [GIT_COMMIT_HUMAN_GATE_LABELS[gitCommitEvidence.reason]]
+        : [
+            GIT_COMMIT_HUMAN_GATE_LABELS[gitCommitEvidence.reason],
+            // DA trigger (7) の開示。Evidence 不成立（review_resumed / review_lineage_unresolved）で
+            // 人間承認へ送る git_commit にだけ付ける。保存済み review_results と Job lineage の読み取りのみ。
+            ...(gitCommitJob !== undefined && hasReviewVerdictDisagreement(storage, gitCommitJob)
+              ? [REVIEW_VERDICT_DISAGREEMENT_LABEL]
+              : []),
+          ]
 
-    if (outcome.decision === 'STALE') {
+    if (linkedApprovalSpent) {
+      // 終端済みの linked 行は書き換えない。応答には現状の行をそのまま載せる。
+      approvalRequest = storage.approvalRequests.findById(gitCommitJob!.approvalId!)
+    } else if (outcome.decision === 'STALE') {
       storage.approvalRequests.updateStatus(existingReq!.id, 'STALE', undefined, true)
       sideEffects.push({ type: 'MARKED_STALE', requestId: existingReq!.id })
       approvalRequest = storage.approvalRequests.findById(existingReq!.id)
     } else if (outcome.decision === 'REJECTED') {
       approvalRequest = existingReq
-    } else if (outcome.decision === 'BLOCKED') {
+    } else if (outcome.decision === 'BLOCKED' && !safeWorkWithoutRequest && !evaluationOnly) {
       const input: ApprovalGateInput = {
         taskId, requestedAction, targetBranch, targetCommit, targetDiffHash, changedFiles,
       }
@@ -686,7 +863,13 @@ export async function approvalGateRoutes(
         }
         approvalRequest = created.approvalRequest
       } else {
-        approvalRequest = storage.approvalRequests.create(approvalData)
+        // Task の WAITING（action を問わない）と同 action の APPROVED を同じ transaction で畳んでから作る。
+        // 別 action の APPROVED は人の判断なので残す（`replaceActiveAndCreate` の invariant）。
+        const replaced = storage.approvalRequests.replaceActiveAndCreate(approvalData)
+        for (const supersededId of replaced.supersededIds) {
+          sideEffects.push({ type: 'SUPERSEDED_APPROVAL_REQUEST', requestId: supersededId })
+        }
+        approvalRequest = replaced.approvalRequest
       }
       sideEffects.push({ type: 'CREATED_APPROVAL_REQUEST', requestId: approvalRequest.id })
       newRequestId = approvalRequest.id
@@ -744,9 +927,9 @@ export async function approvalGateRoutes(
       })
     }
 
-    const continuationPolicy = computeContinuationPolicy(riskReview.riskLevel, outcome.decision, requiresApprovalByPolicy)
     const nextAction = computeNextAction(
       outcome, riskReview.riskLevel, requiresApprovalByPolicy, newRequestId, gitCommitEvidenceVerified,
+      safeWorkWithoutRequest ? 'safe_work' : evaluationOnly && outcome.decision === 'BLOCKED' ? 'evaluation_only' : undefined,
     )
 
     const response: GateCheckResponse = {
@@ -773,13 +956,10 @@ export async function approvalGateRoutes(
       })
     }
 
-    // 同 taskId の既存アクティブリクエストを SUPERSEDED にする
-    const existing = storage.approvalRequests.findActiveByTaskId(result.data.taskId)
-    if (existing) {
-      storage.approvalRequests.updateStatus(existing.id, 'SUPERSEDED')
-    }
-
-    const req_ = storage.approvalRequests.create({
+    // 同 taskId の WAITING（action を問わない）と同 action の APPROVED を、作成と同じ transaction で
+    // SUPERSEDED にする。以前の「最新1件だけ SUPERSEDED → create」は古い WAITING を残し、
+    // 別 action の APPROVED（人の判断）を巻き込んで消していた（2026-10-16 監査）。
+    const { approvalRequest: req_ } = storage.approvalRequests.replaceActiveAndCreate({
       ...result.data,
       status: 'WAITING_FOR_USER',
       expiresAt: computeExpiresAt(),  // Codex P2: サーバー計算
@@ -899,6 +1079,15 @@ export async function approvalGateRoutes(
   })
 
   // PATCH /api/approval-requests/:id/status — 状態更新（人間が承認/拒否する口）
+  //
+  // 「誰が決めたか」（credential 種別だけから導いた human / ai / unknown）を `approval_actor` audit へ残す。
+  // APPROVED は行の状態だけでは人の判断である証明にならない（b8d0fc5d: stored-review recovery の承認が
+  // repair budget を作り直す）。credential 種別を storage の決定操作へ渡し、**状態変更（git_commit は
+  // Job 再 queue も）と同じ SQLite transaction で**書かせる（H-03）。以前は決定の後に別書き込みで残して
+  // おり、間でプロセスが止まると human evidence の無い APPROVED が残り、再 PATCH は 409、stored-review
+  // recovery は永久に拒否、という詰みになっていた。
+  //
+  // この route は `HUMAN_ONLY_ROUTES` に載る（C-02）: split credential mode の ADMIN でしか届かない。
   app.patch<{ Params: { id: string } }>('/approval-requests/:id/status', async (req, reply) => {
     const result = UpdateStatusBody.safeParse(req.body)
     if (!result.success) {
@@ -916,22 +1105,37 @@ export async function approvalGateRoutes(
     }
 
     if (result.data.status === 'APPROVED' && request.requestedAction === 'git_commit') {
-      const approved = storage.approvalRequests.approveAndResumeJob(req.params.id, result.data.reason)
+      const approved = storage.approvalRequests.approveAndResumeJob(
+        req.params.id,
+        result.data.reason,
+        { credentialClass: getCredentialClass(req) },
+      )
       if (!approved.ok) {
         return reply.status(approved.code === 'NOT_FOUND' ? 404 : 409).send({
           error: approved.reason,
+          ...(approved.code === 'EXPIRED' ? { code: APPROVAL_EXPIRED_CODE } : {}),
           ...(approved.approvalRequest ? { status: approved.approvalRequest.status } : {}),
         })
       }
       return reply.send(approved.approvalRequest)
     }
 
-    const updated = storage.approvalRequests.recordDecision(
+    // 期限切れの WAITING は storage が transaction 内で読み直して EXPIRED へ進め、決定しない
+    // （git_commit の approveAndResumeJob と同じ扱い。APPROVED / REJECTED のどちらも）。
+    const decided = storage.approvalRequests.recordDecision(
       req.params.id,
       result.data.status as 'APPROVED' | 'REJECTED',
       result.data.reason,
+      { credentialClass: getCredentialClass(req) },
     )
-    return reply.send(updated)
+    if (!decided.ok) {
+      return reply.status(decided.code === 'NOT_FOUND' ? 404 : 409).send({
+        error: decided.reason,
+        ...(decided.code === 'EXPIRED' ? { code: APPROVAL_EXPIRED_CODE } : {}),
+        ...(decided.approvalRequest ? { status: decided.approvalRequest.status } : {}),
+      })
+    }
+    return reply.send(decided.approvalRequest)
   })
 
   // POST /api/approval-requests/:id/consume — APPROVED → CONSUMED に遷移（一回限りの承認を強制）
@@ -980,25 +1184,29 @@ export async function approvalGateRoutes(
       })
     }
 
-    // 非git_commit経路は既存契約を維持する。
-    if (request.status !== 'APPROVED') {
-      return reply.status(409).send({
-        error: `Cannot consume: current status is '${request.status}' (must be APPROVED)`,
+    // 非 git_commit の consume は、**それを使う実在の Job** に束縛する（2026-10-16 監査・Codex review）。
+    // 以前は jobId 省略・存在しない Job・別 Task の Job でも使い切れ、承認が Task にも実行にも
+    // 結び付いていなかった。この口を使うのは Worker の call_consume（gate/check の requestedAction =
+    // その Job の safeCommand.kind）だけなので、jobId を必須にし、Task 一致・kind 一致・APPROVED・未失効・
+    // commit / diff 一致を storage の 1 transaction で確かめてから CONSUMED にする。
+    // Task 単位の操作（abort_task・reconcile_external_completion・repair_from_stored_review:* 等）の承認は
+    // その名前の command kind を持つ Job が無いので、この口では決して consume できない
+    // （それぞれ verifyAndConsumeForTaskAction で消費する。/consume を迂回路にしない）。
+    if (!jobId) {
+      return reply.status(400).send({ error: 'jobId is required to consume an approval' })
+    }
+    const consumed = storage.approvalRequests.consumeForCommandJob({
+      id: req.params.id,
+      jobId,
+      currentCommit,
+      currentDiffHash,
+    })
+    if (!consumed.ok) {
+      return reply.status(consumed.code === 'NOT_FOUND' || consumed.code === 'JOB_NOT_FOUND' ? 404 : 409).send({
+        error: consumed.reason,
       })
     }
-
-    if (new Date(request.expiresAt) <= new Date()) {
-      storage.approvalRequests.updateStatus(req.params.id, 'EXPIRED', undefined, true)
-      return reply.status(409).send({ error: 'Approval request has expired' })
-    }
-
-    if (request.targetCommit !== currentCommit || request.targetDiffHash !== currentDiffHash) {
-      storage.approvalRequests.updateStatus(req.params.id, 'STALE', undefined, true)
-      return reply.status(409).send({ error: 'Approval request is stale: commit or diff has changed' })
-    }
-
-    const updated = storage.approvalRequests.updateStatus(req.params.id, 'CONSUMED', undefined, true)
-    return reply.send(updated)
+    return reply.send(consumed.approvalRequest)
   })
 
   // GET /api/approval-requests/:id/active?taskId=xxx — アクティブな承認リクエストを取得

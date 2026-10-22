@@ -4,6 +4,7 @@ import type {
   QAResult,
   ReviewResult,
   Task,
+  TaskDetail,
   TaskSummary,
   WatchdogEvent,
 } from '@ai-team/shared'
@@ -15,6 +16,7 @@ import {
   blockerNeedsHumanDecision,
   visibleTaskActions,
   allowsRoutineRecoveryActions,
+  canShowRecoverUI,
   canShowResumeUI,
   deriveJobDisplayState,
   deriveProjectExecutionHealth,
@@ -102,7 +104,7 @@ describe('manualWorkflowIsLocked', () => {
     const approvalRequests: ApprovalRequest[] = [
       {
         changedFiles: [],
-        expiresAt: '2026-08-01T01:00:00.000Z',
+        expiresAt: '2999-01-01T00:00:00.000Z',
         id: 'approval-1',
         requestedAction: 'git_commit',
         riskLevel: 'HIGH',
@@ -115,45 +117,212 @@ describe('manualWorkflowIsLocked', () => {
     ]
     expect(manualWorkflowIsLocked(jobs, approvalRequests)).toBe(true)
   })
+
+  it('does not lock on an expired linked WAITING approval (nobody waits on it; A-02)', () => {
+    const jobs = [makeJob({ id: 'job-1', approvalId: 'approval-1', status: 'blocked' })]
+    const approvalRequests = [
+      { id: 'approval-1', status: 'WAITING_FOR_USER', expiresAt: '2000-01-01T00:00:00.000Z' },
+    ] as ApprovalRequest[]
+    expect(manualWorkflowIsLocked(jobs, approvalRequests)).toBe(false)
+  })
 })
 
-describe('canShowResumeUI', () => {
-  it('shows resume UI when the latest Job is directly blocked (guard violation)', () => {
-    const task = makeTask({ status: 'in_progress' })
-    const jobs = [makeJob({ id: 'job-1', status: 'blocked' })]
-    expect(canShowResumeUI(task, jobs, [])).toBe(true)
+describe('canShowResumeUI — in-flight repair review (lifecycle repair C3 / D3-1)', () => {
+  const blockedJob = {
+    id: 'job-1', taskId: 'task-1', projectId: 'p', agentRole: 'developer_ai', status: 'blocked',
+    safeCommand: { kind: 'test', workingDir: '/w' }, aiCliMode: 'implement', aiCliProvider: 'codex',
+    createdAt: '2026-10-16T00:00:00.000Z',
+  } as unknown as Job
+  const facts = (repairDesignReviewInFlight?: boolean) => ({
+    status: 'blocked' as const, parked: false, projectStatus: 'running' as const, repairDesignReviewInFlight,
   })
 
-  it('shows resume UI when Design Review escalation left Task blocked with a failed latest Job', () => {
-    const task = makeTask({ status: 'blocked' })
-    const jobs = [makeJob({ id: 'job-1', status: 'failed' })]
-    expect(canShowResumeUI(task, jobs, [])).toBe(true)
+  it('hides Resume while the API reports an in-flight repair review, and agrees with the API otherwise', () => {
+    expect(canShowResumeUI(facts(true), [blockedJob], [])).toBe(false)
+    expect(canShowResumeUI(facts(false), [blockedJob], [])).toBe(true)
   })
 
-  it('does not show resume UI when Task is not blocked and latest Job merely failed', () => {
-    const task = makeTask({ status: 'in_progress' })
-    const jobs = [makeJob({ id: 'job-1', status: 'failed' })]
-    expect(canShowResumeUI(task, jobs, [])).toBe(false)
+  it('fails closed when the API did not report the fact (older API)', () => {
+    expect(canShowResumeUI(facts(undefined), [blockedJob], [])).toBe(false)
+  })
+})
+
+describe('canShowResumeUI（共有 evaluateResumeAdmission と同じ判定）', () => {
+  const NOW = Date.parse('2026-08-01T00:30:00.000Z')
+  const detail = (over: Partial<TaskDetail> = {}): TaskDetail => ({
+    ...makeTask({ status: 'blocked' }),
+    parked: false,
+    projectStatus: 'running',
+    humanTaskDecisions: [],
+    repairDesignReviewInFlight: false,
+    ...over,
+  })
+  const blockedImplement = (over: Partial<Job> = {}): Job =>
+    makeJob({ aiCliMode: 'implement', aiCliProvider: 'codex', id: 'job-2', status: 'blocked', createdAt: '2026-08-01T00:10:00.000Z', ...over })
+  const approval = (over: Partial<ApprovalRequest>): ApprovalRequest => ({
+    createdAt: '2026-08-01T00:00:00.000Z',
+    invalidIf: [],
+    changedFiles: [],
+    expiresAt: '2026-08-01T01:00:00.000Z',
+    id: 'approval-1',
+    requestedAction: 'git_commit',
+    riskLevel: 'HIGH',
+    status: 'WAITING_FOR_USER',
+    targetBranch: 'main',
+    targetCommit: 'abc123',
+    targetDiffHash: 'hash',
+    taskId: 'task-1',
+    ...over,
   })
 
-  it('does not show resume UI while a linked approval is still waiting for the user', () => {
-    const task = makeTask({ status: 'blocked' })
-    const jobs = [makeJob({ id: 'job-1', approvalId: 'approval-1', status: 'blocked' })]
-    const approvalRequests: ApprovalRequest[] = [
-      {
-        changedFiles: [],
-        expiresAt: '2026-08-01T01:00:00.000Z',
-        id: 'approval-1',
-        requestedAction: 'git_commit',
-        riskLevel: 'HIGH',
-        status: 'WAITING_FOR_USER',
-        targetBranch: 'main',
-        targetCommit: 'abc123',
-        targetDiffHash: 'hash',
-        taskId: 'task-1',
-      },
-    ]
-    expect(canShowResumeUI(task, jobs, approvalRequests)).toBe(false)
+  it('最新 Job が直接 blocked なら出す（Guard 違反）', () => {
+    expect(canShowResumeUI(detail({ status: 'in_progress' }), [blockedImplement()], [], NOW)).toBe(true)
+  })
+
+  it('Design Review escalation（Task blocked・最新 Job failed）でも出す', () => {
+    expect(canShowResumeUI(detail(), [blockedImplement({ status: 'failed' })], [], NOW)).toBe(true)
+  })
+
+  it('blocked な git_commit Job は aiCliMode が無くても出す', () => {
+    const commit = makeJob({ id: 'commit-1', status: 'blocked', safeCommand: { kind: 'git_commit' } as Job['safeCommand'] })
+    expect(canShowResumeUI(detail(), [commit], [], NOW)).toBe(true)
+  })
+
+  it('Task が blocked でなく最新 Job が failed なだけなら出さない', () => {
+    expect(canShowResumeUI(detail({ status: 'in_progress' }), [blockedImplement({ status: 'failed' })], [], NOW)).toBe(false)
+  })
+
+  it('park された Task には出さない', () => {
+    expect(canShowResumeUI(detail({ parked: true }), [blockedImplement()], [], NOW)).toBe(false)
+  })
+
+  it('quarantine が古い Job にあるだけでも出さない（API は Task の全 Job を見る）', () => {
+    const olderQuarantined = makeJob({
+      aiCliMode: 'implement',
+      createdAt: '2026-08-01T00:00:00.000Z',
+      failureMetadata: { quarantined: true } as Job['failureMetadata'],
+      id: 'job-1',
+      status: 'blocked',
+    })
+    expect(canShowResumeUI(detail(), [blockedImplement(), olderQuarantined], [], NOW)).toBe(false)
+  })
+
+  it('最新 Job に紐付かない別の live な承認待ちがあっても出さない', () => {
+    const unlinked = approval({ id: 'approval-other' })
+    expect(canShowResumeUI(detail(), [blockedImplement()], [unlinked], NOW)).toBe(false)
+  })
+
+  // C-03: Mobile の resume は CEO の操作（人の resume）。live WAITING の Task 単位 request は
+  // API が同じ transaction で置き換えるので、それだけなら Resume を出す（API と同じ判定）。
+  it('live WAITING の Task 単位 request（abort_task）だけなら出す（人の resume が置き換える）', () => {
+    const waitingAbort = approval({ id: 'approval-abort', requestedAction: 'abort_task' })
+    expect(canShowResumeUI(detail(), [blockedImplement()], [waitingAbort], NOW)).toBe(true)
+  })
+
+  it('紐付いた承認待ちが live なら出さない', () => {
+    const job = blockedImplement({ approvalId: 'approval-1' })
+    expect(canShowResumeUI(detail(), [job], [approval({})], NOW)).toBe(false)
+  })
+
+  it('紐付いた WAITING が期限切れなら出す（API は受け付ける）', () => {
+    const job = blockedImplement({ approvalId: 'approval-1' })
+    const expired = approval({ expiresAt: '2026-08-01T00:00:00.000Z' })
+    expect(canShowResumeUI(detail(), [job], [expired], NOW)).toBe(true)
+  })
+
+  it('done の Task には出さない', () => {
+    expect(canShowResumeUI(detail({ status: 'done' }), [blockedImplement()], [], NOW)).toBe(false)
+  })
+
+  it.each(['paused', 'draft', 'archived'] as const)('Project が %s なら出さない', (projectStatus) => {
+    expect(canShowResumeUI(detail({ projectStatus }), [blockedImplement()], [], NOW)).toBe(false)
+  })
+
+  it('Project が見つからない（null）なら出さない', () => {
+    expect(canShowResumeUI(detail({ projectStatus: null }), [blockedImplement()], [], NOW)).toBe(false)
+  })
+
+  it('live な Job（queued / running）が残っていれば出さない', () => {
+    const queuedOlder = makeJob({ id: 'job-0', status: 'queued', createdAt: '2026-08-01T00:00:00.000Z' })
+    expect(canShowResumeUI(detail(), [blockedImplement(), queuedOlder], [], NOW)).toBe(false)
+  })
+
+  it('最新は createdAt で決める（startedAt の新しい古い Job を最新と見なさない）', () => {
+    const olderButLateStart = makeJob({
+      id: 'job-0', status: 'success', createdAt: '2026-08-01T00:00:00.000Z', startedAt: '2026-08-01T00:20:00.000Z',
+    })
+    expect(canShowResumeUI(detail(), [olderButLateStart, blockedImplement()], [], NOW)).toBe(true)
+  })
+
+  it('aiCliMode の無い非 git_commit Job は出さない（API は AI_CLI_MODE_MISSING）', () => {
+    expect(canShowResumeUI(detail(), [blockedImplement({ aiCliMode: undefined })], [], NOW)).toBe(false)
+  })
+
+  it('aiCliProvider の無い非 git_commit Job は出さない（API は AI_CLI_PROVIDER_MISSING）', () => {
+    expect(canShowResumeUI(detail(), [blockedImplement({ aiCliProvider: undefined })], [], NOW)).toBe(false)
+  })
+
+  it('parked / projectStatus を返さない古い API の Task には出さない（判定できない）', () => {
+    expect(canShowResumeUI(makeTask({ status: 'blocked' }), [blockedImplement()], [], NOW)).toBe(false)
+  })
+})
+
+describe('canShowRecoverUI（共有 evaluateRecoverAdmission と同じ判定）', () => {
+  const NOW = Date.parse('2026-08-01T00:30:00.000Z')
+  const detail = (over: Partial<TaskDetail> = {}): TaskDetail => ({
+    ...makeTask({ status: 'blocked' }),
+    parked: false,
+    projectStatus: 'running',
+    humanTaskDecisions: [],
+    repairDesignReviewInFlight: false,
+    ...over,
+  })
+  const waiting = (expiresAt: string): ApprovalRequest => ({
+    createdAt: '2026-08-01T00:00:00.000Z',
+    invalidIf: [],
+    changedFiles: [],
+    expiresAt,
+    id: 'approval-1',
+    requestedAction: 'git_status', // command kind（Job 束縛）。Task 単位の request は recover が置き換える（C-03）
+    riskLevel: 'HIGH',
+    status: 'WAITING_FOR_USER',
+    targetBranch: 'main',
+    targetCommit: 'abc123',
+    targetDiffHash: 'hash',
+    taskId: 'task-1',
+  })
+
+  it('Job 0 件の blocked Task（running Project）には出す', () => {
+    expect(canShowRecoverUI(detail(), [], [], NOW)).toBe(true)
+  })
+
+  it('Job があれば出さない（resume の担当）', () => {
+    expect(canShowRecoverUI(detail(), [makeJob({ status: 'blocked' })], [], NOW)).toBe(false)
+  })
+
+  it.each([
+    [{ status: 'pending' }],
+    [{ status: 'done' }],
+    [{ parked: true }],
+    [{ projectStatus: 'paused' }],
+    [{ projectStatus: 'archived' }],
+    [{ projectStatus: null }],
+  ] as const)('%o なら出さない', (over) => {
+    expect(canShowRecoverUI(detail(over as Partial<TaskDetail>), [], [], NOW)).toBe(false)
+  })
+
+  it('live な承認待ちがあれば出さず、期限切れの WAITING なら出す', () => {
+    expect(canShowRecoverUI(detail(), [], [waiting('2026-08-01T01:00:00.000Z')], NOW)).toBe(false)
+    expect(canShowRecoverUI(detail(), [], [waiting('2026-08-01T00:00:00.000Z')], NOW)).toBe(true)
+  })
+
+  it('live WAITING の Task 単位 request だけなら出す（recover が同じ transaction で置き換える）', () => {
+    const taskScoped = { ...waiting('2026-08-01T01:00:00.000Z'), requestedAction: 'roadmap_adoption' }
+    expect(canShowRecoverUI(detail(), [], [taskScoped], NOW)).toBe(true)
+  })
+
+  it('parked を返さない古い API の Task には出さない', () => {
+    expect(canShowRecoverUI(makeTask({ status: 'blocked' }), [], [], NOW)).toBe(false)
   })
 })
 
@@ -243,14 +412,24 @@ describe('MOB-001: 実行状態の見分け', () => {
 
   it('承認待ちの blocked は approval_waiting として出る', () => {
     const job = baseJob({ status: 'blocked', approvalId: 'apr-1' } as Partial<Job>)
-    const approvals = [{ id: 'apr-1', status: 'WAITING_FOR_USER' }] as ApprovalRequest[]
+    const approvals = [
+      { id: 'apr-1', status: 'WAITING_FOR_USER', expiresAt: '2999-01-01T00:00:00.000Z' },
+    ] as ApprovalRequest[]
     expect(deriveJobDisplayState(job, approvals, [])).toBe('approval_waiting')
+  })
+
+  it('期限切れの WAITING に紐づく blocked は承認待ちではなく blocked（監査 A-02）', () => {
+    const job = baseJob({ status: 'blocked', approvalId: 'apr-1' } as Partial<Job>)
+    const approvals = [
+      { id: 'apr-1', status: 'WAITING_FOR_USER', expiresAt: '2000-01-01T00:00:00.000Z' },
+    ] as ApprovalRequest[]
+    expect(deriveJobDisplayState(job, approvals, [])).toBe('blocked')
   })
 
   it('quarantine された Job には resume UI を出さない', () => {
     // resume しても API 側の quarantine guard が claim を拒否する。
     // 「押しても失敗する操作」をCEOに見せてはならない。
-    const task = { id: 'task-1', status: 'blocked' } as Task
+    const task = { id: 'task-1', status: 'blocked', parked: false, projectStatus: 'running', repairDesignReviewInFlight: false } as TaskDetail
     const quarantined = baseJob({
       status: 'blocked',
       failureMetadata: { quarantined: true },
@@ -258,7 +437,7 @@ describe('MOB-001: 実行状態の見分け', () => {
 
     expect(canShowResumeUI(task, [quarantined], [])).toBe(false)
     // quarantine でない通常の blocked では従来どおり出る
-    expect(canShowResumeUI(task, [baseJob({ status: 'blocked' })], [])).toBe(true)
+    expect(canShowResumeUI(task, [baseJob({ status: 'blocked', aiCliMode: 'implement', aiCliProvider: 'codex' } as Partial<Job>)], [])).toBe(true)
   })
 })
 
@@ -333,7 +512,7 @@ describe('MOB-001 Project実行健全性', () => {
     const health = deriveProjectExecutionHealth(
       [task('t1')],
       { t1: [job({ approvalId: 'a1', id: 'j1', status: 'blocked' })] },
-      [{ id: 'a1', status: 'WAITING_FOR_USER' } as ApprovalRequest],
+      [{ id: 'a1', status: 'WAITING_FOR_USER', expiresAt: '2999-01-01T00:00:00.000Z' } as ApprovalRequest],
     )
     expect(health).toBe('approval_waiting')
     expect(PROJECT_EXECUTION_HEALTH_LABEL[health]).toBe('承認待ち')
@@ -814,35 +993,48 @@ describe('storedReviewRecoveryNotice — backend の事実を言い換えない'
 })
 
 describe('承認状態と操作文言 — 「承認すれば勝手に始まる」とは言わない', () => {
-  const action = (status: string, expiresAt = '2999-01-01T00:00:00.000Z') => ({
-    createdAt: '2026-09-25T00:00:00.000Z',
-    expiresAt,
-    id: 'approval-1',
-    requestedAction: 'repair_from_stored_review:review-job-1',
-    status,
-    taskId: 'task-1',
-  }) as unknown as ApprovalRequest
+  // 承認状態は API の TaskDetail.humanTaskDecisions（authority 確定済みの事実）から出す（lifecycle repair C3）。
+  const decision = (state: 'waiting' | 'approved', requestedAction = 'repair_from_stored_review:review-job-1') => ({
+    approvalRequestId: 'approval-1',
+    requestedAction,
+    state,
+  })
 
-  it('該当する承認が無ければ none', () => {
+  it('該当する判断が無ければ none（事実が無い古い API も none）', () => {
     expect(storedReviewApprovalState('review-job-1', [])).toBe('none')
+    expect(storedReviewApprovalState('review-job-1', undefined)).toBe('none')
   })
 
-  it('別 review Job 向けの承認は数えない', () => {
-    const other = { ...action('APPROVED'), requestedAction: 'repair_from_stored_review:other' } as ApprovalRequest
-    expect(storedReviewApprovalState('review-job-1', [other])).toBe('none')
+  it('別 review Job 向けの判断は数えない', () => {
+    expect(storedReviewApprovalState('review-job-1', [decision('approved', 'repair_from_stored_review:other')])).toBe('none')
   })
 
-  it('WAITING_FOR_USER は waiting、APPROVED は approved', () => {
-    expect(storedReviewApprovalState('review-job-1', [action('WAITING_FOR_USER')])).toBe('waiting')
-    expect(storedReviewApprovalState('review-job-1', [action('APPROVED')])).toBe('approved')
+  it('waiting は waiting、approved は approved', () => {
+    expect(storedReviewApprovalState('review-job-1', [decision('waiting')])).toBe('waiting')
+    expect(storedReviewApprovalState('review-job-1', [decision('approved')])).toBe('approved')
   })
 
   it('view が承認状態を持つ', () => {
     const { task, implementJob, reviewJob, review } = storedReviewShape()
-    const view = storedReviewRecoveryView(task, [implementJob, reviewJob], [review], [], [action('APPROVED')])
+    const view = storedReviewRecoveryView(
+      { ...task, humanTaskDecisions: [decision('approved')] },
+      [implementJob, reviewJob],
+      [review],
+      [],
+    )
     expect(view.kind).toBe('ready')
     if (view.kind !== 'ready') return
     expect(view.approval).toBe('approved')
+  })
+
+  it('生の APPROVED 行（主体記録なし）は Mobile 側で承認済みにしない — API が事実に載せない限り none', () => {
+    // API は主体（approval_actor=human）の無い APPROVED を humanTaskDecisions に載せない。
+    // Mobile は ApprovalRequest の status を読まないので、事実が空なら none のまま。
+    const { task, implementJob, reviewJob, review } = storedReviewShape()
+    const view = storedReviewRecoveryView({ ...task, humanTaskDecisions: [] }, [implementJob, reviewJob], [review], [])
+    expect(view.kind).toBe('ready')
+    if (view.kind !== 'ready') return
+    expect(view.approval).toBe('none')
   })
 
   it('未申請の案内は「承認後にもう一度押す」ことを明示する', () => {
@@ -886,31 +1078,5 @@ describe('typecheck の QA は観測できる事実だけを書く', () => {
   })
 })
 
-describe('承認の期限 — 期限切れを「承認済み」と出さない', () => {
-  const approval = (status: string, expiresAt: string) => ({
-    createdAt: '2026-09-25T00:00:00.000Z',
-    expiresAt,
-    id: 'approval-1',
-    requestedAction: 'repair_from_stored_review:review-job-1',
-    status,
-    taskId: 'task-1',
-  }) as unknown as ApprovalRequest
-
-  const NOW = new Date('2026-09-25T12:00:00.000Z')
-
-  it('期限切れの APPROVED は none 扱い', () => {
-    expect(storedReviewApprovalState('review-job-1', [approval('APPROVED', '2026-09-25T11:00:00.000Z')], NOW)).toBe('none')
-  })
-
-  it('期限切れの WAITING_FOR_USER も none 扱い', () => {
-    expect(storedReviewApprovalState('review-job-1', [approval('WAITING_FOR_USER', '2026-09-25T11:00:00.000Z')], NOW)).toBe('none')
-  })
-
-  it('未失効なら従来どおり反映する', () => {
-    expect(storedReviewApprovalState('review-job-1', [approval('APPROVED', '2026-09-25T13:00:00.000Z')], NOW)).toBe('approved')
-  })
-
-  it('expiresAt が壊れていれば使わない（fail-closed）', () => {
-    expect(storedReviewApprovalState('review-job-1', [approval('APPROVED', 'not-a-date')], NOW)).toBe('none')
-  })
-})
+// 期限（期限切れ・壊れた期限）の解釈は API 側の shared liveTaskDecisionState() が行い、
+// Mobile へは humanTaskDecisions として届く（approvalLiveness.test.ts で固定。lifecycle repair C3）。

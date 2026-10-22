@@ -83,7 +83,26 @@ export interface PriorRepairJob {
    * **省略時は false**。記録が無いことを authority と解釈しない（fail-safe）。
    */
   humanRecoveryEpoch?: boolean
+  /**
+   * この実装を覆う **保存済みの human authority の参照**（読み取りは flow 層）。
+   *
+   * `human_recovery` は `humanRecoveryEpoch` と同じ consume 済み承認を名指す。
+   * `human_resume` は、この実装の stepKey lineage ではなく **それをレビューした review の
+   * resume lineage** 上にある Human Resume を名指す（b8d0fc5d: 初回 implement の review を CEO が
+   * Human Resume した形。実装の lineage には resume が無いので、従来の walker では origin になっていた）。
+   * 根の identity は書き換えない —— 根はこの実装 Job のままで、権限の出どころだけを参照として持つ。
+   * **省略時は authority 無し**（fail-safe）。
+   */
+  implementationAuthority?: GenerationAuthority
 }
+
+/**
+ * generation を始めた human authority の **保存済み事実への参照**。
+ * 予算 reset はこの参照の種別から導く（`generationResetFacts()`）。label ではなく出どころを残す。
+ */
+export type GenerationAuthority =
+  | { kind: 'human_recovery'; approvalRequestId: string; reviewJobId: string }
+  | { kind: 'human_resume'; resumeJobId: string; resumedReviewJobId: string }
 
 export type RepairDecision =
   | {
@@ -150,6 +169,8 @@ export interface RepairGeneration {
   budgetReset: boolean
   /** なぜ再発行された / されなかったのか。audit に残す短い理由。 */
   resetReason: string
+  /** 根に保存済み authority の参照があるときだけ入る（`PriorRepairJob.implementationAuthority`）。 */
+  authority?: GenerationAuthority
 }
 
 /**
@@ -344,6 +365,59 @@ export function resolveReviewedImplementationFrom(
 }
 
 /**
+ * **git_commit Job の `resume:` の段を、`review:<id>:git-commit` を持つ元の git_commit まで遡る。**
+ *
+ * **#348 以前の旧形式の入れ子専用。** 当時の PL daily resume は、承認待ちが期限切れになった git_commit を
+ * `resume:<直前の git_commit>:1` として毎回作り直し、段は日数分伸びた（2026-10-15 production 実測:
+ * Task b6d4097a で 6 段）。1 段しか辿らないと、REJECT 後の Human Resume が元の review へ到達できない。
+ * 新方式（`resume:<anchor>:<n>`）は fixed anchor を1回だけ参照するので、この walk を使わない
+ * （呼び出し側が `classifyGitCommitResumeLineage()` の `legacy` のときだけ呼ぶ）。
+ *
+ * `resolveReviewedImplementationFrom()` と同じ規約で辿る:
+ * - **探索しない。** 各段でキーが名指ししている 1 件だけを読む
+ * - 各段は**同じ Task / Project の git_commit Job** でなければならない（review / implement 等を跨がない）
+ * - 循環・同じ Job の再訪・Task の Job 数を超える段数・途中の欠損は不成立（fail-closed）
+ * - 段のキーは `resume:<id>:1` だけを受け付ける（resume が作る形。`ux_jobs_workflow_step_key` により
+ *   1 つの source に対する successor は 1 件しか存在できないので、lineage は分岐しない）
+ *
+ * 返すのは段の端の git_commit Job である。それが `review:<id>:git-commit` を持つかの検証と、
+ * review → implement の区間は呼び出し側（既存の provenance 規則）が行う。
+ */
+export function resolveGitCommitResumeOrigin(
+  jobs: ReviewLineageJobReader,
+  gitCommitJob: Job,
+): { ok: true; origin: Job; hops: number } | { ok: false; reason: string } {
+  if (gitCommitJob.safeCommand.kind !== 'git_commit') {
+    return { ok: false, reason: `job ${gitCommitJob.id} is ${gitCommitJob.safeCommand.kind}, not git_commit` }
+  }
+  const sameOwner = (job: Job): boolean =>
+    job.taskId === gitCommitJob.taskId && job.projectId === gitCommitJob.projectId
+
+  const maxHops = jobs.findByTaskId(gitCommitJob.taskId).length
+  const visited = new Set<string>([gitCommitJob.id])
+  let anchor = gitCommitJob
+  for (;;) {
+    const resumed = /^resume:([^:]+):1$/.exec(anchor.workflowStepKey ?? '')
+    if (!resumed) break
+    const sourceId = resumed[1] as string
+    if (visited.has(sourceId) || visited.size > maxHops) {
+      return { ok: false, reason: `git_commit resume lineage of ${gitCommitJob.id} does not terminate` }
+    }
+    const source = jobs.findById(sourceId)
+    if (!source) return { ok: false, reason: `resume source job ${sourceId} not found` }
+    if (!sameOwner(source)) {
+      return { ok: false, reason: `resume source job ${sourceId} belongs to a different task or project` }
+    }
+    if (source.safeCommand.kind !== 'git_commit') {
+      return { ok: false, reason: `resume source job is ${source.safeCommand.kind}, not git_commit` }
+    }
+    visited.add(sourceId)
+    anchor = source
+  }
+  return { ok: true, origin: anchor, hops: visited.size - 1 }
+}
+
+/**
  * generation の根がどちら側の事実で決まったか。
  *
  * `origin` は lineage の端（通常の implement 等）。
@@ -391,6 +465,8 @@ export type GenerationWalk =
        * 復元できていない lineage が除外に使われることはない。
        */
       lineageAncestorJobIds: string[]
+      /** 根に保存済み authority の参照があるときだけ入る。 */
+      authority?: GenerationAuthority
     }
   | { ok: false; reason: string }
 
@@ -439,6 +515,7 @@ export function walkRepairGeneration(
     rootJobId: string
     previousGenerationRoot?: string
     kind: 'human_resume' | 'human_recovery'
+    authority?: GenerationAuthority
   } | undefined
 
   const finish = (originJobId: string): GenerationWalk => {
@@ -464,6 +541,7 @@ export function walkRepairGeneration(
           crossedAiResume,
           generationRepairJobIds,
           lineageAncestorJobIds,
+          ...(countedRoot.authority === undefined ? {} : { authority: countedRoot.authority }),
         }
   }
 
@@ -514,11 +592,23 @@ export function walkRepairGeneration(
     // 上流にさらに `human_resume` があっても現在の根を上書きしない。
     // そして `human_resume` と同じく **ここで walk を止めない** —— 止めると、この Job
     // 自身が環の一部でも別 Task から来ていても素通りしてしまう。
+    const authority = job.implementationAuthority
     if (countedRoot === undefined && job.humanRecoveryEpoch === true) {
       countedRoot = {
         rootJobId: cursor,
         previousGenerationRoot: lineageParentOf(stepKey),
         kind: 'human_recovery',
+        ...(authority?.kind === 'human_recovery' ? { authority } : {}),
+      }
+    } else if (countedRoot === undefined && authority?.kind === 'human_resume') {
+      // **review lineage 上の Human Resume を、この実装を根とする generation の authority にする。**
+      // 根は実装 Job のまま（relabel しない）。`human_recovery` と同じく stepKey 種別に依らず、
+      // ここで walk は止めない。予算 reset は既存の `human_resume` 根と同じ導出になる。
+      countedRoot = {
+        rootJobId: cursor,
+        previousGenerationRoot: lineageParentOf(stepKey),
+        kind: 'human_resume',
+        authority,
       }
     }
 
@@ -639,6 +729,7 @@ export function toRepairGeneration(walk: Extract<GenerationWalk, { ok: true }>):
     previousGenerationRoot: walk.previousGenerationRoot,
     crossedAiResume: walk.crossedAiResume,
     ...generationResetFacts(walk),
+    ...(walk.authority === undefined ? {} : { authority: walk.authority }),
   }
 }
 

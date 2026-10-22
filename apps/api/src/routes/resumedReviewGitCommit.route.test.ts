@@ -1,5 +1,6 @@
 import Fastify, { type FastifyInstance } from 'fastify'
-import { createHash } from 'node:crypto'
+import { setCredentialClass } from '../auth/credentialClass'
+import { createHash, randomUUID } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 import { canonicalizeJobUpdate, type Job, type Task } from '@ai-team/shared'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
@@ -33,6 +34,11 @@ async function withApp(run: (app: FastifyInstance) => Promise<void>): Promise<vo
   ])
   resetStorage()
   const app = Fastify()
+  // C-1: the Worker's result delivery is authenticated as the Worker (apiTokenAuth sets the class in
+  // production). These route tests have no auth plugin, so stand in for it on the Worker's PATCH /api/jobs/:id.
+  app.addHook('onRequest', async (req) => {
+    if (req.method === 'PATCH' && /^\/api\/jobs\/[^/?]+(\?|$)/.test(req.url)) setCredentialClass(req, 'worker')
+  })
   app.register(approvalGateRoutes, { prefix: '/api' })
   app.register(taskRoutes, { prefix: '/api/tasks' })
   app.register(jobRoutes, { prefix: '/api/jobs' })
@@ -119,7 +125,8 @@ async function gitCommitsOf(taskId: string): Promise<Job[]> {
   return (await storage()).jobs.findByTaskId(taskId).filter((job) => job.safeCommand.kind === 'git_commit')
 }
 
-async function approve(app: FastifyInstance, review: Job, payload: Record<string, unknown> = approved) {
+// The Worker delivers `success` only as an Outbox event; a direct write is refused (R-FINAL-OPPATCH).
+async function approve(app: FastifyInstance, review: Job, payload: Record<string, unknown> = withOutbox(approved, randomUUID())) {
   const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${review.id}`, payload })
   expect(res.statusCode).toBe(200)
 }
@@ -320,7 +327,7 @@ describe('D4: resumed review 由来の git_commit を CEO が REJECT した後�
     })
   })
 
-  it('git_commit 自体の resume は従来どおり 1 ホップだけ正規化する（1 段は通る）', async () => {
+  it('git_commit 自体の resume 1 段は従来どおり通る', async () => {
     await withApp(async (app) => {
       const c = await chain()
       const s = await storage()
@@ -343,27 +350,129 @@ describe('D4: resumed review 由来の git_commit を CEO が REJECT した後�
     })
   })
 
-  it('git_commit 側の 2 段 resume は従来どおり fail-closed（review lineage の walk と混ぜない）', async () => {
+  /**
+   * PL の daily resume と同じ形で git_commit を n 段作り直す（直前の段は failed、最新は queued）。
+   * 2026-10-15 production の Task b6d4097a は 6 段だった。
+   */
+  async function dailyCommitResumes(c: Chain, commit: Job, n: number): Promise<Job[]> {
+    const s = await storage()
+    const hops: Job[] = []
+    let previous = commit
+    for (let i = 1; i <= n; i++) {
+      s.jobs.update(previous.id, { status: 'failed' } as never)
+      await tick()
+      previous = s.jobs.create({
+        ...c.base, status: 'queued',
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', params: { commitMessage: 'x' } },
+        workflowStepKey: `resume:${previous.id}:1`,
+      } as never)
+      hops.push(previous)
+    }
+    return hops
+  }
+
+  it.each([2, 6])('git_commit 側の %i 段 resume でも元の git_commit から implement を復元し、修正指示の Job を作る', async (n) => {
+    await withApp(async (app) => {
+      const c = await chain()
+      const r1 = await resumedReview(c, c.firstReview)
+      await approve(app, r1)
+      const [commit] = await gitCommitsOf(c.task.id)
+      const hops = await dailyCommitResumes(c, commit!, n)
+      const latest = hops.at(-1)!
+      await rejectCommit(c.task, latest)
+
+      const { statusCode, body } = await resume(app, c.task.id)
+
+      expect(statusCode).toBe(201)
+      expect(body.aiCliMode).toBe('implement')
+      expect(body.aiCliProvider).toBe(c.implementJob.aiCliProvider)
+      expect(body.safeCommand.kind).toBe(c.implementJob.safeCommand.kind)
+      expect(body.aiCliPrompt).toContain(INSTRUCTION)
+      expect(body.workflowStepKey).toBe(`resume:${latest.id}:1`)
+    })
+  })
+
+  it('git_commit 側の段に別 Task の git_commit が挟まれば fail-closed（Job を作らない）', async () => {
     await withApp(async (app) => {
       const c = await chain()
       const s = await storage()
       const r1 = await resumedReview(c, c.firstReview)
       await approve(app, r1)
       const [commit] = await gitCommitsOf(c.task.id)
-      s.jobs.update(commit!.id, { status: 'blocked' } as never)
-      await tick()
-      const hop1 = s.jobs.create({
-        ...c.base, status: 'blocked',
+      const other = await chain(true, c.base.projectId as string)
+      s.jobs.update(commit!.id, { status: 'failed' } as never)
+      const foreign = s.jobs.create({
+        ...other.base, status: 'failed',
         safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', params: { commitMessage: 'x' } },
         workflowStepKey: `resume:${commit!.id}:1`,
       } as never)
       await tick()
-      const hop2 = s.jobs.create({
+      const latest = s.jobs.create({
         ...c.base, status: 'queued',
         safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', params: { commitMessage: 'x' } },
-        workflowStepKey: `resume:${hop1.id}:1`,
+        workflowStepKey: `resume:${foreign.id}:1`,
       } as never)
-      await rejectCommit(c.task, hop2)
+      await rejectCommit(c.task, latest)
+      const before = s.jobs.findByTaskId(c.task.id).length
+
+      const { statusCode, body } = await resume(app, c.task.id)
+
+      expect(statusCode).toBe(409)
+      expect(body.code).toBe('REJECTED_COMMIT_SOURCE_UNRESOLVED')
+      expect(s.jobs.findByTaskId(c.task.id)).toHaveLength(before)
+    })
+  })
+
+  it('git_commit 側の段が review を指していれば fail-closed（review lineage の walk と混ぜない）', async () => {
+    await withApp(async (app) => {
+      const c = await chain()
+      const s = await storage()
+      const r1 = await resumedReview(c, c.firstReview)
+      await approve(app, r1)
+      const [commit] = await gitCommitsOf(c.task.id)
+      s.jobs.update(commit!.id, { status: 'failed' } as never)
+      const misrooted = s.jobs.create({
+        ...c.base, status: 'failed',
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', params: { commitMessage: 'x' } },
+        workflowStepKey: `resume:${r1.id}:1`,
+      } as never)
+      await tick()
+      const latest = s.jobs.create({
+        ...c.base, status: 'queued',
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', params: { commitMessage: 'x' } },
+        workflowStepKey: `resume:${misrooted.id}:1`,
+      } as never)
+      await rejectCommit(c.task, latest)
+      const before = s.jobs.findByTaskId(c.task.id).length
+
+      const { statusCode, body } = await resume(app, c.task.id)
+
+      expect(statusCode).toBe(409)
+      expect(body.code).toBe('REJECTED_COMMIT_SOURCE_UNRESOLVED')
+      expect(s.jobs.findByTaskId(c.task.id)).toHaveLength(before)
+    })
+  })
+
+  it('旧形式の段が新方式の generation（:2 以降）に当たれば fail-closed（#348 の系譜と混ぜない）', async () => {
+    await withApp(async (app) => {
+      const c = await chain()
+      const s = await storage()
+      const r1 = await resumedReview(c, c.firstReview)
+      await approve(app, r1)
+      const [anchor] = await gitCommitsOf(c.task.id)
+      const commitJob = (stepKey: string, status: string) => s.jobs.create({
+        ...c.base, status,
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target', params: { commitMessage: 'x' } },
+        workflowStepKey: stepKey,
+      } as never)
+      s.jobs.update(anchor!.id, { status: 'failed' } as never)
+      await tick()
+      commitJob(`resume:${anchor!.id}:1`, 'failed')
+      await tick()
+      const generation2 = commitJob(`resume:${anchor!.id}:2`, 'failed')
+      await tick()
+      const legacyOnTop = commitJob(`resume:${generation2.id}:1`, 'queued')
+      await rejectCommit(c.task, legacyOnTop)
       const before = s.jobs.findByTaskId(c.task.id).length
 
       const { statusCode, body } = await resume(app, c.task.id)

@@ -308,7 +308,8 @@ gh run view <run-id> --log-failed
 **複合エラー時のトリアージ手順:**
 
 1. `gh run view <run-id> --log-failed` で全エラーを収集する
-2. 根本原因（症状ではなく原因）を特定する
+2. 根本原因（症状ではなく原因）を特定し、同じ原因が他の箇所にも無いかを原因の共有可能性とリスクに
+   応じた範囲で確認する（`specs/21` `evidence-not-spec` の Root Cause Generalization。全数監査ではない）
 3. 前提条件を洗い出してリスト化する
    ```
    例:
@@ -569,7 +570,7 @@ Codexの利用枠は全セッション共有資源。同じ品質をより少な
 
 | # | ルール | 要点 |
 |---|---|---|
-| 014 | 1 Finding = 1 bounded task | 複数Findingを1セッションへまとめない |
+| 014 | 1 Finding = 1 bounded task | 複数Findingを1セッションへまとめない（同じ根本原因の複数症状は、その原因を1 Findingとして扱う。`specs/21` `evidence-not-spec`） |
 | 015 | repository全体の再調査をさせない | Evidence/対象ファイル/Root Cause候補を渡し探索範囲を限定 |
 | 016 | 結論は独立検証、情報収集は繰り返させない | 検証対象の結論と根拠をprompt/Context Packに明示 |
 | 017 | 必要なファイルだけ読む | 無関係な履歴・PR・testを広範囲に読み込ませない |

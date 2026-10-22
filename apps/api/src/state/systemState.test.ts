@@ -3,6 +3,7 @@ import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import { buildSystemState } from './systemState'
 import { triageBlocked } from '../pl/blockedTriage'
+import { technicalRecoveryTargetKey } from '../pl/technicalResumePolicy'
 
 const NOW = '2026-09-14T10:00:00.000Z'
 const now = () => NOW
@@ -443,6 +444,82 @@ describe('buildSystemState — 終端した Design Review も観測できる（p
     expect(state.attention.some((a) => a.kind === 'design_review_idle')).toBe(false)
     expect(state.projects[0].designReview?.status).toBe('succeeded')
   })
+
+  // lifecycle repair C3-c: 判定の出なかった attempt の後の retry cooldown（retryCooldown.ts）中は
+  // rekick しても claim されないので idle ではない。明けたら従来どおり idle に戻る。
+  it('retry cooldown 中の requeued run は idle ではなく、明けると design_review_idle に戻る', () => {
+    const { storage, projectId } = seed()
+    const task = addTask(storage, projectId)
+    const run = storage.designReviewRuns.create({
+      reviewKind: 'task',
+      subjectId: task.id,
+      taskId: task.id,
+      designText: 'd',
+      designTextHash: 'h',
+      taskTitle: 'T',
+      changedFiles: [],
+    })
+    const claimed = storage.designReviewRuns.claim(run.id, 3)
+    storage.designReviewRuns.requeue(run.id, claimed.claimToken!, 'review unavailable: codex logged out')
+    const endedAt = Date.parse(storage.designReviewRuns.findById(run.id)!.completedAt!)
+    const at = (offsetMs: number) => () => new Date(endedAt + offsetMs).toISOString()
+
+    const cooling = buildSystemState(storage, { now: at(4 * 60_000) })
+    expect(cooling.attention.some((a) => a.kind === 'design_review_idle')).toBe(false)
+    expect(cooling.projects[0].designReview).toMatchObject({
+      status: 'queued',
+      attemptCount: 1,
+      idle: false,
+      retryNotBefore: new Date(endedAt + 5 * 60_000).toISOString(),
+    })
+
+    const ready = buildSystemState(storage, { now: at(5 * 60_000) })
+    const idle = ready.attention.find((a) => a.kind === 'design_review_idle')
+    expect(idle?.referenceId).toBe(run.id)
+    expect(idle?.detail).toContain('codex logged out')
+    expect(ready.projects[0].designReview).toMatchObject({ idle: true })
+    expect(ready.projects[0].designReview?.retryNotBefore).toBeUndefined()
+  })
+
+  // 同じ Task の2回目の Design Review episode を1回目と同一視すると、1回目の escalation 済み・
+  // budget 消費済みの記録が2回目を黙らせる（2026-10-16 production・Task `b8d0fc5d`）。
+  it('同じ Task の2つの Design Review 失敗 episode は別の dedup key になる', () => {
+    const { storage, projectId } = seed()
+    const task = addTask(storage, projectId)
+    const createRun = (): string => storage.designReviewRuns.create({
+      reviewKind: 'task',
+      subjectId: task.id,
+      taskId: task.id,
+      designText: 'd',
+      designTextHash: 'h',
+      taskTitle: 'T',
+      changedFiles: [],
+    }).id
+    const failRun = (): string => {
+      const runId = createRun()
+      const claimed = storage.designReviewRuns.claim(runId, 3)
+      storage.designReviewRuns.complete(runId, claimed.run!.claimToken!, 'failed', undefined, 'boom')
+      return runId
+    }
+    const keyOf = (kind: string): string => {
+      const item = buildSystemState(storage, { now }).attention.find((a) => a.kind === kind)
+      if (item === undefined) throw new Error(`no ${kind} attention`)
+      return technicalRecoveryTargetKey(item)
+    }
+
+    const firstRunId = failRun()
+    const firstKey = keyOf('design_review_failed')
+    const secondRunId = failRun()
+    const secondKey = keyOf('design_review_failed')
+
+    expect(firstKey).toBe(`design_review_failed:${firstRunId}`)
+    expect(secondKey).toBe(`design_review_failed:${secondRunId}`)
+    expect(secondKey).not.toBe(firstKey)
+
+    // idle も run 単位。
+    const queuedRunId = createRun()
+    expect(keyOf('design_review_idle')).toBe(`design_review_idle:${queuedRunId}`)
+  })
 })
 
 /**
@@ -536,6 +613,33 @@ describe('D7: 期限切れ承認は live な承認待ちとして扱わない', 
     const diagnosis = triageBlocked(storage, waiting!)
     expect(diagnosis.rootCauseClass).toBe('approval_waiting')
     expect(diagnosis.recommendedLane).toBe('ceo_escalation')
+  })
+
+  it('totals.approvalsWaiting は attention と同じく live な WAITING だけを数える', () => {
+    // 期限切れを数えると、attention に出ないのに「承認待ち 1 件」と表示される（2026-10-16 監査 A2）。
+    expect(buildSystemState(seedBlockedWithWaitingApproval(LIVE).storage, { now }).totals.approvalsWaiting)
+      .toBe(1)
+    expect(buildSystemState(seedBlockedWithWaitingApproval(EXPIRED).storage, { now }).totals.approvalsWaiting)
+      .toBe(0)
+  })
+
+  // 別 action の APPROVED は SUPERSEDED にされず残る。最新の active 行だけを見ると、その陰の古い live WAITING を
+  // 見落とす（Codex review 84fe348）。Task の全 request から live WAITING を探し、その行を referenceId に使う。
+  it.each([
+    ['newer APPROVED of another action', 'abort_task', 'APPROVED', LIVE],
+    ['newer expired WAITING (legacy multi-active)', 'deploy', 'WAITING_FOR_USER', EXPIRED],
+  ] as const)('older live WAITING behind a %s is still counted and referenced', (_label, action, status, expiresAt) => {
+    const { storage, taskId } = seedBlockedWithWaitingApproval(LIVE)
+    const waiting = storage.approvalRequests.findByTaskId(taskId)[0]!
+    storage.approvalRequests.create({
+      taskId, targetBranch: 'b', targetCommit: 'c', targetDiffHash: 'd', riskLevel: 'HIGH',
+      requestedAction: action, status, expiresAt, invalidIf: [], changedFiles: [], triggeredRules: [],
+    } as Parameters<IStorage['approvalRequests']['create']>[0])
+
+    const state = buildSystemState(storage, { now })
+
+    expect(state.totals.approvalsWaiting).toBe(1)
+    expect(state.attention.find((a) => a.kind === 'approval_waiting')?.referenceId).toBe(waiting.id)
   })
 
   it('AC4: 判定しただけで durable row は書き換えない（lazy expiry を壊さない）', () => {

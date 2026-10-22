@@ -1,5 +1,6 @@
 import Fastify, { type FastifyInstance } from 'fastify'
-import { createHash } from 'node:crypto'
+import { setCredentialClass } from '../auth/credentialClass'
+import { createHash, randomUUID } from 'node:crypto'
 import { beforeEach, describe, expect, it } from 'vitest'
 import { canonicalizeJobUpdate, type Job, type Project, type Task } from '@ai-team/shared'
 import { REPAIR_STEP_PREFIX, decideRepairAction } from '../designReview/repairPolicy'
@@ -28,6 +29,11 @@ async function buildApp(): Promise<FastifyInstance> {
   resetStorage()
 
   const app = Fastify()
+  // C-1: the Worker's result delivery is authenticated as the Worker (apiTokenAuth sets the class in
+  // production). These route tests have no auth plugin, so stand in for it on the Worker's PATCH /api/jobs/:id.
+  app.addHook('onRequest', async (req) => {
+    if (req.method === 'PATCH' && /^\/api\/jobs\/[^/?]+(\?|$)/.test(req.url)) setCredentialClass(req, 'worker')
+  })
   app.register(jobRoutes, { prefix: '/api/jobs' })
   await app.ready()
   return app
@@ -125,6 +131,7 @@ async function createRepairJob(sourceJob: Job, task: Task): Promise<Job> {
   })
 }
 
+// The Worker delivers `success` only as an Outbox event (`withOutbox`); a direct write is refused (R-FINAL-OPPATCH).
 function successPatchPayload(overrides: Partial<Job> = {}): Record<string, unknown> {
   return {
     status: 'success',
@@ -154,7 +161,7 @@ describe('repair success reconnects to the existing review-creation flow', () =>
       const res = await app.inject({
         method: 'PATCH',
         url: `/api/jobs/${implement.id}`,
-        payload: successPatchPayload(),
+        payload: withOutbox(successPatchPayload(), randomUUID()),
       })
 
       expect(res.statusCode).toBe(200)
@@ -205,7 +212,7 @@ describe('repair success reconnects to the existing review-creation flow', () =>
       const res = await app.inject({
         method: 'PATCH',
         url: `/api/jobs/${repair.id}`,
-        payload: successPatchPayload(),
+        payload: withOutbox(successPatchPayload(), randomUUID()),
       })
 
       expect(res.statusCode).toBe(200)
@@ -317,7 +324,7 @@ describe('repair success reconnects to the existing review-creation flow', () =>
       await app.inject({
         method: 'PATCH',
         url: `/api/jobs/${repair.id}`,
-        payload: successPatchPayload(),
+        payload: withOutbox(successPatchPayload(), randomUUID()),
       })
       const reviews = await reviewJobsOf(task.id)
       expect(reviews).toHaveLength(1)
@@ -326,13 +333,13 @@ describe('repair success reconnects to the existing review-creation flow', () =>
       const reviewRes = await app.inject({
         method: 'PATCH',
         url: `/api/jobs/${review.id}`,
-        payload: {
+        payload: withOutbox({
           status: 'success',
           exitCode: 0,
           changedFiles: ['test.js'],
           guardResult: { permissionAllowed: true, fileChangeAllowed: true },
           reviewResult: { status: 'approved', summary: 'looks good', findings: [] },
-        },
+        }, randomUUID()),
       })
 
       expect(reviewRes.statusCode).toBe(200)

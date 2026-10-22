@@ -4,12 +4,14 @@ import {
   computeFailureSignature,
   decideRepairAction,
   parseRetrySource,
+  resolveGitCommitResumeOrigin,
   retryStepKeyFor,
   walkRepairGeneration,
   type PriorRepairJob,
   type RepairFailureFacts,
   type ResumeActorClass,
 } from './repairPolicy'
+import type { Job } from '@ai-team/shared'
 
 const FACTS_A: RepairFailureFacts = {
   exitCode: 1,
@@ -850,5 +852,81 @@ describe('hard bound の値そのものを固定する', () => {
     const afterThree = decideRepairAction(three.tip, three.jobs, { exitCode: 91, stderr: 'another' })
     expect(afterThree.action).toBe('escalate')
     if (afterThree.action === 'escalate') expect(afterThree.reason).toContain('limit')
+  })
+})
+
+describe('resolveGitCommitResumeOrigin — git_commit の resume 段を元の git_commit まで遡る', () => {
+  const TASK = 'task-1'
+  const PROJECT = 'project-1'
+
+  function gitCommit(id: string, workflowStepKey: string, owner: Partial<Pick<Job, 'taskId' | 'projectId'>> = {}): Job {
+    return {
+      id, taskId: owner.taskId ?? TASK, projectId: owner.projectId ?? PROJECT, workflowStepKey,
+      status: 'failed', safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' },
+    } as unknown as Job
+  }
+  function review(id: string, workflowStepKey: string): Job {
+    return {
+      id, taskId: TASK, projectId: PROJECT, workflowStepKey, status: 'failed', aiCliMode: 'review',
+      safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+    } as unknown as Job
+  }
+  function reader(jobs: Job[]) {
+    const byId = new Map(jobs.map((job) => [job.id, job]))
+    return {
+      findById: (id: string) => byId.get(id),
+      findByTaskId: (taskId: string) => jobs.filter((job) => job.taskId === taskId),
+    }
+  }
+  /** `review:R:git-commit` を根に、`resume:<prev>:1` を n 段積む（PL の daily resume と同じ形）。 */
+  function dailyChain(n: number): Job[] {
+    const jobs = [gitCommit('c0', 'review:R:git-commit')]
+    for (let i = 1; i <= n; i++) jobs.push(gitCommit(`c${i}`, `resume:c${i - 1}:1`))
+    return jobs
+  }
+
+  it('resume でない git_commit はそのまま返す（0 段）', () => {
+    const jobs = dailyChain(0)
+    expect(resolveGitCommitResumeOrigin(reader(jobs), jobs[0]!)).toEqual({ ok: true, origin: jobs[0], hops: 0 })
+  })
+
+  it.each([1, 2, 6])('%i 段の daily resume chain から元の git_commit を返す', (n) => {
+    const jobs = dailyChain(n)
+    const result = resolveGitCommitResumeOrigin(reader(jobs), jobs[n]!)
+    expect(result).toEqual({ ok: true, origin: jobs[0], hops: n })
+  })
+
+  it('途中の段が欠損していれば fail-closed', () => {
+    const jobs = dailyChain(3).filter((job) => job.id !== 'c1')
+    expect(resolveGitCommitResumeOrigin(reader(jobs), jobs.at(-1)!)).toMatchObject({ ok: false, reason: expect.stringContaining('c1 not found') })
+  })
+
+  it('途中の段が別 Task / 別 Project なら fail-closed', () => {
+    for (const owner of [{ taskId: 'task-2' }, { projectId: 'project-2' }]) {
+      const jobs = [gitCommit('c0', 'review:R:git-commit', owner), gitCommit('c1', 'resume:c0:1'), gitCommit('c2', 'resume:c1:1')]
+      expect(resolveGitCommitResumeOrigin(reader(jobs), jobs[2]!)).toMatchObject({ ok: false, reason: expect.stringContaining('different task or project') })
+    }
+  })
+
+  it('途中の段が git_commit でなければ fail-closed（review の段と混ぜない）', () => {
+    const jobs = [review('r0', 'implement:I:review'), gitCommit('c1', 'resume:r0:1'), gitCommit('c2', 'resume:c1:1')]
+    expect(resolveGitCommitResumeOrigin(reader(jobs), jobs[2]!)).toMatchObject({ ok: false, reason: expect.stringContaining('not git_commit') })
+  })
+
+  it('循環していれば fail-closed', () => {
+    const jobs = [gitCommit('c1', 'resume:c2:1'), gitCommit('c2', 'resume:c1:1')]
+    expect(resolveGitCommitResumeOrigin(reader(jobs), jobs[1]!)).toMatchObject({ ok: false, reason: expect.stringContaining('does not terminate') })
+    const self = [gitCommit('c1', 'resume:c1:1')]
+    expect(resolveGitCommitResumeOrigin(reader(self), self[0]!)).toMatchObject({ ok: false, reason: expect.stringContaining('does not terminate') })
+  })
+
+  it('`resume:<id>:1` 以外の段キーでは遡らない（端として返し、呼び出し側の review:...:git-commit 検証が fail-closed にする）', () => {
+    const jobs = [gitCommit('c0', 'review:R:git-commit'), gitCommit('c1', 'resume:c0:2')]
+    expect(resolveGitCommitResumeOrigin(reader(jobs), jobs[1]!)).toEqual({ ok: true, origin: jobs[1], hops: 0 })
+  })
+
+  it('起点が git_commit でなければ fail-closed', () => {
+    const r = review('r0', 'implement:I:review')
+    expect(resolveGitCommitResumeOrigin(reader([r]), r)).toMatchObject({ ok: false })
   })
 })

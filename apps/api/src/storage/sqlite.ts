@@ -8,6 +8,7 @@
 
 import {
   holdsWorkspaceWhenBlocked,
+  isLiveWorkspaceOwnerJob,
   isStaleBlockedJobCandidate,
   LIVE_JOB_STATUSES,
   OCCUPIES_PROJECT_SQL,
@@ -17,8 +18,10 @@ import Database from 'better-sqlite3'
 import { randomUUID } from 'node:crypto'
 import { z } from 'zod'
 import { CREATE_TABLES, INDEX_STATEMENTS, MIGRATION_STATEMENTS } from './schema'
-import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IPrincipleApplicationStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReviewApprovalAndResumeJobResult, ConsumeApprovalForJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult } from './interface'
-import { computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS, isSupervisedRunKind } from '@ai-team/shared'
+import type { IStorage, IProjectStorage, ITaskStorage, IJobStorage, IApprovalStorage, IReviewResultStorage, IQAResultStorage, IPermissionGrantStorage, IWatchdogEventStorage, IApprovalRequestStorage, IDesignReviewEvidenceStorage, IGateEvaluationStorage, GateEvaluationEvidence, IDesignReviewRunStorage, DesignReviewRun, ClaimDesignReviewRunResult, ISupervisedRunStorage, SupervisedRun, CreateSupervisedRunResult, ClaimSupervisedRunResult, IAuditLogStorage, IPrincipleApplicationStorage, IProjectRoadmapPhaseStorage, IKnowledgeGraphStorage, IDecisionCacheStorage, IIncidentDBStorage, IPatternLibraryStorage, IFeatureDNAStorage, ISelfReflectionStorage, ResumeBlockedTaskResult, RoadmapSyncResult, CreateApprovalForJobResult, ReplaceActiveApprovalAndCreateResult, ReviewApprovalAndResumeJobResult, RecordApprovalDecisionResult, ConsumeApprovalForJobResult, ConsumeApprovalForCommandJobResult, AdvanceWorkflowJobResult, FailIfRunningJobResult, FailAndPrepareRepairResult, PersistReviewWorkflowResult, OutboxEventInput, UpdateWithOutboxEventResult, PersistProviderTimeoutFailureResult, ClearWorkspaceQuarantineResult, CreateRepairJobWithHandoffResult, RepairHandoffRefusalCode, CreateInitialImplementJobResult, CreateManualJobResult, AcknowledgeOutboxEventResult, TaskEscalationResult } from './interface'
+import { DesignReviewRunContentionError, RecoveryApprovalSpentMarkerError } from './interface'
+import { storedReviewRecoverySpentAuditRecord } from '../designReview/repairRecoveryEpoch'
+import { isApprovalBlockingTechnicalAbort, isTaskScopedApprovalAction, computeTaskDisplayStatus, SUPERVISED_RUN_STALE_THRESHOLD_MS, evaluateRecoverAdmission, evaluateResumeAdmission, isSupervisedRunKind, isLiveApprovedApproval, isLiveWaitingApproval } from '@ai-team/shared'
 import type { SupervisedRunKind } from '@ai-team/shared'
 import type { Project, Task, Approval, Job, JobStatus, JobWorkspaceBaseline, JobWorkspaceBaselineEntry, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, DecisionStatus, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger, TaskSummary } from '@ai-team/shared'
 import type {
@@ -31,17 +34,28 @@ import type { TaskContinuation, OperatorRequest } from '@ai-team/shared'
 import type { PrincipleAggregateQuery, PrincipleAggregateRow, PrincipleApplication, PrincipleApplicationInput, PrincipleDisagreementRow, PrincipleReviewStage, StrategicDecision } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
 import { TARGET_WORKING_DIR } from '../config/targetWorkingDir'
-import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
+import { checkImplementJobDesignReviewEvidence, findSupersedingRun } from '../designReviewEvidencePolicy'
+import { classifyStoredRunJudgment } from '../designReview/designReviewCoordinator'
+import { designReviewRetryNotBeforeMs } from '../designReview/retryCooldown'
 import { escalateTaskToHuman, isWorkspaceQuarantined, prepareRepairFlow } from '../designReview/repairFlow'
-import { parseResumeSource, resolveReviewedImplementationFrom, retryStepKeyFor } from '../designReview/repairPolicy'
-import { hasTechnicalAbortMetadata, technicalAbortStateFingerprint } from '../pl/technicalAbortEvidence'
+import {
+  parseResumeSource,
+  resolveGitCommitResumeOrigin,
+  resolveReviewedImplementationFrom,
+  retryStepKeyFor,
+} from '../designReview/repairPolicy'
+import {
+  hasTechnicalAbortMetadata,
+  technicalAbortStateFingerprint,
+  technicalCleanupGenerationMatches,
+} from '../pl/technicalAbortEvidence'
 import type {
   AbortAuthorization,
   TechnicalAbortCleanupSummary,
 } from '../pl/technicalAbortEvidence'
 // 承認待ちの判定は Human Recovery 側の純関数を借りる（precheck と同じ条件を使うため）。
 // 型以外に storage へ依存しないモジュールなので循環しない。
-import { APPROVAL_WAITING_REASON, hasActiveApprovalWaiting } from '../humanRecovery/recoveryAudit'
+import { APPROVAL_WAITING_REASON } from '../humanRecovery/recoveryAudit'
 import {
   classifyGitCommitResumeLineage,
   exactGitCommitResumePredecessor,
@@ -49,6 +63,18 @@ import {
   type GitCommitResumeLineageClassification,
 } from '../gitCommitResumeLineage'
 import { resolveLinkedGitCommitRejection } from '../linkedGitCommitRejection'
+import { blockedJobsReconcileRefusalReason, findBlockedJobsPreventingReconcile } from '../reconcile/externalCompletion'
+import { findBlockedRowsHoldingWorkspace } from '../state/blockedRowOwnership'
+import { classifyApprovedRunBlock, describeApprovedRunBlock } from '../approvedRunBlock'
+import { approvalActorAuditRecord, readApprovalActorClass, readJobsSupersededByHumanResume, resumeActorAuditRecord, withApprovalActorFacts } from '../designReview/resumeActor'
+
+/** resume transaction 内で authority evidence（`resume_actor`）が書けなかったことを表す（G-01）。 */
+class ResumeAuthorityEvidenceWriteError extends Error {
+  constructor(cause: unknown) {
+    super(`failed to record resume_actor: ${cause instanceof Error ? cause.message : String(cause)}`)
+    this.name = 'ResumeAuthorityEvidenceWriteError'
+  }
+}
 
 export class SingleRunningProjectError extends Error {
   constructor() {
@@ -57,10 +83,28 @@ export class SingleRunningProjectError extends Error {
   }
 }
 
-export class ArchiveBlockedByRunningJobError extends Error {
-  constructor() {
-    super('Cannot archive project while a Job is running')
-    this.name = 'ArchiveBlockedByRunningJobError'
+/** Project を放棄する（archive / draft へ戻す）と、その時点で lifecycle を持つ実体が見えなくなる種類。 */
+export type ProjectActiveLifecycleKind =
+  | 'queued_or_running_job'
+  | 'blocked_job'
+  | 'repair_design_review_run'
+  /** repair でない（initial implement 等）queued / running の Design Review run（lifecycle repair C3）。 */
+  | 'design_review_run'
+  /** pending の task_continuation（次 Task を作る途中。lifecycle repair C3）。 */
+  | 'pending_task_continuation'
+
+/**
+ * archive / draft への遷移を拒否した理由。**status 変更と同じ transaction の中で**判定する。
+ *
+ * 以前は archive が running Job だけを見ており、queued Job・未解決の blocked Job・
+ * repair 用 Design Review run を持ったまま Project を放棄できた。放棄された Project は
+ * PL / attention / Worker の所有権判定から外れるため、それらの所有者が誰にも見えないまま残る
+ * （lifecycle repair W5）。pause は対象にしない（CEO の停止スイッチであり、Worker が所有権を見続ける）。
+ */
+export class ProjectHasActiveLifecycleError extends Error {
+  constructor(public readonly blockers: readonly ProjectActiveLifecycleKind[]) {
+    super(`Cannot archive project or return it to draft while it has an active lifecycle: ${blockers.join(', ')}`)
+    this.name = 'ProjectHasActiveLifecycleError'
   }
 }
 
@@ -123,6 +167,12 @@ function recordResumeSourceTerminalized(
  * 人の判断を偽らないため `reason` / `reviewed_at` も書かない。
  * 変えた場合だけ true（呼び出し側が audit に残す）。
  */
+/** better-sqlite3 の SqliteError が、別 connection との lock 競合（再試行で解消しうる）を表すか。 */
+function isSqliteBusyError(err: unknown): boolean {
+  const code = (err as { code?: unknown } | null)?.code
+  return typeof code === 'string' && /^SQLITE_(BUSY|LOCKED)/.test(code)
+}
+
 function supersedeApprovalOfTerminalJob(
   db: Database.Database,
   approvalId: string,
@@ -572,7 +622,9 @@ function buildTaskSummary(
       quarantined: latestJob.failureMetadata?.quarantined === true,
     } : undefined,
     approvalSummary: {
-      hasWaitingApproval: approvalRequests.some(request => request.status === 'WAITING_FOR_USER'),
+      // Mobile / operator 表示の「承認待ち」は shared の `isLiveWaitingApproval` と同じ意味にする。
+      // 期限切れ WAITING を数えると、API が Resume を許すのに画面は承認待ちと出す（2026-10-16 監査 A2）。
+      hasWaitingApproval: approvalRequests.some(request => isLiveWaitingApproval(request)),
       hasRejectedApproval: approvalRequests.some(request => request.status === 'REJECTED'),
       latestApprovalRequestId: latestApproval?.id,
       latestApprovalStatus,
@@ -581,7 +633,7 @@ function buildTaskSummary(
     displayStatus: computeTaskDisplayStatus({
       taskStatus: task.status,
       latestJobStatus: latestJob?.status,
-      linkedApprovalStatus: linkedApproval?.status,
+      linkedApproval,
     }),
     updatedAt: newestIso([
       task.updatedAt,
@@ -630,6 +682,170 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   // `storage` 全体へアクセスする必要がある。クロージャ経由で late-assign する。
   let storage: IStorage
 
+  /**
+   * その Task の blocked 行が、観測なしで workspace 所有者と確定するか。
+   *
+   * **claim guard（`jobs.update` queued→running）・`activeLifecycleKindsOf`・systemState の
+   * `workspace_held_by_stalled_owner` はすべてこの意味を使う**（ownership を自前で書き直さない）。
+   * 実体は `findBlockedRowsHoldingWorkspace()`（`state/blockedRowOwnership.ts`）: shared の
+   * `holdsWorkspaceWhenBlocked()` に park 状態を渡し、Human Resume で後継が作られた旧行を
+   * quarantine でない場合だけ除く（quarantine が優先。Worker と同じ）。
+   *
+   * done / park された Task に残った非 quarantine の blocked 行（`isStaleBlockedJobCandidate`）は
+   * ここでは所有者にしない。それは「所有していない」ではなく「観測しないと決められない」であり、
+   * 観測は Worker（clean worktree・HEAD 解決可能・git 操作なしを確認して初めて解放）と、
+   * 次の initial implement の `computeWorkspaceBaseline` admission（dirty なら fail-closed）が担う。
+   * API がここで所有者と数えると、Worker が解放した後も claim が永久に止まり、出口が無い
+   * （done Task は abort / resume / archive のどれも通らない）。2026-09-17 の abort 事故と同じ構図。
+   */
+  function taskHoldsWorkspaceViaBlockedRow(taskId: string): boolean {
+    const task = tasks.findById(taskId)
+    if (!task) return false
+    return findBlockedRowsHoldingWorkspace(storage, task, jobs.findByTaskId(taskId)).length > 0
+  }
+
+  /**
+   * **別 Task が共有 workspace を所有しているか**（claim guard の所有者述語。唯一の実装）。
+   *
+   * archived 以外の全 Project について、live な所有者（`isLiveWorkspaceOwnerJob`。Worker と共有）か、
+   * workspace を所有する blocked 行（`taskHoldsWorkspaceViaBlockedRow`）を持つ別 Task があれば true。
+   * claim guard（queued → running）と手動 Job 作成（`createManualJob`。lifecycle repair C3）が使う。
+   * **呼び出し側の transaction の中で呼ぶ。**
+   */
+  function anotherTaskHoldsWorkspace(taskId: string): boolean {
+    const otherOwnerRows = db.prepare(
+      "SELECT j.task_id AS task_id, j.status AS status, j.workflow_step_key AS workflow_step_key "
+      + 'FROM jobs j JOIN tasks t ON t.id = j.task_id JOIN projects p ON p.id = t.project_id '
+      + "WHERE p.status != 'archived' AND j.task_id != ? AND j.status IN ('queued','running','blocked')",
+    ).all(taskId) as Array<{ task_id: string; status: string; workflow_step_key: string | null }>
+    if (otherOwnerRows.some((row) => isLiveWorkspaceOwnerJob(row.task_id, {
+      status: row.status,
+      workflowStepKey: row.workflow_step_key,
+    }))) {
+      return true
+    }
+    const blockedTaskIds = [...new Set(otherOwnerRows
+      .filter((row) => row.status === 'blocked')
+      .map((row) => row.task_id))]
+    return blockedTaskIds.some(taskHoldsWorkspaceViaBlockedRow)
+  }
+
+  /**
+   * その Task に queued / running の repair Design Review run（`repair_source_job_id` 付き）があるか。
+   * 意味は `activeLifecycleKindsOf` の `repair_design_review_run` と同じ（Task 単位）。resume admission と
+   * `TaskDetail.repairDesignReviewInFlight` が使う（lifecycle repair C3 / D3-1）。
+   */
+  function hasRepairDesignReviewInFlight(taskId: string): boolean {
+    return db.prepare(
+      "SELECT id FROM design_review_runs WHERE task_id = ? AND status IN ('queued','running') "
+      + 'AND repair_source_job_id IS NOT NULL LIMIT 1',
+    ).get(taskId) !== undefined
+  }
+
+  /**
+   * Project を放棄すると所有者が見えなくなる lifecycle の種類。
+   *
+   * blocked Job が所有者かは claim guard・systemState と同じ `taskHoldsWorkspaceViaBlockedRow()`
+   * （shared の `holdsWorkspaceWhenBlocked` + Human Resume superseded 除外）で決める。
+   * Project は Job の自己申告（`jobs.project_id`）ではなく Task の `project_id` から引く。
+   */
+  function activeLifecycleKindsOf(projectId: string): ProjectActiveLifecycleKind[] {
+    const kinds: ProjectActiveLifecycleKind[] = []
+    const movingJob = db.prepare(
+      "SELECT j.id FROM jobs j JOIN tasks t ON t.id = j.task_id "
+      + "WHERE t.project_id = ? AND j.status IN ('queued','running') LIMIT 1",
+    ).get(projectId)
+    if (movingJob) kinds.push('queued_or_running_job')
+
+    const blockedTaskIds = (db.prepare(
+      "SELECT DISTINCT j.task_id AS task_id FROM jobs j JOIN tasks t ON t.id = j.task_id "
+      + "WHERE t.project_id = ? AND j.status = 'blocked'",
+    ).all(projectId) as Array<{ task_id: string }>).map((row) => row.task_id)
+    if (blockedTaskIds.some(taskHoldsWorkspaceViaBlockedRow)) kinds.push('blocked_job')
+
+    const repairRun = db.prepare(
+      "SELECT r.id FROM design_review_runs r JOIN tasks t ON t.id = r.task_id "
+      + "WHERE t.project_id = ? AND r.status IN ('queued','running') "
+      + 'AND r.repair_source_job_id IS NOT NULL LIMIT 1',
+    ).get(projectId)
+    if (repairRun) kinds.push('repair_design_review_run')
+
+    // **repair でない Design Review run も放棄を止める**（lifecycle repair C3）。initial implement の run が
+    // queued / running のまま archive / draft にすると、ALIGNED の後に archived Project へ誰も claim できない
+    // queued Job が入る（または review が宙に浮く）。名前は repair run と分けて安定させる。
+    //
+    // **run の scope は Task 経由と Project subject 経由の両方で解決する。** review_kind は 'task'
+    // （task_id = subject_id）と 'roadmap'（task_id 無し・subject_id = projectId。Whole-Roadmap Review）の
+    // 2 種類だけ（`DesignReviewKind`）。Task 経由だけを見ると、project initialization の roadmap review が
+    // queued / running の間に archive でき、その後に roadmap / task の同期が続く（Codex review 148a927）。
+    // Project subject の roadmap run は repair_source_job_id の有無に関わらず数える（上の repair 用 query は
+    // Task 経由でしか引かないので、ここで拾わないと repair 付きの roadmap run が両方から漏れる。Codex review 2d8f060）。
+    const otherRun = db.prepare(
+      "SELECT r.id FROM design_review_runs r LEFT JOIN tasks t ON t.id = r.task_id "
+      + "WHERE r.status IN ('queued','running') "
+      + "AND ((t.project_id = ? AND r.repair_source_job_id IS NULL) "
+      + "OR (r.review_kind = 'roadmap' AND r.subject_id = ?)) LIMIT 1",
+    ).get(projectId, projectId)
+    if (otherRun) kinds.push('design_review_run')
+
+    // **pending の task_continuation も放棄を止める**（lifecycle repair C3）。放棄後に continuation が
+    // 「project is unavailable」で失敗し、次 Task が blocked になる。
+    const continuation = db.prepare(
+      "SELECT id FROM task_continuations WHERE project_id = ? AND status = 'pending' LIMIT 1",
+    ).get(projectId)
+    if (continuation) kinds.push('pending_task_continuation')
+    return kinds
+  }
+
+  /**
+   * git_commit の完了が worktree の clean を証明したときだけ、同じ Task に残った blocked 行を終端化する。
+   *
+   * 残すと done な Task の blocked 行になり、Worker はそれを clean と観測するまで所有者として扱う。
+   * done Task の行には人が解く出口が無いので（`abort_task` も resume も done Task を拒否する）、
+   * **作らないことで防ぐ**（lifecycle repair W5）。終端化した Job に紐づく actionable な承認
+   * （WAITING_FOR_USER / APPROVED）は同じ transaction で SUPERSEDED にする（resume の終端化と同じ）。
+   *
+   * 証明は committing Job が報告した `workspaceEndFingerprint` が committed HEAD で `clean` であること。
+   * 欠落・dirty・HEAD 不一致なら何もしない（fail-closed）。quarantine 行と Human Resume に
+   * superseded された行は対象外（前者は既存の clear-quarantine protocol の担当）。
+   */
+  function terminalizeBlockedJobsOnCleanCompletion(taskId: string, committing: Job): void {
+    const fingerprint = committing.failureMetadata?.workspaceEndFingerprint
+    if (
+      fingerprint?.mode !== 'clean'
+      || committing.commitHash === undefined
+      || fingerprint.startCommitHash !== committing.commitHash
+    ) return
+    const taskJobs = jobs.findByTaskId(taskId)
+    const superseded = readJobsSupersededByHumanResume(storage, taskJobs)
+    for (const job of taskJobs) {
+      if (job.id === committing.id || job.status !== 'blocked') continue
+      if (superseded.has(job.id) || job.failureMetadata?.quarantined === true) continue
+      const terminalized = db.prepare(
+        "UPDATE jobs SET status = 'failed' WHERE id = ? AND status = 'blocked'",
+      ).run(job.id)
+      if (terminalized.changes !== 1) continue
+      auditLog.record({
+        actor: 'api',
+        operation: 'completion_terminalized',
+        entityType: 'job',
+        entityId: job.id,
+        result: 'failed',
+        detail: `reason=clean_completion committing_job_id=${committing.id} commit=${committing.commitHash}`,
+      })
+      if (job.approvalId !== undefined && supersedeApprovalOfTerminalJob(db, job.approvalId, job.taskId)) {
+        auditLog.record({
+          actor: 'api',
+          operation: 'supersede',
+          entityType: 'approval_request',
+          entityId: job.approvalId,
+          result: 'success',
+          detail: `reason=linked_job_terminal source_job_id=${job.id} mode=clean_completion committing_job_id=${committing.id}`,
+        })
+      }
+    }
+  }
+
   const projects: IProjectStorage = {
     findAll() {
       const rows = db.prepare('SELECT * FROM projects ORDER BY created_at DESC').all() as any[]
@@ -669,42 +885,48 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       return project
     },
     update(id, data) {
-      const existing = projects.findById(id)
-      if (!existing) return undefined
+      // 判定と書き込みを1つの transaction にする。間に Job が作られて「確認したときは空だった」
+      // が成り立たなくなるのを防ぐ。
+      return db.transaction((): Project | undefined => {
+        const existing = projects.findById(id)
+        if (!existing) return undefined
 
-      if (data.status === 'archived') {
-        const runningJob = db.prepare(
-          `SELECT id FROM jobs WHERE project_id = ? AND status = 'running' LIMIT 1`
-        ).get(id)
-        if (runningJob) {
-          throw new ArchiveBlockedByRunningJobError()
+        // 止めるのは**放棄する遷移**だけ: archived への遷移と、running / paused → draft。
+        // pause は CEO の停止スイッチなので常に通す。paused Project の所有者は Worker が
+        // 引き続き workspace 所有権の判定に含めるので、pause しても見えなくはならない。
+        // archived → paused（復元）は止まった Project を見える側へ戻す操作なので対象にしない。
+        const abandonsProject = (data.status === 'archived' && existing.status !== 'archived')
+          || (data.status === 'draft' && (existing.status === 'running' || existing.status === 'paused'))
+        if (abandonsProject) {
+          const blockers = activeLifecycleKindsOf(id)
+          if (blockers.length > 0) throw new ProjectHasActiveLifecycleError(blockers)
         }
-      }
 
-      const updated = { ...existing, ...data, updatedAt: now() }
-      // startStageを同じUPDATEで書けるようにする。status='running'への遷移と開始stageの
-      // 永続化を別writeにすると、その間のcrashで「runningだがstageが無い」Projectが残り、
-      // recoveryがそれを推測で拾わざるを得なくなる。推測に頼ると、start_stage列導入前から
-      // 存在するlegacy runningまで巻き込んで再初期化しかねない（独立レビュー指摘、2026-09-07）。
-      const writesStage = Object.prototype.hasOwnProperty.call(data, 'startStage')
-      try {
-        db.prepare(`
-          UPDATE projects SET name=?, goal=?, design_philosophy=?, status=?, updated_at=?${
-            writesStage ? ', start_stage=?, start_stage_updated_at=?, start_blocked_reason=NULL' : ''
-          } WHERE id=?
-        `).run(
-          updated.name,
-          updated.goal,
-          JSON.stringify(updated.designPhilosophy),
-          updated.status,
-          updated.updatedAt,
-          ...(writesStage ? [updated.startStage ?? null, updated.updatedAt] : []),
-          id,
-        )
-      } catch (err: unknown) {
-        throwSingleRunningProjectError(err)
-      }
-      return updated
+        const updated = { ...existing, ...data, updatedAt: now() }
+        // startStageを同じUPDATEで書けるようにする。status='running'への遷移と開始stageの
+        // 永続化を別writeにすると、その間のcrashで「runningだがstageが無い」Projectが残り、
+        // recoveryがそれを推測で拾わざるを得なくなる。推測に頼ると、start_stage列導入前から
+        // 存在するlegacy runningまで巻き込んで再初期化しかねない（独立レビュー指摘、2026-09-07）。
+        const writesStage = Object.prototype.hasOwnProperty.call(data, 'startStage')
+        try {
+          db.prepare(`
+            UPDATE projects SET name=?, goal=?, design_philosophy=?, status=?, updated_at=?${
+              writesStage ? ', start_stage=?, start_stage_updated_at=?, start_blocked_reason=NULL' : ''
+            } WHERE id=?
+          `).run(
+            updated.name,
+            updated.goal,
+            JSON.stringify(updated.designPhilosophy),
+            updated.status,
+            updated.updatedAt,
+            ...(writesStage ? [updated.startStage ?? null, updated.updatedAt] : []),
+            id,
+          )
+        } catch (err: unknown) {
+          throwSingleRunningProjectError(err)
+        }
+        return updated
+      })()
     },
 
     updateStartStage(id, stage, blockedReason) {
@@ -773,7 +995,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       const taskRow = db.prepare('SELECT * FROM tasks WHERE id = ?').get(job.taskId) as any
       if (!taskRow) continue
       const task = deserializeTask(taskRow)
-      if (holdsWorkspaceWhenBlocked(task, job)) return { job, task }
+      if (holdsWorkspaceWhenBlocked({ status: task.status, parked: isParkedTaskId(task.id) }, job)) return { job, task }
       // ここへ来るのは stale 候補だけ。証明の及ぶ workspace のものだけを見逃す。
       //
       // **どちらかの workingDir が読めなければ「同じ workspace だ」と言えない。**
@@ -804,6 +1026,63 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   }
 
   /**
+   * repair handoff を断る理由（無ければ undefined）。`createRepairJobWithHandoff` の
+   * transaction 内からだけ呼ぶ —— 外で呼ぶと判定と Job 作成の間に状態が変わりうる。
+   */
+  function repairHandoffRefusal(
+    taskId: string,
+    repairProjectId: string,
+    sourceJobId: string,
+    repairStepKey?: string,
+  ): { code: RepairHandoffRefusalCode; reason: string } | undefined {
+    const task = db.prepare('SELECT status, project_id FROM tasks WHERE id = ?').get(taskId) as
+      | { status: string; project_id: string }
+      | undefined
+    if (task === undefined) return { code: 'TASK_NOT_FOUND', reason: 'task no longer exists' }
+    if (task.status === 'done') return { code: 'TASK_DONE', reason: 'task is already done' }
+    if (isParkedTaskId(taskId)) return { code: 'TASK_PARKED', reason: 'task was parked by abort_task while the review ran' }
+    // **見る Project は Task の正本（tasks.project_id）から引く。** 呼び出し側が渡した projectId を
+    // そのまま信じると、別 Project の running を根拠に止まっている Project へ Job を作りうる。
+    // repair Job と source Job の projectId がどちらも Task の Project と一致しなければ断る。
+    const source = db.prepare('SELECT project_id, task_id FROM jobs WHERE id = ?').get(sourceJobId) as
+      | { project_id: string; task_id: string }
+      | undefined
+    // **source Job は repair 先と同じ Task のものでなければならない。** 別 Task の Job を source に
+    // すると lineage が Task をまたぎ、`walkRepairGeneration()` が数えられない親を持つ repair になる。
+    if (source !== undefined && source.task_id !== taskId) {
+      return {
+        code: 'LINEAGE_MISMATCH',
+        reason: `source job ${sourceJobId} belongs to task ${source.task_id}, not to the repair task ${taskId}`,
+      }
+    }
+    if (repairProjectId !== task.project_id || (source !== undefined && source.project_id !== task.project_id)) {
+      return {
+        code: 'PROJECT_MISMATCH',
+        reason: `repair job / source job project does not match the task's project ${task.project_id}`,
+      }
+    }
+    const project = db.prepare('SELECT status FROM projects WHERE id = ?').get(task.project_id) as { status: string } | undefined
+    if (project?.status !== 'running') {
+      return { code: 'PROJECT_NOT_RUNNING', reason: `project is not running (${project?.status ?? 'missing'})` }
+    }
+    // **source 以外の live Job が既に Task を動かしているなら repair Job を足さない**（lifecycle repair C3 / D3-1。
+    // resume admission の REPAIR_REVIEW_IN_FLIGHT に対する多層防御）。
+    // 同じ repair stepKey の Job は「この handoff の successor が既に在る」良性の重複で、下の dedup /
+    // 一意制約の経路（already_started）が扱うので foreign には数えない。
+    const foreignLive = db.prepare(
+      "SELECT id FROM jobs WHERE task_id = ? AND id != ? AND status IN ('queued','running') "
+      + 'AND (workflow_step_key IS NULL OR workflow_step_key != ?) LIMIT 1',
+    ).get(taskId, sourceJobId, repairStepKey ?? '') as { id: string } | undefined
+    if (foreignLive !== undefined) {
+      return {
+        code: 'FOREIGN_LIVE_JOB',
+        reason: `job ${foreignLive.id} is already queued or running for this task; a repair job would be a second live chain`,
+      }
+    }
+    return undefined
+  }
+
+  /**
    * park を確定させる直前に、承認が**いまも**この操作を許しているかを確かめ、使い切る。
    *
    * ApprovalRequest は Task 単位で発行されるため、target 束縛だけでは
@@ -817,7 +1096,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   function verifyAndConsumeAbortApproval(
     taskId: string,
     approvalRequestId: string,
-  ): { ok: true } | { ok: false; reason: string } {
+  ): { ok: true } | { ok: false; code?: 'APPROVAL_ACTOR_NOT_HUMAN'; reason: string } {
     return verifyAndConsumeTaskApproval(taskId, approvalRequestId, 'abort_task')
   }
 
@@ -836,7 +1115,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       if (
         job.status === 'queued'
         || job.status === 'running'
-        || holdsWorkspaceWhenBlocked(task, job)
+        || holdsWorkspaceWhenBlocked({ status: task.status, parked: isParkedTaskId(task.id) }, job)
         || occupiesProject(task)
       ) return { job, task }
     }
@@ -850,9 +1129,12 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     authorization: AbortAuthorization,
     preCleanupObservation?: JobWorkspaceBaseline,
     cleanupSummary?: TechnicalAbortCleanupSummary,
-  ): { ok: true } | { ok: false; reason: string } {
+  ): { ok: true } | { ok: false; reason: string; code?: 'HUMAN_DECISION_CONFLICT' } {
     if (authorization.kind === 'manual_approval') {
-      return verifyAndConsumeAbortApproval(task.id, authorization.approvalRequestId)
+      const consumed = verifyAndConsumeAbortApproval(task.id, authorization.approvalRequestId)
+      if (consumed.ok) return consumed
+      // 呼び出し側の code 空間（PRECONDITION_FAILED）へ写す。理由文に code を残し、再承認が要ると分かるようにする。
+      return { ok: false, reason: consumed.code ? `${consumed.code}: ${consumed.reason}` : consumed.reason }
     }
     if (carrier === undefined) {
       return { ok: false, reason: 'technical abort requires a cleanup carrier Job' }
@@ -902,6 +1184,46 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         reason: 'pre-cleanup workspace does not exactly match the latest persisted end fingerprint',
       }
     }
+    // requestTechnicalAbort() の precheck（live WAITING / APPROVED があれば拒否）を最終 transaction で
+    // もう一度行う。precheck 後に作られた承認を、park の STALE 化で黙って消さないため（新しい gate ではなく
+    // 同じ条件の atomic 化）。期限解釈は shared isLiveWaitingApproval / isLiveApprovedApproval
+    // （期限切れ APPROVED は consume できないので人の判断として生きていない。監査 B-2）。
+    // 判定は precheck と同じ shared `isApprovalBlockingTechnicalAbort`（H-2 / T-1）: 期限内または期限の
+    // 読めない WAITING、決定主体（approval_actor）が human の APPROVED、cleanup 要求の後に作られ human が
+    // 決めた CONSUMED（承認→消費まで Worker の報告が届かなかった場合）だけが止める。
+    const nowMs = Date.parse(now())
+    const blockingRows = (db.prepare(`
+      SELECT id, status, expires_at, created_at FROM approval_requests
+      WHERE task_id = ? AND status IN ('WAITING_FOR_USER', 'APPROVED', 'CONSUMED')
+      ORDER BY created_at DESC, rowid DESC
+    `).all(task.id) as Array<{ id: string; status: ApprovalGateStatus; expires_at: string; created_at: string }>)
+      .filter((row) => isApprovalBlockingTechnicalAbort(
+        {
+          status: row.status,
+          expiresAt: row.expires_at,
+          createdAt: row.created_at,
+          approvalActor: readApprovalActorClass(storage, row.id),
+        },
+        {
+          nowMs,
+          ...(metadata.abortCleanupRequestedAt !== undefined
+            ? { cleanupRequestedAt: metadata.abortCleanupRequestedAt }
+            : {}),
+        },
+      ))
+    const humanDecision = blockingRows.find((row) => row.status !== 'CONSUMED')
+    const consumedAfterRequest = blockingRows.find((row) => row.status === 'CONSUMED')
+    if (humanDecision !== undefined || consumedAfterRequest !== undefined) {
+      // 専用 code で返す: 呼び出し側は cleanup の失敗として扱わず carrier を quarantine しない。
+      // その代わりこの cleanup generation を同じ transaction で取り消す（再送は NOT_REQUESTED になる）。
+      return {
+        ok: false,
+        code: 'HUMAN_DECISION_CONFLICT',
+        reason: humanDecision !== undefined
+          ? `Task has an active ${humanDecision.status} approval`
+          : `approval ${consumedAfterRequest!.id} was consumed after the cleanup request`,
+      }
+    }
     if (
       cleanupSummary === undefined
       || !Number.isInteger(cleanupSummary.changedPathCount)
@@ -918,11 +1240,131 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     return { ok: true }
   }
 
-  function staleActiveGitCommitApprovals(taskId: string): number {
+  /**
+   * authorized abort / park が成功した Task の active request（`WAITING_FOR_USER` / `APPROVED`）を、
+   * requestedAction と期限を問わず `STALE` へ進める。認可 guard を通過した後、同じ transaction 内で
+   * だけ呼ぶこと。manual abort の承認は先に `CONSUMED` になっているので対象外。
+   * `REJECTED`（CEO の却下の記録）/ `CONSUMED` / `EXPIRED` / `SUPERSEDED` は変えない。
+   */
+  /**
+   * technical cleanup の generation を取り消す（cleanup 要求と technical 認可の marker を消す）。
+   * quarantine はしない: 拒否の理由が「cleanup の失敗」ではなく「人の判断 / 後続の作業が先にある」ときに使う。
+   * marker が無くなるので、同じ generation の再送は completeAbortCleanup() で NOT_REQUESTED になる。
+   */
+  function cancelTechnicalCleanupGeneration(carrier: Job): void {
+    const failureMetadata = { ...(carrier.failureMetadata ?? {}) }
+    delete failureMetadata.abortCleanupRequestedAt
+    delete failureMetadata.abortTechnicalEvidenceId
+    delete failureMetadata.abortTechnicalStateFingerprint
+    delete failureMetadata.abortTechnicalRootCauseClass
+    delete failureMetadata.abortTechnicalAttentionKind
+    delete failureMetadata.abortReason
+    jobs.update(carrier.id, { failureMetadata })
+  }
+
+  function staleActiveApprovalsOfTask(taskId: string): number {
     return db.prepare(
       "UPDATE approval_requests SET status = 'STALE' WHERE task_id = ? "
-      + "AND requested_action = 'git_commit' AND status IN ('WAITING_FOR_USER', 'APPROVED')",
+      + "AND status IN ('WAITING_FOR_USER', 'APPROVED')",
     ).run(taskId).changes
+  }
+
+  /**
+   * **新しい ApprovalRequest を作る直前に、同じ Task の「人の判断待ち」を1件に畳む。**（同一 transaction 内で呼ぶ）
+   *
+   * - `WAITING_FOR_USER` は action・期限を問わず SUPERSEDED（lazy expiry で期限切れも WAITING のまま残る）。
+   * - `APPROVED` は人の判断なので、別 action の要求では SUPERSEDED にしない（2026-10-16 PL 判断:
+   *   進行中の abort_task 承認を repair 要求が消すと park が認可に失敗する）。
+   * - 同 action の `APPROVED` は `includeSameActionApproved` のときだけ置き換える。
+   *
+   * 結果として Task には WAITING が高々1件、APPROVED は action ごとに残る。reason / reviewed_at は書かない。
+   */
+  function supersedeForNewRequest(
+    taskId: string,
+    requestedAction: string,
+    includeSameActionApproved: boolean,
+  ): string[] {
+    const ids = (db.prepare(`
+      SELECT id FROM approval_requests
+      WHERE task_id = ?
+        AND (status = 'WAITING_FOR_USER' OR (? = 1 AND status = 'APPROVED' AND requested_action = ?))
+      ORDER BY created_at ASC, rowid ASC
+    `).all(taskId, includeSameActionApproved ? 1 : 0, requestedAction) as Array<{ id: string }>)
+      .map((row) => row.id)
+    const supersede = db.prepare(`
+      UPDATE approval_requests SET status = 'SUPERSEDED'
+      WHERE id = ? AND status IN ('WAITING_FOR_USER', 'APPROVED')
+    `)
+    for (const id of ids) {
+      if (supersede.run(id).changes !== 1) {
+        throw new Error(`Failed to supersede approval request ${id}`)
+      }
+    }
+    return ids
+  }
+
+  /** supersedeForNewRequest() で置き換えた事実を audit に残す（置換先と action を記録する）。 */
+  function recordSupersededForNewRequest(ids: readonly string[], replacement: ApprovalRequest): void {
+    const recordSupersede = db.prepare(`
+      INSERT INTO audit_log (id, actor, operation, entity_type, entity_id, result, detail, created_at)
+      VALUES (?, 'api', 'supersede', 'approval_request', ?, 'success', ?, ?)
+    `)
+    for (const id of ids) {
+      recordSupersede.run(
+        randomUUID(),
+        id,
+        `reason=replaced_by_new_request new_approval_id=${replacement.id} `
+          + `new_requested_action=${replacement.requestedAction}`,
+        now(),
+      )
+    }
+  }
+
+  /**
+   * **新しい人の判断（Human Resume / Human Recovery）は、その Task の古い Task 単位の判断を置き換える**（C-03）。
+   *
+   * Task 単位の承認（`abort_task` / `reconcile_external_completion` / `repair_from_stored_review:*`）は
+   * Task・action・status・期限だけで照合されるので、resume / recover の前に下りた APPROVED abort が、
+   * 再開後の新しい作業を後から park できてしまう。resume / recover の transaction の中で、その Task の
+   * active（`WAITING_FOR_USER` / `APPROVED`）な Task 単位の request を `SUPERSEDED` にし、既存の
+   * `supersede` audit を残す。対象は requestedAction が command kind（`git_commit` を含む）でないものだけ:
+   * command kind の承認は commit / diff / Job に束縛済みで、この問題を持たない。
+   * `REJECTED` / `CONSUMED` / `STALE` / `EXPIRED` / `SUPERSEDED` は変えない。reason / reviewed_at も書かない。
+   */
+  /** 分類は共有 `isTaskScopedApprovalAction`（command kind でない requestedAction が Task 単位の判断）。 */
+  function activeTaskScopedDecisions(
+    taskId: string,
+  ): Array<{ id: string; status: ApprovalGateStatus; expiresAt: string }> {
+    return (db.prepare(`
+      SELECT id, status, expires_at, requested_action FROM approval_requests
+      WHERE task_id = ? AND status IN ('WAITING_FOR_USER', 'APPROVED')
+      ORDER BY created_at ASC, rowid ASC
+    `).all(taskId) as Array<{ id: string; status: ApprovalGateStatus; expires_at: string; requested_action: string }>)
+      .filter((row) => isTaskScopedApprovalAction(row.requested_action))
+      .map((row) => ({ id: row.id, status: row.status, expiresAt: row.expires_at }))
+  }
+
+  function supersedeTaskScopedDecisions(
+    taskId: string,
+    reason: 'superseded_by_resume' | 'superseded_by_recover',
+    successorDetail: string,
+  ): string[] {
+    const ids = activeTaskScopedDecisions(taskId).map((row) => row.id)
+    const supersede = db.prepare(`
+      UPDATE approval_requests SET status = 'SUPERSEDED'
+      WHERE id = ? AND status IN ('WAITING_FOR_USER', 'APPROVED')
+    `)
+    const recordSupersede = db.prepare(`
+      INSERT INTO audit_log (id, actor, operation, entity_type, entity_id, result, detail, created_at)
+      VALUES (?, 'api', 'supersede', 'approval_request', ?, 'success', ?, ?)
+    `)
+    for (const id of ids) {
+      if (supersede.run(id).changes !== 1) {
+        throw new Error(`Failed to supersede task-scoped approval request ${id}`)
+      }
+      recordSupersede.run(randomUUID(), id, `reason=${reason} ${successorDetail}`, now())
+    }
+    return ids
   }
 
   function technicalAbortAuditDetail(input: {
@@ -943,6 +1385,15 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   }
 
   /**
+   * 承認の期限が過ぎている、または期限値が読めない（壊れた値を「未失効」として通さない）。
+   * `new Date(bad) <= now` は NaN 比較で false になり、壊れた期限の APPROVED を使い切れてしまうため。
+   */
+  function isUnreadableOrPastExpiry(expiresAt: string): boolean {
+    const expiresAtMs = new Date(expiresAt).getTime()
+    return !Number.isFinite(expiresAtMs) || expiresAtMs <= Date.now()
+  }
+
+  /**
    * 同じ契約を **action 名を引数に取る形**で一般化したもの。abort 専用実装を
    * 複製しないために、上の関数はこれへ委譲している。
    *
@@ -950,11 +1401,32 @@ export function createSQLiteStorage(dbPath: string): IStorage {
    * APPROVED か / 失効していないか**。最後に既存の一回限り契約（APPROVED → CONSUMED）を
    * CAS で使い切る。新しい承認種別も新しい遷移も足していない。
    */
+  /**
+   * 人が決めた記録（approval_actor = human）の無い APPROVED を SUPERSEDED にする（supersede audit 付き）。
+   * **呼び出し側の transaction の中で呼ぶ。** authority を使う経路（consume / resume admission）が
+   * 主体の無い APPROVED に出会ったときの唯一の処理（reason=approval_actor_not_human）。
+   */
+  function supersedeNonHumanApproval(approvalRequestId: string): void {
+    const superseded = db.prepare(
+      "UPDATE approval_requests SET status = 'SUPERSEDED' WHERE id = ? AND status = 'APPROVED'",
+    ).run(approvalRequestId)
+    if (superseded.changes === 1) {
+      auditLog.record({
+        actor: 'api',
+        operation: 'supersede',
+        entityType: 'approval_request',
+        entityId: approvalRequestId,
+        result: 'success',
+        detail: 'reason=approval_actor_not_human',
+      })
+    }
+  }
+
   function verifyAndConsumeTaskApproval(
     taskId: string,
     approvalRequestId: string,
     expectedAction: string,
-  ): { ok: true } | { ok: false; reason: string } {
+  ): { ok: true } | { ok: false; code?: 'APPROVAL_ACTOR_NOT_HUMAN'; reason: string } {
     const row = db.prepare('SELECT * FROM approval_requests WHERE id = ?').get(approvalRequestId) as any
     if (!row) {
       return { ok: false, reason: `approval request ${approvalRequestId} does not exist` }
@@ -985,6 +1457,19 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     if (expiresAtMs <= Date.now()) {
       return { ok: false, reason: `approval request ${approvalRequestId} has expired` }
     }
+    // **人が決めた記録（approval_actor = human）の無い APPROVED は authority ではない**（Codex review 361c19a）。
+    // legacy 単一 token / actor 記録導入前の決定は行の状態だけでは人の判断と区別できない。使い切らずに
+    // 同じ transaction で SUPERSEDED にし（supersede audit 付き）、改めて人の承認を求める。
+    if (readApprovalActorClass(storage, approvalRequestId) !== 'human') {
+      supersedeNonHumanApproval(approvalRequestId)
+      return {
+        ok: false,
+        code: 'APPROVAL_ACTOR_NOT_HUMAN',
+        reason:
+          `approval request ${approvalRequestId} has no record that a human (ADMIN credential) decided it;`
+          + ' it was superseded and a fresh human approval is required',
+      }
+    }
 
     const consumed = db.prepare(
       "UPDATE approval_requests SET status = 'CONSUMED' WHERE id = ? AND status = 'APPROVED'",
@@ -998,6 +1483,20 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   const tasks: ITaskStorage = {
     isParked(taskId) {
       return isParkedTaskId(taskId)
+    },
+    hasRepairDesignReviewInFlight(taskId) {
+      return hasRepairDesignReviewInFlight(taskId)
+    },
+    updateIfAdmitted(id, data, admit) {
+      return db.transaction(() => {
+        const current = tasks.findById(id)
+        if (!current) return { ok: false as const, code: 'TASK_NOT_FOUND' as const, reason: 'Task not found' }
+        const refusal = admit(current)
+        if (refusal !== undefined) return { ok: false as const, code: 'NOT_ADMITTED' as const, reason: refusal }
+        const updated = tasks.update(id, data)
+        if (!updated) return { ok: false as const, code: 'TASK_NOT_FOUND' as const, reason: 'Task not found' }
+        return { ok: true as const, task: updated }
+      }).immediate()
     },
     recoverFromBlocked(input) {
       // **状態遷移と audit を1 transaction にする。** 片方だけ成功する経路を残さない。
@@ -1015,47 +1514,56 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         // （独立レビュー round 6 指摘）。読み直す条件が判定に使った条件より少ない限り、
         // IMMEDIATE で lock を取っても意味が無い。
         const current = deserializeTask(row)
-        if (current.status !== 'blocked') {
-          return { ok: false as const, reason: `Task is ${current.status}, not blocked` }
-        }
-
         const jobCount = (db.prepare(
           'SELECT COUNT(*) AS n FROM jobs WHERE task_id = ?',
         ).get(taskId) as { n: number }).n
-        if (jobCount > 0) {
-          return {
-            ok: false as const,
-            reason: `Task acquired ${jobCount} job(s) concurrently; use /resume instead`,
-          }
-        }
-
-        if (isParkedTaskId(taskId)) {
-          return { ok: false as const, reason: 'Task was parked concurrently' }
-        }
-
+        // **Project が running であることも読み直す**（b8d0fc5d 監査）。
+        // precheck の後に Project が pause されたら、pending へ戻しても誰も拾わない。
+        const projectRow = db.prepare('SELECT status FROM projects WHERE id = ?').get(current.projectId) as
+          { status: string } | undefined
         // **有効な承認待ちも同じ transaction の中で確かめ直す。** precheck だけだと、
         // 別 connection が precheck 後・commit 前に Approval Request を作れてしまい、
         // 「人の判断待ちと Recovery が同時進行しない」という条件を破ったまま commit される。
-        // 判定は precheck と同じ `hasActiveApprovalWaiting()` —— 条件をここへ書き写さない。
-        const latestApprovalRow = db.prepare(
-          'SELECT * FROM approval_requests WHERE task_id = ? ORDER BY created_at DESC LIMIT 1',
-        ).get(taskId) as any
-        if (hasActiveApprovalWaiting(
-          latestApprovalRow ? deserializeApprovalRequest(latestApprovalRow) : undefined,
-          now(),
-        )) {
-          // **precheck と同じ code を返す。** ここでしか気付けなかった（= race だった）
-          // というだけで machine-readable code が変わってはならない
-          // （独立レビュー round 7 指摘）。
-          return {
-            ok: false as const,
-            code: 'APPROVAL_WAITING' as const,
-            reason: APPROVAL_WAITING_REASON,
+        const approvalRows = db.prepare(
+          'SELECT * FROM approval_requests WHERE task_id = ? ORDER BY created_at DESC',
+        ).all(taskId) as any[]
+
+        // **判定は precheck と同じ共有の `evaluateRecoverAdmission()`** —— 読み直した値を渡すだけで、
+        // 条件をここへ書き写さない。**precheck と同じ code を返す。** ここでしか気付けなかった
+        // （= race だった）というだけで machine-readable code が変わってはならない（独立レビュー round 7 指摘）。
+        const admission = evaluateRecoverAdmission({
+          taskStatus: current.status,
+          parked: isParkedTaskId(taskId),
+          projectStatus: projectRow?.status,
+          jobCount,
+          approvals: approvalRows.map(deserializeApprovalRequest),
+          nowMs: Date.parse(now()),
+        })
+        if (!admission.ok) {
+          switch (admission.code) {
+            case 'TASK_NOT_BLOCKED':
+              return { ok: false as const, code: admission.code, reason: `Task is ${current.status}, not blocked` }
+            case 'TASK_HAS_JOBS':
+              return {
+                ok: false as const,
+                code: admission.code,
+                reason: `Task acquired ${jobCount} job(s) concurrently; use /resume instead`,
+              }
+            case 'TASK_PARKED':
+              return { ok: false as const, code: admission.code, reason: 'Task was parked concurrently' }
+            case 'PROJECT_UNAVAILABLE':
+              return { ok: false as const, code: admission.code, reason: 'Project is missing or archived' }
+            case 'PROJECT_NOT_RUNNING':
+              return { ok: false as const, code: admission.code, reason: `Project is ${projectRow?.status}, not running` }
+            case 'APPROVAL_WAITING':
+              return { ok: false as const, code: admission.code, reason: APPROVAL_WAITING_REASON }
           }
         }
 
         const updated = tasks.update(taskId, { status: 'pending' })
         if (!updated) return { ok: false as const, reason: 'Task could not be updated' }
+        // Human Recovery は新しい人の判断。古い Task 単位の判断を同じ transaction で置き換える（C-03）。
+        supersedeTaskScopedDecisions(taskId, 'superseded_by_recover', `recovered_task_id=${taskId}`)
 
         auditLog.record({
           actor: 'api',
@@ -1074,6 +1582,52 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       // それでは transaction 内で status を読み直している意味が無い。
       // `jobs.update()` の claim が同じ理由で IMMEDIATE にしてあるのと同じ扱いである。
       return tx.immediate(input.taskId, input.detail)
+    },
+    escalateToHuman(input) {
+      // **判定と書き込みを同じ IMMEDIATE transaction に置く**（Codex review c3-b round 2）。
+      // 以前は呼び出し側が park / done を読んでから無条件の tasks.update で blocked にしていたため、
+      // その間に別 connection が Task を動かすと、読んだ前提の崩れた Task を blocked にできた。
+      const tx = db.transaction((): TaskEscalationResult => {
+        const row = db.prepare('SELECT * FROM tasks WHERE id = ?').get(input.taskId) as any
+        if (!row) return { result: 'not_found' }
+        const current = deserializeTask(row)
+        const refusal = input.precondition?.(current)
+        if (refusal !== undefined) return { result: 'precondition_failed', reason: refusal }
+
+        let result: 'blocked' | 'already_blocked' | 'not_moved_done' | 'not_moved_parked'
+        if (isParkedTaskId(input.taskId)) {
+          result = 'not_moved_parked'
+        } else if (current.status === 'done') {
+          result = 'not_moved_done'
+        } else if (current.status !== 'blocked') {
+          const changed = db.prepare(
+            "UPDATE tasks SET status = 'blocked', updated_at = ? WHERE id = ? AND status = ?",
+          ).run(now(), input.taskId, current.status)
+          if (changed.changes !== 1) {
+            return { result: 'precondition_failed', reason: `task ${input.taskId} changed concurrently` }
+          }
+          result = 'blocked'
+        } else {
+          result = 'already_blocked'
+        }
+        // 記録の失敗で escalation 自体を失敗させない（従来の escalateTaskToHuman と同じ扱い）。
+        try {
+          auditLog.record({
+            actor: 'api',
+            operation: input.audit.operation,
+            entityType: 'task',
+            entityId: input.taskId,
+            result,
+            detail: input.audit.detail,
+          })
+        } catch (error: unknown) {
+          console.warn(
+            `[storage] failed to record the escalation of task ${input.taskId}: ${error instanceof Error ? error.message : String(error)}`,
+          )
+        }
+        return { result }
+      })
+      return tx.immediate()
     },
     findByProjectId(projectId) {
       const rows = db.prepare('SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at ASC').all(projectId) as any[]
@@ -1626,8 +2180,10 @@ export function createSQLiteStorage(dbPath: string): IStorage {
    * **既存 `workflowStepKey` だけ**で逆引きする。
    *
    * ```
-   * [任意] resume:<anchorGitCommitJobId>:<positive generation>
+   * [任意] resume:<anchorGitCommitJobId>:<positive generation>   … 新方式（#348）
    *   → canonical git_commit  review:<reviewJobId>:git-commit（exact id を1回だけ参照）
+   * [0..n 段] 旧形式 resume:<sourceJobId>:1   … #348 以前に PL / Human の resume が入れ子にした git_commit
+   *   → canonical git_commit  review:<reviewJobId>:git-commit
    *   → [0..n 段] review resume:<reviewJobId>:1   … Human Resume で再実行された review（D4）
    *   → review      implement:<implementJobId>:review
    *   → implement   (aiCliMode = 'implement')
@@ -1636,13 +2192,17 @@ export function createSQLiteStorage(dbPath: string): IStorage {
    * **7条件をすべて満たすときだけ返す。1つでも欠ければ fail-closed**（CEO 判断・2026-09-23）。
    * 同一 diff を再承認へ回さないことのほうが、自動復旧できることより優先される。
    *
-   * **2 つの区間を混ぜない。** git_commit 側は fixed anchor を exact id で1回だけ
-   * 正規化する。そこで得た review Job から implement までの区間だけ、D1 と共用の
+   * **2 つの区間を混ぜない。** git_commit 側は、新方式なら fixed anchor を exact id で1回だけ
+   * 正規化する。旧形式（#348 以前の入れ子）だけは `resolveGitCommitResumeOrigin()` が git_commit の段を
+   * 遡る（2026-09-23 の「最大 1 ホップ」では深い旧形式から REJECT 後に修正へ戻れないため、
+   * CEO 判断・2026-10-15 Option A で旧形式に限り多段にした）。そこで得た review Job から
+   * implement までの区間だけ、D1 と共用の
    * `resolveReviewedImplementationFrom()`（review Job だけを経由する bounded / cycle-safe な walk。
    * CEO 承認・2026-09-28）を使う。下の禁止事項は git_commit 側についてのものである。
    *
    * **やってはいけないこと（意図的に実装していない）**:
-   * - git_commit generation 間の `resume:` traversal（anchor は `review:...:git-commit` しか許さない）
+   * - git_commit generation 間の `resume:` traversal（新方式。anchor は `review:...:git-commit` しか許さない）
+   * - git_commit の段と review の段を 1 つの walk で混ぜること（旧形式の端も `review:...:git-commit` しか許さない）
    * - recursive ancestry resolver
    * - 「最新 implement Job」の推測
    * - 複数候補からの選択
@@ -1727,21 +2287,16 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       job.taskId === latestJob.taskId && job.projectId === latestJob.projectId
 
     // 2. New-scheme generations receive their validated canonical anchor.
-    //    Legacy rows retain the previous one-hop `resume:<source>:1` normalization.
+    //    Legacy nested rows (written before #348) walk the git_commit `resume:<source>:1`
+    //    hops back to the canonical git_commit (CEO decision 2026-10-15, Option A).
+    //    The walk is bounded / cycle-safe and only crosses same Task / Project git_commit
+    //    Jobs; a missing hop, a cycle or a non-git_commit hop fails closed. A hop that
+    //    lands on a new-scheme generation > 1 stops there and fails the anchor check below.
     let gitCommitJob = lineage.kind === 'new_scheme' ? lineage.lineage.anchorJob : latestJob
     if (lineage.kind === 'legacy') {
-      const resumed = /^resume:([^:]+):1$/.exec(latestJob.workflowStepKey ?? '')
-      if (resumed) {
-        const source = lineage.referencedJob
-        if (!source) return { ok: false, reason: `resume source job ${resumed[1]} not found` }
-        if (!sameOwner(source)) {
-          return { ok: false, reason: 'resume source job belongs to a different task or project' }
-        }
-        if (source.safeCommand.kind !== 'git_commit') {
-          return { ok: false, reason: `resume source job is ${source.safeCommand.kind}, not git_commit` }
-        }
-        gitCommitJob = source
-      }
+      const origin = resolveGitCommitResumeOrigin(jobs, latestJob)
+      if (!origin.ok) return { ok: false, reason: origin.reason }
+      gitCommitJob = origin.origin
     }
 
     if (!sameOwner(gitCommitJob)) {
@@ -1749,7 +2304,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     }
 
     // 4. `review:<reviewJobId>:git-commit`。
-    //    Legacy nested resume sources do not match, preserving the old fail-closed result.
+    //    review の段（`resume:<review>:1`）はここでは辿らない。git_commit の段と混ぜない。
     const reviewRef = /^review:([^:]+):git-commit$/.exec(gitCommitJob.workflowStepKey ?? '')
     if (!reviewRef) {
       return {
@@ -1812,6 +2367,23 @@ export function createSQLiteStorage(dbPath: string): IStorage {
   }
 
   const jobs: IJobStorage = {
+    classifyOutboxEvent(jobId, outboxEvent) {
+      return checkOutboxEvent(db, jobId, outboxEvent).status
+    },
+    acknowledgeOutboxEventWithoutApplying(jobId, outboxEvent, stillNonApplicable) {
+      return db.transaction((): AcknowledgeOutboxEventResult => {
+        const dedup = checkOutboxEvent(db, jobId, outboxEvent)
+        if (dedup.status === 'conflict') return { ok: false, code: 'OUTBOX_HASH_MISMATCH', reason: dedup.reason }
+        const job = jobs.findById(jobId)
+        if (!job) return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Job not found' }
+        if (dedup.status === 'deduplicated') return { ok: true, job, deduplicated: true }
+        if (!stillNonApplicable(job)) {
+          return { ok: false, code: 'NOW_APPLICABLE', reason: 'the job reached a state the event applies to' }
+        }
+        recordOutboxEvent(db, jobId, outboxEvent)
+        return { ok: true, job, deduplicated: false }
+      }).immediate()
+    },
     findByTaskId(taskId) {
       const rows = db.prepare('SELECT * FROM jobs WHERE task_id = ? ORDER BY created_at DESC, rowid DESC').all(taskId) as any[]
       return rows.map(deserializeJob)
@@ -1855,6 +2427,50 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       } catch {
         return undefined
       }
+    },
+    createManualJob(data) {
+      return db.transaction((): CreateManualJobResult => {
+        if (anotherTaskHoldsWorkspace(data.taskId)) {
+          return {
+            ok: false,
+            code: 'WORKSPACE_HELD_BY_OTHER_TASK',
+            reason: 'another task already holds the shared workspace; a second owner would deadlock every claim',
+          }
+        }
+        return { ok: true, job: jobs.create(data) }
+      }).immediate()
+    },
+    createInitialImplementJob(data) {
+      return db.transaction((): CreateInitialImplementJobResult => {
+        const task = db.prepare(
+          'SELECT status, project_id, roadmap_active, assignee FROM tasks WHERE id = ?',
+        ).get(data.taskId) as
+          | { status: string; project_id: string; roadmap_active: number; assignee: string }
+          | undefined
+        if (task === undefined) return { ok: false, code: 'TASK_NOT_FOUND', reason: 'task no longer exists' }
+        if (task.status !== 'pending' || task.roadmap_active !== 1 || task.assignee !== 'developer_ai') {
+          return {
+            ok: false,
+            code: 'TASK_NOT_INITIAL_TARGET',
+            reason: `task is no longer an initial workflow target (status=${task.status})`,
+          }
+        }
+        if (isParkedTaskId(data.taskId)) {
+          return { ok: false, code: 'TASK_PARKED', reason: 'task was parked by abort_task' }
+        }
+        // Project は Task の正本（tasks.project_id）から引く。
+        const project = db.prepare('SELECT status FROM projects WHERE id = ?').get(task.project_id) as
+          | { status: string }
+          | undefined
+        if (project?.status !== 'running' || data.projectId !== task.project_id) {
+          return {
+            ok: false,
+            code: 'PROJECT_NOT_RUNNING',
+            reason: `project is not running (${project?.status ?? 'missing'})`,
+          }
+        }
+        return { ok: true, job: jobs.create(data) }
+      }).immediate()
     },
     saveFailureExplanation(jobId, envelope) {
       db.prepare(
@@ -1902,19 +2518,65 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           // 承認競合時（下記）と同じく、状態を変えずに現在値を返す。
           return existing
         }
+        // **pause は claim を原子的に止める**（lifecycle repair W5）。Worker の poll と claim の間に
+        // Project が running でなくなった場合、Job は queued のまま残す。Project は Job の
+        // 自己申告（project_id）ではなく Task から引く。
+        const claimingProject = db.prepare(
+          'SELECT p.status AS status FROM tasks t JOIN projects p ON p.id = t.project_id WHERE t.id = ?',
+        ).get(existing.taskId) as { status: string } | undefined
+        if (claimingProject?.status !== 'running') {
+          return existing
+        }
+        // **別 Task が live な所有者なら claim を書かない**（lifecycle repair W5）。
+        //
+        // Worker の所有権判定は複数リクエストで組んだ snapshot に基づくため、その間に別 Task
+        // （paused Project を含む）へ作られた非 initial-implement の queued Job を見落としうる。
+        // ここは claim の単一の choke point（IMMEDIATE transaction 内）なので、同じ意味
+        // （`isLiveWorkspaceOwnerJob`。Worker と共有）で archived 以外の全 Project を再確認する。
+        //
+        // **workspace を所有する blocked 行も所有者として数える。** blocked は running からだけでなく
+        // queued からも起こる（`jobResultApplicationPolicy` は queued → blocked を許し、開始前の
+        // 拒否は blocked + quarantine へ変換される）ので、claim の直列化だけでは防げない。
+        // 判定は `taskHoldsWorkspaceViaBlockedRow()`（shared `holdsWorkspaceWhenBlocked` +
+        // Human Resume superseded 除外）。done な Task の stale 候補は Worker の worktree 観測と
+        // baseline admission に任せる（ここで数えると Worker の解放後も claim が永久に止まる）。
+        if (anotherTaskHoldsWorkspace(existing.taskId)) {
+          return existing
+        }
       }
       // Approval承認とWorkerのblocked結果保存が競合した場合、承認transactionがqueuedへ
       // 戻したJobを古いblocked結果で巻き戻さない。実行結果も再注入せず、現在値を返す。
+      //
+      // **ただし承認後に claim された実行（running）からの blocked は古い結果ではない**（integrated E2E・P1）。
+      // 承認は Job を queued へ戻すので、承認前の実行の遅延 blocked は queued の行に届く。running の行へ
+      // 届く blocked は承認後の実行そのもので、Gate が ALLOW + call_consume を返したのに Worker 側の
+      // policy が実行を拒んだ（例: safe_work_only で git_commit 不可）ことを意味する。これを捨てると
+      // Job は running・承認は APPROVED・attention 無し・resume / recover も拒否、という無音停止になる。
+      // blocked を保存して停止を見せる。承認は APPROVED のまま束縛を保ち、consume しない。
+      let approvedButBlockedByWorker: string | undefined
       if (data.status === 'blocked' && existing.approvalId) {
         const approvalRow = db.prepare(
           'SELECT status FROM approval_requests WHERE id = ?'
         ).get(existing.approvalId) as { status: ApprovalGateStatus } | undefined
-        if (approvalRow?.status === 'APPROVED' || approvalRow?.status === 'CONSUMED') {
+        if (existing.status === 'running' && approvalRow?.status === 'APPROVED') {
+          approvedButBlockedByWorker = existing.approvalId
+        } else if (approvalRow?.status === 'APPROVED' || approvalRow?.status === 'CONSUMED') {
           return existing
         }
       }
 
       const updated = { ...existing, ...data }
+      if (approvedButBlockedByWorker !== undefined && !(updated.stderr ?? '').trim()) {
+        // Worker の gate block 理由は結果 payload に載らない（stderr 空）。停止理由を attention の
+        // detail（stopReason(job.stderr)）に出すため、Worker が実際に送った guardResult / quarantine だけから
+        // 原因を決めて書く（Codex round 2: 全部を gate policy の拒否と書くと Permission 拒否を偽る）。
+        updated.stderr = describeApprovedRunBlock(classifyApprovedRunBlock(updated), {
+          approvalId: approvedButBlockedByWorker,
+          kind: existing.safeCommand.kind,
+          permissionReason: updated.guardResult?.permissionReason,
+          fileViolations: updated.guardResult?.fileViolations,
+        })
+      }
       db.prepare(`
         UPDATE jobs SET
           status=?, started_at=?, completed_at=?, exit_code=?,
@@ -1955,9 +2617,19 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           return { ok: true, job, deduplicated: true }
         }
 
+        const before = jobs.findById(id)
         const updated = jobs.update(id, data)
         if (!updated) {
           return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Job not found' }
+        }
+        // **拒否された claim は「適用済み」として記録しない**（lifecycle repair W5）。記録すると
+        // 同じ event の再送が deduplicated 200 + queued になり、Worker が拒否を成功と取り違えうる。
+        // 記録しなければ再送は毎回評価し直され、同じく拒否（409）される。
+        const claimRefused = data.status === 'running'
+          && before?.status === 'queued'
+          && updated.status !== 'running'
+        if (claimRefused) {
+          return { ok: true, job: updated, deduplicated: false }
         }
         recordOutboxEvent(db, id, outboxEvent)
 
@@ -2017,6 +2689,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         }
         recordOutboxEvent(db, input.jobId, input.outboxEvent)
 
+        terminalizeBlockedJobsOnCleanCompletion(sourceTask.id, updated)
         const continuation = completeTaskAndCreateContinuation(sourceTask, source.id)
 
         return { ok: true, job: updated, continuation, deduplicated: false }
@@ -2048,6 +2721,12 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         const source = jobs.findById(input.sourceJobId)
         if (!source || source.taskId !== task.id) {
           return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Source Job not found for this Task' }
+        }
+        // **blocked Job が残る Task は done にしない。** done Task の blocked 行には出口が無く、
+        // 取り込みには clean worktree の証拠も無いので終端化もしない（先に resume / abort_task）。
+        const blocked = findBlockedJobsPreventingReconcile(storage, task.id)
+        if (blocked.length > 0) {
+          return { ok: false, code: 'TASK_HAS_BLOCKED_JOBS', reason: blockedJobsReconcileRefusalReason(blocked) }
         }
 
         // **Candidate commit と同じ遷移を共有する。** ここに別の完了ロジックは無い。
@@ -2170,15 +2849,18 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           return finishWithoutRetry()
         }
 
-        const latestApprovalRow = db.prepare(`
-          SELECT status FROM approval_requests
+        const approvalRows = db.prepare(`
+          SELECT status, expires_at FROM approval_requests
           WHERE task_id = ?
           ORDER BY created_at DESC, rowid DESC
-          LIMIT 1
-        `).get(source.taskId) as { status: ApprovalGateStatus } | undefined
+        `).all(source.taskId) as Array<{ status: ApprovalGateStatus; expires_at: string }>
+        // live な WAITING は Task の全行から探す: 最新行だけを見ると、新しい APPROVED（別 action の判断は
+        // 残る）の陰の古い live WAITING を見落とす（Codex review 84fe348）。期限切れ WAITING は誰も
+        // 待っていない（承認しても EXPIRED で拒否される）ので retry を止めない。
+        // REJECTED は従来どおり最新行のときだけ、期限に関係なく止める（CEO の却下の記録）。
         if (
-          latestApprovalRow?.status === 'WAITING_FOR_USER' ||
-          latestApprovalRow?.status === 'REJECTED'
+          approvalRows.some((row) => isLiveWaitingApproval({ status: row.status, expiresAt: row.expires_at })) ||
+          approvalRows[0]?.status === 'REJECTED'
         ) {
           return finishWithoutRetry()
         }
@@ -2376,6 +3058,39 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
     createRepairJobWithHandoff(input) {
       const handoffTransaction = db.transaction((): CreateRepairJobWithHandoffResult => {
+        // 0) **Task / Project 状態の再確認は Job を作る transaction の中で行う。**
+        //    Design Review run は handoff の時点で既に succeeded なので、呼び出し側で先に
+        //    確かめると、その後に done / park / Project 停止が起きても repair Job が作られる
+        //    （TOCTOU）。断るときは何も書かず、source Job の所有権にも触らない。
+        //    **blocked では断らない** —— Stored Review Recovery は blocked な Task から正規に handoff する。
+        const refusal = repairHandoffRefusal(
+          input.repairJob.taskId,
+          input.repairJob.projectId,
+          input.sourceJobId,
+          input.repairJob.workflowStepKey,
+        )
+        if (refusal !== undefined) {
+          // R-3: この refusal で何も実体化しなかった承認は使い切られる。marker は refusal と同じ transaction で書き、
+          // 書けなければ refusal ごと確定させない（承認が再利用できる状態で refusal だけが確定する窓を作らない）。
+          if (input.spendRecoveryApprovalOnRefusal !== undefined) {
+            try {
+              auditLog.record(storedReviewRecoverySpentAuditRecord({
+                approvalRequestId: input.spendRecoveryApprovalOnRefusal.approvalRequestId,
+                taskId: input.repairJob.taskId,
+                sourceJobId: input.sourceJobId,
+                runId: input.spendRecoveryApprovalOnRefusal.runId,
+                reason: refusal.code,
+              }))
+            } catch (err: unknown) {
+              throw new RecoveryApprovalSpentMarkerError(
+                `could not record the spent marker for approval ${input.spendRecoveryApprovalOnRefusal.approvalRequestId}: `
+                + (err instanceof Error ? err.message : String(err)),
+              )
+            }
+          }
+          return { ok: false, ...refusal }
+        }
+
         // 1) 後続 repair Job を**先に**作成する。所有権保持（queued + non-initial
         //    workflowStepKey）であり、source Job を解放する前に workspace の所有者が
         //    1本でも存在することを保証する。
@@ -2426,8 +3141,11 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       })
 
       try {
-        return handoffTransaction()
+        return handoffTransaction.immediate()
       } catch (err: unknown) {
+        // marker が書けなかった refusal は確定していない。STORAGE_ERROR（→ human escalation）へ畳まず投げ返し、
+        // handoff を後で再試行させる（R-3）。
+        if (err instanceof RecoveryApprovalSpentMarkerError) throw err
         const message = err instanceof Error ? err.message : String(err)
         if (/not found for repair handoff/.test(message)) {
           return {
@@ -2624,10 +3342,55 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         ).all(taskId) as any[]
         const taskJobs = jobRows.map(deserializeJob)
         const latestJob = taskJobs[0]
-
-        if (!latestJob) {
-          return { ok: false, reason: 'No jobs exist for this task' }
+        // review を起票したときの resume 対象から変わっていたら、review が見ていない Job を resume しない（C3-c）。
+        // **admission より前に判定する。** 差し替わった Job が admission に落ちる形（AI CLI metadata 無し・
+        // queued / running）でも、呼び出し側に返すべき事実は「対象が変わった」である。
+        if (input.expectedSourceJobId !== undefined && latestJob?.id !== input.expectedSourceJobId) {
+          return {
+            ok: false,
+            code: 'RESUME_TARGET_CHANGED',
+            reason: `resume target changed from ${input.expectedSourceJobId} to ${latestJob?.id ?? 'none'} while the Design Review was pending`,
+          }
         }
+        const projectRow = db.prepare('SELECT status FROM projects WHERE id = ?').get(taskRow.project_id) as
+          { status: string } | undefined
+        const approvalRows = db.prepare(
+          'SELECT * FROM approval_requests WHERE task_id = ? ORDER BY created_at DESC'
+        ).all(taskId) as any[]
+
+        // **前提条件は共有の純関数 1 つで決める**（Mobile の Resume ボタンも同じ関数を使う）。
+        // 以下の分岐の注記は、各前提がなぜ在るかの記録として残してある。判定はここでしか行わない。
+        // done / Project 非 running の拒否もこの transaction の中で読み直した値で行う（b8d0fc5d 監査）。
+        // APPROVED の人が実行する Task 単位判断は、決定主体の事実（approval_actor）を付けて渡す。
+        // 主体が human でない live APPROVED は authority ではない: この authoritative な経路で出会ったら
+        // consume 側と同じ approval_actor_not_human で SUPERSEDED にし、人の判断として数えない（lifecycle repair C3）。
+        // 人の resume は completeResumeHandoff が生きた Task 単位の判断をすべて置き換える（superseded_by_resume）ので、
+        // ここで先に別の理由で書き換えない。
+        const resumeNowMs = Date.parse(now())
+        const admissionApprovals = withApprovalActorFacts(storage, approvalRows.map(deserializeApprovalRequest))
+        for (const approval of admissionApprovals) {
+          if (
+            resumedBy?.actorClass !== 'human'
+            && approval.approvalActor !== undefined
+            && approval.approvalActor !== 'human'
+            && isLiveApprovedApproval(approval, resumeNowMs)
+          ) {
+            supersedeNonHumanApproval(approval.id)
+          }
+        }
+        const admission = evaluateResumeAdmission({
+          taskStatus: taskRow.status,
+          parked: isParkedTaskId(taskId),
+          projectStatus: projectRow?.status,
+          jobs: taskJobs,
+          // 同じ transaction で読む（Mobile は TaskDetail.repairDesignReviewInFlight で同じ事実を受け取る）。
+          repairDesignReviewInFlight: hasRepairDesignReviewInFlight(taskId),
+          approvals: admissionApprovals,
+          nowMs: resumeNowMs,
+          // 人の resume は生きた Task 単位の判断を置き換える（completeResumeHandoff）。人でない resume は
+          // それがある間 HUMAN_DECISION_PENDING（C-03）。規則は共有 admission の1箇所（Mobile と同じ）。
+          resumedByHuman: resumedBy?.actorClass === 'human',
+        })
 
         // 通常はJob自体がblockedの場合のみ再開対象（guard違反等）。
         // それに加え、Design Review CONFLICT/NOT_ALIGNED等でrepair flowが
@@ -2635,47 +3398,88 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         // このescalationはJobを更新せずTask.statusだけをblockedにするため、
         // 最新Jobはfailedのまま残る。これを「blockedでない」として拒否すると、
         // 正式にescalateされたTaskが既存のresume経路から一切復旧できなくなる。
-        const isJobDirectlyBlocked = latestJob.status === 'blocked'
-        const isEscalatedFailure = taskRow.status === 'blocked' && latestJob.status === 'failed'
-        if (!isJobDirectlyBlocked && !isEscalatedFailure) {
-          return { ok: false, reason: `Latest job status is ${latestJob.status}, not blocked` }
+        if (!admission.ok) {
+          switch (admission.code) {
+            case 'TASK_DONE':
+              return { ok: false, code: 'TASK_DONE', reason: 'Task is done; a completed task is not resumed' }
+            case 'PROJECT_NOT_RUNNING':
+              return {
+                ok: false,
+                code: 'PROJECT_NOT_RUNNING',
+                reason: `Project is ${projectRow?.status ?? 'missing'}, not running; a resumed job would never be picked up`,
+              }
+            case 'NO_JOBS':
+              return { ok: false, code: 'NO_JOBS', reason: 'No jobs exist for this task' }
+            case 'LATEST_JOB_NOT_BLOCKED':
+              return { ok: false, code: 'LATEST_JOB_NOT_BLOCKED', reason: `Latest job status is ${latestJob?.status}, not blocked` }
+            case 'TASK_PARKED':
+              return {
+                ok: false,
+                code: 'TASK_PARKED',
+                reason: 'This task was parked by abort_task; resuming it would silently un-park it',
+              }
+            case 'WORKSPACE_QUARANTINED': {
+              const reason = taskJobs.find((job) => job.failureMetadata?.quarantined === true)
+                ?.failureMetadata?.quarantineReason ?? 'workspace is quarantined'
+              return { ok: false, code: 'WORKSPACE_QUARANTINED', reason: `Cannot resume: ${reason}` }
+            }
+            case 'LIVE_JOB_EXISTS':
+              return { ok: false, code: 'LIVE_JOB_EXISTS', reason: 'A queued or running job already exists for this task' }
+            case 'REPAIR_REVIEW_IN_FLIGHT':
+              return {
+                ok: false,
+                code: 'REPAIR_REVIEW_IN_FLIGHT',
+                reason: 'A repair design review run is queued or running for this task; it will create the repair job',
+              }
+            case 'APPROVAL_WAITING':
+              return { ok: false, code: 'APPROVAL_WAITING', reason: 'The latest approval request is waiting for user review' }
+            case 'HUMAN_DECISION_PENDING':
+              return {
+                ok: false,
+                code: 'HUMAN_DECISION_PENDING',
+                reason: 'Task has a live task-scoped human decision (WAITING or APPROVED); only a human resume supersedes it',
+              }
+            case 'AI_CLI_MODE_MISSING':
+            case 'AI_CLI_PROVIDER_MISSING':
+              return { ok: false, code: admission.code, reason: 'Latest blocked job is missing AI CLI provider or mode' }
+          }
         }
+        if (!latestJob) {
+          return { ok: false, code: 'NO_JOBS', reason: 'No jobs exist for this task' }
+        }
+        const isJobDirectlyBlocked = latestJob.status === 'blocked'
 
         // **park された Task は resume しない。** abort_task は Task を done にせず
         // 現役から外すだけなので、最新 Job は blocked / failed のまま残る。
         // ここを塞がないと、park した Task が既存の resume 経路から新しい Job を得て
         // そのまま走り出す（独立レビュー Finding 7）。park の解除は CEO の判断であり、
         // resume の副作用として起きてよいものではない。
-        if (isParkedTaskId(taskId)) {
-          return {
-            ok: false,
-            reason: 'This task was parked by abort_task; resuming it would silently un-park it',
-          }
-        }
-
+        //
         // PR-C Tranche 3: workspace quarantine は fail-closed に resume を拒否する。
         // 最新Jobだけを見ず、このTaskの**任意の**未解除quarantine Jobから判定する
         // （quarantine は `running -> blocked` と同一transactionで一度だけ設定され、解除機構はない）。
         // 未検証 workspace を持つ Task へ新しい Job を生成してはならない。
-        if (taskJobs.some((job) => job.failureMetadata?.quarantined === true)) {
-          const reason = taskJobs.find((job) => job.failureMetadata?.quarantined === true)
-            ?.failureMetadata?.quarantineReason ?? 'workspace is quarantined'
-          return { ok: false, code: 'WORKSPACE_QUARANTINED', reason: `Cannot resume: ${reason}` }
-        }
-
-        if (taskJobs.some((job) => job.status === 'queued' || job.status === 'running')) {
-          return { ok: false, reason: 'A queued or running job already exists for this task' }
-        }
-
-        const latestApprovalRow = db.prepare(
-          'SELECT * FROM approval_requests WHERE task_id = ? ORDER BY created_at DESC LIMIT 1'
-        ).get(taskId) as any
-        const latestApproval = latestApprovalRow ? deserializeApprovalRequest(latestApprovalRow) : undefined
 
         // 後継を先に queued で作り、その後で source を failed へ終端化する。両方ともこの
         // transaction 内なので、workspace ownership がどちらにも属さない window は無い。
         // source 行は削除せず、successor の resume:<source>:<n> と audit で lineage を保つ。
         const completeResumeHandoff = (successor: Job): ResumeBlockedTaskResult => {
+          // 誰が再開したか（authority evidence）は resume Job と同じ transaction で書く（G-01）。
+          // 書けなければ resume ごと rollback する —— 本物の Human Resume が resume_actor を欠いたまま
+          // commit され、後から human_resume authority を失う窓を残さない。
+          if (resumedBy !== undefined) {
+            try {
+              auditLog.record(resumeActorAuditRecord({ jobId: successor.id, taskId, ...resumedBy }))
+            } catch (error: unknown) {
+              throw new ResumeAuthorityEvidenceWriteError(error)
+            }
+            // **人の** resume は新しい人の判断。resume 前に下りた Task 単位の判断（abort_task 等）が、
+            // 再開後の作業へ後から効かないよう同じ transaction で置き換える（C-03）。command kind の
+            // 承認には触れない。PL / AI の resume は人の判断を上書きしない（CEO の abort 承認は残る）。
+            if (resumedBy.actorClass === 'human') {
+              supersedeTaskScopedDecisions(taskId, 'superseded_by_resume', `resume_job_id=${successor.id}`)
+            }
+          }
           if (isJobDirectlyBlocked) {
             const terminalized = db.prepare(
               "UPDATE jobs SET status = 'failed' WHERE id = ? AND status = 'blocked'",
@@ -2718,9 +3522,9 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         // 期限切れの承認は resume を妨げない。resume は Approval Gate を迂回せず、
         // 古い行を承認・削除もしない: 新 Job が `/gate/check` で**新しい**Approval Request を
         // 発行し、CEO が Mobile からそれを承認する、という正規経路へ戻すだけである。
-        if (latestApproval?.status === 'WAITING_FOR_USER' && new Date(latestApproval.expiresAt) > new Date(now())) {
-          return { ok: false, reason: 'The latest approval request is waiting for user review' }
-        }
+        // 判定は上の `evaluateResumeAdmission()`（共有の `isLiveWaitingApproval()`）が行う。
+        // W4 の不変条件（Task あたり WAITING は高々 1 行）の下では「最新の有効行が live WAITING」と
+        // 「live WAITING が 1 行でもある」は同値なので、より頑健な後者で判定している。
 
         // Recognized git_commit anchors/generations use fixed anchor + generation.
         // The referenced Job is read exactly once and generations are checked as a set.
@@ -2785,6 +3589,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
               ok: false,
               code: 'DESIGN_REVIEW_PRECONDITION_FAILED',
               reason: rejectedDesignReviewCheck.reason,
+              sourceJobId: latestJob.id,
             }
           }
 
@@ -2832,8 +3637,14 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           return completeResumeHandoff(job)
         }
 
+        // provider / mode の欠落は上の `evaluateResumeAdmission()` が既に拒否している
+        // （git_commit 以外）。ここは型の絞り込みだけで、到達したら同じ code を返す。
         if (!latestJob.aiCliProvider || !latestJob.aiCliMode) {
-          return { ok: false, reason: 'Latest blocked job is missing AI CLI provider or mode' }
+          return {
+            ok: false,
+            code: latestJob.aiCliMode ? 'AI_CLI_PROVIDER_MISSING' : 'AI_CLI_MODE_MISSING',
+            reason: 'Latest blocked job is missing AI CLI provider or mode',
+          }
         }
 
         const designReviewCheck = checkImplementJobDesignReviewEvidence({
@@ -2846,6 +3657,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             ok: false,
             code: 'DESIGN_REVIEW_PRECONDITION_FAILED',
             reason: designReviewCheck.reason,
+            sourceJobId: latestJob.id,
           }
         }
 
@@ -2872,7 +3684,14 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         return completeResumeHandoff(job)
       })
 
-      return resumeTransaction(input.taskId, input.instructionPrompt)
+      const resumedBy = input.resumedBy
+      try {
+        return resumeTransaction(input.taskId, input.instructionPrompt)
+      } catch (error: unknown) {
+        if (!(error instanceof ResumeAuthorityEvidenceWriteError)) throw error
+        // transaction は rollback 済み（resume Job も source の終端化も残っていない）。再試行してよい。
+        return { ok: false, code: 'RESUME_COMMIT_FAILED', reason: error.message }
+      }
     },
     /**
  * abort_task の最終段。所有権解放と park を**単一 transaction**で行う。
@@ -2932,6 +3751,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           }
 
           tasks.update(task.id, { roadmapActive: false })
+          // job 付きの park / abort と同じく、認可通過後に Task の active request を action を問わず STALE にする。
+          const staleApprovalCount = staleActiveApprovalsOfTask(task.id)
           auditLog.record({
             actor: 'api',
             operation: 'task_aborted',
@@ -2940,7 +3761,9 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             result: 'success',
             detail:
               `parked (status kept as ${task.status}, no job to release, `
-              + `approval ${input.authorization.approvalRequestId}): ${input.reason.slice(0, 300)}`,
+              + `approval ${input.authorization.approvalRequestId}`
+              + (staleApprovalCount > 0 ? `, ${staleApprovalCount} active approval(s) staled` : '')
+              + `): ${input.reason.slice(0, 300)}`,
           })
 
           const updated = deserializeTask(db.prepare('SELECT * FROM tasks WHERE id = ?').get(task.id) as any)
@@ -2981,6 +3804,19 @@ export function createSQLiteStorage(dbPath: string): IStorage {
               ok: false as const,
               code: 'PRECONDITION_FAILED' as const,
               reason: `job ${job.id} is ${job.status}, not blocked`,
+            }
+          }
+          if (
+            input.authorization.kind === 'technical_evidence'
+            && !technicalCleanupGenerationMatches(job.failureMetadata, input.cleanupGeneration)
+          ) {
+            // 報告が名指す cleanup generation が carrier の現在の marker と違う（取り消し後に新しい
+            // technical request が出た後の古い証拠の再送など）。cleanup の失敗ではないので quarantine せず、
+            // 何も変えずに typed で返す。現在の generation はそのまま残る。
+            return {
+              ok: false as const,
+              code: 'GENERATION_MISMATCH' as const,
+              reason: `job ${job.id}'s report names a different technical cleanup generation`,
             }
           }
           if (
@@ -3207,7 +4043,12 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             input.cleanupSummary,
           )
           if (!approval.ok) {
-            return { ok: false as const, code: 'PRECONDITION_FAILED' as const, reason: approval.reason }
+            if (approval.code === 'HUMAN_DECISION_CONFLICT') {
+              // 同じ transaction でこの technical cleanup generation を取り消す（quarantine はしない）。
+              // 認可を carrier に残すと、人の判断が CONSUMED になった後の Worker 再送が park してしまう。
+              cancelTechnicalCleanupGeneration(job)
+            }
+            return { ok: false as const, code: approval.code ?? 'PRECONDITION_FAILED' as const, reason: approval.reason }
           }
 
           // ── 解放 → park → audit。すべて同じ transaction ──
@@ -3225,9 +4066,10 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             })
           }
           tasks.update(task.id, { roadmapActive: false })
-          const staleApprovalCount = technical && (input.cleanupSummary?.changedPathCount ?? 0) > 0
-            ? staleActiveGitCommitApprovals(task.id)
-            : 0
+          // 認可（manual approval の consume / technical evidence の再検証）が通った後、同じ transaction で
+          // その Task の active request を action を問わず STALE にする。park / abort 後に残った request は
+          // 誰の判断も待っておらず、残すと再採用後の別 Job が古い判断を拾う（2026-10-16 監査）。
+          const staleApprovalCount = staleActiveApprovalsOfTask(task.id)
           const parkCount = (db.prepare(
             "SELECT COUNT(*) AS count FROM audit_log WHERE entity_type = 'task' AND entity_id = ? "
             + "AND operation = 'task_aborted' AND result = 'success'",
@@ -3248,7 +4090,9 @@ export function createSQLiteStorage(dbPath: string): IStorage {
                 })
               : `parked (status kept as ${task.status}, `
                 + `job(s) ${blockedSiblings.map((sibling) => sibling.id).join(', ')} released, `
-                + `approval ${(input.authorization as Extract<AbortAuthorization, { kind: 'manual_approval' }>).approvalRequestId}): `
+                + `approval ${(input.authorization as Extract<AbortAuthorization, { kind: 'manual_approval' }>).approvalRequestId}`
+                + (staleApprovalCount > 0 ? `, ${staleApprovalCount} active approval(s) staled` : '')
+                + '): '
                 + input.reason.slice(0, 300),
           })
 
@@ -3256,11 +4100,16 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           const updatedTask = deserializeTask(db.prepare('SELECT * FROM tasks WHERE id = ?').get(task.id) as any)
           return { ok: true as const, job: updatedJob, task: updatedTask }
         })
-        return run()
+        // terminal-Task 経路と同じく、最初の読み取りから park まで write lock を保持する（BEGIN IMMEDIATE）。
+        // deferred だと、読んだ後に別 connection が承認や後続 Job を commit したとき write upgrade が
+        // SQLITE_BUSY_SNAPSHOT で失敗し、人の判断との競合が STORAGE_ERROR → quarantine になる（Codex review 527668d）。
+        return run.immediate()
       } catch (err: unknown) {
         return {
           ok: false as const,
-          code: 'STORAGE_ERROR' as const,
+          // 別 connection の write と競合しただけ（SQLITE_BUSY / BUSY_SNAPSHOT / LOCKED）なら再試行可能と返す。
+          // cleanup の失敗ではないので、呼び出し側は carrier を quarantine しない。
+          code: isSqliteBusyError(err) ? 'STORAGE_BUSY' as const : 'STORAGE_ERROR' as const,
           reason: err instanceof Error ? err.message : String(err),
         }
       }
@@ -3281,6 +4130,19 @@ export function createSQLiteStorage(dbPath: string): IStorage {
               ok: false as const,
               code: 'PRECONDITION_FAILED' as const,
               reason: `job ${job.id} does not belong to task ${task.id}`,
+            }
+          }
+          if (
+            input.authorization.kind === 'technical_evidence'
+            && !technicalCleanupGenerationMatches(job.failureMetadata, input.cleanupGeneration)
+          ) {
+            // 報告が名指す cleanup generation が carrier の現在の marker と違う（取り消し後に新しい
+            // technical request が出た後の古い証拠の再送など）。cleanup の失敗ではないので quarantine せず、
+            // 何も変えずに typed で返す。現在の generation はそのまま残る。
+            return {
+              ok: false as const,
+              code: 'GENERATION_MISMATCH' as const,
+              reason: `job ${job.id}'s report names a different technical cleanup generation`,
             }
           }
           if (
@@ -3331,13 +4193,15 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             }
           }
           if (latestJob.id !== job.id) {
-            return {
-              ok: false as const,
-              code: 'PRECONDITION_FAILED' as const,
-              reason:
-                `job ${job.id} is not task ${task.id}'s latest job (${latestJob.id}); `
-                + 'a later execution superseded this abort cleanup request',
+            const reason = `job ${job.id} is not task ${task.id}'s latest job (${latestJob.id}); `
+              + 'a later execution superseded this abort cleanup request'
+            if (input.authorization.kind === 'technical_evidence') {
+              // 後続の Job（人が認可した repair / resume 等）が既にある。古い carrier を quarantine すると
+              // その後続の resume / park まで塞ぐので、この cleanup generation を取り消すだけにする。
+              cancelTechnicalCleanupGeneration(job)
+              return { ok: false as const, code: 'CLEANUP_SUPERSEDED' as const, reason }
             }
+            return { ok: false as const, code: 'PRECONDITION_FAILED' as const, reason }
           }
           if (latestJob.taskId !== task.id || latestJob.projectId !== task.projectId) {
             return {
@@ -3354,13 +4218,13 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             || !Number.isFinite(latestJobCreatedAtMs)
             || cleanupRequestedAtMs < latestJobCreatedAtMs
           ) {
-            return {
-              ok: false as const,
-              code: 'PRECONDITION_FAILED' as const,
-              reason:
-                `abort cleanup request ${cleanupRequestedAt} predates task ${task.id}'s latest job `
-                + `${latestJob.id} (${latestJob.createdAt}); a later Job must not be parked by an older request`,
+            const reason = `abort cleanup request ${cleanupRequestedAt} predates task ${task.id}'s latest job `
+              + `${latestJob.id} (${latestJob.createdAt}); a later Job must not be parked by an older request`
+            if (input.authorization.kind === 'technical_evidence') {
+              cancelTechnicalCleanupGeneration(job)
+              return { ok: false as const, code: 'CLEANUP_SUPERSEDED' as const, reason }
             }
+            return { ok: false as const, code: 'PRECONDITION_FAILED' as const, reason }
           }
           const linkedRejection = resolveLinkedGitCommitRejection(latestJob, {
             findApprovalById: (id) => approvalRequests.findById(id),
@@ -3547,7 +4411,12 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             input.cleanupSummary,
           )
           if (!approval.ok) {
-            return { ok: false as const, code: 'PRECONDITION_FAILED' as const, reason: approval.reason }
+            if (approval.code === 'HUMAN_DECISION_CONFLICT') {
+              // 同じ transaction でこの technical cleanup generation を取り消す（quarantine はしない）。
+              // 認可を carrier に残すと、人の判断が CONSUMED になった後の Worker 再送が park してしまう。
+              cancelTechnicalCleanupGeneration(job)
+            }
+            return { ok: false as const, code: approval.code ?? 'PRECONDITION_FAILED' as const, reason: approval.reason }
           }
 
           if (rejectedGitCommitException) {
@@ -3564,9 +4433,10 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           }
           tasks.update(task.id, { status: 'pending', roadmapActive: false })
           const technical = input.authorization.kind === 'technical_evidence'
-          const staleApprovalCount = technical && (input.cleanupSummary?.changedPathCount ?? 0) > 0
-            ? staleActiveGitCommitApprovals(task.id)
-            : 0
+          // 認可（manual approval の consume / technical evidence の再検証）が通った後、同じ transaction で
+          // その Task の active request を action を問わず STALE にする。park / abort 後に残った request は
+          // 誰の判断も待っておらず、残すと再採用後の別 Job が古い判断を拾う（2026-10-16 監査）。
+          const staleApprovalCount = staleActiveApprovalsOfTask(task.id)
           const parkCount = (db.prepare(
             "SELECT COUNT(*) AS count FROM audit_log WHERE entity_type = 'task' AND entity_id = ? "
             + "AND operation = 'task_aborted' AND result = 'success'",
@@ -3593,9 +4463,12 @@ export function createSQLiteStorage(dbPath: string): IStorage {
                     abortApprovalId: (input.authorization as Extract<AbortAuthorization, { kind: 'manual_approval' }>).approvalRequestId,
                     observedHead: input.observation.startCommitHash,
                     targetDiffHash: linkedRejection.approval.targetDiffHash,
+                    ...(staleApprovalCount > 0 ? { staleApprovalCount } : {}),
                   })
                 : `parked blocked -> pending (approval ${(input.authorization as Extract<AbortAuthorization, { kind: 'manual_approval' }>).approvalRequestId}, `
-                  + `observed job ${job.id}, observed HEAD ${input.observation.startCommitHash}): `
+                  + `observed job ${job.id}, observed HEAD ${input.observation.startCommitHash}`
+                  + (staleApprovalCount > 0 ? `, ${staleApprovalCount} active approval(s) staled` : '')
+                  + '): '
                   + input.reason.slice(0, 300),
           })
 
@@ -3609,10 +4482,32 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       } catch (err: unknown) {
         return {
           ok: false as const,
-          code: 'STORAGE_ERROR' as const,
+          // 別 connection の write と競合しただけ（SQLITE_BUSY / BUSY_SNAPSHOT / LOCKED）なら再試行可能と返す。
+          // cleanup の失敗ではないので、呼び出し側は carrier を quarantine しない。
+          code: isSqliteBusyError(err) ? 'STORAGE_BUSY' as const : 'STORAGE_ERROR' as const,
           reason: err instanceof Error ? err.message : String(err),
         }
       }
+    },
+    retireTechnicalAbortCleanupForGeneration(input) {
+      const retire = db.transaction((): boolean => {
+        const row = db.prepare('SELECT * FROM jobs WHERE id = ?').get(input.jobId) as Record<string, unknown> | undefined
+        if (!row) return false
+        const carrier = deserializeJob(row)
+        if (!technicalCleanupGenerationMatches(carrier.failureMetadata, input.generation)) return false
+        const failureMetadata = { ...(carrier.failureMetadata ?? {}) }
+        delete failureMetadata.abortCleanupRequestedAt
+        delete failureMetadata.abortTechnicalEvidenceId
+        delete failureMetadata.abortTechnicalStateFingerprint
+        delete failureMetadata.abortTechnicalRootCauseClass
+        delete failureMetadata.abortTechnicalAttentionKind
+        delete failureMetadata.abortReason
+        jobs.update(carrier.id, {
+          failureMetadata: { ...failureMetadata, quarantined: true, quarantineReason: input.quarantineReason },
+        })
+        return true
+      })
+      return retire.immediate()
     },
     clearWorkspaceQuarantine(input) {
       const clearTransaction = db.transaction((
@@ -4059,6 +4954,20 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       )
       return req
     },
+    replaceActiveAndCreate(data): ReplaceActiveApprovalAndCreateResult {
+      // 「findActiveByTaskId() で最新1件だけ SUPERSEDED → create()」を呼び出し側ごとに書くと、
+      // (1) 古い WAITING が残る、(2) 別 action の WAITING が残る、(3) 2段の間に割り込める、の3つで
+      // 同じ Task に人の判断待ちが複数並ぶ（2026-10-16 監査）。規則は supersedeForNewRequest() を参照。
+      // 同 action の APPROVED は置き換える: 既存の POST /approval-requests が active 行を status に
+      // 関係なく SUPERSEDED にしていた挙動を保つ（同じ判断を要求し直す = 旧い判断の置き換え）。
+      const replaceTransaction = db.transaction((): ReplaceActiveApprovalAndCreateResult => {
+        const supersededIds = supersedeForNewRequest(data.taskId, data.requestedAction, true)
+        const approvalRequest = approvalRequests.create(data)
+        recordSupersededForNewRequest(supersededIds, approvalRequest)
+        return { approvalRequest, supersededIds }
+      })
+      return replaceTransaction()
+    },
     createForJob(data, jobId): CreateApprovalForJobResult {
       const createTransaction = db.transaction((): CreateApprovalForJobResult => {
         const jobRow = db.prepare('SELECT * FROM jobs WHERE id = ?').get(jobId) as Record<string, unknown> | undefined
@@ -4085,8 +4994,23 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             reason: 'Job is already linked to an approval request',
           }
         }
+        // supersede より先に、対象 Job がまだ承認を待ちうる（running / blocked）ことを同じ transaction で確かめる。
+        // 遅延・再送された gate/check が終わった Job（success / failed）や queued の Job を名指ししても、
+        // 他 Job の WAITING・audit・Job link を一切変えない（approveAndResumeJob() も running / blocked を要求する）。
+        if (job.status !== 'running' && job.status !== 'blocked') {
+          return {
+            ok: false,
+            code: 'JOB_NOT_ACTIVE',
+            reason: `Job is ${job.status}; only a running or blocked git_commit Job can be linked to a new approval`,
+          }
+        }
 
+        // 同じ Task の他の WAITING（action・期限を問わない）は同じ transaction で SUPERSEDED にする。
+        // APPROVED は action を問わず残す: 別 action の APPROVED は人の判断であり、同 action（git_commit）の
+        // APPROVED は別 Job に結び付いた判断でありうる（gate/check は自 Job の linked approval だけを使う）。
+        const supersededIds = supersedeForNewRequest(data.taskId, data.requestedAction, false)
         const approvalRequest = approvalRequests.create(data)
+        recordSupersededForNewRequest(supersededIds, approvalRequest)
         const linked = db.prepare(
           'UPDATE jobs SET approval_id = ? WHERE id = ? AND approval_id IS NULL'
         ).run(approvalRequest.id, jobId)
@@ -4099,7 +5023,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
 
       return createTransaction()
     },
-    approveAndResumeJob(id, reason): ReviewApprovalAndResumeJobResult {
+    approveAndResumeJob(id, reason, decidedBy): ReviewApprovalAndResumeJobResult {
+      if (decidedBy === undefined) throw new Error('approveAndResumeJob requires decidedBy (approval_actor evidence)')
       const approveTransaction = db.transaction((): ReviewApprovalAndResumeJobResult => {
         const record = (result: ReviewApprovalAndResumeJobResult): ReviewApprovalAndResumeJobResult => {
           auditLog.record({
@@ -4123,6 +5048,17 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         }
 
         const reviewedAt = now()
+        // 読めない期限は「期限切れではない」ではない。`new Date(invalid) <= now` は false になり、下の SQL の
+        // 文字列比較（`expires_at > ?`）も素通りしうるので、承認と Job の再 queue へ進む前に止める。
+        // 状態は変えずに EXPIRED と同じ code で拒否する（期限が確かめられない承認は使えない）。
+        if (!Number.isFinite(Date.parse(existing.expiresAt))) {
+          return record({
+            ok: false,
+            code: 'EXPIRED',
+            reason: 'Approval request expiry is unreadable',
+            approvalRequest: existing,
+          })
+        }
         if (new Date(existing.expiresAt) <= new Date(reviewedAt)) {
           const expired = db.prepare(`
             UPDATE approval_requests
@@ -4208,6 +5144,9 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         if (jobUpdated.changes !== 1) {
           throw new Error('Failed to atomically resume the linked Job')
         }
+        // 「誰が決めたか」は承認・Job 再 queue と同じ transaction で書く（H-03）。ここで失敗したら
+        // 承認も再 queue も rollback される —— human evidence の無い APPROVED を残さない。
+        auditLog.record(approvalActorAuditRecord(id, decidedBy.credentialClass))
 
         const approvalRequest = approvalRequests.findById(id)
         const resumedJob = jobs.findById(job.id)
@@ -4218,6 +5157,132 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       })
 
       return approveTransaction()
+    },
+    supersedeUnwaitedSafeWorkRequests(taskId, requestedAction): string[] {
+      // 2026-10-16 Codex review round 3: 最新 1 行だけを畳むと、同じ action の古い legacy WAITING
+      // （b8d0fc5d のような git_status の行）が生き残り、resume / Mobile を塞ぎ続ける。
+      // HIGH の行を全部、audit と同じ transaction で畳む。CRITICAL の行は Worker が待っていた判断なので残す。
+      const supersedeTransaction = db.transaction((): string[] => {
+        const ids = (db.prepare(`
+          SELECT id FROM approval_requests
+          WHERE task_id = ? AND requested_action = ? AND status = 'WAITING_FOR_USER' AND risk_level = 'HIGH'
+          ORDER BY created_at ASC, rowid ASC
+        `).all(taskId, requestedAction) as Array<{ id: string }>).map((row) => row.id)
+        const supersede = db.prepare(`
+          UPDATE approval_requests SET status = 'SUPERSEDED'
+          WHERE id = ? AND status = 'WAITING_FOR_USER'
+        `)
+        for (const id of ids) {
+          if (supersede.run(id).changes !== 1) {
+            throw new Error(`Failed to supersede approval request ${id}`)
+          }
+          auditLog.record({
+            actor: 'api',
+            operation: 'supersede',
+            entityType: 'approval_request',
+            entityId: id,
+            result: 'success',
+            detail: `reason=safe_work_no_waiter requested_action=${requestedAction}`,
+          })
+        }
+        return ids
+      })
+      return supersedeTransaction()
+    },
+    consumeForCommandJob(input): ConsumeApprovalForCommandJobResult {
+      // 2026-10-16 監査（Codex review）: 非 git_commit の /consume は Task にも実在する Job にも
+      // 束縛されておらず、jobId 省略・存在しない Job・別 Task の Job でも使い切れた。
+      // 束縛の検証と CONSUMED への遷移を 1 transaction に閉じる（検証と書き込みの間に割り込ませない）。
+      const consumeTransaction = db.transaction((): ConsumeApprovalForCommandJobResult => {
+        const existing = approvalRequests.findById(input.id)
+        if (!existing) {
+          return { ok: false, code: 'NOT_FOUND', reason: 'Approval request not found' }
+        }
+        if (existing.requestedAction === 'git_commit') {
+          return {
+            ok: false,
+            code: 'GIT_COMMIT_NOT_ALLOWED',
+            reason: 'git_commit approvals are consumed through consumeForJob',
+            approvalRequest: existing,
+          }
+        }
+        const job = jobs.findById(input.jobId)
+        if (!job) {
+          return { ok: false, code: 'JOB_NOT_FOUND', reason: 'Job not found', approvalRequest: existing }
+        }
+        if (job.taskId !== existing.taskId) {
+          return {
+            ok: false,
+            code: 'TASK_MISMATCH',
+            reason: 'Job belongs to a different task than the approval request',
+            approvalRequest: existing,
+          }
+        }
+        // Task 単位の操作（abort_task 等）の承認は、その名前の command kind を持つ Job が無いのでここで落ちる。
+        if (job.safeCommand.kind !== existing.requestedAction) {
+          return {
+            ok: false,
+            code: 'ACTION_MISMATCH',
+            reason: `Cannot consume: approval is for '${existing.requestedAction}', not '${job.safeCommand.kind}'`,
+            approvalRequest: existing,
+          }
+        }
+
+        // 以下は従来の非 git_commit consume と同じ順序・同じ遷移（reason / reviewedAt は保持）。
+        if (existing.status !== 'APPROVED') {
+          return {
+            ok: false,
+            code: 'STATUS_CONFLICT',
+            reason: `Cannot consume: current status is '${existing.status}' (must be APPROVED)`,
+            approvalRequest: existing,
+          }
+        }
+        // D2 hardening: 読めない期限値を「未失効」として通さない（NaN <= now は false になるため）。
+        if (isUnreadableOrPastExpiry(existing.expiresAt)) {
+          const expired = approvalRequests.updateStatus(input.id, 'EXPIRED', undefined, true)
+          return { ok: false, code: 'EXPIRED', reason: 'Approval request has expired', approvalRequest: expired }
+        }
+        if (existing.targetCommit !== input.currentCommit || existing.targetDiffHash !== input.currentDiffHash) {
+          const stale = approvalRequests.updateStatus(input.id, 'STALE', undefined, true)
+          return {
+            ok: false,
+            code: 'STALE',
+            reason: 'Approval request is stale: commit or diff has changed',
+            approvalRequest: stale,
+          }
+        }
+        // D2 hardening: 人が決めた記録（approval_actor = human）の無い APPROVED は authority ではない。
+        // Task 操作の verifyAndConsumeTaskApproval と同じ処理（同じ transaction で SUPERSEDED + audit）。
+        if (readApprovalActorClass(storage, input.id) !== 'human') {
+          supersedeNonHumanApproval(input.id)
+          return {
+            ok: false,
+            code: 'APPROVAL_ACTOR_NOT_HUMAN',
+            reason: 'Approval request has no record that a human (ADMIN credential) decided it; it was superseded',
+            approvalRequest: approvalRequests.findById(input.id),
+          }
+        }
+        // D2 hardening: APPROVED → CONSUMED の遷移は実行中（claim 済み）の Job にだけ許す。queued / blocked /
+        // 終端の Job には使い切らせない（EXPIRED / STALE / SUPERSEDED への無効化は Job の状態に関係なく上で行う）。
+        if (job.status !== 'running') {
+          return {
+            ok: false,
+            code: 'JOB_NOT_RUNNING',
+            reason: `Cannot consume: Job is '${job.status}' (must be running)`,
+            approvalRequest: existing,
+          }
+        }
+
+        const consumed = db.prepare(`
+          UPDATE approval_requests SET status = 'CONSUMED'
+          WHERE id = ? AND status = 'APPROVED'
+        `).run(input.id)
+        if (consumed.changes !== 1) {
+          return { ok: false, code: 'STATUS_CONFLICT', reason: 'Approval request status changed concurrently' }
+        }
+        return { ok: true, approvalRequest: approvalRequests.findById(input.id)! }
+      })
+      return consumeTransaction()
     },
     consumeForJob(input): ConsumeApprovalForJobResult {
       const consumeTransaction = db.transaction((): ConsumeApprovalForJobResult => {
@@ -4303,7 +5368,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           }
         }
 
-        if (new Date(existing.expiresAt) <= new Date()) {
+        // D2 hardening: 読めない期限値を「未失効」として通さない（NaN <= now は false になるため）。
+        if (isUnreadableOrPastExpiry(existing.expiresAt)) {
           db.prepare(`
             UPDATE approval_requests SET status = 'EXPIRED'
             WHERE id = ? AND status = 'APPROVED'
@@ -4313,6 +5379,32 @@ export function createSQLiteStorage(dbPath: string): IStorage {
             code: 'EXPIRED',
             reason: 'Approval request has expired',
             approvalRequest: { ...existing, status: 'EXPIRED' },
+            linkedJobId: linkedJob.id,
+          }
+        }
+
+        // D2 hardening: 人が決めた記録（approval_actor = human）の無い APPROVED は authority ではない。
+        // Task 操作の verifyAndConsumeTaskApproval と同じ処理（同じ transaction で SUPERSEDED + audit）。
+        if (readApprovalActorClass(storage, input.id) !== 'human') {
+          supersedeNonHumanApproval(input.id)
+          return {
+            ok: false,
+            code: 'APPROVAL_ACTOR_NOT_HUMAN',
+            reason: 'Approval request has no record that a human (ADMIN credential) decided it; it was superseded',
+            approvalRequest: { ...existing, status: 'SUPERSEDED' },
+            linkedJobId: linkedJob.id,
+          }
+        }
+
+        // D2 hardening: APPROVED → CONSUMED の遷移は実行中（claim 済み）の Job にだけ許す。同じ Job による
+        // CONSUMED の再送（上の alreadyConsumed）は Job が running でなくても冪等な成功のまま。
+        // EXPIRED / STALE / SUPERSEDED への無効化も Job の状態に関係なく上で行う。
+        if (requestedJob.status !== 'running') {
+          return {
+            ok: false,
+            code: 'JOB_NOT_RUNNING',
+            reason: `Cannot consume: Job is '${requestedJob.status}' (must be running)`,
+            approvalRequest: existing,
             linkedJobId: linkedJob.id,
           }
         }
@@ -4358,21 +5450,44 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       `).run(status, newReason, newReviewedAt, id)
       return { ...existing, status, reason: newReason ?? undefined, reviewedAt: newReviewedAt ?? undefined }
     },
-    recordDecision(id, status, reason) {
-      const decisionTransaction = db.transaction((): ApprovalRequest | undefined => {
-        const updated = approvalRequests.updateStatus(id, status, reason)
-        if (updated) {
-          auditLog.record({
-            actor: 'api',
-            operation: status === 'APPROVED' ? 'approve' : 'reject',
-            entityType: 'approval_request',
-            entityId: id,
-            result: 'success',
-          })
+    recordDecision(id, status, reason, decidedBy) {
+      if (decidedBy === undefined) throw new Error('recordDecision requires decidedBy (approval_actor evidence)')
+      const operation = status === 'APPROVED' ? 'approve' : 'reject'
+      const decisionTransaction = db.transaction((): RecordApprovalDecisionResult => {
+        // **transaction の中で読み直す**: route の事前確認と決定の間に期限が切れた・別の決定が入った行を
+        // 決定しない。期限切れの WAITING は approveAndResumeJob と同じく EXPIRED へ進めて断る。
+        const existing = approvalRequests.findById(id)
+        if (!existing) return { ok: false, code: 'NOT_FOUND', reason: 'Approval request not found' }
+        if (existing.status !== 'WAITING_FOR_USER') {
+          return {
+            ok: false,
+            code: 'STATUS_CONFLICT',
+            reason: `Cannot update status: current status is '${existing.status}'`,
+            approvalRequest: existing,
+          }
         }
-        return updated
+        const decidedAt = now()
+        const isLive: boolean = isLiveWaitingApproval(existing, Date.parse(decidedAt))
+        if (!isLive) {
+          db.prepare(`
+            UPDATE approval_requests SET status = 'EXPIRED' WHERE id = ? AND status = 'WAITING_FOR_USER'
+          `).run(id)
+          auditLog.record({ actor: 'api', operation, entityType: 'approval_request', entityId: id, result: 'failure' })
+          return {
+            ok: false,
+            code: 'EXPIRED',
+            reason: 'Approval request has expired',
+            approvalRequest: { ...existing, status: 'EXPIRED' },
+          }
+        }
+        const updated = approvalRequests.updateStatus(id, status, reason)
+        if (!updated) return { ok: false, code: 'NOT_FOUND', reason: 'Approval request not found' }
+        auditLog.record({ actor: 'api', operation, entityType: 'approval_request', entityId: id, result: 'success' })
+        // 決定と「誰が決めたか」は同じ transaction（H-03）。片方だけが commit される窓を残さない。
+        auditLog.record(approvalActorAuditRecord(id, decidedBy.credentialClass))
+        return { ok: true, approvalRequest: updated }
       })
-      return decisionTransaction()
+      return decisionTransaction.immediate()
     },
   }
 
@@ -4387,21 +5502,46 @@ export function createSQLiteStorage(dbPath: string): IStorage {
     },
     findByTaskId(taskId) {
       const rows = db.prepare(
-        'SELECT * FROM design_review_evidence WHERE task_id = ? ORDER BY created_at DESC, rowid DESC'
+        'SELECT * FROM design_review_evidence WHERE task_id = ? ORDER BY rowid DESC'
       ).all(taskId) as any[]
       return rows.map(deserializeDesignReviewEvidence)
     },
     findLatestByTaskId(taskId) {
       const row = db.prepare(
-        'SELECT * FROM design_review_evidence WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1'
+        'SELECT * FROM design_review_evidence WHERE task_id = ? ORDER BY rowid DESC LIMIT 1'
       ).get(taskId) as any
       return row ? deserializeDesignReviewEvidence(row) : undefined
     },
     findLatestBySubjectId(reviewKind, subjectId) {
       const row = db.prepare(
-        'SELECT * FROM design_review_evidence WHERE review_kind = ? AND subject_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1'
+        'SELECT * FROM design_review_evidence WHERE review_kind = ? AND subject_id = ? ORDER BY rowid DESC LIMIT 1'
       ).get(reviewKind, subjectId) as any
       return row ? deserializeDesignReviewEvidence(row) : undefined
+    },
+    findSupersedingRun(evidence) {
+      // 規則は designReviewEvidencePolicy.findSupersedingRun() の1箇所。ここは同じ subject・同じ hash の
+      // 候補 run を新しい順に渡し、終端 run の判定は API と同じ再計算（classifyStoredRunJudgment）で決める。
+      const rows = db.prepare(
+        'SELECT *, rowid AS _rowid FROM design_review_runs WHERE review_kind = ? AND subject_id = ? AND design_text_hash = ?'
+        + ' ORDER BY rowid DESC'
+      ).all(evidence.reviewKind, evidence.subjectId, evidence.designTextHash) as any[]
+      // **順序は run の挿入順（rowid）で決める。** evidence が生んだ run を知っていれば、それより後に
+      // 挿入された run だけが「新しい」。timestamp（ms 精度・時計の巻き戻り）には頼らない。
+      // 生んだ run が分からない（legacy / 手動登録）・見つからない evidence だけ timestamp 規則に落とす。
+      const origin = evidence.runId !== undefined
+        ? db.prepare('SELECT rowid AS _rowid FROM design_review_runs WHERE id = ?').get(evidence.runId) as
+          | { _rowid: number }
+          | undefined
+        : undefined
+      const insertionOrder = new Map<string, number>(rows.map((row) => [row.id as string, row._rowid as number]))
+      return findSupersedingRun(
+        evidence,
+        rows.map(deserializeDesignReviewRun),
+        classifyStoredRunJudgment,
+        origin !== undefined
+          ? (run) => (insertionOrder.get(run.id) ?? 0) > origin._rowid
+          : undefined,
+      )
     },
     create(data) {
       const subject = resolveDesignReviewSubject(data)
@@ -4416,8 +5556,8 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       db.prepare(`
         INSERT INTO design_review_evidence
           (id, review_kind, subject_id, task_id, design_text_hash, review_load, decision,
-           independent_review_required, independent_review_verdict, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           independent_review_required, independent_review_verdict, created_at, run_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         evidence.id,
         evidence.reviewKind,
@@ -4429,6 +5569,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
         evidence.independentReviewRequired ? 1 : 0,
         evidence.independentReviewVerdict ?? null,
         evidence.createdAt,
+        evidence.runId ?? null,
       )
       return evidence
     },
@@ -4776,21 +5917,25 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       ).get(taskId) as any
       return row ? deserializeDesignReviewRun(row) : undefined
     },
+    // **run / evidence の「最新」「新しい順」は挿入順（rowid）で決める。** created_at は ms 精度で
+    // 時計の巻き戻りもあり、後から挿入された CONFLICT run が「最新」にならないことがあった
+    // （独立レビュー round 11）。evidence の失効順序（findSupersedingRun）と同じ順序を使う。
+    // timestamp は表示用にだけ残す。
     findLatestByTaskId(taskId) {
       const row = db.prepare(
-        'SELECT * FROM design_review_runs WHERE task_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1'
+        'SELECT * FROM design_review_runs WHERE task_id = ? ORDER BY rowid DESC LIMIT 1'
       ).get(taskId) as any
       return row ? deserializeDesignReviewRun(row) : undefined
     },
     findByTaskId(taskId) {
       const rows = db.prepare(
-        'SELECT * FROM design_review_runs WHERE task_id = ? ORDER BY created_at DESC, rowid DESC'
+        'SELECT * FROM design_review_runs WHERE task_id = ? ORDER BY rowid DESC'
       ).all(taskId) as any[]
       return rows.map(deserializeDesignReviewRun)
     },
     findQueued() {
       const rows = db.prepare(
-        "SELECT * FROM design_review_runs WHERE status = 'queued' ORDER BY created_at ASC, rowid ASC"
+        "SELECT * FROM design_review_runs WHERE status = 'queued' ORDER BY rowid ASC"
       ).all() as any[]
       return rows.map(deserializeDesignReviewRun)
     },
@@ -4805,7 +5950,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
       const rows = db.prepare(
         "SELECT * FROM design_review_runs "
         + "WHERE status = 'succeeded' AND repair_source_job_id IS NOT NULL "
-        + 'ORDER BY created_at ASC, rowid ASC'
+        + 'ORDER BY rowid ASC'
       ).all() as any[]
       return rows.map(deserializeDesignReviewRun)
     },
@@ -4819,7 +5964,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           "SELECT * FROM design_review_runs WHERE review_kind = ? AND subject_id = ? AND status IN ('queued','running') LIMIT 1"
         ).get(subject.reviewKind, subject.subjectId) as any
         if (existing) {
-          return reuseActiveRun(existing, data.repairSourceJobId)
+          return reuseActiveRun(existing, data)
         }
 
         const run: DesignReviewRun = {
@@ -4835,18 +5980,19 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           attemptCount: 0,
           createdAt: now(),
           repairSourceJobId: data.repairSourceJobId,
+          resumeSourceJobId: data.resumeSourceJobId,
         }
         try {
           db.prepare(`
             INSERT INTO design_review_runs
               (id, review_kind, subject_id, task_id, design_text, design_text_hash, task_title, changed_files, status,
                attempt_count, claim_token, result_json, error, created_at, started_at, completed_at,
-               repair_source_job_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL, ?)
+               repair_source_job_id, resume_source_job_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL, ?, ?)
           `).run(
             run.id, run.reviewKind, run.subjectId, run.taskId ?? null, run.designText, run.designTextHash, run.taskTitle,
             JSON.stringify(run.changedFiles), run.status, run.attemptCount, run.createdAt,
-            run.repairSourceJobId ?? null,
+            run.repairSourceJobId ?? null, run.resumeSourceJobId ?? null,
           )
         } catch (err) {
           // partial unique index (ux_design_review_runs_subject_active) 違反は「別経路が先に
@@ -4857,7 +6003,7 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           if (!existingAfterConflict) {
             throw err
           }
-          return reuseActiveRun(existingAfterConflict, data.repairSourceJobId)
+          return reuseActiveRun(existingAfterConflict, data)
         }
         return run
       })
@@ -4880,10 +6026,19 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           return {}
         }
 
+        // 判定の出なかった attempt の後の retry cooldown（designReview/retryCooldown.ts）。
+        // 全実行経路がこの claim を通るので、cooldown の強制はここ1箇所に置く。
+        const retryNotBeforeMs = designReviewRetryNotBeforeMs(deserializeDesignReviewRun(current))
+        if (retryNotBeforeMs !== undefined && Date.now() < retryNotBeforeMs) {
+          return { retryNotBefore: new Date(retryNotBeforeMs).toISOString() }
+        }
+
         const claimToken = randomUUID()
+        // completed_at は queued の間だけ「直前の attempt の終了時刻」を表すので、running では消す。
         const result = db.prepare(`
           UPDATE design_review_runs
-          SET status = 'running', attempt_count = attempt_count + 1, claim_token = ?, started_at = ?
+          SET status = 'running', attempt_count = attempt_count + 1, claim_token = ?, started_at = ?,
+              completed_at = NULL
           WHERE id = ? AND status = 'queued'
         `).run(claimToken, now(), id)
 
@@ -4917,16 +6072,18 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           return undefined
         }
 
-        return designReviewEvidence.create(evidenceData)
+        // evidence を生んだ run を結び付ける（失効順序を timestamp ではなく run の挿入順で決めるため）。
+        return designReviewEvidence.create({ ...evidenceData, runId: id })
       })
       return completeTransaction()
     },
     requeue(id, claimToken, error) {
+      // completed_at = 直前の attempt の終了時刻（retry cooldown の起点。次の claim で消える）。
       const result = db.prepare(`
         UPDATE design_review_runs
-        SET status = 'queued', claim_token = NULL, error = ?, started_at = NULL
+        SET status = 'queued', claim_token = NULL, error = ?, started_at = NULL, completed_at = ?
         WHERE id = ? AND claim_token = ? AND status = 'running'
-      `).run(error, id, claimToken)
+      `).run(error, now(), id, claimToken)
       return result.changes === 1
     },
     recoverStaleRunningAtStartup(maxAttempts, startedBefore) {
@@ -6106,6 +7263,7 @@ function deserializeDesignReviewEvidence(row: any): DesignReviewEvidence {
     independentReviewRequired: row.independent_review_required === 1,
     independentReviewVerdict: (row.independent_review_verdict ?? undefined) as DesignReviewEvidence['independentReviewVerdict'] | undefined,
     createdAt: row.created_at,
+    runId: row.run_id ?? undefined,
   }
 }
 
@@ -6187,6 +7345,7 @@ function deserializeDesignReviewRun(row: any): DesignReviewRun {
     startedAt: row.started_at ?? undefined,
     completedAt: row.completed_at ?? undefined,
     repairSourceJobId: row.repair_source_job_id ?? undefined,
+    resumeSourceJobId: row.resume_source_job_id ?? undefined,
   }
 }
 
@@ -6208,13 +7367,30 @@ function deserializeDesignReviewRun(row: any): DesignReviewRun {
  * `repairFlow.ts` の `createRepairJobWithHandoff` 周辺が依拠しているのと同じ不変条件）。
  * ここはその不変条件が将来崩れたときに**黙って壊れない**ための保険である。
  */
-function reuseActiveRun(existingRow: any, requestedRepairSourceJobId: string | undefined): DesignReviewRun {
+function reuseActiveRun(
+  existingRow: any,
+  requested: { repairSourceJobId?: string; designTextHash: string; changedFiles: readonly string[] },
+): DesignReviewRun {
   const existing = deserializeDesignReviewRun(existingRow)
-  if (existing.repairSourceJobId !== requestedRepairSourceJobId) {
-    throw new Error(
+  if (existing.repairSourceJobId !== requested.repairSourceJobId) {
+    throw new DesignReviewRunContentionError(
       'design review run intent mismatch: an active run for this subject has repairSourceJobId='
-      + `${existing.repairSourceJobId ?? 'null'} but ${requestedRepairSourceJobId ?? 'null'} was requested`
+      + `${existing.repairSourceJobId ?? 'null'} but ${requested.repairSourceJobId ?? 'null'} was requested`
       + ` (runId=${existing.id})`,
+      existing.id,
+    )
+  }
+  // **intent が同じでも、runner から見える同一性が違えば別の review である。** 以前は intent だけを
+  // 見ていたため、別の design text / changedFiles の run（例: Challenge の再評価や resume instruction とは
+  // 別の review）を返し、その判定がレビューされていない設計に帰属しえた（独立レビュー指摘・2026-10-16）。
+  // changedFiles は focus 選択に順序が効かないので集合として比べる。
+  const sameFiles = JSON.stringify([...existing.changedFiles].sort())
+    === JSON.stringify([...requested.changedFiles].sort())
+  if (existing.designTextHash !== requested.designTextHash || !sameFiles) {
+    throw new DesignReviewRunContentionError(
+      'design review run identity mismatch: an active run for this subject reviews a different design'
+      + ` (runId=${existing.id})`,
+      existing.id,
     )
   }
   return existing
@@ -6419,7 +7595,7 @@ function reconcileResumedBlockedSourceJobs(db: Database.Database): void {
 
     const jobsForTask = db.prepare('SELECT * FROM jobs WHERE task_id = ? ORDER BY rowid ASC')
     const jobById = db.prepare('SELECT * FROM jobs WHERE id = ?')
-    const approvalStatus = db.prepare('SELECT status FROM approval_requests WHERE id = ?')
+    const approvalStatus = db.prepare('SELECT status, expires_at FROM approval_requests WHERE id = ?')
 
     const exactResumeSuccessors = (sourceJobId: string, taskId: string): Job[] => {
       const taskJobs = (jobsForTask.all(taskId) as unknown[]).map(deserializeJob)
@@ -6460,10 +7636,17 @@ function reconcileResumedBlockedSourceJobs(db: Database.Database): void {
       // 承認待ちが結び付いたままの行は、その承認が approveAndResumeJob() で同じ行を動かしうる。
       // lineage があっても「もう誰も動かさない」とは言えないので触らない（fail-closed）。
       // 結び付いた承認行が見つからない場合も、状態を確かめられないので同じく触らない
-      // （`jobs.approval_id` に外部キーは無い）。期限は見ない —— WAITING は期限切れでも行として残る。
+      // （`jobs.approval_id` に外部キーは無い）。
+      // 期限切れ WAITING は pin しない: `approveAndResumeJob()` は期限切れを EXPIRED として拒否するので、
+      // その承認が同じ行を動かすことはもう無い（期限解釈は shared `isLiveWaitingApproval` に一本化。
+      // 2026-10-16 監査 A2: 期限切れ WAITING が source を恒久的に blocked へ留めていた）。
       if (source.approval_id !== null) {
-        const approval = approvalStatus.get(source.approval_id) as { status: string } | undefined
-        if (approval === undefined || approval.status === 'WAITING_FOR_USER') continue
+        const approval = approvalStatus.get(source.approval_id) as
+          { status: ApprovalGateStatus; expires_at: string } | undefined
+        if (
+          approval === undefined
+          || isLiveWaitingApproval({ status: approval.status, expiresAt: approval.expires_at })
+        ) continue
       }
 
       if (source.failure_metadata !== null) {
@@ -6678,15 +7861,18 @@ function runDesignReviewSubjectMigration(db: Database.Database): void {
         independent_review_required INTEGER NOT NULL DEFAULT 0,
         independent_review_verdict TEXT,
         created_at TEXT NOT NULL,
+        -- この rebuild は runMigrations() の後に走るので、追加済みの run_id もここに書く
+        -- （書かないと同一起動中の evidence 作成が no such column で落ちる）。legacy 行は NULL。
+        run_id TEXT,
         FOREIGN KEY (task_id) REFERENCES tasks(id)
       );
 
       INSERT INTO design_review_evidence_new
         (id, review_kind, subject_id, task_id, design_text_hash, review_load, decision,
-         independent_review_required, independent_review_verdict, created_at)
+         independent_review_required, independent_review_verdict, created_at, run_id)
       SELECT
         id, 'task', task_id, task_id, design_text_hash, review_load, decision,
-        independent_review_required, independent_review_verdict, created_at
+        independent_review_required, independent_review_verdict, created_at, NULL
       FROM design_review_evidence;
 
       DROP TABLE design_review_evidence;
@@ -6713,17 +7899,19 @@ function runDesignReviewSubjectMigration(db: Database.Database): void {
         -- 列をここに書かないと直前に追加された列がこの入れ替えで消え、同一起動中の
         -- create() が no such column で落ちる。legacy 行に intent は無いので値は NULL。
         repair_source_job_id TEXT,
+        -- resume provenance（C3-c）。理由は repair_source_job_id と同じ。legacy 行は NULL。
+        resume_source_job_id TEXT,
         FOREIGN KEY (task_id) REFERENCES tasks(id)
       );
 
       INSERT INTO design_review_runs_new
         (id, review_kind, subject_id, task_id, design_text, design_text_hash, task_title,
          changed_files, status, attempt_count, claim_token, result_json, error, created_at,
-         started_at, completed_at, repair_source_job_id)
+         started_at, completed_at, repair_source_job_id, resume_source_job_id)
       SELECT
         id, 'task', task_id, task_id, design_text, design_text_hash, task_title,
         changed_files, status, attempt_count, claim_token, result_json, error, created_at,
-        started_at, completed_at, NULL
+        started_at, completed_at, NULL, NULL
       FROM design_review_runs;
 
       DROP TABLE design_review_runs;

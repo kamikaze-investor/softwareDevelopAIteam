@@ -5,7 +5,7 @@ import type { Job, ReviewResult } from '@ai-team/shared'
 import { prepareRepairFlow } from './repairFlow'
 import { repairFromStoredReview } from './repairFromStoredReview'
 import { epochCoveredImplementationJobIds, repairRecoveryActionFor } from './repairRecoveryEpoch'
-import { recordResumeActor } from './resumeActor'
+import { recordApprovalActor, recordResumeActor } from './resumeActor'
 
 /**
  * **保存済み review を canonical repair へ戻す recovery action**の回帰テスト
@@ -118,9 +118,12 @@ function productionShape(storage: IStorage, taskOverrides: Record<string, unknow
   return { ids, implementJob: current, reviewJob, review }
 }
 
-/** 人が Mobile の承認 UI で押す操作に相当する。 */
+/**
+ * 人が Mobile の承認 UI で押す操作に相当する。ADMIN credential で決定したという
+ * `approval_actor` の記録も残す（epoch は human が決めた承認しか数えない）。
+ */
 function approve(storage: IStorage, approvalRequestId: string) {
-  return storage.approvalRequests.recordDecision(approvalRequestId, 'APPROVED')
+  return storage.approvalRequests.recordDecision(approvalRequestId, 'APPROVED', undefined, { credentialClass: 'admin' })
 }
 
 const call = (storage: IStorage, taskId: string, reviewJobId: string) =>
@@ -297,6 +300,35 @@ describe('recovery action — 承認を経て canonical repair へ戻る', () =>
     expect(storage.approvalRequests.findById(first.approvalRequestId)?.status).toBe('CONSUMED')
   })
 
+  // H-03 / F-2: actor 記録が導入される前の承認、または決定と actor 記録の間でプロセスが止まった承認は
+  // APPROVED なのに human evidence を持たない。以前はここで APPROVAL_ACTOR_NOT_HUMAN を返し続け、
+  // 行が期限まで APPROVED で居座って誰も新しい要求を作れなかった。使えない承認として置き換え、再度尋ねる。
+  it('human evidence の無い（pre-deploy の）APPROVED は consume せず置き換え、新しい承認待ちを作る', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const { ids, reviewJob } = productionShape(storage)
+
+    const first = call(storage, ids.taskId, reviewJob.id)
+    if (first.status !== 'awaiting_approval') throw new Error(`unexpected ${first.status}`)
+    // actor 行を書かない決定 = actor 記録導入前の承認と同じ形。
+    storage.approvalRequests.updateStatus(first.approvalRequestId, 'APPROVED')
+
+    const second = call(storage, ids.taskId, reviewJob.id)
+    expect(second).toMatchObject({ status: 'awaiting_approval', reused: false })
+    if (second.status !== 'awaiting_approval') return
+    expect(second.approvalRequestId).not.toBe(first.approvalRequestId)
+    expect(storage.approvalRequests.findById(first.approvalRequestId)?.status).toBe('SUPERSEDED')
+    expect(storage.auditLog.findByEntity('approval_request', first.approvalRequestId)
+      .some((entry) => entry.operation === 'supersede'
+        && entry.detail?.includes(`new_approval_id=${second.approvalRequestId}`) === true)).toBe(true)
+    expect(storage.designReviewRuns.findLatestByTaskId(ids.taskId)).toBeUndefined()
+
+    // 新しい要求を人（ADMIN）が承認すれば、それが consume されて repair が queue される。
+    approve(storage, second.approvalRequestId)
+    const third = call(storage, ids.taskId, reviewJob.id)
+    expect(third.status).toBe('queued')
+    expect(storage.approvalRequests.findById(second.approvalRequestId)?.status).toBe('CONSUMED')
+  })
+
   it('承認前に何度呼んでも承認リクエストを増やさない', () => {
     const storage = createSQLiteStorage(':memory:')
     const { ids, reviewJob } = productionShape(storage)
@@ -313,6 +345,37 @@ describe('recovery action — 承認を経て canonical repair へ戻る', () =>
       storage.approvalRequests.findByTaskId(ids.taskId)
         .filter((r) => r.requestedAction === repairRecoveryActionFor(reviewJob.id)).length,
     ).toBe(1)
+  })
+
+  // Task あたり active request は高々1件（2026-10-16 監査）。別 action の生きた要求と、
+  // 期限切れで WAITING のまま残った同 action の要求は、新しい要求と同じ transaction で SUPERSEDED になる。
+  it('承認待ちを作るとき、別 action の active 要求と期限切れの同 action 要求を SUPERSEDED にする', () => {
+    const storage = createSQLiteStorage(':memory:')
+    const { ids, reviewJob } = productionShape(storage)
+    const base = {
+      taskId: ids.taskId, riskLevel: 'HIGH', targetBranch: 'b', targetCommit: 'c', targetDiffHash: 'd',
+      changedFiles: [], triggeredRules: [], invalidIf: [], status: 'WAITING_FOR_USER',
+    }
+    const otherAction = storage.approvalRequests.create({
+      ...base, requestedAction: 'abort_task', expiresAt: new Date(Date.now() + 60_000).toISOString(),
+    } as never).id
+    const expiredSame = storage.approvalRequests.create({
+      ...base,
+      requestedAction: repairRecoveryActionFor(reviewJob.id),
+      expiresAt: new Date(Date.now() - 60_000).toISOString(),
+    } as never).id
+
+    const first = call(storage, ids.taskId, reviewJob.id)
+    expect(first.status).toBe('awaiting_approval')
+    if (first.status !== 'awaiting_approval') return
+    expect(first.reused).toBe(false)
+    expect(storage.approvalRequests.findById(otherAction)?.status).toBe('SUPERSEDED')
+    expect(storage.approvalRequests.findById(expiredSame)?.status).toBe('SUPERSEDED')
+    expect(
+      storage.approvalRequests.findByTaskId(ids.taskId)
+        .filter((r) => r.status === 'WAITING_FOR_USER' || r.status === 'APPROVED')
+        .map((r) => r.id),
+    ).toEqual([first.approvalRequestId])
   })
 
   it('queue 後にもう一度呼んでも run を二重に作らない', () => {

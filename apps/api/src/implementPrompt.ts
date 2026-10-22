@@ -12,7 +12,15 @@ import { mapFileToFocuses } from '@ai-team/worker/src/approvalLevel/focusSelecto
 
 export { buildTaskContract, type TaskContractSource }
 
-function buildFocusedDesignContract(task: Pick<Task, 'allowedPaths'>): string {
+/**
+ * Task に渡す Design Contract。**どの原則をこの Task に適用するかの唯一の owner。**
+ *
+ * 初回実装・PL / Human resume・POST /jobs の implement・repair・remediation はすべてここを通す。
+ * 以前は producer ごとに選び方が違い、POST /jobs と repair だけが signal 無し（core のみ）で選んでいた
+ * ため、同じ Task でも経路によって `canonical-domain-meaning` 等が載ったり載らなかったりした。
+ * 選択規則そのもの（focus → 原則）は `selectPrincipleSlugs()` が持ち、ここでは複製しない。
+ */
+export function buildTaskDesignContract(task: Pick<Task, 'allowedPaths'>): string {
   const principles = loadEngineeringPrinciples()
   return buildDesignContract({
     slugs: selectPrincipleSlugs({
@@ -48,14 +56,9 @@ ${instruction}
 [重要な注意]
 ${authorityNotice}
 
-${buildFocusedDesignContract(task)}`
+${buildTaskDesignContract(task)}`
 }
 
 export function appendImplementContracts(prompt: string, task: TaskContractSource): string {
-  const principles = loadEngineeringPrinciples()
-  const designContract = buildDesignContract({
-    slugs: selectPrincipleSlugs(undefined, principles),
-    principles,
-  })
-  return `${prompt}\n\n${buildTaskContract(task)}\n\n${designContract}`
+  return `${prompt}\n\n${buildTaskContract(task)}\n\n${buildTaskDesignContract(task)}`
 }

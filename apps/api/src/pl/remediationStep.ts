@@ -55,11 +55,6 @@ import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import type { Task } from '@ai-team/shared'
 import {
-  buildDesignContract,
-  loadEngineeringPrinciples,
-  selectPrincipleSlugs,
-} from '@ai-team/shared/src/engineeringPrinciples.js'
-import {
   extractDesignReviewFindings,
   getBaseRoadmapId,
   parseRemediationProposal,
@@ -72,7 +67,6 @@ import {
 } from '@ai-team/shared'
 import { getValidRoadmapItems } from '@ai-team/worker/scripts/roadmap/roadmapParser.js'
 import { classifyReviewLoad } from '@ai-team/worker/src/approvalLevel/reviewLoadClassifier.js'
-import { mapFileToFocuses } from '@ai-team/worker/src/approvalLevel/focusSelector.js'
 import {
   executeRunner,
   recomputeDecision,
@@ -81,8 +75,9 @@ import {
   type RunnerExecution,
 } from '../designReview/designReviewCoordinator'
 import { CHEAP_AI_CONFIG } from '../aiExplain/cheapAiClient'
-import { computeDesignTextHash } from '../designReviewEvidencePolicy'
+import { computeDesignTextHash, isUsableAlignedEvidence } from '../designReviewEvidencePolicy'
 import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
+import { buildTaskDesignContract } from '../implementPrompt'
 import {
   adoptRoadmapItem,
   buildAdoptedDescription,
@@ -236,6 +231,13 @@ export type PlRemediationStatus =
   | 'adoption_rejected'
   /** 採用し直したが fresh Review が通らず Job が作られなかった。 */
   | 'still_not_aligned'
+  /**
+   * 採用し直した fresh Review が**まだ判定を出していない**（runner が判定を返さず run が
+   * queued に戻った）。否定的な判定ではないので escalation しない。run は
+   * design_review_idle → rekick で再開され、ALIGNED になれば既存の
+   * `recoverReadyTasksWithoutJob()` が同じ `createInitialImplementWorkflow()` で Job を作る。
+   */
+  | 'review_pending'
   /** fresh Review が通り implement Job が作られた。 */
   | 'remediated'
 
@@ -320,8 +322,12 @@ export function findRemediationSubject(
   if (run.status !== 'succeeded') return undefined
 
   // evidence が登録されていれば ALIGNED である（非 ALIGNED は evidence を作らない）。
+  // ただし**同じ設計に対する新しい判定が正**。この run が evidence より新しい CONFLICT なら
+  // evidence は覆されており、ここで CONFLICT を見失ってはならない（isUsableAlignedEvidence）。
   const evidence = storage.designReviewEvidence.findLatestByTaskId(task.id)
-  if (evidence?.designTextHash === run.designTextHash) return undefined
+  if (evidence?.designTextHash === run.designTextHash && isUsableAlignedEvidence(evidence, storage.designReviewEvidence)) {
+    return undefined
+  }
 
   // **判定は runner の自己申告（`finalDecision`）を採用せず、API と同じ関数で再計算する。**
   // Job Gate / evidence 登録が使っているのと同一の `recomputeDecision()` を通すので、
@@ -576,19 +582,11 @@ export function buildRemediationPrompt(input: {
 /**
  * Remediation AI へ渡す Design Contract。
  *
- * **実装 prompt と同じ関数から作る**（`buildInitialImplementAiCliPrompt()` と同じ
- * `selectPrincipleSlugs` + `buildDesignContract`）。別に組み立てると、Remediation が
- * 従う原則と実装側が従う原則がずれる。
+ * **実装 prompt と同じ owner（`buildTaskDesignContract()`）から作る**。別に組み立てると、
+ * Remediation が従う原則と実装側が従う原則がずれる。
  */
 function buildRemediationDesignContract(allowedPaths: readonly string[]): string {
-  const principles = loadEngineeringPrinciples()
-  return buildDesignContract({
-    slugs: selectPrincipleSlugs(
-      { predictedFocuses: [...allowedPaths].flatMap(mapFileToFocuses) },
-      principles,
-    ),
-    principles,
-  })
+  return buildTaskDesignContract({ allowedPaths: [...allowedPaths] })
 }
 
 // ────────────────────────────────────────────────────────────
@@ -866,6 +864,9 @@ export async function runRemediationStep(
       reason: outcome.reason,
     }
   }
+  if (outcome.status === 'review_pending') {
+    return { ...common, status: 'review_pending', taskId: outcome.taskId, reason: outcome.reason }
+  }
   return {
     ...common,
     status: outcome.status === 'blocked'
@@ -879,6 +880,7 @@ export async function runRemediationStep(
 /** 修正版 spec を適用した結果。Remediation と PL revision が共有する。 */
 export type ApplyRevisedSpecOutcome =
   | { status: 'applied'; taskId: string; proposedHash: string; specKey: string }
+  | { status: 'review_pending'; taskId: string; reason: string; proposedHash: string; specKey: string }
   | {
       status: 'not_materially_different' | 'blocked' | 'adoption_rejected' | 'still_not_aligned'
       failureCode: string
@@ -1037,6 +1039,30 @@ export async function applyRevisedSpec(
     (job) => job.aiCliPrompt !== undefined && computeDesignTextHash(job.aiCliPrompt) === proposedHash,
   )
   if (!applied) {
+    // **判定がまだ出ていないだけなら否定扱いしない。** この spec の fresh Review run が
+    // queued のまま残っている（runner が判定を返さず requeue された）なら pending として返す。
+    // 判定は保存済みの run から引き直す（メモリ上の結果を持ち回らない）。
+    const active = storage.designReviewRuns.findActiveByTaskId(result.taskId)
+    if (active !== undefined && active.designTextHash === proposedHash) {
+      return {
+        status: 'review_pending',
+        taskId: result.taskId,
+        reason: `the fresh design review of the revised design has not produced a judgment yet (run ${active.id} is ${active.status})`,
+        proposedHash,
+        specKey,
+      }
+    }
+    // 別の設計の review が active で、この spec の review を始められなかった（contention）。
+    // この spec は**まだ一度も審査されていない**ので「通らなかった」とは言えない。
+    if (active !== undefined) {
+      return {
+        status: 'review_pending',
+        taskId: result.taskId,
+        reason: `another design review (run ${active.id}) is active for this task; the revised design has not been reviewed yet`,
+        proposedHash,
+        specKey,
+      }
+    }
     return {
       status: 'still_not_aligned',
       failureCode: 'fresh_review_not_aligned',

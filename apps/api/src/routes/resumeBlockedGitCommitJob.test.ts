@@ -1,4 +1,5 @@
 import Fastify, { type FastifyInstance } from 'fastify'
+import { setCredentialClass } from '../auth/credentialClass.js'
 import { beforeEach, describe, expect, it } from 'vitest'
 import type { ApprovalRequest, Job, Project, Task } from '@ai-team/shared'
 
@@ -27,6 +28,15 @@ async function buildApp(): Promise<FastifyInstance> {
   resetStorage()
 
   const app = Fastify()
+  // production では PATCH /approval-requests/:id/status は HUMAN_ONLY_ROUTES（split mode の ADMIN だけが届く）。
+  // このテスト app は認証 hook を持たないので、その境界だけを模して ADMIN として記録する
+  // （consume は approval_actor=human を要求する。D2 hardening 2026-10-17）。
+  app.addHook('preHandler', async (req) => {
+    const path = req.url.split('?')[0]!
+    if (req.method === 'PATCH' && path.startsWith('/api/approval-requests/') && path.endsWith('/status')) {
+      setCredentialClass(req, 'admin')
+    }
+  })
   app.register(approvalGateRoutes, { prefix: '/api' })
   app.register(taskRoutes, { prefix: '/api/tasks' })
   app.register(jobRoutes, { prefix: '/api/jobs' })
@@ -209,6 +219,14 @@ describe('POST /api/tasks/:id/resume — blocked git_commit Job (STALE approval)
       const { body: resumeBody } = await resumeTask(app, task.id)
       const resumedJob = resumeBody as Job
 
+      // 実際のWorkerはqueued Jobをdequeueした時点でrunningへ遷移させてからgate/checkを呼ぶ。
+      // queued のままの Job には承認を結び付けない（createForJob は running / blocked を要求する）。
+      await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${resumedJob.id}`,
+        payload: { status: 'running' },
+      })
+
       const gateRes = await app.inject({
         method: 'POST',
         url: '/api/gate/check',
@@ -390,6 +408,9 @@ describe('POST /api/tasks/:id/resume — blocked git_commit Job (STALE approval)
         payload: { status: 'APPROVED' },
       })
       expect(approveRes.statusCode).toBe(200)
+      // 承認（approveAndResumeJob）で Job は queued に戻る。Worker は claim（running）してから gate/check・consume する
+      // （consume は running の Job だけを受け付ける。D2 hardening 2026-10-17）。
+      await app.inject({ method: 'PATCH', url: `/api/jobs/${resumedJob.id}`, payload: { status: 'running' } })
 
       const consumeRes = await app.inject({
         method: 'POST',

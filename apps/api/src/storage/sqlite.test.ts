@@ -1833,6 +1833,8 @@ describe('SQLiteStorage', () => {
 
         // quarantine 中は resume を fail-closed で拒否する。所有権の推測ではなく
         // 「未検証 workspace へ再進入させない」ことが目的なので、理由も返す。
+        // （resume は running Project でしか受け付けないので、その前提を揃えてから確かめる）
+        storage.projects.update(projectId, { status: 'running' })
         const resumed = storage.jobs.resumeBlockedTask({
           taskId,
           instructionPrompt: 'try again please',
@@ -1846,7 +1848,8 @@ describe('SQLiteStorage', () => {
       })
       it('rolls back the whole transition when a side effect throws (atomic CAS + side effects)', () => {
         const job = createRunningJob()
-        vi.spyOn(storage.tasks, 'update').mockImplementation(() => {
+        // side effect は Task の escalation（2026-10-17 から tasks.escalateToHuman の単一 transaction）。
+        vi.spyOn(storage.tasks, 'escalateToHuman').mockImplementation(() => {
           throw new Error('simulated side effect failure')
         })
         try {
@@ -1988,6 +1991,8 @@ describe('SQLiteStorage', () => {
           expect(storage.jobs.findById(job.id)?.failureMetadata?.quarantined).toBe(true)
 
           // clearance 前は resume 拒否（既存の fail-closed 不変条件が保たれる）
+          // （resume は running Project でしか受け付けないので、その前提を揃えてから確かめる）
+          storage.projects.update(projectId, { status: 'running' })
           const refusedBefore = storage.jobs.resumeBlockedTask({
             taskId,
             instructionPrompt: 'try again please',
@@ -2261,6 +2266,11 @@ describe('SQLiteStorage', () => {
       })
 
       describe('createRepairJobWithHandoff', () => {
+        // handoff は running な Project でしか Job を作らない（transaction 内の再確認）。
+        beforeEach(() => {
+          storage.projects.update(projectId, { status: 'running' })
+        })
+
         function createBlockedSourceJob(): { id: string; previous: Job } {
           const source = storage.jobs.create({
             taskId,
@@ -2312,6 +2322,76 @@ describe('SQLiteStorage', () => {
           expect(repairJob.aiCliPrompt).toBe('reviewed repair prompt')
           // source Job は所有権を持たない状態（failed）へ解放されている
           expect(storage.jobs.findById(sourceJobId)?.status).toBe('failed')
+        })
+
+        // Task / Project 状態の再確認は Job を作る transaction の中で行う（TOCTOU 回避）。
+        // 断るときは Job を作らず、source Job の所有権（blocked）にも触らない。
+        it('refuses inside the transaction when the Project is not running: no Job, source stays blocked', () => {
+          const source = createBlockedSourceJob()
+          storage.projects.update(projectId, { status: 'paused' })
+
+          const result = storage.jobs.createRepairJobWithHandoff(repairJobInput(source.id))
+
+          expect(result).toMatchObject({ ok: false, code: 'PROJECT_NOT_RUNNING' })
+          expect(storage.jobs.findByTaskId(taskId).some((job) => job.workflowStepKey === `repair:${source.id}:1`)).toBe(false)
+          expect(storage.jobs.findById(source.id)?.status).toBe('blocked')
+        })
+
+        it('refuses inside the transaction when the Task is done, but not merely because it is blocked', () => {
+          const source = createBlockedSourceJob()
+          storage.tasks.update(taskId, { status: 'done' })
+          expect(storage.jobs.createRepairJobWithHandoff(repairJobInput(source.id)))
+            .toMatchObject({ ok: false, code: 'TASK_DONE' })
+          expect(storage.jobs.findById(source.id)?.status).toBe('blocked')
+
+          storage.tasks.update(taskId, { status: 'blocked' })
+          expect(storage.jobs.createRepairJobWithHandoff(repairJobInput(source.id)).ok).toBe(true)
+        })
+
+        it('refuses with LINEAGE_MISMATCH when the source Job belongs to another Task of the same Project', () => {
+          const taskB = storage.tasks.create({
+            projectId, title: 'B', description: '', status: 'pending', assignee: 'developer_ai', dependencies: [],
+          })
+          const sourceOfB = storage.jobs.create({
+            taskId: taskB.id,
+            projectId,
+            agentRole: 'developer_ai',
+            status: 'blocked',
+            safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+            aiCliMode: 'implement',
+          })
+
+          // repair 先は Task A（repairJobInput の taskId）、source は Task B の Job。
+          expect(storage.jobs.createRepairJobWithHandoff(repairJobInput(sourceOfB.id)))
+            .toMatchObject({ ok: false, code: 'LINEAGE_MISMATCH' })
+          expect(storage.jobs.findById(sourceOfB.id)?.status).toBe('blocked')
+          expect(storage.jobs.findByTaskId(taskId).some((job) => job.workflowStepKey === `repair:${sourceOfB.id}:1`)).toBe(false)
+        })
+
+        it('refuses with PROJECT_MISMATCH when the repair or source Job names another Project, keeping source ownership', () => {
+          // Task の Project は止まっていて、別 Project が running。呼び出し側の projectId を信じると通ってしまう形。
+          storage.projects.update(projectId, { status: 'paused' })
+          const other = storage.projects.create({ name: 'Other', goal: 'g', designPhilosophy: [], status: 'running' })
+          const source = createBlockedSourceJob()
+          const input = repairJobInput(source.id)
+
+          expect(storage.jobs.createRepairJobWithHandoff({ ...input, repairJob: { ...input.repairJob, projectId: other.id } }))
+            .toMatchObject({ ok: false, code: 'PROJECT_MISMATCH' })
+          expect(storage.jobs.findById(source.id)?.status).toBe('blocked')
+
+          // source Job が別 Project を名指す場合も同じ。
+          const foreignSource = storage.jobs.create({
+            taskId,
+            projectId: other.id,
+            agentRole: 'developer_ai',
+            status: 'blocked',
+            safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+            aiCliMode: 'implement',
+          })
+          expect(storage.jobs.createRepairJobWithHandoff(repairJobInput(foreignSource.id)))
+            .toMatchObject({ ok: false, code: 'PROJECT_MISMATCH' })
+          expect(storage.jobs.findById(foreignSource.id)?.status).toBe('blocked')
+          expect(storage.jobs.findByTaskId(taskId).some((job) => job.workflowStepKey?.startsWith('repair:'))).toBe(false)
         })
 
         it('transaction rolls back on successor creation failure, source Job REMAINS blocked (ownership retained)', () => {
@@ -2878,6 +2958,65 @@ describe('SQLiteStorage', () => {
         .toBe('job-legacy-source')
     })
 
+    it('keeps resume_source_job_id through the legacy table rebuild, with existing rows NULL (C3-c)', () => {
+      const dbPath = path.join(os.tmpdir(), `ai-team-c3c-legacy-rebuild-${randomUUID()}.db`)
+      createLegacyDesignReviewDatabase(dbPath)
+
+      const upgraded = createSQLiteStorage(dbPath)
+
+      const columns = readDatabase(dbPath, (db) =>
+        (db.pragma('table_info(design_review_runs)') as Array<{ name: string }>).map((c) => c.name),
+      )
+      expect(columns).toContain('resume_source_job_id')
+      // legacy 行の resume 元は推論で埋めない（NULL = 証明なし）。
+      const legacy = readDatabase(dbPath, (db) =>
+        (db.prepare('SELECT resume_source_job_id FROM design_review_runs').all() as Array<{
+          resume_source_job_id: string | null
+        }>).map((r) => r.resume_source_job_id),
+      )
+      expect(legacy.length).toBeGreaterThan(0)
+      expect(legacy.every((value) => value === null)).toBe(true)
+      expect(upgraded.designReviewRuns.findByTaskId('task-legacy-1').every((run) => run.resumeSourceJobId === undefined))
+        .toBe(true)
+
+      // rebuild 直後の同一起動で書け、再起動後も読めること。
+      const written = upgraded.designReviewRuns.create({
+        taskId: 'task-legacy-3',
+        taskTitle: 'Legacy post-upgrade write target',
+        designText: 'Design: post-rebuild resume provenance write.',
+        designTextHash: computeDesignTextHash('Design: post-rebuild resume provenance write.'),
+        changedFiles: [],
+        resumeSourceJobId: 'job-resumed',
+      })
+      expect(written.resumeSourceJobId).toBe('job-resumed')
+      expect(written.repairSourceJobId).toBeUndefined()
+      expect(createSQLiteStorage(dbPath).designReviewRuns.findById(written.id)?.resumeSourceJobId).toBe('job-resumed')
+    })
+
+    it('adds resume_source_job_id to an already-migrated database idempotently (C3-c)', () => {
+      const dbPath = path.join(os.tmpdir(), `ai-team-c3c-additive-${randomUUID()}.db`)
+      const first = createSQLiteStorage(dbPath)
+      const task = first.tasks.create({
+        projectId: first.projects.create({ name: 'P', goal: 'g', designPhilosophy: [], status: 'draft' }).id,
+        title: 'T', description: '', status: 'pending', assignee: 'developer_ai', dependencies: [],
+      } as Parameters<IStorage['tasks']['create']>[0])
+      const existing = first.designReviewRuns.create({
+        taskId: task.id, taskTitle: 'T', designText: 'd', designTextHash: computeDesignTextHash('d'), changedFiles: [],
+      })
+      // A database deployed before C3-c: same schema without the new column.
+      const raw = new Database(dbPath)
+      try {
+        raw.exec('ALTER TABLE design_review_runs DROP COLUMN resume_source_job_id')
+      } finally {
+        raw.close()
+      }
+
+      expect(() => createSQLiteStorage(dbPath)).not.toThrow()
+      const reopened = createSQLiteStorage(dbPath)
+      expect(reopened.designReviewRuns.findById(existing.id)?.resumeSourceJobId).toBeUndefined()
+      expect(() => createSQLiteStorage(dbPath)).not.toThrow()
+    })
+
     it('is idempotent on repeat startup after the rebuild has run once', () => {
       const dbPath = path.join(os.tmpdir(), `ai-team-design-review-subject-idempotent-${randomUUID()}.db`)
       createLegacyDesignReviewDatabase(dbPath)
@@ -2956,6 +3095,66 @@ describe('SQLiteStorage', () => {
         db.pragma("index_info('ux_design_review_runs_subject_active')") as Array<{ name: string }>
       )).map((column) => column.name)
       expect(indexedColumns).toEqual(['review_kind', 'subject_id'])
+    })
+  })
+
+  describe('design_review_evidence.run_id migration', () => {
+    const runIdColumn = (dbPath: string): { name: string; notnull: number; dflt_value: unknown } | undefined =>
+      readDatabase(dbPath, (db) => (
+        db.pragma('table_info(design_review_evidence)') as Array<{ name: string; notnull: number; dflt_value: unknown }>
+      )).find((column) => column.name === 'run_id')
+
+    it('pre-subject legacy DB: rebuild keeps run_id, legacy rows stay NULL, new evidence is run-bound', () => {
+      const dbPath = path.join(os.tmpdir(), `ai-team-evidence-run-id-legacy-${randomUUID()}.db`)
+      const before = createLegacyDesignReviewDatabase(dbPath)
+      const storage = createSQLiteStorage(dbPath)
+
+      expect(runIdColumn(dbPath)).toMatchObject({ notnull: 0, dflt_value: null })
+      for (const row of before.evidenceRows) {
+        expect(storage.designReviewEvidence.findById(row.id)?.runId).toBeUndefined()
+      }
+
+      // legacy fixture の Task には active run があるので、別の Task で新しい evidence を作る。
+      const taskId = storage.tasks.create({
+        projectId: 'project-legacy', title: 'after migration', description: '', status: 'pending',
+        assignee: 'developer_ai', dependencies: [],
+      } as Parameters<IStorage['tasks']['create']>[0]).id
+      const run = storage.designReviewRuns.create({
+        taskId, taskTitle: 't', designText: 'migrated design', designTextHash: 'hash-migrated', changedFiles: [],
+      })
+      const claimed = storage.designReviewRuns.claim(run.id, 3)
+      const evidence = storage.designReviewRuns.completeWithEvidence(run.id, claimed.claimToken!, '{}', {
+        reviewKind: 'task', subjectId: taskId, taskId, designTextHash: 'hash-migrated',
+        reviewLoad: 'low', decision: 'ALIGNED', independentReviewRequired: false,
+      } as never)
+      expect(evidence?.runId).toBe(run.id)
+      expect(storage.designReviewEvidence.findById(evidence!.id)?.runId).toBe(run.id)
+    })
+
+    it('post-subject DB without run_id: the column is added idempotently and existing rows stay NULL', () => {
+      const dbPath = path.join(os.tmpdir(), `ai-team-evidence-run-id-existing-${randomUUID()}.db`)
+      createSQLiteStorage(dbPath)
+      // 列追加前の schema を再現する（列を落とし、既存行を1件置く）。
+      const db = new Database(dbPath)
+      try {
+        db.exec('ALTER TABLE design_review_evidence DROP COLUMN run_id')
+        db.prepare(`
+          INSERT INTO design_review_evidence
+            (id, review_kind, subject_id, task_id, design_text_hash, review_load, decision,
+             independent_review_required, independent_review_verdict, created_at)
+          VALUES ('evidence-before-run-id', 'roadmap', 'project-x', NULL, 'h', 'critical', 'ALIGNED', 0, NULL,
+                  '2026-10-16T09:00:00.000Z')
+        `).run()
+      } finally {
+        db.close()
+      }
+      expect(runIdColumn(dbPath)).toBeUndefined()
+
+      const storage = createSQLiteStorage(dbPath)
+      createSQLiteStorage(dbPath)
+
+      expect(runIdColumn(dbPath)).toMatchObject({ notnull: 0 })
+      expect(storage.designReviewEvidence.findById('evidence-before-run-id')?.runId).toBeUndefined()
     })
   })
 

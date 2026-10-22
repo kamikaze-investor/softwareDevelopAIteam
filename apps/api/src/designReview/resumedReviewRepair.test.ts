@@ -384,10 +384,12 @@ describe('prepareRepairFlow — 既存 admission / budget をそのまま通る'
     })
   })
 
-  it('production 形: 最新の Design Review が実行できなかった run なら、既存 admission が skip する（本修正は変えない）', () => {
+  it('production 形: 最新の Design Review が実行できなかった run は判定ではないので根拠にせず、新しい Design Review を queue する（RC3）', () => {
     // 2026-09-28 production の `d0af140a` の形。low-load review が prompt を読めず
     // REVIEW_UNAVAILABLE で終わった repair run が、Task の最新 Design Review として残っている。
-    // admission の「最新 Design Review が ALIGNED であること」は既存の規則で、D1 はそれを緩めない。
+    // 以前はこれを「最新が ALIGNED でない」として skip していたが、REVIEW_UNAVAILABLE は判定が無い
+    // だけで CONFLICT ではない（b8d0fc5d で Task を恒久停止させた）。queue されるのは新しい
+    // Design Review run であり、repair Job はそれが ALIGNED になって初めて作られる。
     const storage = createSQLiteStorage(':memory:')
     const chain = productionChain(storage)
     const designText = 'repair plan for the first review'
@@ -409,6 +411,6 @@ describe('prepareRepairFlow — 既存 admission / budget をそのまま通る'
 
     const result = prepareRepairFlow(storage, { failedJob: chain.implementJob, reviewJobId: chain.resumedReview.id })
 
-    expect(result).toMatchObject({ action: 'skip', reason: 'task is blocked (latest design review is REVIEW_UNAVAILABLE)' })
+    expect(result).toMatchObject({ action: 'queue', stepKey: `repair:${chain.implementJob.id}:1` })
   })
 })

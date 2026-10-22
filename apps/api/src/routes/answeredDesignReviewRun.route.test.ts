@@ -1,7 +1,9 @@
 import Fastify, { type FastifyInstance } from 'fastify'
+import { setCredentialClass } from '../auth/credentialClass'
 import { Writable } from 'node:stream'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import type { Job } from '@ai-team/shared'
+import { createHash } from 'node:crypto'
+import { canonicalizeJobUpdate, type Job } from '@ai-team/shared'
 
 // **kick だけを止める。** 判定（prepareRepairFlow / admission）は本物を使う。
 vi.mock('../designReview/repairFlow', async (importOriginal) => {
@@ -41,6 +43,11 @@ async function buildApp(lines: LogLine[]): Promise<FastifyInstance> {
     },
   })
   const app = Fastify({ logger: { level: 'warn', stream } })
+  // C-1: the Worker's result delivery is authenticated as the Worker (apiTokenAuth sets the class in
+  // production). These route tests have no auth plugin, so stand in for it on the Worker's PATCH /api/jobs/:id.
+  app.addHook('onRequest', async (req) => {
+    if (req.method === 'PATCH' && /^\/api\/jobs\/[^/?]+(\?|$)/.test(req.url)) setCredentialClass(req, 'worker')
+  })
   app.register(jobRoutes, { prefix: '/api/jobs' })
   await app.ready()
   return app
@@ -77,6 +84,23 @@ async function shape() {
   } as never)
   await tick()
 
+  /** 判定のある終端 run（RC3 以降、REVIEW_UNAVAILABLE は根拠にならないので CONFLICT で止める）。 */
+  const conflictRun = async (): Promise<string> => {
+    const designText = `repair plan ${Math.random()}`
+    const run = s.designReviewRuns.create({
+      taskId: task.id, taskTitle: 'VPS docs', designText, designTextHash: computeDesignTextHash(designText),
+      changedFiles: [DOC], repairSourceJobId: i1.id,
+    })
+    const claimed = s.designReviewRuns.claim(run.id, 3)
+    s.designReviewRuns.complete(run.id, claimed.claimToken!, 'succeeded', JSON.stringify({
+      reviewLoad: 'low', selectedFocuses: [], focusedReviewResults: [],
+      integrationReviewResult: { decision: 'CONFLICT', summary: 'CONFLICT', findings: [] },
+      finalDecision: 'CONFLICT',
+    }))
+    await tick()
+    return run.id
+  }
+
   const unavailableRun = async (): Promise<string> => {
     const designText = `repair plan ${Math.random()}`
     const run = s.designReviewRuns.create({
@@ -101,10 +125,12 @@ async function shape() {
     return r1
   }
 
-  return { s, taskId: task.id, i1, unavailableRun, humanResumedReview }
+  return { s, taskId: task.id, i1, unavailableRun, conflictRun, humanResumedReview }
 }
 
-const changesRequested = {
+// A review verdict reaches the API only as the Worker's Outbox delivery; a direct `success` write is refused
+// (R-FINAL-OPPATCH), so the fixture carries an eventId + payloadHash like `persistTerminalUpdate()` does.
+const changesRequestedResult = {
   status: 'success',
   exitCode: 0,
   changedFiles: [DOC],
@@ -114,6 +140,11 @@ const changesRequested = {
     summary: 'second review',
     findings: [{ severity: 'medium', file: DOC, message: 'secret boundary claim is wrong' }],
   },
+}
+const changesRequested = {
+  ...changesRequestedResult,
+  eventId: 'answered-run-review-delivery',
+  payloadHash: createHash('sha256').update(canonicalizeJobUpdate(changesRequestedResult)).digest('hex'),
 }
 
 describe('D3: PATCH の review 分岐と Human Resume で回答済みの Design Review run', () => {
@@ -148,9 +179,9 @@ describe('D3: PATCH の review 分岐と Human Resume で回答済みの Design 
     const lines: LogLine[] = []
     const app = await buildApp(lines)
     try {
-      const { s, taskId, i1, unavailableRun, humanResumedReview } = await shape()
+      const { s, taskId, i1, conflictRun, humanResumedReview } = await shape()
       const r1 = await humanResumedReview()
-      const runId = await unavailableRun()
+      const runId = await conflictRun()
 
       const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${r1.id}`, payload: changesRequested })
 
@@ -160,11 +191,36 @@ describe('D3: PATCH の review 分岐と Human Resume で回答済みの Design 
       const warn = lines.find((line) => line.msg.includes('stage 2 skipped'))
       expect(warn).toMatchObject({
         level: 40,
-        reason: 'task is blocked (latest design review is REVIEW_UNAVAILABLE)',
+        reason: 'task is blocked (latest design review is CONFLICT)',
         sourceJobId: i1.id,
         reviewJobId: r1.id,
         runId,
       })
+    } finally {
+      await app.close()
+    }
+  })
+
+  it('L4: blocked Task で skip したら repair_admission_skipped を audit に残し、Task は動かさない', async () => {
+    const lines: LogLine[] = []
+    const app = await buildApp(lines)
+    try {
+      const { s, taskId, i1, conflictRun, humanResumedReview } = await shape()
+      const r1 = await humanResumedReview()
+      const runId = await conflictRun()
+
+      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${r1.id}`, payload: changesRequested })
+
+      expect(res.statusCode).toBe(200)
+      const rows = s.auditLog.findByEntity('task', taskId)
+        .filter((entry) => entry.operation === 'repair_admission_skipped')
+      expect(rows).toHaveLength(1)
+      expect(rows[0]!.result).toBe('not_admitted')
+      expect(rows[0]!.detail).toContain('reason_code=not_admitted')
+      expect(rows[0]!.detail).toContain(`review_job_id=${r1.id}`)
+      expect(rows[0]!.detail).toContain(`implementation_job_id=${i1.id}`)
+      expect(rows[0]!.detail).toContain(`design_review_run_id=${runId}`)
+      expect(s.tasks.findById(taskId)?.status).toBe('blocked')
     } finally {
       await app.close()
     }

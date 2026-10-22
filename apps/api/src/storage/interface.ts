@@ -10,12 +10,25 @@
 import type { Project, Task, Approval, Job, JobWorkspaceBaseline, ReviewResult, QAResult, PermissionGrant, WatchdogEvent, ApprovalRequest, ApprovalGateStatus, TaskStatus, TaskSummary, DesignReviewEvidence, DesignReviewKind, AuditLogEntry, ProjectRoadmapPhase, PersistedTaskFailureExplanationV1, TaskContinuation, OperatorRequest, OperatorRequestStatus, OperatorRequestDisposition, OperatorRequestPlAction, OperatorRequestRequesterClass, ProjectStartStage, SupervisedRunKind, SupervisedRunStatus, SupervisedRunTerminalStatus } from '@ai-team/shared'
 import type {
   AbortAuthorization,
+  TechnicalAbortCleanupGeneration,
   TechnicalAbortCleanupSummary,
 } from '../pl/technicalAbortEvidence'
 import type { KGNode, KGEdge, KGNodeType, KGEdgeType, DecisionRecord, IncidentRecord, IncidentSeverity, PatternRecord, FeatureDNA, PatternTrigger, SelfReflectionEntry, ReflectionTrigger } from '@ai-team/shared'
-import type { AiCliProvider, AiCliMode } from '@ai-team/shared'
+import type { AiCliProvider, AiCliMode, RecoverAdmissionCode } from '@ai-team/shared'
+import type { ResumeAdmissionCode } from '@ai-team/shared'
 import type { PrincipleApplication, PrincipleApplicationInput, PrincipleAggregateQuery, PrincipleAggregateRow, PrincipleDisagreementRow, PrincipleVersionAggregateRow } from '@ai-team/shared'
 import type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
+import type { CredentialClass } from '../auth/credentialClass'
+import type { ResumeActorEvidence } from '../designReview/resumeActor'
+
+/**
+ * 承認の決定を下した主体（`apiTokenAuth()` が決めた credential 種別だけ）。
+ * storage はこれを `approval_actor` audit 行として**状態変更と同じ transaction で**書く（H-03）。
+ * 行の形は `designReview/resumeActor.ts` の `approvalActorAuditRecord()` が唯一の出どころ。
+ */
+export interface ApprovalDecisionActor {
+  credentialClass: CredentialClass | undefined
+}
 
 export type { RoadmapSyncTaskInput, RoadmapTaskSpecConflict, RoadmapSyncPhaseInput, RoadmapPhaseSpecConflict } from './roadmapTaskValidation'
 
@@ -37,7 +50,29 @@ export type ResumeBlockedTaskResult =
          */
         | 'REJECTED_COMMIT_SOURCE_UNRESOLVED'
         | 'GIT_COMMIT_RESUME_LINEAGE_INVALID'
+        /** 共有 `evaluateResumeAdmission()` の前提条件による拒否（Mobile と同じ code）。 */
+        | ResumeAdmissionCode
+        /**
+         * resume と同じ transaction で書く authority evidence（`resume_actor`）が書けなかった（G-01）。
+         * transaction ごと rollback 済みで何も変わっていないので、同じ resume を再試行してよい。
+         */
+        | 'RESUME_COMMIT_FAILED'
+        /**
+         * 人でない resume（PL / AI / 主体不明）を、Task に生きた Task 単位の人の判断（未期限の APPROVED /
+         * WAITING の abort_task 等）がある間は行わない。否定ではなく正当な人の判断待ち。
+         */
+        | 'HUMAN_DECISION_PENDING'
+        /**
+         * Design Review を待つ間に resume 対象（最新 Job）が変わった。何も作っていない。
+         * 否定ではなく再試行可能（PL は pending、route は 409）。
+         */
+        | 'RESUME_TARGET_CHANGED'
       reason: string
+      /**
+       * `DESIGN_REVIEW_PRECONDITION_FAILED` のときだけ入る、この resume が再開する Job の id。
+       * resume-with-design-review が起票する run の `resumeSourceJobId` になる（推論せずここから渡す）。
+       */
+      sourceJobId?: string
     }
 
 /**
@@ -115,7 +150,7 @@ export type ReconcileExternalCompletionResult =
   | { ok: true; task: Task; continuation: TaskContinuation }
   | {
       ok: false
-      code: 'TASK_NOT_FOUND' | 'JOB_NOT_FOUND' | 'ALREADY_DONE' | 'STORAGE_ERROR'
+      code: 'TASK_NOT_FOUND' | 'JOB_NOT_FOUND' | 'ALREADY_DONE' | 'TASK_HAS_BLOCKED_JOBS' | 'STORAGE_ERROR'
       reason: string
     }
 export type PersistProviderTimeoutFailureResult =
@@ -170,13 +205,69 @@ export type FailAndPrepareRepairResult =
  *   - repair Job の作成が失敗したら transaction 全体が rollback し、
  *     source Job は `blocked` のまま（所有権保持）となる。
  */
+/**
+ * 同じ subject に**別の同一性**の active Design Review run があり、要求された run を作れない。
+ * active run は subject ごとに1本（partial unique index）なので、相手が終わるまで待つしかない。
+ * 呼び出し側はこれを「判定がまだ無い」（pending）として扱う —— 否定的な判定ではない。
+ */
+export class DesignReviewRunContentionError extends Error {
+  constructor(message: string, readonly activeRunId: string) {
+    super(message)
+    this.name = 'DesignReviewRunContentionError'
+  }
+}
+
+/** handoff refusal と同じ transaction で使い切り marker を書けなかった（R-3）。refusal は確定していない。 */
+export class RecoveryApprovalSpentMarkerError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'RecoveryApprovalSpentMarkerError'
+  }
+}
+
 export type CreateRepairJobWithHandoffResult =
   | { ok: true; repairJob: Job }
   | {
       ok: false
-      code: 'SOURCE_JOB_NOT_FOUND' | 'STORAGE_ERROR'
+      code: 'SOURCE_JOB_NOT_FOUND' | 'STORAGE_ERROR' | RepairHandoffRefusalCode
       reason: string
     }
+
+/** `acknowledgeOutboxEventWithoutApplying()` の結果。 */
+export type AcknowledgeOutboxEventResult =
+  | { ok: true; job: Job; deduplicated: boolean }
+  | { ok: false; code: 'OUTBOX_HASH_MISMATCH' | 'JOB_NOT_FOUND' | 'NOW_APPLICABLE'; reason: string }
+
+/** `createManualJob()` の結果。断った場合 Job は作られていない。 */
+export type CreateManualJobResult =
+  | { ok: true; job: Job }
+  | { ok: false; code: 'WORKSPACE_HELD_BY_OTHER_TASK'; reason: string }
+
+/** `createInitialImplementJob()` の結果。断った場合 Job は作られていない。 */
+export type CreateInitialImplementJobResult =
+  | { ok: true; job: Job }
+  | {
+      ok: false
+      code: 'TASK_NOT_FOUND' | 'TASK_NOT_INITIAL_TARGET' | 'TASK_PARKED' | 'PROJECT_NOT_RUNNING'
+      reason: string
+    }
+
+/**
+ * handoff transaction 内で Task / Project 状態を確かめ直して断ったときの理由。
+ * 断った場合 repair Job は作られず、source Job の所有権も変わらない。
+ */
+export type RepairHandoffRefusalCode =
+  | 'TASK_NOT_FOUND'
+  | 'TASK_DONE'
+  | 'TASK_PARKED'
+  | 'PROJECT_NOT_RUNNING'
+  | 'PROJECT_MISMATCH'
+  | 'LINEAGE_MISMATCH'
+  /**
+   * Task に source 以外の queued / running Job がある（例: repair review の間に Human Resume が作った
+   * `resume:`）。repair Job を足すと 1 Task に 2 本の live 連鎖が並ぶ（lifecycle repair C3 / D3-1）。
+   */
+  | 'FOREIGN_LIVE_JOB'
 
 export type PersistReviewWorkflowResult =
   | {
@@ -200,9 +291,28 @@ export type PersistReviewWorkflowResult =
       reason: string
     }
 
+/**
+ * `replaceActiveAndCreate()` の結果。`supersededIds` は同じ transaction で SUPERSEDED にした
+ * 旧 request（WAITING は action・期限を問わず、APPROVED は同 action のものだけ）。
+ */
+export interface ReplaceActiveApprovalAndCreateResult {
+  approvalRequest: ApprovalRequest
+  supersededIds: string[]
+}
+
 export type CreateApprovalForJobResult =
   | { ok: true; approvalRequest: ApprovalRequest }
-  | { ok: false; code: 'JOB_NOT_FOUND' | 'JOB_MISMATCH' | 'JOB_ALREADY_LINKED'; reason: string }
+  | { ok: false; code: 'JOB_NOT_FOUND' | 'JOB_MISMATCH' | 'JOB_ALREADY_LINKED' | 'JOB_NOT_ACTIVE'; reason: string }
+
+/** `recordDecision()` の結果（PATCH /approval-requests/:id/status の git_commit 承認以外）。 */
+export type RecordApprovalDecisionResult =
+  | { ok: true; approvalRequest: ApprovalRequest }
+  | {
+      ok: false
+      code: 'NOT_FOUND' | 'STATUS_CONFLICT' | 'EXPIRED'
+      reason: string
+      approvalRequest?: ApprovalRequest
+    }
 
 export type ReviewApprovalAndResumeJobResult =
   | { ok: true; approvalRequest: ApprovalRequest; job: Job }
@@ -232,9 +342,34 @@ export type ConsumeApprovalForJobResult =
         | 'JOB_NOT_FOUND'
         | 'JOB_NOT_UNIQUE'
         | 'JOB_MISMATCH'
+        | 'JOB_NOT_RUNNING'
+        | 'APPROVAL_ACTOR_NOT_HUMAN'
       reason: string
       approvalRequest?: ApprovalRequest
       linkedJobId?: string
+    }
+
+/**
+ * `consumeForCommandJob()` の結果。git_commit 以外の、Job 実行が使う承認の consume。
+ * 失敗時の `approvalRequest` は遷移後（EXPIRED / STALE へ進めた場合はその状態）の行。
+ */
+export type ConsumeApprovalForCommandJobResult =
+  | { ok: true; approvalRequest: ApprovalRequest }
+  | {
+      ok: false
+      code:
+        | 'NOT_FOUND'
+        | 'GIT_COMMIT_NOT_ALLOWED'
+        | 'JOB_NOT_FOUND'
+        | 'TASK_MISMATCH'
+        | 'ACTION_MISMATCH'
+        | 'JOB_NOT_RUNNING'
+        | 'STATUS_CONFLICT'
+        | 'EXPIRED'
+        | 'STALE'
+        | 'APPROVAL_ACTOR_NOT_HUMAN'
+      reason: string
+      approvalRequest?: ApprovalRequest
     }
 
 export interface RoadmapSyncResult {
@@ -287,11 +422,32 @@ export interface IProjectStorage {
  * （独立レビュー round 7 指摘）。呼び出し側はこの値をそのまま上へ伝播すればよく、
  * `reason` 文字列を突き合わせて分類し直してはならない。
  */
+/** `ITaskStorage.escalateToHuman()` の結果。前4つは `task_escalated_to_human` audit の result と同じ語彙。 */
+export type TaskEscalationResult =
+  | { result: 'blocked' | 'already_blocked' | 'not_moved_done' | 'not_moved_parked' }
+  | { result: 'not_found' }
+  | { result: 'precondition_failed'; reason: string }
+
 export type RecoverFromBlockedResult =
   | { ok: true; task: Task }
-  | { ok: false; code?: 'APPROVAL_WAITING'; reason: string }
+  | { ok: false; code?: RecoverAdmissionCode; reason: string }
 
 export interface ITaskStorage {
+  /**
+   * `admit(current)` が undefined を返したときだけ `update(id, data)` を行う。読み直し・判定・書き込みを
+   * **1 つの IMMEDIATE transaction** で行う（`admit` は同じ connection の storage を同期的に読む）。
+   * 汎用 PATCH の owned → pending 出口が stranded 述語を確かめ直すために使う（lifecycle repair C3）。
+   */
+  updateIfAdmitted(
+    id: string,
+    data: Partial<Task>,
+    admit: (current: Task) => string | undefined,
+  ): { ok: true; task: Task } | { ok: false; code: 'TASK_NOT_FOUND' | 'NOT_ADMITTED'; reason: string }
+  /**
+   * queued / running の repair Design Review run（`repair_source_job_id` 付き）があるか（読み取りのみ）。
+   * resume admission と `TaskDetail.repairDesignReviewInFlight` の唯一の事実（lifecycle repair C3 / D3-1）。
+   */
+  hasRepairDesignReviewInFlight(taskId: string): boolean
   findByProjectId(projectId: string): Task[]
   /**
    * abort_task で park された Task か。**park 判定の唯一の定義**である。
@@ -312,24 +468,33 @@ export interface ITaskStorage {
    * precheck と `tx.immediate()` の間に別 connection が Job を入れたり park したり
    * 承認要求を作ったりできるためで、**読み直す条件が判定に使った条件より少ない限り
    * IMMEDIATE で lock を取っても意味が無い**（独立レビュー round 6 指摘）。
-   * ここで確かめ直すのは:
+   * 確かめ直す条件（`status === 'blocked'`・Job 0 件・park されていない・有効な承認待ちが無い・
+   * Project が `running`）は precheck と**同じ共有の `evaluateRecoverAdmission()`** に、
+   * transaction の中で読み直した値を渡して判定する。条件をここへ書き写さない。
    *
-   *   1. `status === 'blocked'`
-   *   2. Job が0件
-   *   3. park されていない
-   *   4. 有効な承認待ちが無い（未期限の `WAITING_FOR_USER`。判定は
-   *      `humanRecovery/recoveryAudit` の `hasActiveApprovalWaiting()` で precheck と共有）
-   *
-   * 呼び出し側が持つのは**ここに無い政策判定だけ**（Project が archived か、
-   * 自律ループから到達できるか、`nextDriver` は何か 等）。
+   * 呼び出し側が持つのは**ここに無い政策判定だけ**（自律ループから到達できるか、
+   * `nextDriver` は何か 等）。
    *
    * **`code` は race のときも precheck と同じ値を返すために在る。** 同じ原因なのに
    * 「precheck で気付いたか transaction で気付いたか」で machine-readable code が
    * 変わってはならない（独立レビュー round 7 指摘）。理由文字列を比較して code へ
-   * 戻すような実装はしないこと。いま分類しているのは承認待ちだけで、
-   * 他の precondition failure を網羅的に code 化する必要は無い。
+   * 戻すような実装はしないこと。
    */
   recoverFromBlocked(input: { taskId: string; detail: string }): RecoverFromBlockedResult
+  /**
+   * Human escalation（Task → `blocked`）と、その理由の audit 行を**1つの IMMEDIATE transaction**で書く。
+   * 意味論（park 済み・done は動かさない、既に blocked なら記録だけ）の正本は
+   * `designReview/repairFlow.ts` の `escalateTaskToHuman()` で、ここはそれを原子的に行う器である。
+   *
+   * `precondition` を渡すと、lock を取った後・書き込みの前に**同じ transaction の中で**評価する
+   * （呼び出し側が precheck に使った事実を読み直すため）。文字列を返したら何も書かずに
+   * `precondition_failed` を返す。precondition は park / done の判定より先に評価する。
+   */
+  escalateToHuman(input: {
+    taskId: string
+    audit: { operation: string; detail: string }
+    precondition?: (task: Task) => string | undefined
+  }): TaskEscalationResult
   findById(id: string): Task | undefined
   findSummaries(options?: { limit?: number; projectId?: string; status?: TaskStatus }): TaskSummary[]
   /**
@@ -396,6 +561,20 @@ export interface IJobStorage {
   findFailureExplanation(jobId: string): PersistedTaskFailureExplanationV1 | undefined
   saveFailureExplanation(jobId: string, envelope: PersistedTaskFailureExplanationV1): void
   create(job: Omit<Job, 'id' | 'createdAt'>): Job
+  /**
+   * initial implement Job を、**Project が running で Task がまだ初回 workflow の対象**（roadmapActive・
+   * pending・developer_ai・park されていない）であることを**同じ transaction で確かめ直してから**作る
+   * （lifecycle repair C3）。Design Review を await している間に Project が archive / draft / pause され、
+   * または Task が done / park されたら作らない（archived Project に誰も claim できない queued Job を残さない）。
+   */
+  createInitialImplementJob(job: Omit<Job, 'id' | 'createdAt'>): CreateInitialImplementJobResult
+  /**
+   * `POST /api/jobs` の手動 Job を作る。**同じ transaction で**、claim guard と同じ所有者述語で
+   * 別 Task が共有 workspace を所有していないことを確かめる（lifecycle repair C3）。workflowStepKey の
+   * 無い queued Job は所有者と数えられるので、2 つの Task がそれぞれ持つと multiple_live_owners で
+   * すべての claim が止まる。
+   */
+  createManualJob(job: Omit<Job, 'id' | 'createdAt'>): CreateManualJobResult
   update(id: string, data: Partial<Job>): Job | undefined
   /**
    * Job更新（+Outbox冪等化）を行う。
@@ -409,6 +588,25 @@ export interface IJobStorage {
     outboxEvent?: OutboxEventInput,
     queueDesignReview?: QueuedDesignReviewRunInput,
   ): UpdateWithOutboxEventResult
+  /**
+   * Outbox event がこの Job に既に適用済みか（読み取りのみ。書き込み経路の dedup と同じ照合）。
+   * - `deduplicated`: 同じ eventId・同じ payloadHash が適用済み（完全な再送）
+   * - `conflict`: 同じ eventId が別の Job か別の payloadHash で適用済み
+   * - `new`: 未適用（または outboxEvent 無し）
+   */
+  classifyOutboxEvent(jobId: string, outboxEvent: OutboxEventInput | undefined): 'new' | 'deduplicated' | 'conflict'
+  /**
+   * **適用できない Outbox 配送を「適用済み」として記録し、payload を何も適用しない**（lifecycle repair C3）。
+   *
+   * 同じ transaction で Job を読み直し、`stillNonApplicable(job)` が true のときだけ event を記録する
+   * （Worker はこの event を捨てられる）。Job の列は 1 つも書かない。読み直した時点で適用可能に
+   * なっていれば `NOW_APPLICABLE` を返し、呼び出し側は通常の適用経路へ進む。
+   */
+  acknowledgeOutboxEventWithoutApplying(
+    jobId: string,
+    outboxEvent: OutboxEventInput,
+    stillNonApplicable: (job: Job) => boolean,
+  ): AcknowledgeOutboxEventResult
   /** provider timeout結果の保存と、条件を満たす1回限りのretry Job作成を単一transactionで行う。 */
   persistCommitSuccessWithContinuation(input: {
     jobId: string
@@ -471,12 +669,22 @@ export interface IJobStorage {
    *      成功した実装の結果を書き換えてしまうため（2026-09-25 修正）。
    *   3. この handoff に属する Task / recovery 状態更新（あれば）を適用
    * いずれかが失敗したら transaction 全体が rollback し、source Job は `blocked` のまま。
+   *
+   * 1 の前に、同じ transaction 内で Task が存在し `done` でも park 済みでもないこと、
+   * Project が `running` であることを確かめ直す。満たさなければ何も書かずに
+   * `RepairHandoffRefusalCode` で断る（`blocked` な Task は断らない）。
    */
   createRepairJobWithHandoff(input: {
     sourceJobId: string
     repairJob: Omit<Job, 'id' | 'createdAt' | 'status'> & { status?: 'queued' }
     /** この handoff に属する Task / recovery 状態更新（任意）。 */
     taskUpdate?: Partial<Task>
+    /**
+     * source 実装に epoch を開いていた consume 済み Stored Review Recovery 承認（R-3）。
+     * handoff を断るとき、その承認の使い切り marker を**同じ transaction で**書く。marker が書けなければ
+     * `RecoveryApprovalSpentMarkerError` を投げ、refusal は確定しない。
+     */
+    spendRecoveryApprovalOnRefusal?: { approvalRequestId: string; runId: string }
   }): CreateRepairJobWithHandoffResult
   /** workflow Jobの結果保存と次step Jobの作成を単一transactionで冪等に行う。 */
   updateAndCreateNextWorkflowJob(input: {
@@ -496,6 +704,18 @@ export interface IJobStorage {
   resumeBlockedTask(input: {
     taskId: string
     instructionPrompt: string
+    /**
+     * 誰が再開したか。渡すと resume Job の作成と**同じ transaction で** `resume_actor` 行を書き、
+     * 書けなければ resume ごと rollback して `RESUME_COMMIT_FAILED` を返す（G-01）。
+     * `human` の resume は新しい人の判断として、その Task の Task 単位の承認を置き換える（C-03）。
+     */
+    resumedBy?: ResumeActorEvidence
+    /**
+     * resume-with-design-review の2回目の呼び出しが渡す、review を起票したときの resume 対象 Job
+     * （1回目が返した `sourceJobId`）。transaction 内で最新 Job がこれと違えば、successor を作らず
+     * `RESUME_TARGET_CHANGED` を返す（review が見ていない Job を resume しない。C3-c）。
+     */
+    expectedSourceJobId?: string
   }): ResumeBlockedTaskResult
   /**
    * PR-C finding 14 修復 (BLOCKER B): quarantine を解除する（単一transaction・冪等）。
@@ -559,6 +779,8 @@ export interface IJobStorage {
     preCleanupObservation?: JobWorkspaceBaseline
     /** technical audit に残す counts-only summary。 */
     cleanupSummary?: TechnicalAbortCleanupSummary
+    /** technical cleanup で必須: 報告が名指す generation（carrier の現在の marker と一致を要求する）。 */
+    cleanupGeneration?: TechnicalAbortCleanupGeneration
   }): ReleaseBlockedJobAndParkTaskResult
   /**
    * 通常は全 Job が既に terminal な blocked Task を abort_task で park する最終段。
@@ -584,7 +806,18 @@ export interface IJobStorage {
     authorization: AbortAuthorization
     preCleanupObservation?: JobWorkspaceBaseline
     cleanupSummary?: TechnicalAbortCleanupSummary
+    cleanupGeneration?: TechnicalAbortCleanupGeneration
   }): ReleaseBlockedJobAndParkTaskResult
+  /**
+   * Technical Abort cleanup の generation を、報告が名指す generation と carrier の現在の marker が
+   * 一致するときだけ退役させる（marker を消して quarantine する）。一致確認と書き込みは単一 transaction。
+   * 一致しなければ何も変えず false（遅れて届いた古い generation の拒否が新しい generation を壊さない）。
+   */
+  retireTechnicalAbortCleanupForGeneration(input: {
+    jobId: string
+    generation: TechnicalAbortCleanupGeneration
+    quarantineReason: string
+  }): boolean
   clearWorkspaceQuarantine(input: {
     jobId: string
     /** Worker が今この瞬間に観測した workspace の baseline 形式記録。 */
@@ -606,7 +839,23 @@ export type ReleaseBlockedJobAndParkTaskResult =
   | { ok: true; job: Job; task: Task }
   | {
     ok: false
-    code: 'NOT_FOUND' | 'PRECONDITION_FAILED' | 'VERIFICATION_FAILED' | 'STORAGE_ERROR'
+    /**
+     * Technical Abort の最終 transaction で、cleanup の失敗ではない理由で拒否したときの code。
+     * どちらも carrier を quarantine せず、同じ transaction でその cleanup generation を取り消す。
+     * - `HUMAN_DECISION_CONFLICT`: precheck 後に live な WAITING / APPROVED、または CONSUMED の request が現れた。
+     * - `CLEANUP_SUPERSEDED`: carrier より後の Job（repair / resume 等）が既にある。
+     */
+    code:
+      | 'NOT_FOUND'
+      | 'PRECONDITION_FAILED'
+      | 'VERIFICATION_FAILED'
+      | 'STORAGE_ERROR'
+      | 'HUMAN_DECISION_CONFLICT'
+      | 'CLEANUP_SUPERSEDED'
+      /** 別 connection の write と lock 競合した（再試行可能。何も変えていない）。 */
+      | 'STORAGE_BUSY'
+      /** 報告の technical cleanup generation が carrier の現在の marker と違う（何も変えていない）。 */
+      | 'GENERATION_MISMATCH'
     reason: string
   }
 
@@ -648,7 +897,12 @@ export interface IApprovalRequestStorage {
     taskId: string
     approvalRequestId: string
     expectedAction: string
-  }): { ok: true } | { ok: false; reason: string }
+  }): { ok: true } | {
+    ok: false
+    /** 人が決めた記録の無い APPROVED。SUPERSEDED にされ、改めて人の承認が要る。 */
+    code?: 'APPROVAL_ACTOR_NOT_HUMAN'
+    reason: string
+  }
   findByTaskId(taskId: string): ApprovalRequest[]
   findById(id: string): ApprovalRequest | undefined
   /** task_id で WAITING_FOR_USER / APPROVED 状態のものを返す（CONSUMED は除外） */
@@ -656,13 +910,23 @@ export interface IApprovalRequestStorage {
   /** status = WAITING_FOR_USER の全件を返す（health-score 用） */
   findWaiting(): ApprovalRequest[]
   create(data: Omit<ApprovalRequest, 'id' | 'createdAt'>): ApprovalRequest
+  /**
+   * **Task あたり WAITING_FOR_USER は高々1件、APPROVED は action ごと**という invariant を守る作成。
+   * 単一 transaction で、その Task の WAITING 行を requestedAction・期限を問わず SUPERSEDED にし、
+   * 同 action の APPROVED も置き換えてから新しい行を insert する。別 action の APPROVED は人の判断なので残す。
+   * Job に結び付く git_commit の作成（`createForJob`）は同じ規則で WAITING だけを畳み、APPROVED は残す。
+   */
+  replaceActiveAndCreate(data: Omit<ApprovalRequest, 'id' | 'createdAt'>): ReplaceActiveApprovalAndCreateResult
   /** git_commit Approval の作成と jobs.approval_id 設定を単一transactionで行う。 */
   createForJob(
     data: Omit<ApprovalRequest, 'id' | 'createdAt'>,
     jobId: string,
   ): CreateApprovalForJobResult
-  /** WAITING_FOR_USER の git_commit Approval をCAS更新し、同一Jobをqueuedへ戻す。 */
-  approveAndResumeJob(id: string, reason?: string): ReviewApprovalAndResumeJobResult
+  /**
+   * WAITING_FOR_USER の git_commit Approval をCAS更新し、同一Jobをqueuedへ戻す。
+   * 承認・Job 再 queue と同じ transaction で `decidedBy` の `approval_actor` 行を書く（必須）。
+   */
+  approveAndResumeJob(id: string, reason: string | undefined, decidedBy: ApprovalDecisionActor): ReviewApprovalAndResumeJobResult
   /** Job/Task/Action/baselineを検証して git_commit Approval を一度だけconsumeする。 */
   consumeForJob(input: {
     id: string
@@ -670,10 +934,41 @@ export interface IApprovalRequestStorage {
     currentCommit: string
     currentDiffHash: string
   }): ConsumeApprovalForJobResult
+  /**
+   * 誰も待っていない safe work の承認待ちを畳む（単一 transaction）。その Task・その requestedAction の
+   * WAITING_FOR_USER のうち、**保存 riskLevel が HIGH の行すべて**を SUPERSEDED にし、1 行ずつ
+   * `supersede` audit（reason=safe_work_no_waiter）を残す。CRITICAL の行には触れない。畳んだ id を返す。
+   */
+  supersedeUnwaitedSafeWorkRequests(taskId: string, requestedAction: string): string[]
+  /**
+   * git_commit 以外の承認を、それを使う **実在する Job** に束縛して一度だけ consume する（単一 transaction）。
+   * Job が同じ Task のもので、Job の command kind が承認の requestedAction と一致し、APPROVED・未失効・
+   * commit / diff 一致のときだけ CONSUMED にする。期限切れは EXPIRED、commit / diff 不一致は STALE へ進める。
+   * Task 単位の操作（abort_task・repair_from_stored_review:* 等）の承認は command kind を持つ Job が
+   * 存在しないので、ここでは決して consume できない（それぞれ `verifyAndConsumeForTaskAction` を使う）。
+   */
+  consumeForCommandJob(input: {
+    id: string
+    jobId: string
+    currentCommit: string
+    currentDiffHash: string
+  }): ConsumeApprovalForCommandJobResult
   /** preserveReviewMeta=true のとき reason/reviewedAt を上書きしない（consume 用） */
   updateStatus(id: string, status: ApprovalGateStatus, reason?: string, preserveReviewMeta?: boolean): ApprovalRequest | undefined
-  /** 人間による APPROVED/REJECTED 決定を更新し、同一transactionでaudit_logへ記録する（PATCH /status 用） */
-  recordDecision(id: string, status: 'APPROVED' | 'REJECTED', reason?: string): ApprovalRequest | undefined
+  /**
+   * 人間による APPROVED/REJECTED 決定を更新し、同一transactionでaudit_logへ記録する（PATCH /status 用）。
+   * 決定と同じ transaction で `decidedBy` の `approval_actor` 行も書く（必須。片方だけ残らない）。
+   *
+   * transaction の中で行を読み直し、**生きた WAITING（`isLiveWaitingApproval`）でなければ決定しない**。
+   * 期限切れの WAITING は `approveAndResumeJob` と同じく EXPIRED へ進めて `EXPIRED` を返す
+   * （以前は status だけを見て APPROVED にし、何の authority にもならない承認が 200 で返っていた）。
+   */
+  recordDecision(
+    id: string,
+    status: 'APPROVED' | 'REJECTED',
+    reason: string | undefined,
+    decidedBy: ApprovalDecisionActor,
+  ): RecordApprovalDecisionResult
 }
 
 export interface IDesignReviewEvidenceStorage {
@@ -681,6 +976,11 @@ export interface IDesignReviewEvidenceStorage {
   findByTaskId(taskId: string): DesignReviewEvidence[]
   findLatestByTaskId(taskId: string): DesignReviewEvidence | undefined
   findLatestBySubjectId(reviewKind: DesignReviewKind, subjectId: string): DesignReviewEvidence | undefined
+  /**
+   * この evidence を覆す、同じ subject・同じ design hash の新しい run（active か、ALIGNED 以外の判定で
+   * 終端したもの）。無ければ undefined。規則は `designReviewEvidencePolicy.findSupersedingRun()`。
+   */
+  findSupersedingRun(evidence: DesignReviewEvidence): DesignReviewRun | undefined
   create(data: DesignReviewEvidenceCreateInput): DesignReviewEvidence
 }
 
@@ -725,12 +1025,26 @@ export interface DesignReviewRun {
    * repair 予算の計算へは一切関与しない。
    */
   repairSourceJobId?: string
+  /**
+   * **resume provenance。** resume-with-design-review（PL / Human）が起票した run でだけ入り、
+   * その resume が再開する Job の id（`ResumeBlockedTaskResult.sourceJobId`）。
+   *
+   * retry cooldown 中に PL が「この Job の復旧はこの run の判定待ち」と判断する唯一の根拠で、
+   * timestamp や「最新 Job」から推論しない（RC1）。NULL（legacy・他経路）は証明なしとして扱う。
+   * `repairSourceJobId` とは別の事実であり、流用しない。active run の再利用時は最初の値が残る。
+   */
+  resumeSourceJobId?: string
 }
 
 /** claim結果。claimできなかった場合は run=undefined。 */
 export interface ClaimDesignReviewRunResult {
   run?: DesignReviewRun
   claimToken?: string
+  /**
+   * 判定の出なかった attempt の後の retry cooldown 中で claim しなかったとき、明ける時刻（ISO）。
+   * 方針は `designReview/retryCooldown.ts`。
+   */
+  retryNotBefore?: string
 }
 
 /** terminal Job update と同一transactionでqueue するDesign Review run の内容。 */
@@ -913,7 +1227,12 @@ export interface IDesignReviewRunStorage {
    * repair admission が「Human Resume で回答済みの run」を根拠から外すための read-only 導出。
    */
   findByTaskId(taskId: string): DesignReviewRun[]
-  /** 同一Taskにqueued/running中のrunがある場合は作成せず既存を返す（partial unique index準拠）。 */
+  /**
+   * 同一 subject に queued/running の run があれば作成しない（partial unique index 準拠で active は1本）。
+   * **runner から見える同一性**（designTextHash・changedFiles・repairSourceJobId）が一致するときだけ
+   * 既存 run を返し、一致しなければ `DesignReviewRunContentionError` を投げる —— 別の設計の run を
+   * 黙って返すと、レビューされていない設計にその判定が帰属してしまう。
+   */
   create(input: DesignReviewRunCreateInput): DesignReviewRun
   /** startup recovery後に再kick対象となるqueued run一覧。 */
   findQueued(): DesignReviewRun[]
@@ -943,7 +1262,11 @@ export interface IDesignReviewRunStorage {
    * ここでは判定しない。
    */
   findTerminalRepairPurposeRuns(): DesignReviewRun[]
-  /** queuedのrunをrunningへ遷移し、attempt_countを加算して新しいclaim_tokenを発行する。 */
+  /**
+   * queuedのrunをrunningへ遷移し、attempt_countを加算して新しいclaim_tokenを発行する。
+   * 判定の出なかった task run の retry cooldown（`designReview/retryCooldown.ts`）中は claim せず
+   * `retryNotBefore` を返す。**cooldown を強制するのはここ1箇所だけ**である。
+   */
   claim(id: string, maxAttempts: number): ClaimDesignReviewRunResult
   /** claim_token一致時のみ終端へ遷移する。不一致（stale）ならfalseを返し、呼び出し側は結果を破棄する。 */
   complete(id: string, claimToken: string, status: 'succeeded' | 'failed', resultJson?: string, error?: string): boolean
@@ -957,7 +1280,11 @@ export interface IDesignReviewRunStorage {
     resultJson: string,
     evidence: DesignReviewEvidenceCreateInput,
   ): DesignReviewEvidence | undefined
-  /** claim_token一致時のみqueuedへ戻し、tokenを無効化する。 */
+  /**
+   * claim_token一致時のみqueuedへ戻し、tokenを無効化する。
+   * 直前の attempt の終了時刻を `completedAt` に記録する（retry cooldown の起点）。queued の行でだけ
+   * この意味を持ち、次の claim で消える。
+   */
   requeue(id: string, claimToken: string, error: string): boolean
   /**
    * API process crash後の起動時回収専用。runningのまま残った行をqueuedへ戻す。
