@@ -11,11 +11,12 @@
  *           重み（F=1, N=|N|/n）付きの評価対象を frame.json に書く
  *   pack    --repo <path>   label 用 packet（diff・base 記録抜粋。detector の出力は含めない）を labels-input.jsonl に書く
  *   mutants --repo <path>   e405c7c7^ に対する mutant diff を mutants.json に書く
- *   detect  --repo <path> [--repeats 3]   frame の全件 + known positives + mutants を検出し results.jsonl に追記する
+ *   detect  --repo <path> frame の全件 + known positives + mutants を検出し results.jsonl に追記する
  *   score   --labels <labels.json>        重み付き recall / precision / routine flag rate（bootstrap 95% CI）と再現性を report.json に書く
  */
 
 import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
@@ -34,11 +35,13 @@ import {
 
 export const EVAL_SCRIPT_VERSION = 1
 const DEFAULT_SEED = 20261023
+/** v3.1: repeat は3回で固定（score 側の「ちょうど N 本」と同じ値を使う） */
+const REPEATS = 3
 const KNOWN_POSITIVES: ReadonlyArray<{ sha: string; target: EvalTarget }> = [
-  { sha: 'e405c7c7', target: { file: 'apps/api/src/pl/conflictResolutionStep.ts', mechanismKeywords: ['challenge'] } },
-  { sha: 'feb4dffc', target: { file: 'apps/api/src/pl/conflictResolutionStep.ts', mechanismKeywords: ['challenge', 'remediation', 'critic'] } },
-  { sha: '516ca1ec', target: { file: 'packages/shared/src/criticalDesignFacts.ts', mechanismKeywords: ['critical', 'facts', 'rechallenge'] } },
-  { sha: '5c08ec9f', target: { file: '', mechanismKeywords: ['re-review', 'rereview', 'same-hash', 'challenge'] } },
+  { sha: 'e405c7c7', target: { files: ['apps/api/src/pl/conflictResolutionStep.ts'], mechanismKeywords: ['challenge'] } },
+  { sha: 'feb4dffc', target: { files: ['apps/api/src/pl/conflictResolutionStep.ts', 'apps/api/src/pl/remediationStep.ts', 'packages/shared/src/independentRemediationPolicy.ts', 'packages/shared/src/independentCriticPolicy.ts'], mechanismKeywords: ['challenge', 'remediation', 'critic'] } },
+  { sha: '516ca1ec', target: { files: ['packages/shared/src/criticalDesignFacts.ts'], mechanismKeywords: ['critical', 'facts', 'rechallenge'] } },
+  { sha: '5c08ec9f', target: { files: ['apps/api/src/pl/challengeAnswer.ts', 'apps/api/src/pl/conflictResolutionStep.ts', 'apps/api/src/designReview/repairFlow.ts'], mechanismKeywords: ['challenge', 're-review', 'rereview', 'disagreement'] } },
 ]
 
 // ---------------------------------------------------------------------------
@@ -141,8 +144,8 @@ export function buildFrame(
 // ---------------------------------------------------------------------------
 
 export interface EvalTarget {
-  /** 空文字なら file を問わない */
-  file: string
+  /** 候補の `file` がこのどれかと完全一致すること（wildcard は無い） */
+  files: string[]
   mechanismKeywords: string[]
 }
 
@@ -160,7 +163,7 @@ export interface Mutant {
 }
 
 const CRS = 'apps/api/src/pl/conflictResolutionStep.ts'
-const CHALLENGE_TARGET: EvalTarget = { file: CRS, mechanismKeywords: ['challenge'] }
+const CHALLENGE_TARGET: EvalTarget = { files: [CRS], mechanismKeywords: ['challenge'] }
 
 interface FileEdit { file: string; after: string | null }
 
@@ -241,10 +244,10 @@ export function buildMutants(repo: string, base = 'e405c7c7^'): Mutant[] {
     m('m04b-consumer-noop', 'literal は残したまま loop が challenge_aligned を resolved と扱わなくする', [{
       file: 'apps/api/src/pl/executionLoop.ts',
       after: mustReplace(loop, "\n    || status === 'challenge_aligned'", ''),
-    }], { ...positive, target: { file: 'apps/api/src/pl/executionLoop.ts', mechanismKeywords: ['challenge'] } }),
+    }], { ...positive, target: { files: ['apps/api/src/pl/executionLoop.ts'], mechanismKeywords: ['challenge'] } }),
     m('m05-file-deleted', 'Challenge の dispute 判定を持つ policy file を削除', [{
       file: 'packages/shared/src/independentCriticPolicy.ts', after: null,
-    }], { ...positive, target: { file: 'packages/shared/src/independentCriticPolicy.ts', mechanismKeywords: ['critic', 'challenge', 'dispute'] } }),
+    }], { ...positive, target: { files: ['packages/shared/src/independentCriticPolicy.ts'], mechanismKeywords: ['critic', 'challenge', 'dispute'] } }),
     m('m06-token-cancel', 'union から消した literal を同じ file の別構文へ足し、release を止める', [{
       file: CRS,
       after: mustReplace(
@@ -255,7 +258,7 @@ export function buildMutants(repo: string, base = 'e405c7c7^'): Mutant[] {
     }], positive),
     m('m07-config-flip', 'Critic round の上限 2 → 0（Critic と、その先の Challenge が走らなくなる）', [{
       file: CRS, after: mustReplace(crs, 'export const PL_MAX_CRITIC_ROUNDS = 2', 'export const PL_MAX_CRITIC_ROUNDS = 0'),
-    }], { ...positive, target: { file: CRS, mechanismKeywords: ['critic'] } }),
+    }], { ...positive, target: { files: [CRS], mechanismKeywords: ['critic'] } }),
     m('m08-late-hunk', '大きな生成 file の後ろに Challenge 分岐の削除を置く', [
       { file: 'apps/api/src/generated/fixtures.ts', after: `${filler}\n` },
       { file: CRS, after: removedDispatch },
@@ -286,7 +289,18 @@ export interface DetectionRecord {
   kind: 'frame' | 'positive' | 'mutant'
   run: number
   model: string
+  /** sha256(model | 両 prompt 本文 | diff | base)。同じ item の repeat が同じ入力かを確かめる */
+  inputFingerprint: string
+  /** cost: 待機時間と prompt の大きさ（detection + correctness） */
+  latencyMs: number
+  promptChars: number
   observation: MaterialityObservation
+}
+
+export function inputFingerprint(parts: { model: string; detection: string; evaluation: string; diff: string; base: string }): string {
+  return createHash('sha256')
+    .update([parts.model, parts.detection, parts.evaluation, parts.diff, parts.base].join('\u0000'))
+    .digest('hex')
 }
 
 function readInstructions(repoRoot: string): { detection: string; evaluation: string } {
@@ -303,6 +317,8 @@ function readInstructions(repoRoot: string): { detection: string; evaluation: st
 export interface Label {
   sha: string
   material: boolean
+  /** material のうち、既存のものに触れず新しいものを足すだけ（`introduces` のみ）の commit */
+  introducesOnly?: boolean
 }
 
 export type RunState = 'target_detected' | 'not_detected' | 'candidates_present' | 'no_candidates' | 'unavailable'
@@ -312,9 +328,13 @@ export function runState(observation: MaterialityObservation, target: EvalTarget
   if (observation.status !== 'ok' && observation.detection === undefined) return 'unavailable'
   const candidates = observation.detection?.candidates ?? []
   if (target === undefined) return candidates.length > 0 ? 'candidates_present' : 'no_candidates'
-  const hit = candidates.some((c) => (target.file === '' || c.file === target.file)
+  return matchTarget(observation, target) ? 'target_detected' : 'not_detected'
+}
+
+/** target に一致する候補。file は完全一致（wildcard は持たない）、mechanism / evidence は keyword の部分一致 */
+export function matchTarget(observation: MaterialityObservation, target: EvalTarget) {
+  return observation.detection?.candidates.find((c) => target.files.includes(c.file)
     && target.mechanismKeywords.some((k) => `${c.mechanism} ${c.evidence}`.toLowerCase().includes(k.toLowerCase())))
-  return hit ? 'target_detected' : 'not_detected'
 }
 
 export interface WeightedPoint { weight: number; stratum: 'F' | 'N'; predicted: boolean; actual: boolean }
@@ -364,58 +384,107 @@ const PREDICTORS: Record<string, Predictor> = {
   llmOrSignal: (o, k) => k.length > 0 || (o.status === 'ok' && (o.detection?.material ?? false)),
 }
 
+/**
+ * 正解の切り方:
+ * - `all`: material 全部を正例にする
+ * - `primary`: 既存のものを消す・替える・意味を変える commit だけを正例にする（`introducesOnly` は対象外として除く）
+ * - `introduces`: `introducesOnly` の commit だけで recall を出す（追加型の設計判断の検出率）
+ */
 export function scoreFrame(frame: Frame, labels: readonly Label[], records: readonly DetectionRecord[]) {
-  const label = new Map(labels.map((l) => [l.sha, l.material]))
-  const firstRun = new Map(records.filter((r) => r.kind === 'frame' && r.run === 0).map((r) => [r.itemId, r.observation]))
+  const label = new Map(labels.map((l) => [l.sha, l]))
+  const frameRuns = records.filter((r) => r.kind === 'frame' && r.run === 0)
+  // 同じ commit の run 0 が別入力で2本以上あるなら、どちらを採るかで結果が変わる。集計から外して報告する
+  const mixed = new Set(frameRuns.filter((r) => frameRuns.some((o) => o.itemId === r.itemId && o.inputFingerprint !== r.inputFingerprint)).map((r) => r.itemId))
+  const firstRun = new Map(frameRuns.filter((r) => !mixed.has(r.itemId)).map((r) => [r.itemId, r.observation]))
   const unlabeled = frame.items.filter((i) => !label.has(i.sha)).map((i) => i.sha)
   const missingRun = frame.items.filter((i) => !firstRun.has(i.sha)).map((i) => i.sha)
   const scored = frame.items.filter((i) => label.has(i.sha) && firstRun.has(i.sha))
-  const unavailable = scored.filter((i) => firstRun.get(i.sha)?.status !== 'ok').length
-  const metrics: Record<string, unknown> = {}
-  for (const [name, predict] of Object.entries(PREDICTORS)) {
-    const points = scored.map((i) => ({
-      weight: i.weight, stratum: i.stratum, actual: label.get(i.sha) as boolean,
-      predicted: predict(firstRun.get(i.sha) as MaterialityObservation, i.signalKinds),
-    }))
-    const rates = weightedRates(points)
-    metrics[name] = {
-      ...rates,
-      recallCI: stratifiedBootstrap(points, (ps) => weightedRates(ps).recall),
-      precisionCI: stratifiedBootstrap(points, (ps) => weightedRates(ps).precision),
-      routineFlagRateCI: stratifiedBootstrap(points, (ps) => weightedRates(ps).routineFlagRate),
+  // 抽出重みで母集団へ戻した unavailable 率（N の1件は |N|/n 件を代表する）
+  const totalWeight = scored.reduce((n, i) => n + i.weight, 0)
+  const unavailableWeight = scored.filter((i) => firstRun.get(i.sha)?.status !== 'ok').reduce((n, i) => n + i.weight, 0)
+
+  const views: Record<string, { include: (l: Label) => boolean; actual: (l: Label) => boolean }> = {
+    all: { include: () => true, actual: (l) => l.material },
+    primary: { include: (l) => !(l.material && l.introducesOnly === true), actual: (l) => l.material },
+    introduces: { include: (l) => l.material && l.introducesOnly === true, actual: () => true },
+  }
+  const metrics: Record<string, Record<string, unknown>> = {}
+  for (const [view, { include, actual }] of Object.entries(views)) {
+    metrics[view] = {}
+    for (const [name, predict] of Object.entries(PREDICTORS)) {
+      const points = scored
+        .filter((i) => include(label.get(i.sha) as Label))
+        .map((i) => ({
+          weight: i.weight, stratum: i.stratum, actual: actual(label.get(i.sha) as Label),
+          predicted: predict(firstRun.get(i.sha) as MaterialityObservation, i.signalKinds),
+        }))
+      metrics[view][name] = {
+        n: points.length,
+        ...weightedRates(points),
+        recallCI: stratifiedBootstrap(points, (ps) => weightedRates(ps).recall),
+        precisionCI: stratifiedBootstrap(points, (ps) => weightedRates(ps).precision),
+        routineFlagRateCI: stratifiedBootstrap(points, (ps) => weightedRates(ps).routineFlagRate),
+      }
     }
   }
-  return { scored: scored.length, unlabeled, missingRun, unavailableRate: scored.length === 0 ? null : unavailable / scored.length, metrics }
+  return {
+    scored: scored.length,
+    unlabeled,
+    missingRun,
+    mixedInputs: [...mixed],
+    unavailableRate: totalWeight === 0 ? null : unavailableWeight / totalWeight,
+    metrics,
+  }
 }
 
-export function scoreRepeatability(
-  items: ReadonlyArray<{ itemId: string; target?: EvalTarget; expectCandidate?: boolean; expectResponsibility?: string }>,
-  records: readonly DetectionRecord[],
-) {
+export interface RepeatItem {
+  itemId: string
+  target?: EvalTarget
+  expectCandidate?: boolean
+  expectResponsibility?: string
+}
+
+/**
+ * v3.1 の再現性。
+ * - 同じ item の run は **同じ入力**（`inputFingerprint`）で、ちょうど `expectedRuns` 本でなければ `invalid` として集計から外す
+ * - flip は run state（unavailable を含む）が揃わないこと。同じ見逃しが続くのは flip ではなく hit rate に出る
+ * - correctness の安定性は、target を検出し **かつ評価が得られた** run だけで比べる。評価の欠落は別に数える
+ */
+export function scoreRepeatability(items: readonly RepeatItem[], records: readonly DetectionRecord[], expectedRuns: number) {
   const out = items.map((item) => {
-    const runs = records.filter((r) => r.itemId === item.itemId)
+    const runs = records.filter((r) => r.itemId === item.itemId).sort((a, b) => a.run - b.run)
+    const fingerprints = new Set(runs.map((r) => r.inputFingerprint))
+    const invalid = runs.length !== expectedRuns ? 'run_count' : fingerprints.size > 1 ? 'mixed_inputs' : null
     const states = runs.map((r) => runState(r.observation, item.target))
-    const responsibilities = runs
-      .filter((r, i) => states[i] === 'target_detected')
-      .map((r) => {
-        const target = item.target as EvalTarget
-        const candidate = r.observation.detection?.candidates.find((c) => (target.file === '' || c.file === target.file)
-          && target.mechanismKeywords.some((k) => `${c.mechanism} ${c.evidence}`.toLowerCase().includes(k.toLowerCase())))
-        return r.observation.evaluations?.find((e) => e.candidateId === candidate?.id)?.responsibility ?? 'missing'
-      })
+    const detected = item.target === undefined ? [] : runs.filter((_r, i) => states[i] === 'target_detected')
+    const evaluated = detected.flatMap((r) => {
+      const candidate = matchTarget(r.observation, item.target as EvalTarget)
+      const evaluation = r.observation.evaluations?.find((e) => e.candidateId === candidate?.id)
+      return evaluation ? [evaluation.responsibility] : []
+    })
     return {
       itemId: item.itemId,
+      invalid,
       runs: runs.length,
       states,
       flipped: new Set(states).size > 1,
+      unavailableRuns: states.filter((s) => s === 'unavailable').length,
       targetHitRate: item.target ? states.filter((s) => s === 'target_detected').length / Math.max(1, runs.length) : null,
       expectCandidate: item.expectCandidate ?? null,
-      responsibilities,
-      responsibilityStable: responsibilities.length < 2 ? 'insufficient' : new Set(responsibilities).size === 1,
+      responsibilities: evaluated,
+      evaluationMissing: detected.length - evaluated.length,
+      responsibilityStable: evaluated.length < 2 ? 'insufficient' : new Set(evaluated).size === 1,
       expectResponsibility: item.expectResponsibility ?? null,
     }
   })
-  return { items: out, flipRate: out.length === 0 ? null : out.filter((o) => o.flipped).length / out.length }
+  const valid = out.filter((o) => o.invalid === null)
+  const totalRuns = valid.reduce((n, o) => n + o.runs, 0)
+  return {
+    items: out,
+    invalidItems: out.length - valid.length,
+    flipRate: valid.length === 0 ? null : valid.filter((o) => o.flipped).length / valid.length,
+    unavailableRunRate: totalRuns === 0 ? null : valid.reduce((n, o) => n + o.unavailableRuns, 0) / totalRuns,
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -472,30 +541,37 @@ async function main(): Promise<void> {
   if (cmd === 'detect') {
     const { callGeminiForReview } = await import('../src/metaReviewer/geminiClient.js')
     const model = process.env.GEMINI_MODEL?.trim() || 'gemini-2.5-flash'
-    const provider: ReviewProvider = (prompt) => callGeminiForReview(prompt, model)
+    let promptChars = 0
+    const provider: ReviewProvider = (prompt) => { promptChars += prompt.length; return callGeminiForReview(prompt, model) }
     const instructions = readInstructions(path.resolve(__dirname, '../../..'))
-    const repeats = Number(a.repeats ?? '3')
     const frame = JSON.parse(readFileSync(file('frame.json'), 'utf-8')) as Frame
     const mutants = JSON.parse(readFileSync(file('mutants.json'), 'utf-8')) as Mutant[]
+    // 再開は **同じ入力**の run だけを済みとみなす（model や prompt を変えて再開すると別の run として足される）
     const done = new Set(existsSync(file('results.jsonl'))
       ? readFileSync(file('results.jsonl'), 'utf-8').split('\n').filter(Boolean).map((l) => {
         const r = JSON.parse(l) as DetectionRecord
-        return `${r.kind}:${r.itemId}:${r.run}`
+        return `${r.kind}:${r.itemId}:${r.run}:${r.inputFingerprint}`
       })
       : [])
     const record = async (kind: DetectionRecord['kind'], itemId: string, run: number, title: string, diff: string, base: string) => {
-      if (done.has(`${kind}:${itemId}:${run}`)) return
+      const fingerprint = inputFingerprint({ model, detection: instructions.detection, evaluation: instructions.evaluation, diff, base })
+      if (done.has(`${kind}:${itemId}:${run}:${fingerprint}`)) return
+      promptChars = 0
+      const started = Date.now()
       const observation = await observeDesignMateriality({
         title, diff, records: gitRecordReader(repo, base),
         detectionInstructions: instructions.detection, evaluationInstructions: instructions.evaluation,
       }, provider)
-      appendFileSync(file('results.jsonl'), `${JSON.stringify({ itemId, kind, run, model, observation } satisfies DetectionRecord)}\n`)
+      const entry: DetectionRecord = {
+        itemId, kind, run, model, inputFingerprint: fingerprint, latencyMs: Date.now() - started, promptChars, observation,
+      }
+      appendFileSync(file('results.jsonl'), `${JSON.stringify(entry)}\n`)
       console.log(`${kind} ${itemId} run=${run} ${observation.status}${observation.reason ? ` (${observation.reason})` : ''} material=${observation.detection?.material ?? '-'}`)
     }
     // frame は 1 回。repeat 対象は known positives・mutants・N の先頭 20 件（v3.1）
     for (const item of frame.items) await record('frame', item.sha, 0, item.subject, commitDiff(repo, item.sha), `${item.sha}^1`)
     const repeatNegatives = frame.items.filter((i) => i.stratum === 'N').slice(0, 20)
-    for (let run = 0; run < repeats; run++) {
+    for (let run = 0; run < REPEATS; run++) {
       for (const p of KNOWN_POSITIVES) await record('positive', p.sha, run, git(repo, ['log', '-1', '--format=%s', p.sha]).trim(), commitDiff(repo, p.sha), `${p.sha}^1`)
       for (const m of mutants) await record('mutant', m.id, run, m.description, m.diff, m.base)
       for (const n of repeatNegatives.slice(0, run === 0 ? 0 : 20)) await record('frame', n.sha, run, n.subject, commitDiff(repo, n.sha), `${n.sha}^1`)
@@ -509,17 +585,34 @@ async function main(): Promise<void> {
     const mutants = JSON.parse(readFileSync(file('mutants.json'), 'utf-8')) as Mutant[]
     const records = readFileSync(file('results.jsonl'), 'utf-8').split('\n').filter(Boolean).map((l) => JSON.parse(l) as DetectionRecord)
     const repeatNegatives = frame.items.filter((i) => i.stratum === 'N').slice(0, 20)
+    const mutantRecords = records.filter((r) => r.kind === 'mutant')
+    const percentile = (values: number[], q: number) => {
+      if (values.length === 0) return null
+      const sorted = values.slice().sort((x, y) => x - y)
+      return sorted[Math.floor(q * (sorted.length - 1))]
+    }
+    // M4 の推奨はこの数値を読んだ人（PL / CEO）が出す。script は数値だけを出す
     const report = {
       schemaVersion: DESIGN_MATERIALITY_SCHEMA_VERSION,
       evalScriptVersion: EVAL_SCRIPT_VERSION,
       repoHead: frame.repoHead,
       models: [...new Set(records.map((r) => r.model))],
       detectionPromptHashes: [...new Set(records.map((r) => r.observation.detectionPromptHash).filter(Boolean))].length,
+      cost: {
+        observations: records.length,
+        latencyMsP50: percentile(records.map((r) => r.latencyMs), 0.5),
+        latencyMsP95: percentile(records.map((r) => r.latencyMs), 0.95),
+        promptCharsP50: percentile(records.map((r) => r.promptChars), 0.5),
+        promptCharsP95: percentile(records.map((r) => r.promptChars), 0.95),
+        evaluationCallRate: records.length === 0 ? null : records.filter((r) => r.observation.evaluationPromptHash !== undefined).length / records.length,
+      },
       historical: scoreFrame(frame, labels, records),
       repeatability: {
-        positives: scoreRepeatability(KNOWN_POSITIVES.map((p) => ({ itemId: p.sha, target: p.target, expectCandidate: true })), records.filter((r) => r.kind === 'positive')),
-        mutants: scoreRepeatability(mutants.map((m) => ({ itemId: m.id, target: m.target, expectCandidate: m.expectCandidate, expectResponsibility: m.expectResponsibility })), records.filter((r) => r.kind === 'mutant')),
-        negatives: scoreRepeatability(repeatNegatives.map((n) => ({ itemId: n.sha })), records.filter((r) => r.kind === 'frame' && repeatNegatives.some((n) => n.sha === r.itemId))),
+        positives: scoreRepeatability(KNOWN_POSITIVES.map((p) => ({ itemId: p.sha, target: p.target, expectCandidate: true })), records.filter((r) => r.kind === 'positive'), REPEATS),
+        mutants: scoreRepeatability(mutants.map((m) => ({ itemId: m.id, target: m.target, expectCandidate: m.expectCandidate, expectResponsibility: m.expectResponsibility })), mutantRecords, REPEATS),
+        // rename-only は target 付き（preserved になるか）と、target なし（候補が出るか）の両方で測る
+        mutantsUntargeted: scoreRepeatability(mutants.filter((m) => m.id === 'm10-rename-only').map((m) => ({ itemId: m.id })), mutantRecords, REPEATS),
+        negatives: scoreRepeatability(repeatNegatives.map((n) => ({ itemId: n.sha })), records.filter((r) => r.kind === 'frame' && repeatNegatives.some((n) => n.sha === r.itemId)), REPEATS),
       },
     }
     writeFileSync(file('report.json'), JSON.stringify(report, null, 2))

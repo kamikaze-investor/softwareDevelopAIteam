@@ -311,3 +311,57 @@ describe('observeDesignMateriality — 例外を外へ出さない', () => {
       .resolves.toMatchObject({ status: 'unavailable', reason: 'internal_error' })
   })
 })
+
+describe('独立レビュー指摘（code review round 1）の回帰', () => {
+  it('A4: capDiff は小さな上限でも上限を超えない', () => {
+    const diff = fileDiff('apps/api/src/x.ts', Array.from({ length: 50 }, (_, i) => `-line ${i}`))
+    for (const limit of [0, 1, 10, 60, 200]) expect(capDiff(diff, limit).text.length).toBeLessThanOrEqual(limit)
+  })
+
+  it('1行 enum の member 削除を拾う', () => {
+    const diff = fileDiff('apps/api/src/x.ts', ['-export enum Stage { Critic, Challenge }', '+export enum Stage { Critic }'])
+    expect(kinds(computeMaterialitySignals(diff))).toEqual(['contract_member_removed:Challenge'])
+  })
+
+  it('個数で相殺する（同じ case arm を2つ消して1つ足せば、1つ消えている）', () => {
+    const diff = fileDiff('apps/api/src/x.ts', ["-    case 'challenge':", "-    case 'challenge':", "+    case 'challenge':"])
+    expect(kinds(computeMaterialitySignals(diff))).toEqual(['contract_member_removed:challenge'])
+  })
+
+  it('quote された diff header の path も読む', () => {
+    const diff = [
+      'diff --git "a/apps/api/src/ステージ.ts" "b/apps/api/src/ステージ.ts"',
+      '--- "a/apps/api/src/ステージ.ts"',
+      '+++ "b/apps/api/src/ステージ.ts"',
+      '@@ -1,2 +1,1 @@',
+      "-  | 'challenge_aligned'",
+    ].join('\n')
+    expect(computeMaterialitySignals(diff).map((s) => s.file)).toEqual(['apps/api/src/ステージ.ts'])
+  })
+
+  const signals = computeMaterialitySignals(fileDiff('apps/api/src/x.ts', ["-  | 'challenge_aligned'"]))
+  const sid = signals[0].id
+  const candidate = { id: 'c1', kind: 'removes', subject: 'mechanism', mechanism: 'm', file: 'apps/api/src/x.ts', evidence: 'e' }
+
+  it('detection: 同じ signal への disposition の重複・未知の signal id は不成立', () => {
+    const dup = { material: true, candidates: [candidate], signalDisposition: [
+      { signalId: sid, disposition: 'supports_candidate:c1', reason: '' },
+      { signalId: sid, disposition: 'unrelated', reason: '' },
+    ] }
+    expect(parseDetection(JSON.stringify(dup), signals)).toEqual({ ok: false, reason: 'duplicate_disposition' })
+    const unknown = { material: true, candidates: [candidate], signalDisposition: [
+      { signalId: sid, disposition: 'supports_candidate:c1', reason: '' },
+      { signalId: 'ffffffffffff', disposition: 'unrelated', reason: '' },
+    ] }
+    expect(parseDetection(JSON.stringify(unknown), signals)).toEqual({ ok: false, reason: 'unknown_signal' })
+  })
+
+  it('evaluation: moved なのに newOwner が無ければ不成立', () => {
+    const body = { evaluations: [{
+      candidateId: 'c1', responsibility: 'moved', newOwner: null, recordConsistency: 'no_record',
+      ceoDirectedProvenance: 'unknown', provenanceEvidence: '', correctness: '', simplicity: '', naturalness: '',
+    }] }
+    expect(parseEvaluation(JSON.stringify(body), [{ ...candidate, kind: 'removes', subject: 'mechanism' }]))
+      .toEqual({ ok: false, reason: 'moved_without_owner' })
+  })
+})

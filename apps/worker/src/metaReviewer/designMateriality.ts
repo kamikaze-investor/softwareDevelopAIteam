@@ -77,7 +77,8 @@ export function splitUnifiedDiff(diff: string): FileDiff[] {
   let current: FileDiff | undefined
   let inHunk = false
   for (const raw of diff.split(/\r?\n/)) {
-    const header = raw.match(/^diff --git a\/(.+?) b\/(.+)$/)
+    // 特殊文字を含む path は git が `"a/…" "b/…"` と quote する
+    const header = raw.match(/^diff --git "?a\/(.+?)"? "?b\/(.+?)"?$/)
     if (header) {
       current = { path: header[2], deleted: false, lines: [] }
       files.push(current)
@@ -88,6 +89,7 @@ export function splitUnifiedDiff(diff: string): FileDiff[] {
     if (!inHunk) {
       if (raw.startsWith('deleted file mode')) current.deleted = true
       if (raw.startsWith('--- a/') && current.deleted) current.path = raw.slice(6)
+      if (raw.startsWith('--- "a/') && current.deleted) current.path = raw.slice(7).replace(/"$/, '')
       if (raw.startsWith('@@')) { inHunk = true; current.lines.push(null) }
       continue
     }
@@ -104,9 +106,9 @@ type ContractSubtype = 'union' | 'enum' | 'case' | 'map'
  * 1 file の hunk 行から、契約メンバーを side（'-' / '+'）ごとに抜き出す。
  * enum / exported const object の block は、hunk 内に見えている opener（context 行を含む）から追う近似。
  */
-function contractMembers(lines: ReadonlyArray<string | null>): { removed: Map<string, string>; added: Set<string> } {
-  const removed = new Map<string, string>()
-  const added = new Set<string>()
+function contractMembers(lines: ReadonlyArray<string | null>): { removed: Map<string, ContractCount>; added: Map<string, number> } {
+  const removed = new Map<string, ContractCount>()
+  const added = new Map<string, number>()
   // side ごとに block 状態を持つ（'-' 側の block と '+' 側の block は別物）
   const block: Record<'-' | '+', ContractSubtype | undefined> = { '-': undefined, '+': undefined }
   for (const line of lines) {
@@ -124,7 +126,17 @@ function contractMembers(lines: ReadonlyArray<string | null>): { removed: Map<st
     const caseArm = body.match(/^\s*case\s+(['"])([^'"\n]{1,120})\1\s*:/)
     if (caseArm) found.push(['case', caseArm[2]])
 
+    // 1行 enum（`enum Stage { Critic, Challenge }`）は opener と member が同じ行にある
+    const inlineEnum = body.match(/\benum\s+\w+\s*\{([^}]*)\}/)
+    if (inlineEnum) {
+      for (const member of inlineEnum[1].split(',')) {
+        const m = member.match(/^\s*([A-Za-z_]\w*)/)
+        if (m) found.push(['enum', m[1]])
+      }
+    }
+
     for (const side of sides) {
+      if (inlineEnum) break
       const opened = /\benum\s+\w+\s*\{/.test(body)
         ? 'enum'
         : /^\s*export\s+const\s+\w+(\s*:\s*[^=]+)?\s*=\s*\{\s*$/.test(body)
@@ -145,11 +157,19 @@ function contractMembers(lines: ReadonlyArray<string | null>): { removed: Map<st
     if (sign === ' ') continue
     for (const [subtype, token] of found) {
       const key = `${subtype}:${token}`
-      if (sign === '-') { if (!removed.has(key)) removed.set(key, token) } else added.add(key)
+      if (sign === '-') {
+        const entry = removed.get(key)
+        if (entry) entry.count++
+        else removed.set(key, { token, count: 1 })
+      } else {
+        added.set(key, (added.get(key) ?? 0) + 1)
+      }
     }
   }
   return { removed, added }
 }
+
+interface ContractCount { token: string; count: number }
 
 /**
  * unified diff から S1–S4 を決定的に計算する。
@@ -182,7 +202,8 @@ export function computeMaterialitySignals(diff: string): MaterialitySignal[] {
     if (file.deleted) push('source_file_deleted', file.path, file.path)
 
     const { removed, added } = contractMembers(file.lines)
-    for (const [key, token] of removed) if (!added.has(key)) push('contract_member_removed', file.path, token)
+    // 個数で相殺する（同じ case arm を2つ消して1つ足したなら、1つ消えている）
+    for (const [key, { token, count }] of removed) if (count > (added.get(key) ?? 0)) push('contract_member_removed', file.path, token)
 
     const removedComments = new Map<string, string>()
     const addedComments = new Set<string>()
@@ -325,7 +346,9 @@ export function capDiff(diff: string, limit = MAX_DETECTION_DIFF_CHARS): CappedD
   // file header だけで上限を超える（file 数が極端に多い）場合の最終 fallback: 先頭から上限で切る
   const joined = parts.join('\n')
   const marker = '\n[… truncated: diff exceeds cap even after per-file allocation …]'
-  const text = joined.length <= limit ? joined : `${joined.slice(0, limit - marker.length)}${marker}`
+  const text = joined.length <= limit
+    ? joined
+    : limit > marker.length ? `${joined.slice(0, limit - marker.length)}${marker}` : joined.slice(0, Math.max(0, limit))
   return { text, truncated: true, truncatedFiles }
 }
 
@@ -478,6 +501,9 @@ export function parseDetection(raw: string, signals: readonly MaterialitySignal[
     dispositions.push({ signalId: d.signalId, disposition: d.disposition, reason: d.reason })
   }
   const answered = new Set(dispositions.map((d) => d.signalId))
+  if (answered.size !== dispositions.length) return { ok: false, reason: 'duplicate_disposition' }
+  const known = new Set(signals.map((s) => s.id))
+  if (dispositions.some((d) => !known.has(d.signalId))) return { ok: false, reason: 'unknown_signal' }
   const required = signals.filter((s) => s.kind !== 'behavior_test_removed')
   if (required.some((s) => !answered.has(s.id))) return { ok: false, reason: 'signal_not_disposed' }
 
@@ -513,6 +539,8 @@ export function parseEvaluation(raw: string, candidates: readonly MaterialityCan
       || typeof e.simplicity !== 'string' || typeof e.naturalness !== 'string') {
       return { ok: false, reason: 'invalid_evaluation' }
     }
+    // moved は移り先を名指しできて初めて moved である
+    if (e.responsibility === 'moved' && !isString(e.newOwner)) return { ok: false, reason: 'moved_without_owner' }
     out.push({
       candidateId: e.candidateId,
       responsibility: e.responsibility,
