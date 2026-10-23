@@ -3,6 +3,7 @@ import type { MaterialityObservation } from '../src/metaReviewer/designMateriali
 import {
   buildFrame,
   classifyApiError,
+  correctnessFlags,
   promptVersion,
   inputFingerprint,
   runState,
@@ -192,5 +193,31 @@ describe('promptVersion', () => {
   it('instructions が変われば版が変わる', () => {
     expect(promptVersion({ detection: 'a', evaluation: 'b' })).not.toEqual(promptVersion({ detection: 'a2', evaluation: 'b' }))
     expect(promptVersion({ detection: 'a', evaluation: 'b' }).detection).toMatch(/^[0-9a-f]{12}$/)
+  })
+})
+
+describe('correctnessFlags（狭い予測）', () => {
+  const evaluation = (over: Record<string, unknown>) => ({
+    candidateId: 'c1', responsibility: 'preserved', newOwner: null, recordConsistency: 'consistent',
+    ceoDirectedProvenance: 'no', provenanceEvidence: '', correctness: '', simplicity: '', naturalness: '', ...over,
+  })
+  const obs = (kind: string, over: Record<string, unknown>, status: 'ok' | 'unavailable' = 'ok'): MaterialityObservation => ({
+    schemaVersion: 1, status, signals: [], excerpts: [],
+    detection: { material: true, candidates: [{ id: 'c1', kind: kind as 'removes', subject: 'mechanism', mechanism: 'm', file: 'f', evidence: '' }], signalDisposition: [] },
+    evaluations: [evaluation(over) as never],
+  })
+
+  it.each([
+    ['lost', 'removes', { responsibility: 'lost' }, true],
+    ['記録と食い違う', 'redefines', { responsibility: 'moved', newOwner: 'x', recordConsistency: 'contradicts_unupdated_record' }, true],
+    ['CEO 指示で preserved 以外', 'replaces', { responsibility: 'unclear', ceoDirectedProvenance: 'yes' }, true],
+    ['preserved（改名）', 'replaces', { responsibility: 'preserved' }, false],
+    ['追加だけ', 'introduces', { responsibility: 'lost' }, false],
+  ])('%s → %s', (_label, kind, over, expected) => {
+    expect(correctnessFlags(obs(kind, over))).toBe(expected)
+  })
+
+  it('評価が得られていない run は false', () => {
+    expect(correctnessFlags(obs('removes', { responsibility: 'lost' }, 'unavailable'))).toBe(false)
   })
 })

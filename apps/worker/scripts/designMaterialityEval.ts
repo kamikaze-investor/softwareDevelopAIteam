@@ -385,6 +385,11 @@ export interface Label {
   material: boolean
   /** material のうち、既存のものに触れず新しいものを足すだけ（`introduces` のみ）の commit */
   introducesOnly?: boolean
+  /**
+   * 狭い正解（M4 が問題にする類）: 記録された・CEO 指示の既存の責務や機構を、消す / 替える / 意味を変えて、
+   * 記録どおりに果たされなくなる変更。または Authority 境界の変更。PR #404 の e405c7c7 がこれにあたる
+   */
+  approvedResponsibilityAtRisk?: boolean
 }
 
 export type RunState = 'target_detected' | 'not_detected' | 'candidates_present' | 'no_candidates' | 'unavailable'
@@ -448,6 +453,22 @@ const PREDICTORS: Record<string, Predictor> = {
   // unavailable は「未検出」として数える（落とさない）
   llm: (o) => o.status === 'ok' && (o.detection?.material ?? false),
   llmOrSignal: (o, k) => k.length > 0 || (o.status === 'ok' && (o.detection?.material ?? false)),
+  // correctness の判定から作る狭い予測（M4 が条件にするなら、この形になる）
+  correctnessFlag: (o) => correctnessFlags(o),
+}
+
+/**
+ * correctness が「記録された責務が失われる・記録と食い違う・CEO 指示の設計を保たない」と判定した候補があるか。
+ * 追加（introduces）だけの候補は数えない。評価が得られていない run は false（未検出として数える）。
+ */
+export function correctnessFlags(o: MaterialityObservation): boolean {
+  if (o.status !== 'ok') return false
+  const kindOf = new Map((o.detection?.candidates ?? []).map((c) => [c.id, c.kind]))
+  return (o.evaluations ?? []).some((e) => kindOf.get(e.candidateId) !== 'introduces' && (
+    e.responsibility === 'lost'
+    || e.recordConsistency === 'contradicts_unupdated_record'
+    || (e.ceoDirectedProvenance === 'yes' && e.responsibility !== 'preserved')
+  ))
 }
 
 /**
@@ -473,6 +494,7 @@ export function scoreFrame(frame: Frame, labels: readonly Label[], records: read
     all: { include: () => true, actual: (l) => l.material },
     primary: { include: (l) => !(l.material && l.introducesOnly === true), actual: (l) => l.material },
     introduces: { include: (l) => l.material && l.introducesOnly === true, actual: () => true },
+    narrow: { include: (l) => l.approvedResponsibilityAtRisk !== undefined, actual: (l) => l.approvedResponsibilityAtRisk === true },
   }
   const metrics: Record<string, Record<string, unknown>> = {}
   for (const [view, { include, actual }] of Object.entries(views)) {
