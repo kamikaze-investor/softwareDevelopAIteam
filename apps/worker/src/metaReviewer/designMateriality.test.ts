@@ -365,3 +365,10 @@ describe('独立レビュー指摘（code review round 1）の回帰', () => {
       .toEqual({ ok: false, reason: 'moved_without_owner' })
   })
 })
+
+describe('独立レビュー指摘（code review round 2）の回帰', () => {
+  it('1行 enum の初期化子文字列内の `,` で member を切らない', () => {
+    const diff = fileDiff('apps/api/src/x.ts', ['-export enum E { A = "x,y", B }', '+export enum E { A = "x,z", B }'])
+    expect(computeMaterialitySignals(diff)).toEqual([])
+  })
+})

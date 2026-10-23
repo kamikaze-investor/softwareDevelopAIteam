@@ -289,7 +289,7 @@ export interface DetectionRecord {
   kind: 'frame' | 'positive' | 'mutant'
   run: number
   model: string
-  /** sha256(model | 両 prompt 本文 | diff | base)。同じ item の repeat が同じ入力かを確かめる */
+  /** sha256(model | 両 prompt 本文 | title | diff | base)。同じ item の repeat が同じ入力かを確かめる */
   inputFingerprint: string
   /** cost: 待機時間と prompt の大きさ（detection + correctness） */
   latencyMs: number
@@ -297,9 +297,9 @@ export interface DetectionRecord {
   observation: MaterialityObservation
 }
 
-export function inputFingerprint(parts: { model: string; detection: string; evaluation: string; diff: string; base: string }): string {
+export function inputFingerprint(parts: { model: string; detection: string; evaluation: string; title: string; diff: string; base: string }): string {
   return createHash('sha256')
-    .update([parts.model, parts.detection, parts.evaluation, parts.diff, parts.base].join('\u0000'))
+    .update([parts.model, parts.detection, parts.evaluation, parts.title, parts.diff, parts.base].join('\u0000'))
     .digest('hex')
 }
 
@@ -454,7 +454,10 @@ export function scoreRepeatability(items: readonly RepeatItem[], records: readon
   const out = items.map((item) => {
     const runs = records.filter((r) => r.itemId === item.itemId).sort((a, b) => a.run - b.run)
     const fingerprints = new Set(runs.map((r) => r.inputFingerprint))
-    const invalid = runs.length !== expectedRuns ? 'run_count' : fingerprints.size > 1 ? 'mixed_inputs' : null
+    // run 番号はちょうど 0..expectedRuns-1 を1本ずつ（[0,0,1] は run 2 の欠落）
+    const runIds = runs.map((r) => r.run).join(',')
+    const expectedIds = Array.from({ length: expectedRuns }, (_, i) => i).join(',')
+    const invalid = runIds !== expectedIds ? 'run_count' : fingerprints.size > 1 ? 'mixed_inputs' : null
     const states = runs.map((r) => runState(r.observation, item.target))
     const detected = item.target === undefined ? [] : runs.filter((_r, i) => states[i] === 'target_detected')
     const evaluated = detected.flatMap((r) => {
@@ -468,7 +471,9 @@ export function scoreRepeatability(items: readonly RepeatItem[], records: readon
       runs: runs.length,
       states,
       flipped: new Set(states).size > 1,
+      // detection の失敗（run state）と、correctness を含むどこかの失敗（observation.status）を分けて数える
       unavailableRuns: states.filter((s) => s === 'unavailable').length,
+      anyUnavailableRuns: runs.filter((r) => r.observation.status !== 'ok').length,
       targetHitRate: item.target ? states.filter((s) => s === 'target_detected').length / Math.max(1, runs.length) : null,
       expectCandidate: item.expectCandidate ?? null,
       responsibilities: evaluated,
@@ -484,6 +489,7 @@ export function scoreRepeatability(items: readonly RepeatItem[], records: readon
     invalidItems: out.length - valid.length,
     flipRate: valid.length === 0 ? null : valid.filter((o) => o.flipped).length / valid.length,
     unavailableRunRate: totalRuns === 0 ? null : valid.reduce((n, o) => n + o.unavailableRuns, 0) / totalRuns,
+    anyUnavailableRunRate: totalRuns === 0 ? null : valid.reduce((n, o) => n + o.anyUnavailableRuns, 0) / totalRuns,
   }
 }
 
@@ -554,7 +560,7 @@ async function main(): Promise<void> {
       })
       : [])
     const record = async (kind: DetectionRecord['kind'], itemId: string, run: number, title: string, diff: string, base: string) => {
-      const fingerprint = inputFingerprint({ model, detection: instructions.detection, evaluation: instructions.evaluation, diff, base })
+      const fingerprint = inputFingerprint({ model, detection: instructions.detection, evaluation: instructions.evaluation, title, diff, base })
       if (done.has(`${kind}:${itemId}:${run}:${fingerprint}`)) return
       promptChars = 0
       const started = Date.now()
@@ -591,7 +597,8 @@ async function main(): Promise<void> {
       const sorted = values.slice().sort((x, y) => x - y)
       return sorted[Math.floor(q * (sorted.length - 1))]
     }
-    // M4 の推奨はこの数値を読んだ人（PL / CEO）が出す。script は数値だけを出す
+    // M4 の推奨はこの数値を読んだ人（PL / CEO）が出す。script は数値だけを出す。
+    // token 数は geminiClient が usage を返さないため取れない。prompt 文字数を代理指標にする
     const report = {
       schemaVersion: DESIGN_MATERIALITY_SCHEMA_VERSION,
       evalScriptVersion: EVAL_SCRIPT_VERSION,

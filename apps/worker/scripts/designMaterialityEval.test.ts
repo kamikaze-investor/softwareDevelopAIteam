@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { MaterialityObservation } from '../src/metaReviewer/designMateriality.js'
 import {
   buildFrame,
+  inputFingerprint,
   runState,
   sampleWithoutReplacement,
   scoreRepeatability,
@@ -144,5 +145,28 @@ describe('独立レビュー指摘（code review round 1）の回帰', () => {
 
   it('A3: target の file は完全一致（無関係な file の候補は target 検出にならない）', () => {
     expect(runState(observation([{ file: 'apps/api/src/unrelated.ts', mechanism: 'challenge' }]), target)).toBe('not_detected')
+  })
+})
+
+describe('独立レビュー指摘（code review round 2）の回帰', () => {
+  const target = { files: ['apps/api/src/pl/conflictResolutionStep.ts'], mechanismKeywords: ['challenge'] }
+  const rec = (run: number, observation: MaterialityObservation): DetectionRecord =>
+    ({ itemId: 'p', kind: 'positive', run, model: 'm', inputFingerprint: 'fp', latencyMs: 0, promptChars: 0, observation })
+  const detected = (status: 'ok' | 'unavailable'): MaterialityObservation =>
+    ({ ...observation([{ file: target.files[0], mechanism: 'challenge' }]), status, evaluations: status === 'ok' ? [] : undefined })
+
+  it('run 番号 [0,0,1] は run 2 の欠落として invalid', () => {
+    const result = scoreRepeatability([{ itemId: 'p', target }], [rec(0, detected('ok')), rec(0, detected('ok')), rec(1, detected('ok'))], 3)
+    expect(result.items[0].invalid).toBe('run_count')
+  })
+
+  it('correctness だけの timeout も anyUnavailableRunRate に出る', () => {
+    const result = scoreRepeatability([{ itemId: 'p', target }], [0, 1, 2].map((run) => rec(run, detected('unavailable'))), 3)
+    expect(result).toMatchObject({ unavailableRunRate: 0, anyUnavailableRunRate: 1 })
+  })
+
+  it('fingerprint は title を含む', () => {
+    const base = { model: 'm', detection: 'd', evaluation: 'e', diff: 'x', base: 'b' }
+    expect(inputFingerprint({ ...base, title: 'a' })).not.toBe(inputFingerprint({ ...base, title: 'b' }))
   })
 })
