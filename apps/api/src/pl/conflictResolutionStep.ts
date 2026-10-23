@@ -58,6 +58,7 @@ import {
 } from '../ctoAi/initialImplementWorkflow'
 import { extractImplementationScope, extractItemDescription } from '../ctoAi/roadmapAdoption'
 import type { DesignReviewRun, IStorage } from '../storage/interface'
+import { configuredTargetRoot } from '../utils/pathGuard'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { ADOPTION_REPOSITORY_MAP, resolveLedgerPath } from './adoptionStep'
 import {
@@ -675,7 +676,9 @@ async function runCriticRound(
         priorRevisions: priorRevisionSummaries(storage, taskId),
       }),
     ].join('\n'),
-    workingDir: process.env.TARGET_ROOT ?? runnerDeps.workingDir,
+    // AI CLI は TARGET_ROOT 配下でしか動かない（AiCliAdapter の workingDir 検査）。TARGET_ROOT 未設定時の
+    // fallback を Stable の repoRoot にすると Production では必ず拒否される（2026-10-23 実測）。
+    workingDir: configuredTargetRoot(),
     useLegacyLandlockSandbox: candidate.provider === 'codex',
   })
 
