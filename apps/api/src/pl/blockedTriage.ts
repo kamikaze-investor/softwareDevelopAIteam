@@ -70,12 +70,7 @@ import {
   type HumanRecoveryNextDriver,
 } from '../humanRecovery/recoverBlockedTask'
 import type { AuditLogEntry, GateTechnicalStopCode, Job } from '@ai-team/shared'
-import {
-  SAFE_COMMAND_TIMEOUT_FAILURE_KIND,
-  gateTechnicalStopCodeOfJob,
-  isLiveApprovedApproval,
-  isLiveWaitingApproval,
-} from '@ai-team/shared'
+import { gateTechnicalStopCodeOfJob, isLiveApprovedApproval, isLiveWaitingApproval } from '@ai-team/shared'
 import type { DesignReviewRun, IStorage } from '../storage/interface'
 import { isUsableAlignedEvidence } from '../designReviewEvidencePolicy'
 import { retryStepKeyFor } from '../designReview/repairPolicy'
@@ -92,13 +87,9 @@ import {
 
 /**
  * 技術停止の理由コード。Worker が stderr に残す Gate の理由コード（rule 6.8）に加え、
- * 理由コードの無い「承認済み git_commit の Gate 段階の拒否」（rule 6.9）と、
- * Worker が `failureMetadata.kind` に構造化して残した SafeCommand の実行予算切れ（rule 6.1）を持つ。
+ * 理由コードの無い「承認済み git_commit の Gate 段階の拒否」（rule 6.9）を表す値を1つだけ持つ。
  */
-export type TechnicalStopCode =
-  | GateTechnicalStopCode
-  | 'approved_commit_gate_refusal'
-  | typeof SAFE_COMMAND_TIMEOUT_FAILURE_KIND
+export type TechnicalStopCode = GateTechnicalStopCode | 'approved_commit_gate_refusal'
 
 /** 解決レーン。**増やさない。** 分類を増やす前に、既存4つで表せないかを先に疑うこと。 */
 export const BLOCKED_LANES = [
@@ -956,46 +947,6 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
       confidence: 'high',
       recommendedLane: 'auto_recovery',
       summary: 'provider の一時障害で止まっている。既存 policy が retry 可能と定めている形である。',
-    }
-  }
-
-  // ── 6.1 SafeCommand の実行予算切れ（2026-10-23 implement stall）──────────────
-  //
-  // AI CLI の後の SafeCommand（test / build / typecheck 等）が kind 別の実行予算で containment に
-  // kill された。Worker は containment の timedOut から `failureMetadata.kind='safe_command_timeout'` を
-  // 構造化して保存する（stderr は解析しない）。これは Decision Authority の判断ではなく技術停止なので、
-  // 既定の `unknown → ceo_escalation` へ落とさない（2026-10-23 production: 全件 pass する 147s の
-  // `pnpm test` が 120s 予算で kill され、純粋な技術失敗が CEO へ上がった）。
-  // 自動 resume は同じ予算で同じ停止を繰り返すだけなので行わない。rule 6.8 / 6.9 と同じく
-  // 技術レーン（auto_recovery）+ `technicalStop` とし、PL は既存の `technical_exhausted`
-  // （対象単位・重複排除・理由コードつき）として記録して見せ続ける。原因（予算 / テスト構成）を直した後の
-  // 明示 resume が出口。生きている Job があるなら、その結果を待つ（ここでは扱わない）。
-  if (
-    facts.job?.failureMetadata?.kind === SAFE_COMMAND_TIMEOUT_FAILURE_KIND
-    && facts.job.status === 'failed'
-    && !hasLiveJob(facts)
-  ) {
-    return {
-      ...result,
-      rootCauseClass: 'unknown',
-      blockingLayer: 'unknown',
-      evidence: [
-        {
-          fact: 'job.failureMetadata',
-          id: facts.job.id,
-          value: `kind=${SAFE_COMMAND_TIMEOUT_FAILURE_KIND} safeCommand=${facts.job.safeCommand.kind}`,
-        },
-      ],
-      recoverable: false,
-      existingRecoveryAvailable: true,
-      requiresAuthorityChange: false,
-      confidence: 'high',
-      recommendedLane: 'auto_recovery',
-      technicalStop: SAFE_COMMAND_TIMEOUT_FAILURE_KIND,
-      summary:
-        `SafeCommand（${facts.job.safeCommand.kind}）が実行予算を超えて containment に停止された。`
-        + '実装の修正でも自動 resume でも予算は変わらない技術停止で、CEO 判断も求めない（技術停止として見せ続ける）。'
-        + '原因（実行予算・テスト構成）を直した後に resume すれば再開できる。',
     }
   }
 

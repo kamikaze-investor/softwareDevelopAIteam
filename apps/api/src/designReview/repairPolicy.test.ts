@@ -290,6 +290,26 @@ describe('decideRepairAction — safe_command_timeout', () => {
     expect(decision.action).toBe('repair')
   })
 
+  it('boundary: a repeated timeout at MAX_REPAIR_ATTEMPTS depth reports technical_timeout_repeated, not attempt_limit', () => {
+    const built = chain(MAX_REPAIR_ATTEMPTS, (i) => (i === MAX_REPAIR_ATTEMPTS - 1 ? TIMEOUT_1 : { exitCode: i, stderr: `distinct ${i}` }))
+    const decision = decideRepairAction(built.tip, built.jobs, TIMEOUT_2)
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.code).toBe('technical_timeout_repeated')
+  })
+
+  it('boundary: a first timeout at MAX_REPAIR_ATTEMPTS depth is still attempt_limit', () => {
+    const built = chain(MAX_REPAIR_ATTEMPTS, (i) => ({ exitCode: i, stderr: `distinct ${i}` }))
+    const decision = decideRepairAction(built.tip, built.jobs, TIMEOUT_1)
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') expect(decision.code).toBe('attempt_limit')
+  })
+
+  it('boundary: one below MAX_REPAIR_ATTEMPTS, a first timeout is still repaired', () => {
+    const built = chain(MAX_REPAIR_ATTEMPTS - 1, (i) => ({ exitCode: i, stderr: `distinct ${i}` }))
+    const decision = decideRepairAction(built.tip, built.jobs, TIMEOUT_1)
+    expect(decision.action).toBe('repair')
+  })
+
   it('regression: repeated provider_timeout keeps the existing repair behaviour (unchanged)', () => {
     const priors: PriorRepairJob[] = [
       originJob(ORIGIN_ID, PROVIDER_TIMEOUT),

@@ -1325,7 +1325,8 @@ export async function runJob(
       // 到達しないまま workspace を永久に所有し続けるため（Phase 2 の目的と両立しない）。
       // timeout 時も通常 failure として即 terminalize せず、containment kill →
       // populated=0 → git marker 確認 → reconciliation の共通 protocol を必ず通る。
-      // 予算は kind 別（test/build=600s, typecheck=300s, その他 120s。watchdog の表が正本）。
+      // 予算は kind 別の kill budget（test/build=600s, typecheck=300s, その他 120s）。
+      // watchdog の alert 閾値とは別の policy 値（execution/safeCommandTimeout.ts）。
       // 一律 120s では全件 pass する 147s の `pnpm test` が毎回 kill された（2026-10-23）。
       const timeoutMs = safeCommandTimeoutMs(job.safeCommand.kind)
       const contained = await runContainedOrThrow({

@@ -1,9 +1,6 @@
 import type { CommandKind } from '@ai-team/shared'
 
-/**
- * CommandKind ごとのスタル判定閾値（ms）。
- * SafeCommand の実行予算（`execution/safeCommandTimeout.ts`）もこの表を正本として使う（複製しない）。
- */
+/** CommandKind ごとのスタル判定閾値（ms） */
 const STALL_THRESHOLDS_MS: Record<CommandKind, number> = {
   git_status:       30_000,   //  30s — 超高速なはず
   git_diff:         30_000,   //  30s

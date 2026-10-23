@@ -784,25 +784,16 @@ export function decideRepairAction(
     }
   }
 
-  if (walk.depth >= MAX_REPAIR_ATTEMPTS) {
-    return {
-      action: 'escalate',
-      reason: `repair attempts reached the limit (${MAX_REPAIR_ATTEMPTS})`,
-      signature,
-      code: 'attempt_limit',
-      generation: toRepairGeneration(walk),
-    }
-  }
-
   // **SafeCommand の実行予算切れは、同じ generation で 2 回目を repair しない。**
   //
   // `safe_command_timeout` は Worker が containment の timedOut から構造化して保存する（stderr は見ない）。
   // 1 回目は実装が無限ループ等を持ち込んだ可能性があるので通常どおり 1 回 repair を許す。
   // しかし 2 回目は「実装を直しても予算は変わらない」技術停止である可能性が高く、
   // 同じ予算で同じ SafeCommand を最大 3 回繰り返すだけになる（2026-10-23 production: 全件 pass する
-  // 147s の `pnpm test` を 120s 予算で 3 repair 繰り返した）。既存の escalate（repair を作らず blocked）へ渡し、
-  // その後は blockedTriage が技術レーン（technical_exhausted、CEO へは上げない）として扱う。
+  // 147s の `pnpm test` を 120s 予算で 3 repair 繰り返した）。既存の escalate（repair を作らず Task を blocked、
+  // `job_failed` は attention に残る）へ渡す。Triage の扱いは変えない。
   // 根（origin / resume 根）も同じ generation の試行として数える。起点自身は数えない。
+  // **一般の attempt_limit より先に評価する**（上限の深さで 2 回目の timeout が来ても理由を取り違えない）。
   if (newFacts.failureKind === SAFE_COMMAND_TIMEOUT_FAILURE_KIND) {
     const generationJobIds = new Set([walk.rootJobId, ...walk.generationRepairJobIds])
     generationJobIds.delete(sourceJobId)
@@ -820,6 +811,16 @@ export function decideRepairAction(
         code: 'technical_timeout_repeated',
         generation: toRepairGeneration(walk),
       }
+    }
+  }
+
+  if (walk.depth >= MAX_REPAIR_ATTEMPTS) {
+    return {
+      action: 'escalate',
+      reason: `repair attempts reached the limit (${MAX_REPAIR_ATTEMPTS})`,
+      signature,
+      code: 'attempt_limit',
+      generation: toRepairGeneration(walk),
     }
   }
 
