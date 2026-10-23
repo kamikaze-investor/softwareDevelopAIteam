@@ -360,6 +360,19 @@ describe('evaluateGitCommitEvidence — Design Review の判定反転（design_r
     expect(evaluateGitCommitEvidence(chain.storage, chain.input)).toEqual({ passed: true })
   })
 
+  it('lineage を辿れない resume:<anchor>:1 の git_commit でも、判定反転を design_review_reversed として足す', () => {
+    const chain = seedChain({ designReviewRuns: [{ outcome: 'conflict' }, { outcome: 'aligned' }] })
+    const resumed = { ...chain.gitCommitJob, workflowStepKey: `resume:${chain.gitCommitJob.id}:1` }
+    expect(failuresOf(chain, { gitCommitJob: resumed }))
+      .toEqual(['review_lineage_unresolved', 'design_review_reversed'])
+  })
+
+  it('反転の無い resume:<anchor>:1 の git_commit には design_review_reversed を足さない', () => {
+    const chain = seedChain({ designReviewRuns: [{ outcome: 'aligned' }] })
+    const resumed = { ...chain.gitCommitJob, workflowStepKey: `resume:${chain.gitCommitJob.id}:1` }
+    expect(failuresOf(chain, { gitCommitJob: resumed })).toEqual(['review_lineage_unresolved'])
+  })
+
   it('判定の無い run（REVIEW_UNAVAILABLE / failed）は否定に数えない', () => {
     const chain = seedChain({
       designReviewRuns: [{ outcome: 'unavailable' }, { outcome: 'failed' }, { outcome: 'aligned' }],

@@ -188,6 +188,16 @@ export function evaluateGitCommitEvidence(
     failures.length === 0
       ? { passed: true }
       : { passed: false, reason: 'insufficient_safety_evidence', failures }
+  // lineage を辿れずに打ち切る経路（`resume:<anchor>:N` の git_commit 等）でも、同じ設計での Design Review
+  // 判定反転は DA trigger (7) として開示する。既に fail closed している経路にだけ失敗を足す（通す方向には働かない）。
+  // implement Job を特定できないので、Task の最新 evidence（ALIGNED のときだけ）で判定する。
+  const earlyResult = (): GitCommitEvidenceResult => {
+    const latest = storage.designReviewEvidence.findLatestByTaskId(input.task.id)
+    if (latest?.decision === 'ALIGNED' && hasEarlierNegativeDesignReviewRun(storage, latest)) {
+      fail('design_review_reversed')
+    }
+    return result()
+  }
 
   const { gitCommitJob, task, targetCommit, targetDiffHash } = input
 
@@ -231,7 +241,7 @@ export function evaluateGitCommitEvidence(
   const stepMatch = GIT_COMMIT_STEP_KEY.exec(gitCommitJob.workflowStepKey ?? '')
   if (!stepMatch) {
     fail('review_lineage_unresolved')
-    return result()
+    return earlyResult()
   }
   const reviewJob = storage.jobs.findById(stepMatch[1] as string)
   if (
@@ -241,7 +251,7 @@ export function evaluateGitCommitEvidence(
     || reviewJob.aiCliMode !== 'review'
   ) {
     fail('review_job_invalid')
-    return result()
+    return earlyResult()
   }
 
   // review result は、その review Job 自身のものが 1 件だけ
@@ -276,7 +286,7 @@ export function evaluateGitCommitEvidence(
   const reviewed = resolveReviewedImplementation(storage, reviewJob.id)
   if (!reviewed.ok) {
     fail('implementation_unresolved')
-    return result()
+    return earlyResult()
   }
   // resume を挟んだ review は、implement 終了から review 開始までの間に worktree が変わり得る。
   // Stage 1 では対象外とする（範囲を狭める方向の制限）。

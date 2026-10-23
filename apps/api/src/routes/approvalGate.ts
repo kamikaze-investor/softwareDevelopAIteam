@@ -50,8 +50,11 @@ import { gateEvaluationRoutes } from './gateEvaluations'
 // v3（2026-10-16 監査 RC4/RC6）: 承認を requestedAction 単位に束縛し、SAFE_WORK の HIGH には承認依頼を
 // 作らず、RISK_RULES の HIGH 対象に commitGate.ts（K-2）と docs/project_memory/rules/**（K-1）だけを足した。
 // 2026-10-17 の authority・admission・recovery 定義ファイルへの拡張は Risk と Authority の混同として取り下げた。
-// v2 の evidence を読む側（roadmapAdoption の Candidate commit 証明）は v2 / v3 の両方を受け付ける。
-export const GATE_POLICY_VERSION = 'gate-policy-v3'
+// v4（2026-10-23）: 同じ設計（同じ designTextHash）への Design Review が CONFLICT / UNCERTAIN の後に
+// ALIGNED へ反転した git_commit を `design_review_reversed` で人間承認へ fail closed し、DA trigger (7) の
+// 「review verdict disagreement」ラベルを付ける（resume chain の git_commit でも付ける）。ALLOW は厳しくなる方向のみ。
+// evidence を読む側（roadmapAdoption の Candidate commit 証明）は v2 / v3 / v4 を受け付ける。
+export const GATE_POLICY_VERSION = 'gate-policy-v4'
 
 /** 承認 PATCH が期限切れの WAITING を決定しなかったときの 409 `code`（Mobile が文言へ写す）。 */
 const APPROVAL_EXPIRED_CODE = 'APPROVAL_EXPIRED'
