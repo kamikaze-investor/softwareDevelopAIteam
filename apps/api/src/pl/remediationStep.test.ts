@@ -25,6 +25,8 @@ import {
   findRemediationSubject,
   stageEntries,
   PL_MAX_REMEDIATION_ATTEMPTS,
+  PL_MAX_TECHNICAL_FAILURES_PER_STAGE,
+  tallyConflictStage,
   REMEDIATION_SYSTEM_PROMPT,
   buildRemediationPrompt,
   runRemediationStep,
@@ -528,7 +530,7 @@ describe('著者の独立性 — 自分の却下案を自分で書き直させ�
     expect(used).toEqual(['codex', 'claude_code'])
   })
 
-  it('両 flagship を使い切ったら no_independent_model で止まる（弱い model へ落ちない）', async () => {
+  it('両 flagship が runner_failed しただけなら著者ではないので no_independent_model にならない', async () => {
     const { storage, taskId } = seedConflictedTask()
     // provenance だけを2件置き、両 provider が既に使われた状態を作る。
     for (const provider of ['codex', 'claude_code']) {
@@ -539,7 +541,88 @@ describe('著者の独立性 — 自分の却下案を自分で書き直させ�
       })
     }
 
-    // 予算も尽きているので、まず attempts_exhausted で止まることを確かめる。
+    // runner_failed は判定でも著者でもない（2026-10-23 `#2cae0d07`）。判定予算は残り、
+    // 両 provider とも提案を書いていないので著者として除外されず、flagship を選んで実行できる。
+    let selected: string | undefined
+    const result = await runRemediationStep(storage, taskId, deps({
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async (raw: string) => {
+          selected = (JSON.parse(raw) as { provider: string }).provider
+          return { ok: true, stdout: JSON.stringify({ ...PROPOSAL, abandon: true }), timedOut: false }
+        },
+      },
+    }))
+
+    expect(result.status).toBe('abandon_recommended')
+    expect(result.failureCode).not.toBe('no_independent_flagship')
+    expect(['codex', 'claude_code']).toContain(selected)
+  })
+
+  it('Production 形（remediation runner_failed: codex, claude_code）の3回目は flagship を選べる（runner 失敗は著者ではない）', async () => {
+    const { storage, taskId } = seedConflictedTask()
+    for (const provider of ['codex', 'claude_code']) {
+      storage.auditLog.record({
+        actor: 'api', operation: 'pl_independent_remediation', entityType: 'pl_remediation',
+        entityId: `remediate:${taskId}`, result: 'success',
+        detail: `provider=${provider} model=m vendor=v excluded=- unverified_separation=opencode-go`
+          + ' stage=remediation rejected_specs=1 outcome=runner_failed',
+      })
+    }
+    let executions = 0
+    const result = await runRemediationStep(storage, taskId, deps({
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async () => {
+          executions += 1
+          return { ok: false, stdout: '', error: 'boom', timedOut: false }
+        },
+      },
+    }))
+
+    expect(executions).toBe(1)
+    expect(result.status).toBe('remediation_failed')
+    expect(result.failureCode).toBe('runner_failed')
+  })
+
+  it('parse 済みの提案（abandon / fspec 行）を書いた provider は従来どおり著者として除外される', async () => {
+    for (const authored of [
+      'provider=codex model=m stage=remediation rejected_specs=1 outcome=abandon',
+      'provider=codex model=m stage=remediation proposed=h fspec=abc rejected_fspec=def outcome=not_different',
+    ]) {
+      const { storage, taskId } = seedConflictedTask()
+      storage.auditLog.record({
+        actor: 'api', operation: 'pl_independent_remediation', entityType: 'pl_remediation',
+        entityId: `remediate:${taskId}`, result: 'success', detail: authored,
+      })
+      const used: string[] = []
+      await runRemediationStep(storage, taskId, deps({
+        runnerDeps: {
+          runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+          execute: async (raw: string) => {
+            used.push((JSON.parse(raw) as { provider: string }).provider)
+            return { ok: false, stdout: '', error: 'boom', timedOut: false }
+          },
+        },
+      }))
+
+      expect(used).toEqual(['claude_code'])
+    }
+  })
+
+  it('両 flagship が提案を書いていたら、判定予算が尽きて attempts_exhausted で止まる', async () => {
+    const { storage, taskId } = seedConflictedTask()
+    storage.auditLog.record({
+      actor: 'api', operation: 'pl_independent_remediation', entityType: 'pl_remediation',
+      entityId: `remediate:${taskId}`, result: 'success',
+      detail: 'provider=codex model=m stage=remediation outcome=abandon',
+    })
+    storage.auditLog.record({
+      actor: 'api', operation: 'pl_independent_remediation', entityType: 'pl_remediation',
+      entityId: `remediate:${taskId}`, result: 'success',
+      detail: 'provider=claude_code model=m stage=remediation proposed=h fspec=abc rejected_fspec=- outcome=adopting',
+    })
+
     const result = await runRemediationStep(storage, taskId, deps())
 
     expect(result.status).toBe('attempts_exhausted')
@@ -692,7 +775,10 @@ describe('有界性と記録', () => {
     expect(countRemediationAttempts(storage, taskId)).toBe(1)
   })
 
-  it('上限に達したら実行せず attempts_exhausted を返す', async () => {
+  it('runner 失敗は判定予算ではなく技術的失敗上限で打ち切り、上限後は実行せず attempts_exhausted を返す', async () => {
+    // 以前は runner_failed ×PL_MAX_REMEDIATION_ATTEMPTS で判定予算が尽きていた（判定 0 件で terminal。
+    // 2026-10-23 `#2cae0d07`）。runner_failed は判定ではないので、別の上限
+    // PL_MAX_TECHNICAL_FAILURES_PER_STAGE で有界にする（無制限には再試行しない）。
     const { storage, taskId } = seedConflictedTask()
     let executions = 0
     const failing = deps({
@@ -705,13 +791,42 @@ describe('有界性と記録', () => {
       },
     })
 
-    for (let i = 0; i < PL_MAX_REMEDIATION_ATTEMPTS; i += 1) {
+    for (let i = 0; i < PL_MAX_TECHNICAL_FAILURES_PER_STAGE; i += 1) {
       await runRemediationStep(storage, taskId, failing)
     }
+    // runner 失敗は著者ではないので3回とも flagship を選んで実行し、3回とも技術的失敗として数える。
+    const tally = tallyConflictStage(storage, taskId, 'remediation')
+    expect(tally).toEqual({ judgments: 0, technicalFailures: PL_MAX_TECHNICAL_FAILURES_PER_STAGE })
+    const executionsAtCap = executions
     const beyond = await runRemediationStep(storage, taskId, failing)
+
+    expect(executions).toBe(executionsAtCap)
+    expect(beyond.status).toBe('attempts_exhausted')
+    expect(beyond.reason).toContain('technical failures exhausted the stage')
+  })
+
+  it('parse 済みの提案（abandon）は判定予算を消費し、PL_MAX_REMEDIATION_ATTEMPTS 回で attempts_exhausted', async () => {
+    const { storage, taskId } = seedConflictedTask()
+    let executions = 0
+    const abandoning = deps({
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async () => {
+          executions += 1
+          return { ok: true, stdout: JSON.stringify({ ...PROPOSAL, abandon: true }), timedOut: false }
+        },
+      },
+    })
+
+    for (let i = 0; i < PL_MAX_REMEDIATION_ATTEMPTS; i += 1) {
+      expect((await runRemediationStep(storage, taskId, abandoning)).status).toBe('abandon_recommended')
+    }
+    const beyond = await runRemediationStep(storage, taskId, abandoning)
 
     expect(executions).toBe(PL_MAX_REMEDIATION_ATTEMPTS)
     expect(beyond.status).toBe('attempts_exhausted')
+    expect(tallyConflictStage(storage, taskId, 'remediation'))
+      .toEqual({ judgments: PL_MAX_REMEDIATION_ATTEMPTS, technicalFailures: 0 })
   })
 
   it('ledger が読めない場合も試行として記録する（通知ループを作らない）', async () => {
@@ -749,6 +864,103 @@ describe('有界性と記録', () => {
     expect(entries[0]?.detail).toContain('model=gpt-5.6-sol')
     // PL の provider は vendor を解決できないので、分離を主張せず記録する。
     expect(entries[0]?.detail).toContain('unverified_separation=opencode-go')
+  })
+})
+
+describe('parse 済みの提案は後段が失敗しても判定として残る（独立レビュー P2a）', () => {
+  it('runner が ok=false でも stdout に完全な提案があれば、判定として provider 付きで数える（採用はしない）', async () => {
+    const { storage, taskId } = seedConflictedTask()
+    let adopted = false
+
+    const result = await runRemediationStep(storage, taskId, deps({
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async () => ({ ok: false, stdout: JSON.stringify(PROPOSAL), error: 'exit 1 after output', timedOut: false }),
+      },
+      adopt: async () => { adopted = true; throw new Error('must not adopt a proposal from a failed run') },
+    }))
+
+    expect(result.status).toBe('remediation_failed')
+    expect(adopted).toBe(false)
+    expect(tallyConflictStage(storage, taskId, 'remediation')).toEqual({ judgments: 1, technicalFailures: 0 })
+    const rows = stageEntries(storage, taskId, 'remediation').map((e) => e.detail ?? '')
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toContain('provider=codex')
+    expect(rows[0]).toContain('outcome=runner_failed_after_proposal')
+  })
+
+  it('runner が ok=false で stdout が空 / 不完全なら従来どおり技術的失敗', async () => {
+    for (const stdout of ['', '{"diagnosis":"途中で切れた']) {
+      const { storage, taskId } = seedConflictedTask()
+
+      await runRemediationStep(storage, taskId, deps({
+        runnerDeps: {
+          runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+          execute: async () => ({ ok: false, stdout, error: 'boom', timedOut: false }),
+        },
+      }))
+
+      expect(tallyConflictStage(storage, taskId, 'remediation')).toEqual({ judgments: 0, technicalFailures: 1 })
+    }
+  })
+
+  it('parse 後、fspec 行を書く前に storage / 認可が throw しても provider 付きの判定行を1行だけ残す', async () => {
+    const { storage, taskId } = seedConflictedTask()
+    const record = storage.auditLog.record.bind(storage.auditLog)
+    let armed = false
+    storage.auditLog.record = ((entry: Parameters<typeof record>[0]) => {
+      // 提案の parse 後、remediation 以外の audit（Gate の認可記録）が落ちる状況を作る。
+      if (armed && entry.entityType !== 'pl_remediation') throw new Error('storage unavailable')
+      return record(entry)
+    }) as typeof storage.auditLog.record
+
+    await expect(runRemediationStep(storage, taskId, deps({
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async () => { armed = true; return { ok: true, stdout: JSON.stringify(PROPOSAL), timedOut: false } },
+      },
+    }))).rejects.toThrow('storage unavailable')
+
+    const rows = stageEntries(storage, taskId, 'remediation').map((e) => e.detail ?? '')
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toContain('provider=codex')
+    expect(rows[0]).toContain('outcome=proposal_parsed_apply_exception')
+    expect(tallyConflictStage(storage, taskId, 'remediation')).toEqual({ judgments: 1, technicalFailures: 0 })
+  })
+
+  it('applyRevisedSpec が判定行（adopting）を書いた後に throw したら、追加の行を書かない（二重計上しない）', async () => {
+    const { storage, taskId } = seedConflictedTask()
+
+    await expect(runRemediationStep(storage, taskId, deps({
+      adopt: async () => { throw new Error('adoption crashed') },
+    }))).rejects.toThrow('adoption crashed')
+
+    const rows = stageEntries(storage, taskId, 'remediation').map((e) => e.detail ?? '')
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toContain('outcome=adopting')
+  })
+
+  it('壊れた応答（unusable）は判定予算を消費する（fail-closed）が、Remediation は止まらず次を試す', async () => {
+    const { storage, taskId } = seedConflictedTask()
+    storage.auditLog.record({
+      actor: 'api', operation: 'pl_independent_remediation', entityType: 'pl_remediation',
+      entityId: `remediate:${taskId}`, result: 'success',
+      detail: 'provider=codex model=m stage=remediation rejected_specs=1 outcome=unusable',
+    })
+    const used: string[] = []
+
+    await runRemediationStep(storage, taskId, deps({
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async (raw: string) => {
+          used.push((JSON.parse(raw) as { provider: string }).provider)
+          return { ok: false, stdout: '', error: 'boom', timedOut: false }
+        },
+      },
+    }))
+
+    expect(tallyConflictStage(storage, taskId, 'remediation')).toEqual({ judgments: 1, technicalFailures: 1 })
+    expect(used).toHaveLength(1)
   })
 })
 

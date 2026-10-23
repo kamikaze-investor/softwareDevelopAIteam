@@ -370,11 +370,11 @@ describe('recoverBlockedTask — nextDriver は再投入後に何が動くかを
     expect(storage.tasks.findById(taskId)?.status).toBe('blocked')
   })
 
-  it('**Remediation 予算を使い切っていたら remediation を約束しない**', () => {
+  it('**Remediation の判定予算を使い切っていたら remediation を約束しない**（判定 = parse 済みの提案。技術的失敗は数えない）', () => {
     const { storage, taskId } = seed({ roadmapTaskKey: 'some-item' })
     completeReviewAsConflict(storage, taskId)
     for (let i = 0; i < PL_MAX_REMEDIATION_ATTEMPTS; i += 1) {
-      recordRemediationFailure(storage, taskId, `attempt ${i}`)
+      recordRemediationFailure(storage, taskId, `stage=remediation attempt=${i} outcome=abandon`)
     }
 
     const result = recoverBlockedTask(storage, { taskId, reason: 'r' })
