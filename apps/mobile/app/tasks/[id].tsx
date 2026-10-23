@@ -69,6 +69,7 @@ import {
   submitTaskAbort,
 } from '../../lib/taskAbort'
 import { POLLING_INTERVAL_MS, usePolling } from '../../lib/usePolling'
+import { TASK_NUMBER_TEXT_STYLE, taskNumberLabel } from '../../lib/taskNumber'
 
 const RESUME_INSTRUCTION_MAX_LENGTH = 2000
 // MOB-001: 自由入力を「停止時の既定の対処」に見せない。
@@ -1780,6 +1781,9 @@ export default function TaskDetailScreen(): ReactElement {
         <Text style={styles.title} numberOfLines={2}>
           {data?.task.title ?? 'Task詳細'}
         </Text>
+        {taskNumberLabel(data?.task.id ?? taskId) !== null && (
+          <Text style={TASK_NUMBER_TEXT_STYLE} selectable>{taskNumberLabel(data?.task.id ?? taskId)}</Text>
+        )}
       </View>
 
       {error !== null && (

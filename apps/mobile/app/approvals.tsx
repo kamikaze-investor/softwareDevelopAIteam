@@ -30,6 +30,7 @@ import {
 } from 'react-native'
 
 import { apiFetch } from '../lib/api'
+import { TASK_NUMBER_TEXT_STYLE, taskNumberLabel } from '../lib/taskNumber'
 import { approvalIdLabel, approvalTargetDescription, copyApprovalId } from '../lib/approvalIdentity'
 import {
   fetchPendingApprovals,
@@ -764,6 +765,9 @@ export default function ApprovalsScreen(): ReactElement {
               <Text style={styles.itemTitle}>
                 AIがしようとしていること: {formatRequestedActionSummary(item.requestedAction)}
               </Text>
+              {taskNumberLabel(item.taskId) !== null && (
+                <Text style={TASK_NUMBER_TEXT_STYLE} selectable>対象の{taskNumberLabel(item.taskId)}</Text>
+              )}
 
               {riskSummary.map((label) => (
                 <Text key={label} style={styles.metaText}>
