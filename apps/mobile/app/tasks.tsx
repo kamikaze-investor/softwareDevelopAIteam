@@ -19,6 +19,7 @@ import {
 } from 'react-native'
 
 import { apiFetch } from '../lib/api'
+import { TASK_NUMBER_TEXT_STYLE, taskNumberLabel } from '../lib/taskNumber'
 
 const TASK_STATUS_BADGE_FALLBACK = {
   backgroundColor: '#73737322',
@@ -246,6 +247,9 @@ function TaskCard({ task, watchdogEvents }: { task: TaskSummary; watchdogEvents:
       </View>
 
       <Text style={styles.itemTitle}>{task.title}</Text>
+      {taskNumberLabel(task.taskId) !== null && (
+        <Text style={TASK_NUMBER_TEXT_STYLE} selectable>{taskNumberLabel(task.taskId)}</Text>
+      )}
 
       {attentionText !== null && (
         <View style={[styles.attentionBox, statusBadgeStyle]}>

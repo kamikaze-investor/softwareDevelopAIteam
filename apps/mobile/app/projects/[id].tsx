@@ -34,6 +34,7 @@ import {
   type ProjectExecutionHealth,
 } from '../../lib/taskWorkflow'
 import { apiFetch } from '../../lib/api'
+import { TASK_NUMBER_TEXT_STYLE, taskNumberLabel } from '../../lib/taskNumber'
 import { POLLING_INTERVAL_MS, usePolling } from '../../lib/usePolling'
 
 /**
@@ -605,6 +606,9 @@ function RunningTaskJobsSection({
               />
             )}
           </View>
+          {taskNumberLabel(task.id) !== null && (
+            <Text style={TASK_NUMBER_TEXT_STYLE}>{taskNumberLabel(task.id)}</Text>
+          )}
           {jobs.map((job) => (
             <View key={job.id} style={styles.jobRow}>
               <Text style={styles.jobCommand} numberOfLines={1}>
@@ -649,6 +653,9 @@ function FailedTasksSection({
           <Text style={styles.itemTitle} numberOfLines={2}>
             {task.title}
           </Text>
+          {taskNumberLabel(task.id) !== null && (
+            <Text style={TASK_NUMBER_TEXT_STYLE}>{taskNumberLabel(task.id)}</Text>
+          )}
           {(jobsByTaskId[task.id] ?? []).some(isQuarantined) && (
             <Text style={[styles.failureText, { color: '#dc2626' }]}>
               安全停止中 — AI開発チームによる作業領域の復旧が必要です（CEOの操作は不要）
