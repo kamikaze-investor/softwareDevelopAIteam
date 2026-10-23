@@ -140,7 +140,18 @@ const PL_PROPOSAL_AUTHOR_MODEL = CHEAP_AI_CONFIG.model
  * 「元設計者へ解決案生成を戻さない」という本経路の前提そのものが崩れる（独立レビュー指摘）。
  *
  * 材料は自前の audit 行の provenance だけである（新しいテーブルは作らない）。
+ *
+ * **著者は判定を生んだ行の provider だけである。** runner_failed / unusable / preflight 失敗の
+ * provider は提案を1つも書いていないので著者ではない。数えると、判定 0 件のまま両 flagship が
+ * 著者として除外され、Remediation が `no_independent_flagship` でしか終われなくなる
+ * （2026-10-23 `#2cae0d07`）。分類は `classifyConflictRecoveryRow()` の1箇所だけを使う。
+ * 提案を書いた（却下された）provider は従来どおり除外される。
  */
+function priorRemediationAuthors(storage: IStorage, taskId: string): string[] {
+  return priorProvidersForStage(storage, taskId, 'remediation', { judgmentsOnly: true })
+}
+
+/** この chain で Remediation に使った provider（Preference の順位付け用。著者判定には使わない）。 */
 function priorRemediationProviders(storage: IStorage, taskId: string): string[] {
   return priorProvidersForStage(storage, taskId, 'remediation')
 }
@@ -266,9 +277,13 @@ function priorProvidersForStage(
   storage: IStorage,
   taskId: string,
   stage: 'critic' | 'remediation' | 'challenge' | 'pl_revision',
+  options: { judgmentsOnly?: boolean } = {},
 ): string[] {
   const providers: string[] = []
   for (const entry of stageEntries(storage, taskId, stage)) {
+    if (options.judgmentsOnly === true
+      && (stage === 'critic' || stage === 'remediation')
+      && classifyConflictRecoveryRow(stage, entry.detail) !== 'judgment') continue
     const provider = /\bprovider=([\w-]+)/.exec(entry.detail ?? '')?.[1]
     if (provider !== undefined && !providers.includes(provider)) providers.push(provider)
   }
@@ -809,7 +824,8 @@ export async function runRemediationStep(
   const selection = selectRemediationModel({
     // 1回目は PL（vendor 未解決）、2回目以降は前回の Remediation 著者も除外対象になる。
     // **Remediation 著者は Task Design を書いた側**なので、ここは hard 側で正しい。
-    authorProviders: [PL_PROPOSAL_AUTHOR_PROVIDER, ...priorProviders],
+    // 著者は判定（parse 済みの提案）を生んだ provider だけ。runner 失敗は著者ではない。
+    authorProviders: [PL_PROPOSAL_AUTHOR_PROVIDER, ...priorRemediationAuthors(storage, taskId)],
     // **vendor が解決できない相手にも、model 単位の分離は必ず効かせる。**
     authorModels: [PL_PROPOSAL_AUTHOR_MODEL],
     // 初回 implement Job の Design Review は常に `changedFiles: []` で走る

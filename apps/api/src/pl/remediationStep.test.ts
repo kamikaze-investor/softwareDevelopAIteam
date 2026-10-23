@@ -530,7 +530,7 @@ describe('著者の独立性 — 自分の却下案を自分で書き直させ�
     expect(used).toEqual(['codex', 'claude_code'])
   })
 
-  it('両 flagship を使い切ったら no_independent_model で止まる（弱い model へ落ちない）', async () => {
+  it('両 flagship が runner_failed しただけなら著者ではないので no_independent_model にならない', async () => {
     const { storage, taskId } = seedConflictedTask()
     // provenance だけを2件置き、両 provider が既に使われた状態を作る。
     for (const provider of ['codex', 'claude_code']) {
@@ -541,11 +541,91 @@ describe('著者の独立性 — 自分の却下案を自分で書き直させ�
       })
     }
 
-    // runner_failed は判定ではないので判定予算は残っている（2026-10-23 `#2cae0d07`）。
-    // よって予算ではなく、著者分離（両 flagship が既に使われた）で止まる。
+    // runner_failed は判定でも著者でもない（2026-10-23 `#2cae0d07`）。判定予算は残り、
+    // 両 provider とも提案を書いていないので著者として除外されず、flagship を選んで実行できる。
+    let selected: string | undefined
+    const result = await runRemediationStep(storage, taskId, deps({
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async (raw: string) => {
+          selected = (JSON.parse(raw) as { provider: string }).provider
+          return { ok: true, stdout: JSON.stringify({ ...PROPOSAL, abandon: true }), timedOut: false }
+        },
+      },
+    }))
+
+    expect(result.status).toBe('abandon_recommended')
+    expect(result.failureCode).not.toBe('no_independent_flagship')
+    expect(['codex', 'claude_code']).toContain(selected)
+  })
+
+  it('Production 形（remediation runner_failed: codex, claude_code）の3回目は flagship を選べる（runner 失敗は著者ではない）', async () => {
+    const { storage, taskId } = seedConflictedTask()
+    for (const provider of ['codex', 'claude_code']) {
+      storage.auditLog.record({
+        actor: 'api', operation: 'pl_independent_remediation', entityType: 'pl_remediation',
+        entityId: `remediate:${taskId}`, result: 'success',
+        detail: `provider=${provider} model=m vendor=v excluded=- unverified_separation=opencode-go`
+          + ' stage=remediation rejected_specs=1 outcome=runner_failed',
+      })
+    }
+    let executions = 0
+    const result = await runRemediationStep(storage, taskId, deps({
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async () => {
+          executions += 1
+          return { ok: false, stdout: '', error: 'boom', timedOut: false }
+        },
+      },
+    }))
+
+    expect(executions).toBe(1)
+    expect(result.status).toBe('remediation_failed')
+    expect(result.failureCode).toBe('runner_failed')
+  })
+
+  it('parse 済みの提案（abandon / fspec 行）を書いた provider は従来どおり著者として除外される', async () => {
+    for (const authored of [
+      'provider=codex model=m stage=remediation rejected_specs=1 outcome=abandon',
+      'provider=codex model=m stage=remediation proposed=h fspec=abc rejected_fspec=def outcome=not_different',
+    ]) {
+      const { storage, taskId } = seedConflictedTask()
+      storage.auditLog.record({
+        actor: 'api', operation: 'pl_independent_remediation', entityType: 'pl_remediation',
+        entityId: `remediate:${taskId}`, result: 'success', detail: authored,
+      })
+      const used: string[] = []
+      await runRemediationStep(storage, taskId, deps({
+        runnerDeps: {
+          runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+          execute: async (raw: string) => {
+            used.push((JSON.parse(raw) as { provider: string }).provider)
+            return { ok: false, stdout: '', error: 'boom', timedOut: false }
+          },
+        },
+      }))
+
+      expect(used).toEqual(['claude_code'])
+    }
+  })
+
+  it('両 flagship が提案を書いていたら、判定予算が尽きて attempts_exhausted で止まる', async () => {
+    const { storage, taskId } = seedConflictedTask()
+    storage.auditLog.record({
+      actor: 'api', operation: 'pl_independent_remediation', entityType: 'pl_remediation',
+      entityId: `remediate:${taskId}`, result: 'success',
+      detail: 'provider=codex model=m stage=remediation outcome=abandon',
+    })
+    storage.auditLog.record({
+      actor: 'api', operation: 'pl_independent_remediation', entityType: 'pl_remediation',
+      entityId: `remediate:${taskId}`, result: 'success',
+      detail: 'provider=claude_code model=m stage=remediation proposed=h fspec=abc rejected_fspec=- outcome=adopting',
+    })
+
     const result = await runRemediationStep(storage, taskId, deps())
 
-    expect(result.status).toBe('no_independent_model')
+    expect(result.status).toBe('attempts_exhausted')
   })
 })
 
@@ -714,7 +794,7 @@ describe('有界性と記録', () => {
     for (let i = 0; i < PL_MAX_TECHNICAL_FAILURES_PER_STAGE; i += 1) {
       await runRemediationStep(storage, taskId, failing)
     }
-    // 3回目は著者分離で no_independent_flagship になり得るが、それも技術的失敗として数える。
+    // runner 失敗は著者ではないので3回とも flagship を選んで実行し、3回とも技術的失敗として数える。
     const tally = tallyConflictStage(storage, taskId, 'remediation')
     expect(tally).toEqual({ judgments: 0, technicalFailures: PL_MAX_TECHNICAL_FAILURES_PER_STAGE })
     const executionsAtCap = executions
