@@ -43,6 +43,7 @@ import {
 } from '@ai-team/worker/src/guards/fileChangeGuard.js'
 import type { ChangeManifest, EntryType, FileChange } from '@ai-team/worker/src/guards/changeManifest.js'
 import type { ChangeManifestEntry } from './approvalExplain/changeManifestIdentity'
+import { classifyStoredRunJudgment } from './designReview/designReviewCoordinator'
 import { checkImplementJobDesignReviewEvidence } from './designReviewEvidencePolicy'
 import { resolveReviewedImplementation } from './designReview/repairFlow'
 import { parseResumeSource, resolveGitCommitResumeOrigin } from './designReview/repairPolicy'
@@ -80,6 +81,7 @@ export type GitCommitEvidenceFailure =
   | 'implementation_unresolved'
   | 'implementation_not_successful'
   | 'design_review_not_aligned'
+  | 'design_review_reversed'
 
 export type GitCommitEvidenceResult =
   | { passed: true }
@@ -286,9 +288,45 @@ export function evaluateGitCommitEvidence(
     { taskId: task.id, aiCliMode: implementJob.aiCliMode, aiCliPrompt: implementJob.aiCliPrompt },
     storage.designReviewEvidence,
   )
-  if (!designReview.ok || designReview.evidence === undefined) fail('design_review_not_aligned')
+  if (!designReview.ok || designReview.evidence === undefined) {
+    fail('design_review_not_aligned')
+  } else if (hasEarlierNegativeDesignReviewRun(storage, designReview.evidence)) {
+    // 同じ設計（同じ designTextHash）への CONFLICT / UNCERTAIN が、後の ALIGNED で覆っただけ
+    // （例: Challenge の再評価）。spec 22 §14-3 DA trigger (7)「review 判定不一致が未解決」として、
+    // `review_resumed` と同じく人間承認へ fail closed する（Evidence を通す方向には働かない）。
+    fail('design_review_reversed')
+  }
 
   return result()
+}
+
+/**
+ * **使った ALIGNED evidence より前に、同じ subject・同じ designTextHash の run が否定判定で終わっていたか**
+ * （spec 22 §14-3 DA trigger (7)）。
+ *
+ * evidence policy は「最新の判定が正」なので、古い CONFLICT は新しい ALIGNED を無効にしない
+ * （`designReviewEvidencePolicy.findSupersedingRun()`）。それ自体は Job 作成の規則として正しいが、
+ * commit 時点では「同一設計への判定が割れた」事実が消える。ここではそれを commit の Evidence 不成立として拾う。
+ *
+ * - 判定の分類は既存の `classifyStoredRunJudgment()`（failed / REVIEW_UNAVAILABLE / 結果なしは `none` =
+ *   否定に数えない）。
+ * - hash が違う run（設計を改訂する前の CONFLICT）は数えない —— 改訂された設計は不一致ではない。
+ * - 「前」の順序は `findSupersedingRun()` と同じ規約: evidence を生んだ run が分かればその run より前に
+ *   挿入された run（`findByTaskId()` は新しい順）、分からなければ evidence より厳密に前に作られた run。
+ */
+function hasEarlierNegativeDesignReviewRun(
+  storage: IStorage,
+  evidence: { taskId?: string; reviewKind: string; subjectId: string; designTextHash: string; createdAt: string; runId?: string },
+): boolean {
+  if (evidence.taskId === undefined) return false
+  const runs = storage.designReviewRuns.findByTaskId(evidence.taskId)
+  const originIndex = evidence.runId !== undefined ? runs.findIndex((run) => run.id === evidence.runId) : -1
+  return runs.some((run, index) => {
+    if (run.reviewKind !== evidence.reviewKind || run.subjectId !== evidence.subjectId) return false
+    if (run.designTextHash !== evidence.designTextHash) return false
+    const earlier = originIndex >= 0 ? index > originIndex : run.createdAt < evidence.createdAt
+    return earlier && classifyStoredRunJudgment(run) === 'negative'
+  })
 }
 
 /**

@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { runRiskReview, type Job, type Task } from '@ai-team/shared'
 import { createSQLiteStorage } from './storage/sqlite'
-import type { IStorage } from './storage/interface'
+import type { DesignReviewRun, IStorage } from './storage/interface'
+import { classifyStoredRunJudgment } from './designReview/designReviewCoordinator'
 import { readCurrentWorktreeDiff } from './approvalExplain/diffReader'
 import { buildWorktreeChangeManifest } from './approvalExplain/changeManifestReader'
 import { computeDesignTextHash } from './designReviewEvidencePolicy'
@@ -67,6 +68,45 @@ interface ChainOptions {
   reviewEvidence?: boolean
   /** implement Job の workflowStepKey（provider timeout retry 等の lineage を再現する）。 */
   implementStepKey?: string
+  /**
+   * evidence より前に、この順で終端させる Design Review run（design text の既定は PROMPT）。
+   * 指定したときは、最後の run を evidence を生んだ run（`runId`）として記録する。
+   */
+  designReviewRuns?: Array<{ outcome: DesignReviewRunOutcome; designText?: string }>
+}
+
+type DesignReviewRunOutcome = 'aligned' | 'conflict' | 'uncertain' | 'unavailable' | 'failed'
+
+// changedFiles [] の task review は scope_simplicity を選ぶ（medium load）。
+function runnerOutput(decision: 'ALIGNED' | 'CONFLICT' | 'UNCERTAIN', finalDecision: string = decision): string {
+  return JSON.stringify({
+    focusedReviewResults: [{ focus: 'scope_simplicity', decision }],
+    integrationReviewResult: { decision },
+    finalDecision,
+  })
+}
+
+/** 1 本の Design Review run を作って終端させる（storage の claim / complete をそのまま使う）。 */
+function recordDesignReviewRun(
+  storage: IStorage,
+  taskId: string,
+  outcome: DesignReviewRunOutcome,
+  designText: string = PROMPT,
+): DesignReviewRun {
+  const run = storage.designReviewRuns.create({
+    taskId, taskTitle: 'T', designText, designTextHash: computeDesignTextHash(designText), changedFiles: [],
+  })
+  const claimed = storage.designReviewRuns.claim(run.id, 3)
+  if (outcome === 'failed') {
+    storage.designReviewRuns.complete(run.id, claimed.claimToken!, 'failed', undefined, 'runner crashed')
+  } else {
+    const output = outcome === 'aligned' ? runnerOutput('ALIGNED')
+      : outcome === 'conflict' ? runnerOutput('CONFLICT')
+        : outcome === 'uncertain' ? runnerOutput('UNCERTAIN')
+          : runnerOutput('ALIGNED', 'REVIEW_UNAVAILABLE')
+    storage.designReviewRuns.complete(run.id, claimed.claimToken!, 'succeeded', output)
+  }
+  return storage.designReviewRuns.findById(run.id)!
 }
 
 function seedChain(options: ChainOptions = {}): Chain {
@@ -123,8 +163,11 @@ function seedChain(options: ChainOptions = {}): Chain {
   }
 
   const designReview = options.designReview ?? 'aligned'
+  const runs = (options.designReviewRuns ?? []).map((spec) =>
+    recordDesignReviewRun(storage, task.id, spec.outcome, spec.designText))
   if (designReview !== 'none') {
     storage.designReviewEvidence.create({
+      ...(runs.length > 0 ? { runId: runs[runs.length - 1]!.id } : {}),
       taskId: task.id,
       designTextHash: computeDesignTextHash(PROMPT),
       reviewLoad: 'low',
@@ -283,6 +326,45 @@ describe('evaluateGitCommitEvidence — exact provenance', () => {
   it('Design Review evidence が無い / ALIGNED でなければ通さない', () => {
     expect(failuresOf(seedChain({ designReview: 'none' }))).toContain('design_review_not_aligned')
     expect(failuresOf(seedChain({ designReview: 'conflict' }))).toContain('design_review_not_aligned')
+  })
+})
+
+/**
+ * spec 22 §14-3 DA trigger (7): 同じ設計（同じ designTextHash）への Design Review が否定判定の後に
+ * ALIGNED へ反転した（例: Challenge の再評価）なら、`review_resumed` と同じく人間承認へ fail closed する。
+ */
+describe('evaluateGitCommitEvidence — Design Review の判定反転（design_review_reversed）', () => {
+  it('fixture の run は既存の分類器で意図どおりに分類される', () => {
+    const chain = seedChain()
+    const judgments = (['aligned', 'conflict', 'uncertain', 'unavailable', 'failed'] as const)
+      .map((outcome) => classifyStoredRunJudgment(recordDesignReviewRun(chain.storage, chain.task.id, outcome)))
+    expect(judgments).toEqual(['aligned', 'negative', 'negative', 'none', 'none'])
+  })
+
+  for (const negative of ['conflict', 'uncertain'] as const) {
+    it(`同じ hash の ${negative} の後の ALIGNED は design_review_reversed で通さない`, () => {
+      const chain = seedChain({ designReviewRuns: [{ outcome: negative }, { outcome: 'aligned' }] })
+      expect(failuresOf(chain)).toEqual(['design_review_reversed'])
+    })
+  }
+
+  it('同じ hash で ALIGNED だけなら従来どおり通る', () => {
+    const chain = seedChain({ designReviewRuns: [{ outcome: 'aligned' }] })
+    expect(evaluateGitCommitEvidence(chain.storage, chain.input)).toEqual({ passed: true })
+  })
+
+  it('改訂前の別 hash の CONFLICT の後、新しい hash の ALIGNED は通る（改訂は判定不一致ではない）', () => {
+    const chain = seedChain({
+      designReviewRuns: [{ outcome: 'conflict', designText: 'an earlier, revised design' }, { outcome: 'aligned' }],
+    })
+    expect(evaluateGitCommitEvidence(chain.storage, chain.input)).toEqual({ passed: true })
+  })
+
+  it('判定の無い run（REVIEW_UNAVAILABLE / failed）は否定に数えない', () => {
+    const chain = seedChain({
+      designReviewRuns: [{ outcome: 'unavailable' }, { outcome: 'failed' }, { outcome: 'aligned' }],
+    })
+    expect(evaluateGitCommitEvidence(chain.storage, chain.input)).toEqual({ passed: true })
   })
 })
 

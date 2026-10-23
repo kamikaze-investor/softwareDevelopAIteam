@@ -75,6 +75,8 @@ const GIT_COMMIT_HUMAN_GATE_LABELS: Record<GitCommitHumanGateReason, string> = {
  * 同じ実装に対する review が changes_requested を返した後、resume で再実行した review が approved を返した
  * git_commit に付ける（2026-10-09 b6d4097a: 同一 diff の指摘が再実行で消え、そのまま承認依頼になった）。
  * 判定は既に Safety Evidence 側で fail closed しているので、これは CEO へ「判断が割れている」ことを見せるだけ。
+ * 同じ設計（同じ designTextHash）への Design Review が CONFLICT / UNCERTAIN の後に ALIGNED へ反転した
+ * git_commit（Evidence 不成立 `design_review_reversed`）にも付ける。
  */
 const REVIEW_VERDICT_DISAGREEMENT_LABEL = 'review verdict disagreement'
 const SAFE_RISK_RULE_LABELS = new Set([
@@ -829,7 +831,9 @@ export async function approvalGateRoutes(
             GIT_COMMIT_HUMAN_GATE_LABELS[gitCommitEvidence.reason],
             // DA trigger (7) の開示。Evidence 不成立（review_resumed / review_lineage_unresolved）で
             // 人間承認へ送る git_commit にだけ付ける。保存済み review_results と Job lineage の読み取りのみ。
-            ...(gitCommitJob !== undefined && hasReviewVerdictDisagreement(storage, gitCommitJob)
+            // Design Review の同一設計での判定反転（design_review_reversed）も同じ DA trigger (7) である。
+            ...((gitCommitJob !== undefined && hasReviewVerdictDisagreement(storage, gitCommitJob))
+              || gitCommitEvidence.failures.includes('design_review_reversed')
               ? [REVIEW_VERDICT_DISAGREEMENT_LABEL]
               : []),
           ]
