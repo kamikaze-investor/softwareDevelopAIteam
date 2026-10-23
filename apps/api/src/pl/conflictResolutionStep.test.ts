@@ -292,7 +292,6 @@ describe('Critic → 条件分岐', () => {
 
       const result = await runConflictResolutionRound(storage, taskId, deps(
         { ...CRITIQUE_BASE, findingAssessments: [assessment] },
-        { reEvaluate: async () => { throw new Error('must not re-evaluate without grounds') } },
       ) as never)
 
       expect(result.stage).toBe('pl_revision')
@@ -300,107 +299,59 @@ describe('Critic → 条件分岐', () => {
     }
   })
 
-  it('根拠付き dispute なら Challenge へ分岐し、**同一 design text** を再評価する', async () => {
-    const { storage, taskId, designText } = seed()
-    let reEvaluated: string | undefined
-
-    const result = await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
-      reEvaluate: async (_s: unknown, input: { designText: string }) => {
-        reEvaluated = input.designText
-        return { status: 'not_aligned', decision: 'CONFLICT' }
-      },
-    }) as never)
-
-    expect(result.stage).toBe('challenge')
-    // **byte-identical であること。** spec を変更しない。
-    expect(reEvaluated).toBe(designText)
-  })
-
-  it('Challenge が ALIGNED でなければ release しない（CONFLICT / UNCERTAIN の双方）', async () => {
-    for (const decision of ['CONFLICT', 'UNCERTAIN', 'REVIEW_UNAVAILABLE']) {
-      const { storage, taskId } = seed()
-
-      const result = await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
-        reEvaluate: async () => ({ status: 'not_aligned', decision }),
-        ensureJob: async () => { throw new Error('must not create a job') },
-      }) as never)
-
-      expect(result.status).toBe('challenge_not_aligned')
-    }
-  })
-
-  it('Challenge が ALIGNED なら既存 Job Gate 経由で Job が作られる', async () => {
+  it('根拠付き dispute でも**却下済みの同一 spec を再審査しない**（verdict re-roll は DA trigger 7 に反する）', async () => {
+    // 以前は byte-identical な spec を fresh Design Review へ再提出し、ALIGNED なら Job を作っていた。
+    // 再審査 run が ALIGNED で終われば既存 coordinator が usable evidence を登録し、既存の回収が
+    // PL を経由せずに Job を作るので、「ALIGNED でも Job を作らない」では塞がらない。
     const { storage, taskId } = seed()
-    let gateCalled = false
-
-    const result = await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
-      reEvaluate: async () => ({ status: 'evidence_registered', decision: 'ALIGNED' }),
-      ensureJob: async () => { gateCalled = true; return { taskId, status: 'created', job: {} } },
-    }) as never)
-
-    expect(result.status).toBe('challenge_aligned')
-    expect(gateCalled).toBe(true)
-  })
-
-  it('**same spec + same finding への Challenge は1回だけ**（PASS reroll にしない）', async () => {
-    const { storage, taskId, designText } = seed()
-    let evaluations = 0
-    const challenging = deps(DISPUTED_CRITIQUE, {
-      reEvaluate: async () => {
-        evaluations += 1
-        return { status: 'not_aligned', decision: 'CONFLICT' }
-      },
-    })
-
-    const first = await runConflictResolutionRound(storage, taskId, challenging as never)
-
-    // canonical prompt の書式だけが変わっても、同じ material spec の Challenge 予算は復活しない。
-    const reformatted = `${designText}\n\n[non-semantic prompt format revision]`
-    const run = storage.designReviewRuns.create({
-      taskId,
-      taskTitle: 'CONFLICT した項目',
-      designText: reformatted,
-      designTextHash: computeDesignTextHash(reformatted),
-      changedFiles: [],
-    })
-    const claimed = storage.designReviewRuns.claim(run.id, 3)
-    storage.designReviewRuns.complete(run.id, claimed.claimToken as string, 'succeeded', CONFLICT_RESULT_JSON)
-
-    const second = await runConflictResolutionRound(storage, taskId, challenging as never)
-
-    expect(first.stage).toBe('challenge')
-    // 2回目は上限に当たり、Challenge せず PL revision へ落ちる（止まらない）。
-    expect(second.stage).toBe('pl_revision')
-    expect(evaluations).toBe(1)
-  })
-
-  it('Challenge の上限に当たっても BLOCKED にせず PL revision を続ける', async () => {
-    const { storage, taskId, designText } = seed()
-    // Task Contract 導入前に永続化された audit は prompt hash key を持つ。
-    // seed が実際に Review へ保存した prompt を使い、legacy key の読み取り互換を固定する。
-    recordRemediationFailure(
-      storage,
-      taskId,
-      `stage=challenge chal=${computeDesignTextHash(designText).slice(0, 12)}`
-      + ':scope_simplicity outcome=starting',
-    )
+    const originalRun = storage.designReviewRuns.findLatestByTaskId(taskId)
 
     const result = await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE) as never)
 
+    // Critique は PL revision へ渡り、同一 spec の review run は作られない。Job も無い。
     expect(result.stage).toBe('pl_revision')
+    expect(storage.designReviewRuns.findLatestByTaskId(taskId)?.id).toBe(originalRun?.id)
+    expect(storage.jobs.findByTaskId(taskId)).toHaveLength(0)
+    // 元 CONFLICT run は履歴として保持される（削除・上書きしない）。
+    expect(storage.designReviewRuns.findById(originalRun!.id)?.resultJson).toBe(originalRun!.resultJson)
+    // 異議は記録する（再審査していないことも明示する）。
+    const details = stageEntries(storage, taskId, 'challenge').map((e) => e.detail ?? '')
+    expect(details).toHaveLength(1)
+    expect(details[0]).toContain('orig_verdict=CONFLICT')
+    expect(details[0]).toContain('finding=scope_simplicity')
+    expect(details[0]).toContain('grounds=contradicts_code_or_spec')
+    expect(details[0]).toContain('evidence=yes')
+    expect(details[0]).toContain('rereview=none')
+    expect(details[0]).toContain('outcome=critic_dispute_recorded')
   })
 
-  it('元 CONFLICT run は履歴として保持される（削除・上書きしない）', async () => {
+  it('同じ (spec, finding) への異議は1行だけ記録する（Round を重ねても二重に書かない）', async () => {
     const { storage, taskId } = seed()
-    const before = storage.designReviewRuns.findLatestByTaskId(taskId)
 
-    await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
-      reEvaluate: async () => ({ status: 'not_aligned', decision: 'CONFLICT' }),
+    await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE) as never)
+    await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE) as never)
+
+    expect(stageEntries(storage, taskId, 'challenge')).toHaveLength(1)
+    // 異議の記録は critic の予算に入らない（Round は critiqued 行で数える）。
+    expect(selectConflictStage(storage, taskId).criticRounds).toBe(2)
+  })
+
+  it('根拠付き dispute でも、PL が修正した（materially different な）spec は fresh ALIGNED なら従来どおり Job を作る', async () => {
+    const { storage, taskId } = seed()
+    const originalRun = storage.designReviewRuns.findLatestByTaskId(taskId)
+
+    const result = await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
+      adopt: (s: IStorage, input: Parameters<typeof adoptRoadmapItem>[1]) => adoptRoadmapItem(s, input, {
+        ensureInitialWorkflows: (st, pid) => ensureInitialWorkflowsForActiveTasks(st, pid, {
+          runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+          execute: async () => ({ ok: true, stdout: ALIGNED_RESULT_JSON, timedOut: false }),
+        }),
+      }),
     }) as never)
 
-    // 差し替えた reEvaluate は run を作らないので、元 run がそのまま残っていること。
-    expect(storage.designReviewRuns.findById(before!.id)).toBeDefined()
-    expect(storage.designReviewRuns.findById(before!.id)?.resultJson).toBe(before!.resultJson)
+    expect(result).toMatchObject({ status: 'revised_and_aligned', taskId })
+    expect(storage.designReviewRuns.findLatestByTaskId(taskId)?.designTextHash).not.toBe(originalRun?.designTextHash)
+    expect(storage.jobs.findByTaskId(taskId)).toHaveLength(1)
   })
 })
 
@@ -423,9 +374,7 @@ describe('Binding Safety / Authority は Challenge で release されない', ()
       }],
     }
 
-    const result = await runConflictResolutionRound(storage, taskId, deps(bindingDispute, {
-      reEvaluate: async () => { throw new Error('binding finding must not be challenged') },
-    }) as never)
+    const result = await runConflictResolutionRound(storage, taskId, deps(bindingDispute) as never)
 
     expect(result.stage).toBe('pl_revision')
     expect(stageEntries(storage, taskId, 'challenge')).toHaveLength(0)
@@ -482,50 +431,6 @@ describe('Critic model の Preference と fallback', () => {
   })
 })
 
-describe('audit / observability', () => {
-  it('Challenge は orig provider/model を **unavailable** と明示する', async () => {
-    // 元 Design Reviewer の provider/model は既存 pipeline が記録していない。
-    // 取得できないものを推測で埋めず `unavailable` と書く
-    // （owner: review-provider-exhausted-alternate-rereview）。
-    const { storage, taskId } = seed()
-
-    await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
-      reEvaluate: async () => ({ status: 'not_aligned', decision: 'CONFLICT' }),
-    }) as never)
-    const details = stageEntries(storage, taskId, 'challenge').map((e) => e.detail ?? '').join(' ')
-
-    expect(details).toContain('orig_provider=unavailable')
-    expect(details).toContain('orig_model=unavailable')
-  })
-
-  it('verdict reversal を後から追跡できる形で記録する', async () => {
-    const { storage, taskId } = seed()
-
-    await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
-      reEvaluate: async () => ({ status: 'evidence_registered', decision: 'ALIGNED' }),
-      ensureJob: async () => ({ taskId, status: 'created', job: {} }),
-    }) as never)
-    const details = stageEntries(storage, taskId, 'challenge').map((e) => e.detail ?? '').join(' ')
-
-    expect(details).toContain('orig_verdict=CONFLICT')
-    expect(details).toContain('chal_verdict=ALIGNED')
-    expect(details).toContain('reversal=yes')
-    expect(details).toContain('finding=scope_simplicity')
-    expect(details).toContain('grounds=contradicts_code_or_spec')
-    expect(details).toContain('evidence=yes')
-  })
-
-  it('Challenge の消費は再評価の**前**に記録する（途中で落ちても再抽選できない）', async () => {
-    const { storage, taskId } = seed()
-
-    await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
-      reEvaluate: async () => { throw new Error('crash during re-evaluation') },
-    }) as never).catch(() => undefined)
-
-    expect(stageEntries(storage, taskId, 'challenge').length).toBeGreaterThan(0)
-  })
-})
-
 describe('有界性', () => {
   it('Critic runner 失敗も Round として記録する（記録しないと予算が効かない）', async () => {
     const { storage, taskId } = seed()
@@ -541,6 +446,27 @@ describe('有界性', () => {
     // Critic の失敗は **Critic Round の予算**を消費する（Remediation の予算とは別勘定）。
     expect(stageEntries(storage, taskId, 'critic').length).toBe(1)
     expect(countRemediationAttempts(storage, taskId)).toBe(0)
+  })
+
+  it('Critic runner が ok=false でも stdout に完全な Critique があれば判定として数え、その Critique は使わない', async () => {
+    const { storage, taskId } = seed()
+    let revised = false
+
+    const result = await runConflictResolutionRound(storage, taskId, deps(SUPPORTED_CRITIQUE, {
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async () => ({ ok: false, stdout: JSON.stringify(SUPPORTED_CRITIQUE), error: 'exit 1', timedOut: false }),
+      },
+      revise: async () => { revised = true; return '' },
+    }) as never)
+
+    expect(result.status).toBe('critic_failed')
+    expect(revised).toBe(false)
+    const rows = stageEntries(storage, taskId, 'critic').map((e) => e.detail ?? '')
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toContain('provider=')
+    expect(rows[0]).toContain('outcome=runner_failed_after_critique')
+    expect(selectConflictStage(storage, taskId)).toMatchObject({ criticRounds: 1, criticTechnicalFailures: 0 })
   })
 
   it('Critique が壊れていても Round として記録する', async () => {
@@ -625,169 +551,6 @@ describe('parsePlRevision', () => {
  * 評価済み・否定として記録せず pending で返す。同じ run が rekick で判定まで進み、ALIGNED なら
  * 既存 `recoverReadyTasksWithoutJob()` が Job を1回だけ作る。Challenge を引き直すことはしない。
  */
-describe('Challenge の再評価が requeued になった場合', () => {
-  // 判定の出なかった attempt の後の retry cooldown（retryCooldown.ts）は時計で明けさせる。
-  afterEach(() => { vi.useRealTimers() })
-
-  function coordinator(stdout: string) {
-    return {
-      runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
-      execute: async () => ({ ok: true, stdout, timedOut: false }),
-    }
-  }
-
-  it('review_pending を返し、evaluated と記録せず、Job も作らない', async () => {
-    const { storage, taskId } = seed()
-
-    const result = await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
-      coordinatorDeps: coordinator('null'),
-      ensureJob: async () => { throw new Error('must not create a job before a judgment') },
-    }) as never)
-
-    expect(result).toMatchObject({ stage: 'challenge', status: 'review_pending' })
-    const details = stageEntries(storage, taskId, 'challenge').map((entry) => entry.detail ?? '')
-    expect(details.some((detail) => detail.includes('outcome=evaluated'))).toBe(false)
-    expect(details.some((detail) => detail.includes('outcome=pending'))).toBe(true)
-    expect(storage.designReviewRuns.findLatestByTaskId(taskId)?.status).toBe('queued')
-  })
-
-  it('同じ run が rekick で ALIGNED になれば、既存の回収が Job を1回だけ作る', async () => {
-    const { storage, taskId } = seed()
-    await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
-      coordinatorDeps: coordinator('null'),
-    }) as never)
-    const run = storage.designReviewRuns.findLatestByTaskId(taskId)!
-
-    passDesignReviewRetryCooldown()
-    await executeQueuedRun(storage, run, coordinator(ALIGNED_RESULT_JSON))
-    expect(storage.designReviewEvidence.findLatestByTaskId(taskId)?.decision).toBe('ALIGNED')
-    expect(storage.jobs.findByTaskId(taskId)).toEqual([])
-
-    expect((await recoverReadyTasksWithoutJob(storage, coordinator(ALIGNED_RESULT_JSON))).recovered).toBe(1)
-    expect((await recoverReadyTasksWithoutJob(storage, coordinator(ALIGNED_RESULT_JSON))).recovered).toBe(0)
-    expect(storage.jobs.findByTaskId(taskId)).toHaveLength(1)
-  })
-})
-describe('Challenge と他の review / 回収経路の重なり（独立レビュー round 6）', () => {
-  it('別の設計の review が active なら Challenge を消費せず pending（再評価も呼ばない）', async () => {
-    const { storage, taskId } = seed()
-    let otherId = ''
-
-    const result = await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
-      // Critic を待っている間に、同じ Task へ別の設計の review（例: resume instruction）が起票された。
-      runnerDeps: {
-        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
-        execute: async () => {
-          otherId = storage.designReviewRuns.create({
-            taskId, taskTitle: 'other', designText: 'a different resume instruction',
-            designTextHash: computeDesignTextHash('a different resume instruction'), changedFiles: [],
-          }).id
-          return { ok: true, stdout: JSON.stringify(DISPUTED_CRITIQUE), timedOut: false }
-        },
-      },
-      reEvaluate: async () => { throw new Error('must not re-evaluate while another review is active') },
-    }) as never)
-
-    expect(result).toMatchObject({ stage: 'challenge', status: 'review_pending' })
-    expect(result.reason).toContain(otherId)
-    // starting 行が無い = Challenge は消費されていない。
-    expect(stageEntries(storage, taskId, 'challenge')).toEqual([])
-  })
-
-  it('ALIGNED の後に回収経路が先に初回 Job を作っていても、challenge_aligned として扱う', async () => {
-    const { storage, taskId, designText } = seed()
-    const task = storage.tasks.findById(taskId)!
-
-    const result = await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
-      reEvaluate: async () => {
-        // 再評価が ALIGNED になった直後に、recoverReadyTasksWithoutJob() が同じ prompt で Job を作った。
-        storage.jobs.create({
-          taskId, projectId: task.projectId, agentRole: 'developer_ai', status: 'queued',
-          workflowStepKey: `task:${taskId}:initial-implement`,
-          safeCommand: { kind: 'test', workingDir: '/workspace/target' },
-          aiCliMode: 'implement', aiCliPrompt: designText,
-        } as never)
-        return { status: 'evidence_registered', decision: 'ALIGNED' }
-      },
-      ensureJob: async () => ({ taskId, status: 'skipped', reason: 'initial workflow job already exists' }),
-    }) as never)
-
-    expect(result.status).toBe('challenge_aligned')
-    expect(storage.jobs.findByTaskId(taskId)).toHaveLength(1)
-  })
-
-  it('ensureJob が skipped で、レビューした prompt の Job も無ければ従来どおり not_aligned', async () => {
-    const { storage, taskId } = seed()
-
-    const result = await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
-      reEvaluate: async () => ({ status: 'evidence_registered', decision: 'ALIGNED' }),
-      ensureJob: async () => ({ taskId, status: 'skipped', reason: 'task was parked by abort_task' }),
-    }) as never)
-
-    expect(result).toMatchObject({ status: 'challenge_not_aligned', failureCode: 'gate_did_not_release' })
-  })
-})
-describe('Challenge の同一性と「既に在る」の判定（独立レビュー round 7）', () => {
-  function criticThat(onRun: () => void) {
-    return {
-      runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
-      execute: async () => { onRun(); return { ok: true, stdout: JSON.stringify(DISPUTED_CRITIQUE), timedOut: false } },
-    }
-  }
-
-  it('同じ text / files でも repair 目的の active run なら別の review として pending（Challenge を消費しない）', async () => {
-    const { storage, taskId, designText } = seed()
-
-    const result = await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
-      runnerDeps: criticThat(() => {
-        storage.designReviewRuns.create({
-          taskId, taskTitle: 'repair', designText, designTextHash: computeDesignTextHash(designText),
-          changedFiles: [], repairSourceJobId: 'source-job-1',
-        })
-      }),
-      reEvaluate: async () => { throw new Error('must not re-evaluate against a repair-purpose run') },
-    }) as never)
-
-    expect(result).toMatchObject({ stage: 'challenge', status: 'review_pending' })
-    expect(stageEntries(storage, taskId, 'challenge')).toEqual([])
-  })
-
-  // Remediation の対象は Job 0 件の Task なので、Job は再評価の最中（ALIGNED の直後）に現れる形で再現する。
-  async function challengeWith(workflowStepKey: string | undefined, reason: string) {
-    const { storage, taskId, designText } = seed()
-    const projectId = storage.tasks.findById(taskId)!.projectId
-    // '__CANONICAL__' は初回 workflow の canonical key（task:<taskId>:initial-implement）を表す。
-    const key = workflowStepKey === '__CANONICAL__' ? `task:${taskId}:initial-implement` : workflowStepKey
-    const result = await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
-      reEvaluate: async () => {
-        if (key !== undefined) {
-          storage.jobs.create({
-            taskId, projectId, agentRole: 'developer_ai', status: 'queued', workflowStepKey: key,
-            safeCommand: { kind: 'test', workingDir: '/workspace/target' }, aiCliMode: 'implement', aiCliPrompt: designText,
-          } as never)
-        }
-        return { status: 'evidence_registered', decision: 'ALIGNED' }
-      },
-      ensureJob: async () => ({ taskId, status: 'skipped', reason }),
-    }) as never)
-    return result.status
-  }
-
-  it('同じ prompt の repair / resume Job は canonical な初回 Job ではないので released にしない', async () => {
-    expect(await challengeWith('repair:some-job:1', INITIAL_WORKFLOW_JOB_EXISTS)).toBe('challenge_not_aligned')
-    expect(await challengeWith('resume:some-job:1', INITIAL_WORKFLOW_JOB_EXISTS)).toBe('challenge_not_aligned')
-  })
-
-  it('skip 理由が「既に在る」以外なら、canonical な初回 Job が在っても released にしない', async () => {
-    const status = await challengeWith('__CANONICAL__', 'task was parked by abort_task')
-    expect(status).toBe('challenge_not_aligned')
-  })
-
-  it('「既に在る」で、canonical な初回 Job がレビューした prompt のものなら released', async () => {
-    expect(await challengeWith('__CANONICAL__', INITIAL_WORKFLOW_JOB_EXISTS)).toBe('challenge_aligned')
-  })
-})
-
 describe('Critic runner は TARGET_ROOT 未設定でも target root で AI CLI を動かす（2026-10-23 Production）', () => {
   it('TARGET_ROOT が無いとき workingDir は /workspace/target（Stable の runner workingDir ではない）', async () => {
     const { storage, taskId } = seed()

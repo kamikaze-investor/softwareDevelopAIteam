@@ -14,6 +14,7 @@ import {
   PL_MAX_TECHNICAL_FAILURES_PER_STAGE,
   recordRemediationFailure,
   tallyConflictStage,
+  TECHNICAL_FAILURE_OUTCOMES,
 } from './remediationStep'
 import { PL_MAX_CRITIC_ROUNDS, selectConflictStage, type ConflictRoundResult } from './conflictResolutionStep'
 
@@ -131,31 +132,42 @@ function markEscalated(storage: IStorage, taskId: string): void {
 
 describe('classifyConflictRecoveryRow — 判定 / 技術的失敗の唯一の分類表', () => {
   it.each([
-    // critic: parse 済みの Critique だけが判定
-    ['critic', 'stage=critic provider=codex model=m disputes=0 binding_disputes=0 outcome=critiqued', 'judgment'],
+    // 技術的失敗は明示 allowlist だけ（model が応答する前に止まった行）
     ['critic', criticRunnerFailed('codex'), 'technical'],
-    ['critic', 'stage=critic provider=codex model=m outcome=critique_unusable', 'technical'],
     ['critic', 'stage=critic outcome=item_not_in_ledger', 'technical'],
     ['critic', 'stage=critic outcome=ledger_unreadable', 'technical'],
     ['critic', 'stage=critic outcome=exception', 'technical'],
-    // 旧形式（pl_revision を別 stage にする前）の critic 行の fspec= は同じ Round の2行目。二重計上しない
-    ['critic', 'stage=critic proposed=h fspec=abc rejected_fspec=- outcome=adopting', 'technical'],
-    // remediation: parse 済みの提案が判定
-    ['remediation', 'provider=codex model=m stage=remediation rejected_specs=1 outcome=abandon', 'judgment'],
-    ['remediation', 'provider=codex stage=remediation proposed=h fspec=abc rejected_fspec=def outcome=not_different', 'judgment'],
-    ['remediation', 'provider=codex stage=remediation proposed=h fspec=abc rejected_fspec=- outcome=PATHS_TOO_BROAD', 'judgment'],
-    ['remediation', 'provider=codex stage=remediation proposed=h fspec=abc rejected_fspec=- outcome=adopting', 'judgment'],
     ['remediation', remediationRunnerFailed('codex'), 'technical'],
-    ['remediation', 'provider=codex model=m stage=remediation outcome=unusable', 'technical'],
     ['remediation', 'outcome=item_not_in_ledger', 'technical'],
     ['remediation', 'outcome=ledger_unreadable', 'technical'],
     ['remediation', 'outcome=no_independent_flagship', 'technical'],
     ['remediation', 'stage=remediation outcome=exception', 'technical'],
-    // outcome の無い旧形式の行は判定の証拠が無い
-    ['remediation', 'attempt 0', 'technical'],
-    ['remediation', undefined, 'technical'],
+    // 旧形式（pl_revision を別 stage にする前）の critic 行の fspec= は同じ Round の2行目。二重計上しない
+    ['critic', 'stage=critic proposed=h fspec=abc rejected_fspec=- outcome=adopting', 'technical'],
+    // 判定: parse 済みの結果
+    ['critic', 'stage=critic provider=codex model=m disputes=0 binding_disputes=0 outcome=critiqued', 'judgment'],
+    ['critic', 'stage=critic provider=codex model=m outcome=runner_failed_after_critique', 'judgment'],
+    ['remediation', 'provider=codex model=m stage=remediation rejected_specs=1 outcome=abandon', 'judgment'],
+    ['remediation', 'provider=codex stage=remediation proposed=h fspec=abc rejected_fspec=def outcome=not_different', 'judgment'],
+    ['remediation', 'provider=codex stage=remediation proposed=h fspec=abc rejected_fspec=- outcome=PATHS_TOO_BROAD', 'judgment'],
+    ['remediation', 'provider=codex stage=remediation proposed=h fspec=abc rejected_fspec=- outcome=adopting', 'judgment'],
+    ['remediation', 'provider=codex model=m stage=remediation outcome=runner_failed_after_proposal', 'judgment'],
+    ['remediation', 'provider=codex model=m stage=remediation outcome=proposal_parsed_apply_exception', 'judgment'],
+    // 判定（fail-closed）: model は応答したが壊れていた / 未知の outcome / outcome の無い旧形式
+    ['critic', 'stage=critic provider=codex model=m outcome=critique_unusable', 'judgment'],
+    ['remediation', 'provider=codex model=m stage=remediation outcome=unusable', 'judgment'],
+    ['critic', 'stage=critic outcome=some_future_outcome', 'judgment'],
+    ['remediation', 'stage=remediation outcome=some_future_outcome', 'judgment'],
+    ['remediation', 'attempt 0', 'judgment'],
+    ['remediation', undefined, 'judgment'],
   ] as const)('%s: %s → %s', (stage, detail, expected) => {
     expect(classifyConflictRecoveryRow(stage, detail)).toBe(expected)
+  })
+
+  it('技術的失敗の allowlist はコードが記録する outcome そのもの', () => {
+    expect([...TECHNICAL_FAILURE_OUTCOMES].sort()).toEqual(
+      ['exception', 'item_not_in_ledger', 'ledger_unreadable', 'no_independent_flagship', 'runner_failed'],
+    )
   })
 
   it('challenge / pl_revision の行は critic / remediation の予算に入らない（二重計上しない）', () => {

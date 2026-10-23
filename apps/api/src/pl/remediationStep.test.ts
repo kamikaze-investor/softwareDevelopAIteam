@@ -867,6 +867,103 @@ describe('有界性と記録', () => {
   })
 })
 
+describe('parse 済みの提案は後段が失敗しても判定として残る（独立レビュー P2a）', () => {
+  it('runner が ok=false でも stdout に完全な提案があれば、判定として provider 付きで数える（採用はしない）', async () => {
+    const { storage, taskId } = seedConflictedTask()
+    let adopted = false
+
+    const result = await runRemediationStep(storage, taskId, deps({
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async () => ({ ok: false, stdout: JSON.stringify(PROPOSAL), error: 'exit 1 after output', timedOut: false }),
+      },
+      adopt: async () => { adopted = true; throw new Error('must not adopt a proposal from a failed run') },
+    }))
+
+    expect(result.status).toBe('remediation_failed')
+    expect(adopted).toBe(false)
+    expect(tallyConflictStage(storage, taskId, 'remediation')).toEqual({ judgments: 1, technicalFailures: 0 })
+    const rows = stageEntries(storage, taskId, 'remediation').map((e) => e.detail ?? '')
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toContain('provider=codex')
+    expect(rows[0]).toContain('outcome=runner_failed_after_proposal')
+  })
+
+  it('runner が ok=false で stdout が空 / 不完全なら従来どおり技術的失敗', async () => {
+    for (const stdout of ['', '{"diagnosis":"途中で切れた']) {
+      const { storage, taskId } = seedConflictedTask()
+
+      await runRemediationStep(storage, taskId, deps({
+        runnerDeps: {
+          runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+          execute: async () => ({ ok: false, stdout, error: 'boom', timedOut: false }),
+        },
+      }))
+
+      expect(tallyConflictStage(storage, taskId, 'remediation')).toEqual({ judgments: 0, technicalFailures: 1 })
+    }
+  })
+
+  it('parse 後、fspec 行を書く前に storage / 認可が throw しても provider 付きの判定行を1行だけ残す', async () => {
+    const { storage, taskId } = seedConflictedTask()
+    const record = storage.auditLog.record.bind(storage.auditLog)
+    let armed = false
+    storage.auditLog.record = ((entry: Parameters<typeof record>[0]) => {
+      // 提案の parse 後、remediation 以外の audit（Gate の認可記録）が落ちる状況を作る。
+      if (armed && entry.entityType !== 'pl_remediation') throw new Error('storage unavailable')
+      return record(entry)
+    }) as typeof storage.auditLog.record
+
+    await expect(runRemediationStep(storage, taskId, deps({
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async () => { armed = true; return { ok: true, stdout: JSON.stringify(PROPOSAL), timedOut: false } },
+      },
+    }))).rejects.toThrow('storage unavailable')
+
+    const rows = stageEntries(storage, taskId, 'remediation').map((e) => e.detail ?? '')
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toContain('provider=codex')
+    expect(rows[0]).toContain('outcome=proposal_parsed_apply_exception')
+    expect(tallyConflictStage(storage, taskId, 'remediation')).toEqual({ judgments: 1, technicalFailures: 0 })
+  })
+
+  it('applyRevisedSpec が判定行（adopting）を書いた後に throw したら、追加の行を書かない（二重計上しない）', async () => {
+    const { storage, taskId } = seedConflictedTask()
+
+    await expect(runRemediationStep(storage, taskId, deps({
+      adopt: async () => { throw new Error('adoption crashed') },
+    }))).rejects.toThrow('adoption crashed')
+
+    const rows = stageEntries(storage, taskId, 'remediation').map((e) => e.detail ?? '')
+    expect(rows).toHaveLength(1)
+    expect(rows[0]).toContain('outcome=adopting')
+  })
+
+  it('壊れた応答（unusable）は判定予算を消費する（fail-closed）が、Remediation は止まらず次を試す', async () => {
+    const { storage, taskId } = seedConflictedTask()
+    storage.auditLog.record({
+      actor: 'api', operation: 'pl_independent_remediation', entityType: 'pl_remediation',
+      entityId: `remediate:${taskId}`, result: 'success',
+      detail: 'provider=codex model=m stage=remediation rejected_specs=1 outcome=unusable',
+    })
+    const used: string[] = []
+
+    await runRemediationStep(storage, taskId, deps({
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async (raw: string) => {
+          used.push((JSON.parse(raw) as { provider: string }).provider)
+          return { ok: false, stdout: '', error: 'boom', timedOut: false }
+        },
+      },
+    }))
+
+    expect(tallyConflictStage(storage, taskId, 'remediation')).toEqual({ judgments: 1, technicalFailures: 1 })
+    expect(used).toHaveLength(1)
+  })
+})
+
 describe('abandon — 元案を捨てる結論', () => {
   it('ledger を書き換えず、採用もせずに abandon_recommended を返す', async () => {
     // 「実装しないで閉じる」state はこのシステムに無く、ledger は CEO の正本である。

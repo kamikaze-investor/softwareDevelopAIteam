@@ -141,14 +141,18 @@ const PL_PROPOSAL_AUTHOR_MODEL = CHEAP_AI_CONFIG.model
  *
  * 材料は自前の audit 行の provenance だけである（新しいテーブルは作らない）。
  *
- * **著者は判定を生んだ行の provider だけである。** runner_failed / unusable / preflight 失敗の
- * provider は提案を1つも書いていないので著者ではない。数えると、判定 0 件のまま両 flagship が
- * 著者として除外され、Remediation が `no_independent_flagship` でしか終われなくなる
- * （2026-10-23 `#2cae0d07`）。分類は `classifyConflictRecoveryRow()` の1箇所だけを使う。
- * 提案を書いた（却下された）provider は従来どおり除外される。
+ * **著者は提案を書いた判定行の provider だけである。** runner_failed / preflight 失敗の provider は
+ * 提案を1つも書いていないので著者ではない。数えると、判定 0 件のまま両 flagship が著者として
+ * 除外され、Remediation が `no_independent_flagship` でしか終われなくなる（2026-10-23 `#2cae0d07`）。
+ * 分類は `classifyConflictRecoveryRow()` の1箇所だけを使う。
+ *
+ * `unusable`（応答はあったが構造が壊れていた）は判定予算を消費するが、著者には数えない。
+ * 著者独立性の目的は「却下された設計を書いた側に書き直させない」ことで、壊れた応答は
+ * 提出も却下もされる設計を含まないからである。parse 済みの提案（abandon / fspec 行 /
+ * runner 失敗後に stdout から parse できた提案 / 適用中の例外）を書いた provider は除外される。
  */
 function priorRemediationAuthors(storage: IStorage, taskId: string): string[] {
-  return priorProvidersForStage(storage, taskId, 'remediation', { judgmentsOnly: true })
+  return priorProvidersForStage(storage, taskId, 'remediation', { authorsOnly: true })
 }
 
 /** この chain で Remediation に使った provider（Preference の順位付け用。著者判定には使わない）。 */
@@ -215,20 +219,23 @@ export type ConflictRecoveryRowKind = 'judgment' | 'technical'
 /**
  * 既存の CONFLICT 復旧 audit 行を「判定」と「技術的失敗」に分ける。**唯一の分類表**。
  *
- * **判定 = runner が parse 済みの結果を返した行**（肯定的な証拠がある行だけ）:
- *   - critic: `outcome=critiqued`（Critique が parse できた）。Challenge の行は `stage=challenge`
- *     に載り、critiqued の**後**にしか書かれない（同じ Round の続き）ので critic の予算には数えない。
- *     数えると1 Round で2回分を消費する（pl_revision を別 stage にしたのと同じ理由）
- *   - remediation: `outcome=abandon`（parse 済みの提案が「捨てる」と結論した）と、
- *     `applyRevisedSpec()` が書く `fspec=` 付きの行（not_different / Gate の failureCode /
- *     adopting）。後者は提案が parse でき、その spec key が計算できたことの証拠である
+ * **技術的失敗は明示した allowlist だけである**（`TECHNICAL_FAILURE_OUTCOMES`）。いずれも
+ * model が応答を返す前に止まった行で、記録している箇所は次のとおり:
+ *   - `runner_failed` … critic / remediation の runner が ok=false で、stdout にも完全な結果が無い
+ *   - `exception` … PL ループが step の例外を記録する（`executionLoop.ts` remediateConflict。
+ *     step がこの試行を何も記録していなかったときだけ書かれる）
+ *   - `item_not_in_ledger` / `ledger_unreadable` … model を呼ぶ前の ledger 読み取り失敗
+ *     （remediation: `runRemediationStep`、critic: `runConflictResolutionRound` の readLedgerBody）
+ *   - `no_independent_flagship` … remediation の model 選択（preflight）で候補が無い
  *
- * **技術的失敗 = parse 済みの結果が無いまま記録された行**（それ以外すべて）:
- *   runner_failed / exception / critique_unusable / unusable / item_not_in_ledger /
- *   ledger_unreadable / no_independent_flagship、`outcome=` の無い旧形式の行など。
+ * **それ以外はすべて判定（fail-closed）。** `critique_unusable` / `unusable`（model は応答したが
+ * 構造が壊れていた）も、未知の outcome も、`outcome=` の無い旧形式の行も判定予算を消費する。
+ * schema を守らない応答で追加の抽選を得させないためである（独立レビュー指摘）。
  *
- * 未知の outcome を技術的失敗側へ倒すのは、判定の証拠が無い行で判定予算を消費させないため。
- * それでも `PL_MAX_TECHNICAL_FAILURES_PER_STAGE` で有界なので、無限に再試行はしない。
+ * 例外は1つだけ: critic 行に `fspec=` が付いた旧形式（pl_revision を別 stage にする前）は、
+ * 同じ Round の2行目（critiqued の後に書かれた適用結果）である。判定として数えると1 Round を
+ * 2回分数える（二重計上）ので判定には数えない。Challenge の行は `stage=challenge` に載るので
+ * critic の予算にはそもそも入らない。
  *
  * 旧来の行は削除せず、この関数で**読み替える**だけである（DB migration なし）。
  */
@@ -237,16 +244,30 @@ export function classifyConflictRecoveryRow(
   detail: string | undefined,
 ): ConflictRecoveryRowKind {
   const text = detail ?? ''
-  const outcome = /\boutcome=(\S+)/.exec(text)?.[1]
-  if (stage === 'critic') {
-    // critic 行の `fspec=` は pl_revision を別 stage にする前の旧形式で、同じ Round の2行目である。
-    // 判定として数えると1 Round を2回分数える（二重計上）ので、critiqued だけを数える。
-    return outcome === 'critiqued' ? 'judgment' : 'technical'
-  }
-  if (outcome === 'abandon') return 'judgment'
-  if (/\bfspec=\S+/.test(text)) return 'judgment'
-  return 'technical'
+  const outcome = conflictRowOutcome(text)
+  if (outcome !== undefined && TECHNICAL_FAILURE_OUTCOMES.includes(outcome)) return 'technical'
+  if (stage === 'critic' && outcome !== 'critiqued' && /\bfspec=\S+/.test(text)) return 'technical'
+  return 'judgment'
 }
+
+function conflictRowOutcome(detail: string | undefined): string | undefined {
+  return /\boutcome=(\S+)/.exec(detail ?? '')?.[1]
+}
+
+/** 判定を生まなかった技術的失敗として数える outcome（明示 allowlist。未知の outcome は判定扱い）。 */
+export const TECHNICAL_FAILURE_OUTCOMES: readonly string[] = [
+  'runner_failed',
+  'exception',
+  'item_not_in_ledger',
+  'ledger_unreadable',
+  'no_independent_flagship',
+]
+
+/**
+ * 判定のうち、model が応答したが構造化された結果にならなかったもの。予算は消費するが、
+ * 提案を1つも書いていないので Remediation の著者には数えない（`priorRemediationAuthors()`）。
+ */
+const MALFORMED_RESPONSE_OUTCOMES: readonly string[] = ['unusable', 'critique_unusable']
 
 export interface ConflictStageTally {
   judgments: number
@@ -277,13 +298,14 @@ function priorProvidersForStage(
   storage: IStorage,
   taskId: string,
   stage: 'critic' | 'remediation' | 'challenge' | 'pl_revision',
-  options: { judgmentsOnly?: boolean } = {},
+  options: { authorsOnly?: boolean } = {},
 ): string[] {
   const providers: string[] = []
   for (const entry of stageEntries(storage, taskId, stage)) {
-    if (options.judgmentsOnly === true
+    if (options.authorsOnly === true
       && (stage === 'critic' || stage === 'remediation')
-      && classifyConflictRecoveryRow(stage, entry.detail) !== 'judgment') continue
+      && (classifyConflictRecoveryRow(stage, entry.detail) !== 'judgment'
+        || MALFORMED_RESPONSE_OUTCOMES.includes(conflictRowOutcome(entry.detail) ?? ''))) continue
     const provider = /\bprovider=([\w-]+)/.exec(entry.detail ?? '')?.[1]
     if (provider !== undefined && !providers.includes(provider)) providers.push(provider)
   }
@@ -896,7 +918,15 @@ export async function runRemediationStep(
 
   // **試行は必ず記録する。** 記録しないと上限が効かず、同じ失敗を無限に繰り返せる。
   if (!execution.ok) {
-    recordRemediation(storage, taskId, `${provenance} outcome=runner_failed`)
+    // **stdout に完全な提案があれば、それは判定である**（会計のみ。採用・適用はしない）。
+    // runner が提案を書いた後に落ちた場合を技術的失敗として数えると、parse 済みの提案が
+    // 判定予算を消費せず、その provider も著者として残らない（独立レビュー指摘）。
+    const parsedBeforeFailure = execution.stdout !== '' && parseRemediationProposal(execution.stdout) !== undefined
+    recordRemediation(
+      storage,
+      taskId,
+      `${provenance} outcome=${parsedBeforeFailure ? 'runner_failed_after_proposal' : 'runner_failed'}`,
+    )
     return {
       status: 'remediation_failed',
       taskId,
@@ -940,18 +970,33 @@ export async function runRemediationStep(
   // ── 修正版 spec を適用する（guard → Gate → 採用 → fresh Review の共有経路）──
   //
   // **PL revision と同じ関数を通す。** 誰が spec を書いたかで関門が変わってはならない。
-  const outcome = await applyRevisedSpec(storage, {
-    subject,
-    ledgerBody,
-    submittedScope: buildRemediatedScope(proposal),
-    rawScope: proposal.implementationScope,
-    allowedPaths: proposal.allowedPaths,
-    acceptanceCriteria: proposal.acceptanceCriteria,
-    riskOpinionLevel: 'INDEPENDENT_REMEDIATION',
-    rationale: proposal.resolution,
-    provenance: provenance,
-    ...(deps.adopt !== undefined ? { adopt: deps.adopt } : {}),
-  })
+  //
+  // **parse 済みの提案は、後段が throw しても判定として残す。** `applyRevisedSpec()` が
+  // `fspec=` 行を書く前（Gate・storage・hash の準備中）に落ちると、PL ループは provider の無い
+  // `outcome=exception`（技術的失敗）しか書けず、判定予算も著者記録も失われる（独立レビュー指摘）。
+  // 既に判定行が書かれていれば足さない（二重計上しない）。PL ループ側は試行数が増えていれば
+  // exception 行を書かないので、ここで1行になる。
+  const rowsBeforeApply = countConflictAttempts(storage, taskId)
+  let outcome: ApplyRevisedSpecOutcome
+  try {
+    outcome = await applyRevisedSpec(storage, {
+      subject,
+      ledgerBody,
+      submittedScope: buildRemediatedScope(proposal),
+      rawScope: proposal.implementationScope,
+      allowedPaths: proposal.allowedPaths,
+      acceptanceCriteria: proposal.acceptanceCriteria,
+      riskOpinionLevel: 'INDEPENDENT_REMEDIATION',
+      rationale: proposal.resolution,
+      provenance: provenance,
+      ...(deps.adopt !== undefined ? { adopt: deps.adopt } : {}),
+    })
+  } catch (error: unknown) {
+    if (countConflictAttempts(storage, taskId) === rowsBeforeApply) {
+      recordRemediation(storage, taskId, `${provenance} outcome=proposal_parsed_apply_exception`)
+    }
+    throw error
+  }
 
   const common = {
     taskId,
