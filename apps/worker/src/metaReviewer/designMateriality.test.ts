@@ -391,7 +391,7 @@ describe('独立レビュー指摘（code review round 4）の回帰', () => {
     ['A = "x,y", B', 'A = "", B'],
     ["A = 1 /* don't */, B /* it's */", 'A = 1  , B  '],
     ['A = "/*", B, C = "*/"', 'A = "", B, C = ""'],
-    ["A = 'it\'s', B // tail, C", 'A = "", B '],
+    [String.raw`A = 'it\'s', B // tail, C`, 'A = "", B '],
   ])('stripStringsAndComments(%s)', (input, expected) => {
     expect(stripStringsAndComments(input)).toBe(expected)
   })
