@@ -8,6 +8,7 @@ import {
   parseDetection,
   parseEvaluation,
   signalId,
+  stripStringsAndComments,
   type BaseRecordReader,
   type MaterialitySignal,
 } from './designMateriality.js'
@@ -377,5 +378,21 @@ describe('独立レビュー指摘（code review round 3）の回帰', () => {
   it("1行 enum のコメント内の `'` を引用符と誤らない", () => {
     const diff = fileDiff('apps/api/src/x.ts', ["-export enum E { A = 1 /* don't */, B /* it's */ }", "+export enum E { A = 1 /* don't */ }"])
     expect(kinds(computeMaterialitySignals(diff))).toEqual(['contract_member_removed:B'])
+  })
+})
+
+describe('独立レビュー指摘（code review round 4）の回帰', () => {
+  it('1行 enum の文字列内のコメント記号をコメントと誤らない', () => {
+    const diff = fileDiff('apps/api/src/x.ts', ['-export enum E { A = "/*", B, C = "*/" }', '+export enum E { A = "/*", C = "*/" }'])
+    expect(kinds(computeMaterialitySignals(diff))).toEqual(['contract_member_removed:B'])
+  })
+
+  it.each([
+    ['A = "x,y", B', 'A = "", B'],
+    ["A = 1 /* don't */, B /* it's */", 'A = 1  , B  '],
+    ['A = "/*", B, C = "*/"', 'A = "", B, C = ""'],
+    ["A = 'it\'s', B // tail, C", 'A = "", B '],
+  ])('stripStringsAndComments(%s)', (input, expected) => {
+    expect(stripStringsAndComments(input)).toBe(expected)
   })
 })

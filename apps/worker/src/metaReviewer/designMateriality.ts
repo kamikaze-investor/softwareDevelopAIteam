@@ -129,13 +129,8 @@ function contractMembers(lines: ReadonlyArray<string | null>): { removed: Map<st
     // 1行 enum（`enum Stage { Critic, Challenge }`）は opener と member が同じ行にある
     const inlineEnum = body.match(/\benum\s+\w+\s*\{([^}]*)\}/)
     if (inlineEnum) {
-      // 初期化子の文字列リテラル内の `,` で切らないよう、先にコメント（中の `'` を引用符と誤らないため）、
-      // 次に文字列を空にする
-      const stripped = inlineEnum[1]
-        .replace(/\/\*[\s\S]*?\*\//g, ' ')
-        .replace(/(['"`])(?:\\.|(?!\1).)*\1/g, '""')
-        .replace(/\/\/.*$/, '')
-      for (const member of stripped.split(',')) {
+      // 初期化子の文字列・コメント内の `,` で切らないよう、両方を1回の走査で取り除いてから切る
+      for (const member of stripStringsAndComments(inlineEnum[1]).split(',')) {
         const m = member.match(/^\s*([A-Za-z_]\w*)/)
         if (m) found.push(['enum', m[1]])
       }
@@ -176,6 +171,34 @@ function contractMembers(lines: ReadonlyArray<string | null>): { removed: Map<st
 }
 
 interface ContractCount { token: string; count: number }
+
+/**
+ * 1行のコードから文字列リテラルを `""` に、コメントを空白に置き換える。
+ * 文字列とコメントを同じ走査で追うので、文字列内の `/*` もコメント内の `'` も取り違えない。
+ */
+export function stripStringsAndComments(line: string): string {
+  let out = ''
+  let i = 0
+  while (i < line.length) {
+    const ch = line[i]
+    if (ch === '/' && line[i + 1] === '*') {
+      const end = line.indexOf('*/', i + 2)
+      out += ' '
+      i = end < 0 ? line.length : end + 2
+    } else if (ch === '/' && line[i + 1] === '/') {
+      break
+    } else if (ch === "'" || ch === '"' || ch === '`') {
+      let j = i + 1
+      while (j < line.length && line[j] !== ch) j += line[j] === '\\' ? 2 : 1
+      out += '""'
+      i = j + 1
+    } else {
+      out += ch
+      i++
+    }
+  }
+  return out
+}
 
 /**
  * unified diff から S1–S4 を決定的に計算する。
