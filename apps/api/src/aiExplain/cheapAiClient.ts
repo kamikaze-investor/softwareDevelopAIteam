@@ -8,14 +8,15 @@ import { join, resolve } from 'node:path'
  * ## latency / timeout 契約（cheap AI = OpenCode CLI の1経路だけ）
  *
  * AI CLI 呼び出しは `runOpenCodeCli` の1種類だけで、caller の種類に応じて試行回数と期限を選ぶ。
- * PL adoption proposal だけは JSON だけを返す専用 agent（`PL_ADOPTION_PROPOSAL_AGENT`）を `--agent` で選ぶ。
+ * PL adoption proposal と PL revision（CONFLICT 解決）は JSON だけを返す専用 agent（`PL_ADOPTION_PROPOSAL_AGENT`）を
+ * `--agent` で選ぶ（既定 agent は `<tool_call>` を本文で返すことがある）。
  * それ以外の caller は OpenCode の既定 agent と従来どおりの引数のまま。
  *
  * | caller | 試行 | 1試行の期限 | CLI 起動後の最悪待ち |
  * | --- | --- | --- | --- |
  * | 説明・質問（approvalAi / taskFailureAi） | 1回 | `CHEAP_AI_ATTEMPT_TIMEOUT_MS` | `CHEAP_AI_SINGLE_ATTEMPT_MAX_WAIT_MS` |
  * | PL 推論（`retryTransientOnce: true`、adoption proposal 以外） | 最大2回 | `CHEAP_AI_ATTEMPT_TIMEOUT_MS` | `CHEAP_AI_RETRYING_MAX_WAIT_MS` |
- * | PL adoption proposal（専用 agent + `retryTransientOnce: true`） | 最大2回 | `PL_ADOPTION_PROPOSAL_ATTEMPT_TIMEOUT_MS` | `PL_ADOPTION_PROPOSAL_MAX_WAIT_MS` = 2 × (120秒 + grace) + backoff |
+ * | PL adoption proposal / PL revision（専用 agent + `retryTransientOnce: true`） | 最大2回 | `PL_ADOPTION_PROPOSAL_ATTEMPT_TIMEOUT_MS` | `PL_ADOPTION_PROPOSAL_MAX_WAIT_MS` = 2 × (120秒 + grace) + backoff |
  *
  * - **timeout**: 期限到達で AIteamOS がプロセスグループへ SIGTERM、`CHEAP_AI_KILL_GRACE_MS` 後に SIGKILL して
  *   close を待たずに決着する。CLI 起動後の待ちは上表の caller 別上限を超えない。
