@@ -6,7 +6,6 @@ import type { ReactElement } from 'react'
 import { useCallback, useEffect, useState } from 'react'
 import type {
   ApprovalExplanationResponse,
-  ApprovalGateStatus,
   ApprovalQuestionResponse,
   ApprovalQuestionTurn,
   ApprovalRequest,
@@ -40,14 +39,15 @@ import {
   setCachedApprovals,
 } from '../lib/approvalsCache'
 import type { ApprovalWithProject } from '../lib/approvalsCache'
+import {
+  approvalGateDecisionPath,
+  buildApprovalGateDecisionBody,
+} from '../lib/approvalGateDecision'
+import type { ApprovalGateDecisionStatus } from '../lib/approvalGateDecision'
 import { formatApprovalDecisionErrorMessage } from '../lib/resumeErrorMessage'
 import { POLLING_INTERVAL_MS, usePolling } from '../lib/usePolling'
 
 type DecisionStatus = 'approved' | 'rejected'
-type ApprovalGateDecisionStatus = Extract<
-  ApprovalGateStatus,
-  'APPROVED' | 'REJECTED'
->
 
 type RejectTarget =
   | { type: 'policy'; item: ApprovalWithProject }
@@ -510,9 +510,9 @@ export default function ApprovalsScreen(): ReactElement {
   ): Promise<void> {
     try {
       const response = await apiFetch(
-        `/api/approval-requests/${requestId}/status`,
+        approvalGateDecisionPath(requestId),
         {
-          body: JSON.stringify({ reason, status }),
+          body: JSON.stringify(buildApprovalGateDecisionBody(status, reason)),
           headers: { 'Content-Type': 'application/json' },
           method: 'PATCH',
         },

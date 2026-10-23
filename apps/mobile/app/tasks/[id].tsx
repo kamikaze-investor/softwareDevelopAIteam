@@ -63,11 +63,19 @@ import { formatResumeErrorMessage, RESUME_ERROR_MESSAGE_FALLBACK } from '../../l
 import { readApiRejection, submitTaskRecovery } from '../../lib/taskRecovery'
 import {
   ABORT_REQUEST_CONFIRM_MESSAGE,
+  ONE_TAP_ABORT_BUTTON_LABEL,
+  ONE_TAP_ABORT_CONFIRM_TITLE,
+  ONE_TAP_ABORT_DEFAULT_DEPS,
+  ONE_TAP_ABORT_PROGRESS_TEXT,
   abortActionView,
   canShowAbortUI,
   createAbortApprovalRequest,
+  createOneTapAbortRunner,
+  oneTapAbortConfirmMessage,
+  oneTapAbortView,
   submitTaskAbort,
 } from '../../lib/taskAbort'
+import type { OneTapAbortStage } from '../../lib/taskAbort'
 import { POLLING_INTERVAL_MS, usePolling } from '../../lib/usePolling'
 import { TASK_NUMBER_TEXT_STYLE, taskNumberLabel } from '../../lib/taskNumber'
 
@@ -993,26 +1001,34 @@ function StoredReviewRecoverySection({
 interface AbortSectionProps {
   isSubmitting: boolean
   jobs: Job[]
-  /** 直前の操作結果（作成した承認依頼 id・実行結果）。画面を離れるまで表示する */
+  /** 直前の操作結果（実行結果・止まった段階の文言）。画面を離れるまで表示する */
   lastResult: string | null
+  /** ワンタップ中止（起票 → 人の承認 → 実行を 1 回の確認で） */
+  onAbort: () => void
   onCreateRequest: () => void
   onExecute: (approvalRequestId: string) => void
+  /** ワンタップ中止の実行中の段階（進行状況の文言を出す）。実行中でなければ null */
+  progress: OneTapAbortStage | null
   task: TaskDetail
 }
 
 /**
- * 既存の manual abort（park）経路。表示条件は `canShowAbortUI()`、ボタン状態は `abortActionView()`。
- * **承認はこの画面ではしない**（承認一覧の human-only PATCH のまま）。
+ * 既存の manual abort（park）経路。表示条件は `canShowAbortUI()`。
+ * 主ボタンはワンタップ中止（`oneTapAbortView()` / `runOneTapAbort()`。承認は承認一覧と同じ human-only PATCH）。
+ * 「手順を分けて行う」の下に従来の 2 ボタン（`abortActionView()`。起票ボタンは承認を連鎖させない）を残す。
  */
 function AbortSection({
   isSubmitting,
   jobs,
   lastResult,
+  onAbort,
   onCreateRequest,
   onExecute,
+  progress,
   task,
 }: AbortSectionProps): ReactElement | null {
   if (!canShowAbortUI(task, jobs)) return null
+  const oneTap = oneTapAbortView(task.humanTaskDecisions)
   const view = abortActionView(task.humanTaskDecisions)
   const approval = view.approval
 
@@ -1020,6 +1036,26 @@ function AbortSection({
     <View style={styles.section}>
       <Text style={styles.sectionTitle}>Task を中止（park）</Text>
       <View style={styles.resumeBox}>
+        <Text style={styles.resumeHelpText}>{oneTap.note}</Text>
+        <TouchableOpacity
+          disabled={isSubmitting}
+          onPress={onAbort}
+          style={[
+            styles.resumeSubmitButton,
+            styles.recoverButton,
+            styles.abortExecuteButton,
+            isSubmitting && styles.resumeSubmitButtonDisabled,
+          ]}
+        >
+          {isSubmitting && (
+            <ActivityIndicator color="#fff" size="small" />
+          )}
+          <Text style={styles.resumeSubmitButtonText}>{ONE_TAP_ABORT_BUTTON_LABEL}</Text>
+        </TouchableOpacity>
+        {progress !== null && (
+          <Text style={[styles.resumeHelpText, styles.abortResultText]}>{ONE_TAP_ABORT_PROGRESS_TEXT[progress]}</Text>
+        )}
+        <Text style={styles.abortStepwiseHeading}>手順を分けて行う</Text>
         <Text style={styles.resumeHelpText}>{view.note}</Text>
         <TouchableOpacity
           disabled={isSubmitting || !view.canCreateRequest}
@@ -1510,6 +1546,7 @@ export default function TaskDetailScreen(): ReactElement {
   const [isSubmittingRecovery, setIsSubmittingRecovery] = useState(false)
   const [isSubmittingAbort, setIsSubmittingAbort] = useState(false)
   const [lastAbortResult, setLastAbortResult] = useState<string | null>(null)
+  const [abortProgress, setAbortProgress] = useState<OneTapAbortStage | null>(null)
 
   const loadTaskDetail = useCallback(async (): Promise<void> => {
     if (taskId === null || taskId.length === 0) {
@@ -1726,6 +1763,38 @@ export default function TaskDetailScreen(): ReactElement {
     }
   }, [loadTaskDetail, taskId])
 
+  // ワンタップ中止: CEO が自分で始めた中止なので、1 回の確認の後ろで起票 → 人の承認 → 実行を順に呼ぶ（lib の runOneTapAbort）。
+  // runner は二重送信を API の手前で止める（描画の反映前の 2 回押し対策）。
+  const oneTapAbortRunner = useMemo(
+    () => createOneTapAbortRunner({ ...ONE_TAP_ABORT_DEFAULT_DEPS, onProgress: setAbortProgress }),
+    [],
+  )
+
+  const submitOneTapAbort = useCallback(async (): Promise<void> => {
+    if (taskId === null || taskId.length === 0 || data === null) return
+    const view = oneTapAbortView(data.task.humanTaskDecisions)
+    setIsSubmittingAbort(true)
+    try {
+      const result = await oneTapAbortRunner.run(taskId, view.approval)
+      if (result === null) return
+      setLastAbortResult(result.message)
+      Alert.alert(result.ok ? 'Task を中止（park）' : '中止失敗', result.message)
+    } finally {
+      setAbortProgress(null)
+      await loadTaskDetail()
+      setIsSubmittingAbort(false)
+    }
+  }, [data, loadTaskDetail, oneTapAbortRunner, taskId])
+
+  const handleOneTapAbort = useCallback((): void => {
+    if (isSubmittingAbort || oneTapAbortRunner.isRunning() || data === null) return
+    const view = oneTapAbortView(data.task.humanTaskDecisions)
+    Alert.alert(ONE_TAP_ABORT_CONFIRM_TITLE, oneTapAbortConfirmMessage(data.task, view), [
+      { style: 'cancel', text: 'キャンセル' },
+      { onPress: () => { void submitOneTapAbort() }, style: 'destructive', text: '中止する' },
+    ])
+  }, [data, isSubmittingAbort, oneTapAbortRunner, submitOneTapAbort])
+
   const handleExecuteAbort = useCallback((approvalRequestId: string): void => {
     if (isSubmittingAbort) return
     Alert.alert(
@@ -1848,8 +1917,10 @@ export default function TaskDetailScreen(): ReactElement {
             isSubmitting={isSubmittingAbort}
             jobs={data.jobs}
             lastResult={lastAbortResult}
+            onAbort={handleOneTapAbort}
             onCreateRequest={handleCreateAbortRequest}
             onExecute={handleExecuteAbort}
+            progress={abortProgress}
             task={data.task}
           />
           <JobHistorySection jobs={data.jobs} />
@@ -2229,6 +2300,13 @@ const styles = StyleSheet.create({
   abortResultText: {
     marginBottom: 0,
     marginTop: 12,
+  },
+  abortStepwiseHeading: {
+    color: '#6b7280',
+    fontSize: 13,
+    fontWeight: '600',
+    marginBottom: 6,
+    marginTop: 20,
   },
   resumeBox: {
     backgroundColor: '#141414',
