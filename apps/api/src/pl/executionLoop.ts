@@ -836,9 +836,9 @@ async function remediateConflict(
   }
 
   /** 設計が既存 Review Pipeline を通って実装へ進める状態になったか。 */
-  // 同一 spec の再審査（旧 Challenge）は DA trigger 7 の verdict re-roll なので廃止した。
   const resolved = status === 'remediated'
     || status === 'revised_and_aligned'
+    || status === 'challenge_aligned'
 
   const provenance = provider !== undefined ? ` provider=${provider} model=${model}` : ''
   record(

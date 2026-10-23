@@ -151,8 +151,19 @@ describe('PL tick — CONFLICT 解決の配線', () => {
     expect(result.status).toBe('acted')
   })
 
-  it('**resolved として扱うのは修正版の fresh ALIGNED だけ**（同一 spec の再審査は廃止。DA trigger 7）', async () => {
-    for (const status of ['revised_not_aligned', 'revision_rejected', 'critique_unusable'] as const) {
+  it('challenge が ALIGNED なら acted（既存 Job Gate が Job を作っている）', async () => {
+    const { storage } = seedConflicted()
+
+    const result = await runPlTick(storage, deps({
+      resolveConflict: async (_s, id) =>
+        round({ status: 'challenge_aligned', stage: 'challenge', taskId: id }),
+    }))
+
+    expect(result.status).toBe('acted')
+  })
+
+  it('**challenge が ALIGNED でなければ実装へ進まない**（release しない）', async () => {
+    for (const status of ['challenge_not_aligned', 'challenge_cap_reached'] as const) {
       resetPlLoopInFlightForTest()
       const { storage } = seedConflicted()
 

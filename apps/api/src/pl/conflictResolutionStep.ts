@@ -20,9 +20,8 @@
  *     → 解決しなければ Independent Remediation → 既存 adoption seam → 既存 Design Review
  *     → それでも解決しなければ terminal
  *
- * **Critic が Review Finding 自体を具体的根拠付きで dispute しても、却下済みの同一 spec は
- * 再審査しない**（verdict re-roll は DA trigger 7 に反する）。異議は `stage=challenge` の audit 行に
- * 記録し、Critique として PL revision へ渡すだけである。
+ * **Critic が Review Finding 自体を具体的根拠付きで dispute した場合だけ**、frozen spec に
+ * 対する `stage=challenge` へ条件分岐する。**challenge は固定 stage ではない。**
  *
  * ## Independent Remediation は最初の手段ではない
  *
@@ -46,13 +45,21 @@ import {
 import { getValidRoadmapItems } from '@ai-team/worker/scripts/roadmap/roadmapParser.js'
 import { requestText } from '../aiExplain/cheapAiClient'
 import {
+  buildDefaultCoordinatorDeps,
+  createAndExecuteDesignReview,
   executeRunner,
   type CoordinatorDeps,
   type RunnerExecution,
 } from '../designReview/designReviewCoordinator'
+import {
+  createInitialImplementWorkflow,
+  INITIAL_WORKFLOW_JOB_EXISTS,
+  initialWorkflowStepKey,
+} from '../ctoAi/initialImplementWorkflow'
 import { extractImplementationScope, extractItemDescription } from '../ctoAi/roadmapAdoption'
-import type { IStorage } from '../storage/interface'
+import type { DesignReviewRun, IStorage } from '../storage/interface'
 import { configuredTargetRoot } from '../utils/pathGuard'
+import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { ADOPTION_REPOSITORY_MAP, resolveLedgerPath } from './adoptionStep'
 import {
   applyRevisedSpec,
@@ -367,8 +374,14 @@ export type ConflictRoundStatus =
   | 'revised_not_aligned'
   /** PL の修正案が使えなかった / Gate に止められた。 */
   | 'revision_rejected'
+  /** frozen spec の再評価が ALIGNED evidence を生み、既存 Gate が Job を作った。 */
+  | 'challenge_aligned'
+  /** frozen spec の再評価が ALIGNED にならなかった。**release しない。** */
+  | 'challenge_not_aligned'
+  /** 同一 (spec, finding) の再評価は既に使い切っている。 */
+  | 'challenge_cap_reached'
   /**
-   * 修正版の fresh Review が**まだ判定を出していない**（run が queued に戻った）。
+   * 再評価 / 修正版の fresh Review が**まだ判定を出していない**（run が queued に戻った）。
    * 否定的な判定ではないので escalation しない。run は design_review_idle → rekick で再開され、
    * ALIGNED なら既存 `recoverReadyTasksWithoutJob()` が `createInitialImplementWorkflow()` で
    * Job を作る（stepKey 一意で1回だけ）。CONFLICT なら次の Round がその判定から始まる。
@@ -400,6 +413,10 @@ export interface ConflictResolutionDeps {
   runnerDeps?: CoordinatorDeps
   /** PL 自身の model による修正。既定は既存 cheap client（PL は Task Design の Owner）。 */
   revise?: (system: string, user: string) => Promise<string>
+  /** frozen spec の再評価。既定は既存 `createAndExecuteDesignReview()`。 */
+  reEvaluate?: typeof createAndExecuteDesignReview
+  /** 再評価で ALIGNED になった後の Job 生成。既定は既存 `createInitialImplementWorkflow()`。 */
+  ensureJob?: typeof createInitialImplementWorkflow
   coordinatorDeps?: CoordinatorDeps
   readLedger?: () => string
   remediationDeps?: PlRemediationDeps
@@ -410,10 +427,11 @@ export interface ConflictResolutionDeps {
 const PL_REVISION_MAX_TOKENS = 900
 
 /**
- * 同一 (material spec, finding) に対する Critic 異議のキー。
+ * 同一 (material spec, finding) に対する再評価キー。
  *
- * prompt hash ではなく Remediation と同じ material-spec identity（scope + allowedPaths）を使う。
- * 新しい counter table は作らず、既存 audit 行にこのキーを書いておき、同じ異議を二重に記録しない。
+ * canonical prompt の書式変更だけで Challenge 予算を復活させないため、prompt hash ではなく
+ * Remediation と同じ material-spec identity（scope + allowedPaths）を使う。新しい counter table は
+ * 作らず、既存 audit 行にこのキーを書いておき、存在すれば消費済みとする。
  */
 function challengeKey(subject: RemediationSubject, findingSource: string): string {
   const specKey = shortSpecKey({
@@ -421,6 +439,11 @@ function challengeKey(subject: RemediationSubject, findingSource: string): strin
     allowedPaths: subject.task.allowedPaths ?? [],
   })
   return `${specKey.slice(0, 12)}:${findingSource}`
+}
+
+/** Task Contract 導入前の audit 行が使っていた prompt-hash key。読み取り互換にだけ使う。 */
+function legacyChallengeKey(designTextHash: string, findingSource: string): string {
+  return `${designTextHash.slice(0, 12)}:${findingSource}`
 }
 
 function challengeConsumed(storage: IStorage, taskId: string, keys: readonly string[]): boolean {
@@ -456,6 +479,182 @@ function readLedgerBody(
       reason: `roadmap ledger could not be read: ${error instanceof Error ? error.message : String(error)}`,
     }
   }
+}
+
+/**
+ * frozen spec に対する **fresh formal re-evaluation** を1回だけ行う。
+ *
+ * ## 呼称について厳密であること（CEO 指示 2026-09-18）
+ *
+ * これは **different-vendor independent re-review ではない。** 現状の実装では
+ *   - 元 Design Reviewer の provider / model を**取得できない**（`DesignReviewRun` に
+ *     provider 欄が無く、`strategicReview` は `providerUsed` を捨てている）
+ *   - したがって再評価側が元 Reviewer と別 vendor / model である保証も**無い**
+ * ため、「reviewer diversity 確認済み」「独立 reviewer による再審査」とは表現しない。
+ * 不足している provenance の owner は既存 Roadmap item
+ * `review-provider-exhausted-alternate-rereview` である。
+ *
+ * **保証するのはここまで**: 「Critic の具体的な異議に基づく、同一 frozen Task Spec への
+ * once-per-(spec, finding) な fresh formal re-evaluation」。判定は既存
+ * `recomputeDecision()` が行い、ALIGNED evidence が出た場合のみ既存 Job Gate へ進む。
+ * **新しい override action は作らない。** 元の CONFLICT run は履歴として保持し、削除も上書きもしない。
+ */
+async function runChallenge(
+  storage: IStorage,
+  subject: RemediationSubject,
+  dispute: FindingAssessment,
+
+  deps: ConflictResolutionDeps,
+): Promise<ConflictRoundResult> {
+  const taskId = subject.task.id
+  const key = challengeKey(subject, dispute.source)
+  const legacyKey = legacyChallengeKey(subject.reviewedDesignTextHash, dispute.source)
+  const base = { stage: 'challenge' as const, taskId }
+
+  if (challengeConsumed(storage, taskId, [key, legacyKey])) {
+    return {
+      ...base,
+      status: 'challenge_cap_reached',
+      failureCode: 'challenge_already_used',
+      reason:
+        `the same frozen spec and finding (${dispute.source}) has already had its one`
+        + ' fresh re-evaluation; repeating it would be drawing for a different verdict',
+    }
+  }
+
+  // **別の同一性の review が active なら、Challenge を消費せず待つ。** active run は Task ごとに
+  // 1本なので、ここで再評価を要求しても別の設計の run しか返らない（create() は契約上それを返さず
+  // contention を投げる）。それを消費してしまうと、この Challenge は一度も評価されずに失われる。
+  // ここから create() までの間に await は無いので、判定と作成の間に別経路は割り込めない。
+  const active = storage.designReviewRuns.findActiveByTaskId(taskId)
+  if (active !== undefined && !isSameReviewIdentity(active, subject)) {
+    return {
+      ...base,
+      status: 'review_pending',
+      reason: `another design review (run ${active.id}) is active for this task; the challenge waits for it`,
+    }
+  }
+
+  // **先に消費を記録する。** 後で書くと、途中で落ちた場合に何度でも引けてしまう。
+  // `orig_provider` / `orig_model` は取得不能なので `unavailable` と明示する
+  // （owner: review-provider-exhausted-alternate-rereview）。
+  recordRemediationFailure(
+    storage,
+    taskId,
+    `stage=challenge chal=${key} orig_provider=unavailable orig_model=unavailable`
+    + ` orig_verdict=CONFLICT finding=${dispute.source} grounds=${dispute.grounds ?? '-'}`
+    + ` evidence=${dispute.evidence !== undefined ? 'yes' : 'no'} outcome=starting`,
+  )
+
+  const reEvaluate = deps.reEvaluate ?? createAndExecuteDesignReview
+  const outcome = await reEvaluate(
+    storage,
+    {
+      taskId,
+      taskTitle: subject.task.title,
+      // **byte-identical。** spec は変更しない。
+      designText: subject.reviewedDesignText,
+      // **元 run と同じ changedFiles。** `[]` に落とすと reviewLoad が下がり、
+      // critical で必須の Independent Review が省かれてしまう。
+      changedFiles: [...subject.reviewedChangedFiles],
+    },
+    deps.coordinatorDeps ?? buildDefaultCoordinatorDeps(),
+  )
+
+  // **requeued は判定ではない。** 評価済み（outcome=evaluated）とも否定とも記録しない。
+  // 再評価 run は queued のまま残り、design_review_idle → rekick で同じ run が判定まで進む。
+  // Challenge は1回きりのまま —— 新しい run を引き直さず、この run の判定がこの Challenge の
+  // 判定になる（上の starting 行は「この Challenge は始まった」の記録として残す）。
+  // `contended` / 読み直しても終端していない `not_claimable` / `stale` も同じく判定待ち。
+  if (
+    outcome.status === 'requeued' || outcome.status === 'contended'
+    || outcome.status === 'not_claimable' || outcome.status === 'stale'
+  ) {
+    recordRemediationFailure(
+      storage,
+      taskId,
+      `stage=challenge chal=${key} orig_verdict=CONFLICT outcome=pending`
+      + ` reason=${outcome.decision ?? outcome.status}`,
+    )
+    return {
+      ...base,
+      status: 'review_pending',
+      reason: 'the fresh re-evaluation has not produced a judgment yet; the queued run will be resumed',
+    }
+  }
+
+  const verdict = outcome.decision ?? outcome.status
+  // verdict reversal を観測可能な事実として残す（新しい metrics backend は作らない）。
+  recordRemediationFailure(
+    storage,
+    taskId,
+    `stage=challenge chal=${key} orig_verdict=CONFLICT chal_verdict=${verdict}`
+    + ` reversal=${outcome.status === 'evidence_registered' ? 'yes' : 'no'} outcome=evaluated`,
+  )
+
+  if (outcome.status !== 'evidence_registered') {
+    // **release しない。** UNCERTAIN / REVIEW_UNAVAILABLE / CONFLICT はいずれも通さない。
+    return {
+      ...base,
+      status: 'challenge_not_aligned',
+      failureCode: `challenge_${String(verdict).toLowerCase()}`,
+      reason:
+        `the fresh re-evaluation of the unchanged spec returned ${String(verdict)};`
+        + ' the original finding stands and the design does not proceed',
+    }
+  }
+
+  // ALIGNED evidence が出た。**既存 Job Gate に従って進む**（override はしない）。
+  const ensureJob = deps.ensureJob ?? createInitialImplementWorkflow
+  const job = await ensureJob(storage, taskId, deps.coordinatorDeps ?? buildDefaultCoordinatorDeps())
+  // **Job が既に在るなら成功である。** ALIGNED の後、既存の `recoverReadyTasksWithoutJob()` 等が
+  // 先に初回 Job を作っていると ensureJob は skipped を返す。保存済みの Job を読み直し、
+  // **「既に在る」で skip し、かつ canonical な初回 Job がレビューした prompt のもの**のときだけ
+  // released とみなす。他の skip 理由（park 等）は従来どおり失敗。
+  const released = job.status === 'created'
+    || (job.status === 'skipped' && job.reason === INITIAL_WORKFLOW_JOB_EXISTS
+      && hasCanonicalInitialJobForReviewedPrompt(storage, subject))
+
+  return {
+    ...base,
+    status: released ? 'challenge_aligned' : 'challenge_not_aligned',
+    ...(released
+      ? {}
+      : {
+          failureCode: 'gate_did_not_release',
+          reason: `re-evaluation aligned but the existing job gate did not create a job: ${job.reason}`,
+        }),
+  }
+}
+
+/**
+ * active run が、この Challenge が再評価する frozen spec と同じ review か。
+ *
+ * storage の再利用条件（`reuseActiveRun`）と同じ同一性で比べる: design hash・changedFiles（集合）・
+ * successor intent。Challenge は repair ではないので `repairSourceJobId` が無い run だけが同じ review である。
+ * intent を見ないと、同じ prompt の repair 目的 run があるときに Challenge を消費した直後に
+ * create() が contention になり、Challenge が評価されずに失われる（独立レビュー round 7）。
+ */
+function isSameReviewIdentity(run: DesignReviewRun, subject: RemediationSubject): boolean {
+  return run.repairSourceJobId === undefined
+    && run.designTextHash === subject.reviewedDesignTextHash
+    && JSON.stringify([...run.changedFiles].sort()) === JSON.stringify([...subject.reviewedChangedFiles].sort())
+}
+
+/**
+ * ensureJob が「初回 workflow Job は既に在る」で skip したとき、その Job が**この Challenge が
+ * レビューした prompt から作られた canonical な初回 Job**か。
+ *
+ * canonical key（`task:<taskId>:initial-implement`）と prompt の同一性の両方を要求する。
+ * 同じ prompt の repair / resume Job は初回 Job ではないので数えない。
+ */
+function hasCanonicalInitialJobForReviewedPrompt(storage: IStorage, subject: RemediationSubject): boolean {
+  const canonicalKey = initialWorkflowStepKey(subject.task.id)
+  return storage.jobs.findByTaskId(subject.task.id).some((job) =>
+    job.workflowStepKey === canonicalKey
+    && job.aiCliMode === 'implement'
+    && job.aiCliPrompt !== undefined
+    && computeDesignTextHash(job.aiCliPrompt) === subject.reviewedDesignTextHash)
 }
 
 /**
@@ -572,31 +771,17 @@ async function runCriticRound(
     ...(binding.length > 0 ? { bindingDisputes: binding } : {}),
   }
 
-  // ── 具体的根拠付きの advisory dispute: **同一 spec を再審査しない** ──────────
+  // ── 条件分岐: 具体的根拠付きの advisory dispute があるか ──────────
   //
-  // 以前はここで byte-identical な却下済み spec を fresh Design Review へ再提出し（Challenge）、
-  // ALIGNED なら Job を作っていた。それは同じ入力に対する CONFLICT と ALIGNED を、
-  // Second Independent Review / Meta Review で解消しないまま共存させる verdict re-roll であり、
-  // DA trigger 7（Review verdict の不一致が未解消）に反する（独立レビュー指摘 P1）。
-  //
-  // 「ALIGNED が出たら Job を作らない」だけでは塞がらない: 再審査 run は ALIGNED で終わった時点で
-  // 既存 coordinator が usable evidence を登録し、既存の回収（`recoverReadyTasksWithoutJob()`）が
-  // PL を経由せずに Job を作る（requeued run が後から rekick で終わる場合も同じ）。evidence の登録・
-  // 有効性は Design Review / Job Gate の責務で、ここから変えてはならない。したがって
-  // **同一 spec の再審査そのものを起こさない**。Critic の異議は記録し（1 (spec, finding) につき1行）、
-  // Critique として PL revision へ渡す。修正版は material-difference guard と fresh Design Review を通る。
+  // **challenge は固定 stage ではない。** ここだけが入口である。
   const target = challengeTarget(critique, subject.findings.map((f) => f.source))
   if (target !== undefined) {
-    const key = challengeKey(subject, target.source)
-    if (!challengeConsumed(storage, taskId, [key])) {
-      recordRemediationFailure(
-        storage,
-        taskId,
-        `stage=challenge chal=${key} orig_verdict=CONFLICT finding=${target.source}`
-        + ` grounds=${target.grounds ?? '-'} evidence=${target.evidence !== undefined ? 'yes' : 'no'}`
-        + ' rereview=none outcome=critic_dispute_recorded',
-      )
+    const dispute = target
+    const challenge = await runChallenge(storage, subject, dispute, deps)
+    if (challenge.status !== 'challenge_cap_reached') {
+      return { ...challenge, ...withCritic }
     }
+    // 上限を使い切っている場合は通常の PL revision へ落ちる（**止めない**）。
   }
 
   return { ...(await runPlRevision(storage, subject, ledgerBody, critique, deps)), ...withCritic }
