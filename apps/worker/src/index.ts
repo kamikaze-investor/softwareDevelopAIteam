@@ -632,9 +632,10 @@ export async function persistJobResult(
     commitHash: result.commitHash,
     completedAt: result.completedAt,
     guardResult: result.guardResult,
-    failureMetadata: result.providerFailureKind || result.workspaceState || result.refusal || workspaceEndFingerprint
+    failureMetadata: result.providerFailureKind || result.safeCommandFailureKind || result.workspaceState
+      || result.refusal || workspaceEndFingerprint
       ? {
-          kind: result.providerFailureKind,
+          kind: result.providerFailureKind ?? result.safeCommandFailureKind,
           workspaceState: result.workspaceState,
           refusal: result.refusal,
           workspaceEndFingerprint,

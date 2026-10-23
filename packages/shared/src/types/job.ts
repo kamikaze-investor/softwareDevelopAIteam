@@ -62,7 +62,21 @@ export type JobRefusalMetadata = JobRefusalFacts & (
     }
 )
 
+/**
+ * `JobFailureMetadata.kind` に Worker が書く、timeout 系の構造化された失敗種別。
+ * （`kind` 自体は open string のまま。workspace_* 等の既存値もある。）
+ *
+ * - `provider_timeout`: AI CLI（provider）が渡した timeoutMs で kill された
+ * - `safe_command_timeout`: AI CLI の後の SafeCommand（test / build / typecheck 等）が
+ *   kind 別の実行予算で containment に kill された（2026-10-23 implement stall）。
+ *   実装を直しても予算は変わらない技術停止なので、stderr の解析ではなくこの値で判定する。
+ */
+export const SAFE_COMMAND_TIMEOUT_FAILURE_KIND = 'safe_command_timeout' as const
+
+export type JobTimeoutFailureKind = 'provider_timeout' | typeof SAFE_COMMAND_TIMEOUT_FAILURE_KIND
+
 export interface JobFailureMetadata {
+  /** 構造化された失敗種別。timeout 系の値は `JobTimeoutFailureKind`。 */
   kind?: string
   workspaceState?: 'unchanged' | 'changed' | 'unknown'
   refusal?: JobRefusalMetadata

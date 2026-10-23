@@ -243,6 +243,64 @@ describe('decideRepairAction — 既存挙動', () => {
 })
 
 // ---------------------------------------------------------------------------
+// 2026-10-23 implement stall: SafeCommand の実行予算切れは同じ generation で 2 回目を repair しない。
+// ---------------------------------------------------------------------------
+
+describe('decideRepairAction — safe_command_timeout', () => {
+  // stderr はテスト出力で毎回変わりうるので、判定は構造化された kind だけで行う。
+  const TIMEOUT_1: RepairFailureFacts = { exitCode: 1, stderr: 'vitest progress A', failureKind: 'safe_command_timeout' }
+  const TIMEOUT_2: RepairFailureFacts = { exitCode: 1, stderr: 'vitest progress B', failureKind: 'safe_command_timeout' }
+  const PROVIDER_TIMEOUT: RepairFailureFacts = { exitCode: 1, stderr: '', failureKind: 'provider_timeout' }
+
+  it('the first safe_command_timeout of a generation still gets one ordinary repair', () => {
+    const decision = decideRepairAction(ORIGIN_ID, [originJob(ORIGIN_ID, TIMEOUT_1)], TIMEOUT_1)
+    expect(decision.action).toBe('repair')
+    if (decision.action === 'repair') expect(decision.attempt).toBe(1)
+  })
+
+  it('a repeated safe_command_timeout (origin timed out, the repair timed out again) escalates without another repair', () => {
+    const priors: PriorRepairJob[] = [
+      originJob(ORIGIN_ID, TIMEOUT_1),
+      // 起点（いま失敗した repair）。flow 層は今回の facts で上書きして渡す。
+      repairOf(ORIGIN_ID, 'repair-1', 'failed', TIMEOUT_2),
+    ]
+    const decision = decideRepairAction('repair-1', priors, TIMEOUT_2)
+    expect(decision.action).toBe('escalate')
+    if (decision.action === 'escalate') {
+      expect(decision.code).toBe('technical_timeout_repeated')
+      expect(decision.generation?.rootJobId).toBe(ORIGIN_ID)
+    }
+  })
+
+  it('a timeout after a non-timeout repair failure is not "repeated" and is repaired as before', () => {
+    const priors: PriorRepairJob[] = [
+      originJob(ORIGIN_ID, FACTS_A),
+      repairOf(ORIGIN_ID, 'repair-1', 'failed', TIMEOUT_1),
+    ]
+    const decision = decideRepairAction('repair-1', priors, TIMEOUT_1)
+    expect(decision.action).toBe('repair')
+  })
+
+  it('a timeout in a previous (human-resumed) generation does not count against the new generation', () => {
+    const priors: PriorRepairJob[] = [
+      originJob(ORIGIN_ID, TIMEOUT_1),
+      resumeOf(ORIGIN_ID, 'resume-1', 'human', 'failed', TIMEOUT_2),
+    ]
+    const decision = decideRepairAction('resume-1', priors, TIMEOUT_2)
+    expect(decision.action).toBe('repair')
+  })
+
+  it('regression: repeated provider_timeout keeps the existing repair behaviour (unchanged)', () => {
+    const priors: PriorRepairJob[] = [
+      originJob(ORIGIN_ID, PROVIDER_TIMEOUT),
+      repairOf(ORIGIN_ID, 'repair-1', 'failed', PROVIDER_TIMEOUT),
+    ]
+    const decision = decideRepairAction('repair-1', priors, PROVIDER_TIMEOUT)
+    expect(decision.action).toBe('repair')
+  })
+})
+
+// ---------------------------------------------------------------------------
 // 4〜7: Human resume は新しい generation の根になる。
 // ---------------------------------------------------------------------------
 

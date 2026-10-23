@@ -25,7 +25,12 @@ import type {
   ReviewResult,
   Task,
 } from '@ai-team/shared'
-import { aiCliTimeoutMs, findGateTechnicalStopCode, runRiskReview } from '@ai-team/shared'
+import {
+  SAFE_COMMAND_TIMEOUT_FAILURE_KIND,
+  aiCliTimeoutMs,
+  findGateTechnicalStopCode,
+  runRiskReview,
+} from '@ai-team/shared'
 import { z } from 'zod'
 import { createAiCliAdapter } from './aiCli/factory.js'
 import { AiCliPromptRefusalError } from './aiCli/adapter.js'
@@ -88,8 +93,7 @@ import {
   isContainmentInfrastructureError,
   runContainedOrThrow,
 } from './execution/runContainedCommand.js'
-
-const JOB_TIMEOUT_MS = 120_000
+import { safeCommandTimeoutMs } from './execution/safeCommandTimeout.js'
 
 
 /** recovery git 操作の実行上限（P1 Phase 2）。従来は timeout が無かった */
@@ -361,6 +365,12 @@ export interface JobRunResult {
   startedAt: string
   completedAt: string
   providerFailureKind?: AiCliResult['providerFailureKind']
+  /**
+   * SafeCommand が kind 別の実行予算で containment に kill されたときだけ立つ。
+   * 既存 `failureMetadata.kind` へ保存される（新しい保存欄は作らない）。
+   * provider failure は SafeCommand 実行前に return するので両者は同時に立たない。
+   */
+  safeCommandFailureKind?: typeof SAFE_COMMAND_TIMEOUT_FAILURE_KIND
   refusal?: JobFailureMetadata['refusal']
   workspaceState?: 'unchanged' | 'changed' | 'unknown'
   /** 子プロセスと Job 固有 cleanup が終わった時点の value-free workspace fingerprint。 */
@@ -1299,6 +1309,8 @@ export async function runJob(
   let beforeCommitHash: string | undefined
   let afterCommitHash: string | undefined
   let createdCommitHash: string | undefined
+  // SafeCommand が kind 別の実行予算で containment に kill されたか（構造化して API へ渡す）。
+  let safeCommandTimedOut = false
 
   if (!job.dryRun) {
     // アトミックジョブの場合は実行前コミットハッシュを記録
@@ -1308,26 +1320,30 @@ export async function runJob(
 
     try {
       // P1 Phase 2: SafeCommand は子孫を fork し得るため per-job cgroup へ封じ込める。
-      // atomic Job もこれまでの unbounded 実行をやめて JOB_TIMEOUT_MS で区切る。
+      // atomic Job もこれまでの unbounded 実行をやめて kind 別の実行予算で区切る。
       // unbounded のままだと timeout が発火せず、kill / drain / reconciliation へ
       // 到達しないまま workspace を永久に所有し続けるため（Phase 2 の目的と両立しない）。
       // timeout 時も通常 failure として即 terminalize せず、containment kill →
       // populated=0 → git marker 確認 → reconciliation の共通 protocol を必ず通る。
+      // 予算は kind 別（test/build=600s, typecheck=300s, その他 120s。watchdog の表が正本）。
+      // 一律 120s では全件 pass する 147s の `pnpm test` が毎回 kill された（2026-10-23）。
+      const timeoutMs = safeCommandTimeoutMs(job.safeCommand.kind)
       const contained = await runContainedOrThrow({
         jobId: job.id,
         attemptId: nextContainmentAttemptId('safe-command'),
         argv: resolved.argv,
         cwd: job.safeCommand.workingDir,
         env: buildTargetCommandEnv(),
-        timeoutMs: JOB_TIMEOUT_MS,
+        timeoutMs,
       })
       stdout = contained.stdout
       if (contained.exitCode === 0) {
         stderr = contained.stderr
       } else {
         exitCode = contained.exitCode ?? 1
+        safeCommandTimedOut = contained.timedOut
         stderr = contained.stderr || (contained.timedOut
-          ? `command timed out after ${JOB_TIMEOUT_MS}ms and was terminated by containment`
+          ? `command timed out after ${timeoutMs}ms (${job.safeCommand.kind} budget) and was terminated by containment`
           : '')
       }
     } catch (err: unknown) {
@@ -1505,6 +1521,7 @@ export async function runJob(
       preChangedPaths: [...preManifest.paths],
     },
     reviewResult: structuredReviewResult,
+    ...(safeCommandTimedOut ? { safeCommandFailureKind: SAFE_COMMAND_TIMEOUT_FAILURE_KIND } : {}),
   }
 }
 

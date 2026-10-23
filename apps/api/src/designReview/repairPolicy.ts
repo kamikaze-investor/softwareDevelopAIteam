@@ -20,6 +20,7 @@
 
 import { createHash } from 'node:crypto'
 import type { Job } from '@ai-team/shared'
+import { SAFE_COMMAND_TIMEOUT_FAILURE_KIND } from '@ai-team/shared'
 
 /** 同一Taskで自動生成を許すrepair Jobの上限（hard bound）。 */
 export const MAX_REPAIR_ATTEMPTS = 3
@@ -39,6 +40,13 @@ export const RETRY_STEP_PREFIX = 'retry:'
  * 実際のkeyは `resume:<sourceJobId>:<n>`（`resumeBlockedTask()` だけが付ける規約）。
  */
 export const RESUME_STEP_PREFIX = 'resume:'
+
+/** `decideRepairAction()` が escalate を返すときの構造化理由。 */
+export type RepairEscalationCode =
+  | 'attempt_limit'
+  | 'lineage_unreconstructable'
+  | 'no_actionable_information'
+  | 'technical_timeout_repeated'
 
 export interface RepairFailureFacts {
   exitCode?: number
@@ -141,8 +149,10 @@ export type RepairDecision =
        * - `attempt_limit`: この generation の repair 段数が上限に達した
        * - `lineage_unreconstructable`: chain を辿れなかった（fail-closed）
        * - `no_actionable_information`: 同じ失敗の繰り返しで手がかりが無い
+       * - `technical_timeout_repeated`: SafeCommand の実行予算切れ（`safe_command_timeout`）が
+       *   この generation で繰り返された。実装の修正では予算は変わらない技術停止
        */
-      code: 'attempt_limit' | 'lineage_unreconstructable' | 'no_actionable_information'
+      code: RepairEscalationCode
       /**
        * lineage を辿れたときだけ入る（`lineage_unreconstructable` では undefined）。
        *
@@ -781,6 +791,35 @@ export function decideRepairAction(
       signature,
       code: 'attempt_limit',
       generation: toRepairGeneration(walk),
+    }
+  }
+
+  // **SafeCommand の実行予算切れは、同じ generation で 2 回目を repair しない。**
+  //
+  // `safe_command_timeout` は Worker が containment の timedOut から構造化して保存する（stderr は見ない）。
+  // 1 回目は実装が無限ループ等を持ち込んだ可能性があるので通常どおり 1 回 repair を許す。
+  // しかし 2 回目は「実装を直しても予算は変わらない」技術停止である可能性が高く、
+  // 同じ予算で同じ SafeCommand を最大 3 回繰り返すだけになる（2026-10-23 production: 全件 pass する
+  // 147s の `pnpm test` を 120s 予算で 3 repair 繰り返した）。既存の escalate（repair を作らず blocked）へ渡し、
+  // その後は blockedTriage が技術レーン（technical_exhausted、CEO へは上げない）として扱う。
+  // 根（origin / resume 根）も同じ generation の試行として数える。起点自身は数えない。
+  if (newFacts.failureKind === SAFE_COMMAND_TIMEOUT_FAILURE_KIND) {
+    const generationJobIds = new Set([walk.rootJobId, ...walk.generationRepairJobIds])
+    generationJobIds.delete(sourceJobId)
+    const timeoutRepeated = priorJobs.some(
+      (job) =>
+        generationJobIds.has(job.id) &&
+        job.status === 'failed' &&
+        job.facts.failureKind === SAFE_COMMAND_TIMEOUT_FAILURE_KIND,
+    )
+    if (timeoutRepeated) {
+      return {
+        action: 'escalate',
+        reason: 'the SafeCommand timed out again in this repair generation; a repair cannot change the execution budget',
+        signature,
+        code: 'technical_timeout_repeated',
+        generation: toRepairGeneration(walk),
+      }
     }
   }
 
