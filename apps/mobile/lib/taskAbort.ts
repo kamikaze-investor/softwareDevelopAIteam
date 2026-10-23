@@ -8,8 +8,7 @@
  *   3. `POST /api/tasks/:id/abort` — 人が承認した `abort_task` を使って park を要求する。
  *      `cleanup_requested` なら Worker が作業場所を観測し、clean のときだけ park が成立する
  *
- * 手順を分けた経路（起票 → 承認一覧で承認 → 実行）はそのまま残す（`abortActionView()`・
- * `createAbortApprovalRequest()`・`submitTaskAbort()`。起票ボタンは承認を連鎖させない）。
+ * Task 画面のボタンは「タスクを中止」1 つ（CEO 判断 2026-10-23）。AI/PL が起票した依頼は従来どおり承認一覧で扱う。
  *
  * ワンタップ中止（`runOneTapAbort()`）: CEO が Task 画面で自分から中止を始めたときは、起票そのものが CEO の判断なので、
  * 1 回の確認ダイアログの後ろで 1→2→3 を順に呼ぶ。authority は変えない —— 2 は承認一覧と同じ human-only PATCH・
@@ -43,7 +42,7 @@ export const ABORT_TASK_ACTION = 'abort_task'
  * 起票と実行の監査理由（API の abort 側上限 2000 文字）。CEO に理由を書かせない ——
  * 「Mobile のボタンから CEO が実行した」こと自体が監査に残すべき事実である（`/recover` と同じ方針）。
  */
-export const MOBILE_ABORT_REASON = 'CEO が Mobile の「Task を中止（park）」から実行'
+export const MOBILE_ABORT_REASON = 'CEO が Mobile の「タスクを中止」から実行'
 
 export interface AbortApprovalRequestBody {
   taskId: string
@@ -106,7 +105,7 @@ export type AbortSectionTask =
   Pick<Task, 'status' | 'roadmapActive'> & Partial<Pick<TaskDetail, 'parked' | 'humanTaskDecisions'>>
 
 /**
- * 「Task を中止（park）」を出すか。
+ * 「タスクを中止」を出すか。
  *
  * API `abortTask()` の入口条件のうち、Task 行から読めるものだけを写す（admission の再実装ではない）:
  * done でない（`TASK_ALREADY_DONE`）・pending か blocked（`TASK_NOT_PARKABLE`）・roadmapActive（`TASK_NOT_ACTIVE`）・
@@ -163,57 +162,11 @@ export function oneTapAbortView(
   }
 }
 
-/** 画面が出すボタンの状態。描画から切り離してテストする。 */
-export interface AbortActionView {
-  approval: AbortApprovalState
-  /** Step A「中止の承認依頼を作成」を押せるか。承認待ち・承認済みがあるときは押させない */
-  canCreateRequest: boolean
-  /** Step B「承認済みの中止を実行」を押せるか。人が承認した live な abort_task があるときだけ */
-  canExecute: boolean
-  note: string
-}
-
-export function abortActionView(
-  humanTaskDecisions: readonly TaskHumanDecisionFact[] | undefined,
-): AbortActionView {
-  const approval = abortApprovalState(humanTaskDecisions)
-  if (approval.kind === 'approved') {
-    return {
-      approval,
-      canCreateRequest: false,
-      canExecute: true,
-      // 新しい依頼を作ると同じ action の APPROVED が置き換えられる（B-5）ので、ここでは作らせない。
-      note: `中止の承認が下りています（承認依頼 ${approval.approvalRequestId}）。「承認済みの中止を実行」を押すと park を要求します。`,
-    }
-  }
-  if (approval.kind === 'waiting') {
-    return {
-      approval,
-      canCreateRequest: false,
-      canExecute: false,
-      note: `中止の承認依頼 ${approval.approvalRequestId} が承認待ちです。承認一覧で承認したあと、この画面に戻って実行してください。承認だけでは中止されません。`,
-    }
-  }
-  return {
-    approval,
-    canCreateRequest: true,
-    canExecute: false,
-    note: 'このTaskを完了扱いにせず現役から外します（Roadmapの残作業は消えません）。'
-      + 'まず承認依頼を作成し、承認一覧で承認してから実行してください。',
-  }
-}
-
-/** 起票の確認ダイアログ文言。起票は同じ Task の他の承認待ちを置き換える（B-5）ことを先に伝える。 */
-export const ABORT_REQUEST_CONFIRM_MESSAGE =
-  'このTaskの中止（park）の承認依頼を作成しますか？\n'
-  + 'このTaskに他の承認待ちがある場合、それらは置き換えられます。'
-  + '作成後、承認一覧で承認してください（この画面からは承認しません）。'
-
 /** ワンタップ中止のボタン文言。 */
-export const ONE_TAP_ABORT_BUTTON_LABEL = 'このTaskを中止する'
+export const ONE_TAP_ABORT_BUTTON_LABEL = 'タスクを中止'
 
 /** 確認ダイアログの題。 */
-export const ONE_TAP_ABORT_CONFIRM_TITLE = 'このTaskを中止しますか？'
+export const ONE_TAP_ABORT_CONFIRM_TITLE = 'タスクを中止しますか？'
 
 /**
  * 確認ダイアログの本文。対象 Task（タイトル + タスク番号）と効果を先に伝える。

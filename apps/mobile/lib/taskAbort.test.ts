@@ -12,7 +12,6 @@ import {
   ABORT_PARKED_MESSAGE,
   ABORT_UNREADABLE_SUCCESS_MESSAGE,
   MOBILE_ABORT_REASON,
-  abortActionView,
   abortApprovalState,
   buildAbortApprovalRequestBody,
   canShowAbortUI,
@@ -107,32 +106,22 @@ describe('canShowAbortUI', () => {
   })
 })
 
-describe('abortApprovalState / abortActionView', () => {
-  it('事実が無い・別 action だけなら none（起票だけ押せる）', () => {
+describe('abortApprovalState', () => {
+  it('事実が無い・別 action だけなら none', () => {
     expect(abortApprovalState(undefined)).toEqual({ kind: 'none' })
-    const view = abortActionView([decision('a1', 'repair_from_stored_review:r1', 'approved')])
-    expect(view.approval).toEqual({ kind: 'none' })
-    expect(view.canCreateRequest).toBe(true)
-    expect(view.canExecute).toBe(false)
+    expect(abortApprovalState([decision('a1', 'repair_from_stored_review:r1', 'approved')])).toEqual({ kind: 'none' })
   })
 
-  it('承認待ちなら起票も実行も押させず、承認一覧へ案内する', () => {
-    const view = abortActionView([decision('w1', 'abort_task', 'waiting')])
-    expect(view.approval).toEqual({ approvalRequestId: 'w1', kind: 'waiting' })
-    expect(view.canCreateRequest).toBe(false)
-    expect(view.canExecute).toBe(false)
-    expect(view.note).toContain('w1')
-    expect(view.note).toContain('承認一覧')
+  it('承認待ちの abort_task は waiting', () => {
+    expect(abortApprovalState([decision('w1', 'abort_task', 'waiting')]))
+      .toEqual({ approvalRequestId: 'w1', kind: 'waiting' })
   })
 
-  it('人が承認した abort_task があれば実行だけ押せる（新しい起票で APPROVED を置き換えさせない）', () => {
-    const view = abortActionView([
+  it('人が承認した abort_task があれば approved を優先する（新しい起票で APPROVED を置き換えさせない）', () => {
+    expect(abortApprovalState([
       decision('w1', 'abort_task', 'waiting'),
       decision('ap1', 'abort_task', 'approved'),
-    ])
-    expect(view.approval).toEqual({ approvalRequestId: 'ap1', kind: 'approved' })
-    expect(view.canCreateRequest).toBe(false)
-    expect(view.canExecute).toBe(true)
+    ])).toEqual({ approvalRequestId: 'ap1', kind: 'approved' })
   })
 })
 
