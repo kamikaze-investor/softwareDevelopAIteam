@@ -46,7 +46,6 @@ import {
   type ReviewedImplementation,
   type PriorRepairJob,
   type RepairGeneration,
-  type RepairEscalationCode,
   type RepairFailureFacts,
   type ResumeActorClass,
   type GenerationAuthority,
@@ -91,7 +90,7 @@ export type RepairPreparation =
       action: 'escalate'
       reason: string
       /** `decideRepairAction` の構造化理由。admission で落ちた場合は undefined。 */
-      code?: RepairEscalationCode
+      code?: 'attempt_limit' | 'lineage_unreconstructable' | 'no_actionable_information'
       /**
        * lineage を辿れた escalate でだけ入る。
        * **上限に達した generation でも、それが誰の権限で始まったかは確定している。**
