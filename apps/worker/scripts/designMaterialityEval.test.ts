@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest'
 import type { MaterialityObservation } from '../src/metaReviewer/designMateriality.js'
 import {
   buildFrame,
+  classifyApiError,
+  promptVersion,
   inputFingerprint,
   runState,
   sampleWithoutReplacement,
@@ -97,7 +99,7 @@ describe('runState / repeatability（v3.1）', () => {
   })
 
   const records = (itemId: string, obs: MaterialityObservation[]): DetectionRecord[] =>
-    obs.map((observation, run) => ({ itemId, kind: 'mutant', run, model: 'm', inputFingerprint: 'fp', latencyMs: 0, promptChars: 0, observation }))
+    obs.map((observation, run) => ({ itemId, kind: 'mutant', run, model: 'm', promptVersion: { detection: 'd', evaluation: 'e' }, inputFingerprint: 'fp', latencyMs: 0, promptChars: 0, apiErrors: [], observation }))
 
   it('3回とも同じく見逃した positive は flip ではない（hit rate 0 として別に出る）', () => {
     const result = scoreRepeatability([{ itemId: 'p', target }], records('p', [observation([]), observation([]), observation([])]), 3)
@@ -120,7 +122,7 @@ describe('runState / repeatability（v3.1）', () => {
 describe('独立レビュー指摘（code review round 1）の回帰', () => {
   const target = { files: ['apps/api/src/pl/conflictResolutionStep.ts'], mechanismKeywords: ['challenge'] }
   const record = (run: number, observation: MaterialityObservation, inputFingerprint = 'fp'): DetectionRecord =>
-    ({ itemId: 'p', kind: 'positive', run, model: 'm', inputFingerprint, latencyMs: 0, promptChars: 0, observation })
+    ({ itemId: 'p', kind: 'positive', run, model: 'm', promptVersion: { detection: 'd', evaluation: 'e' }, inputFingerprint, latencyMs: 0, promptChars: 0, apiErrors: [], observation })
   const hit = (evaluations: MaterialityObservation['evaluations'], status: 'ok' | 'unavailable' = 'ok'): MaterialityObservation => ({
     ...observation([{ file: target.files[0], mechanism: 'Challenge stage' }]),
     status,
@@ -151,7 +153,7 @@ describe('独立レビュー指摘（code review round 1）の回帰', () => {
 describe('独立レビュー指摘（code review round 2）の回帰', () => {
   const target = { files: ['apps/api/src/pl/conflictResolutionStep.ts'], mechanismKeywords: ['challenge'] }
   const rec = (run: number, observation: MaterialityObservation): DetectionRecord =>
-    ({ itemId: 'p', kind: 'positive', run, model: 'm', inputFingerprint: 'fp', latencyMs: 0, promptChars: 0, observation })
+    ({ itemId: 'p', kind: 'positive', run, model: 'm', promptVersion: { detection: 'd', evaluation: 'e' }, inputFingerprint: 'fp', latencyMs: 0, promptChars: 0, apiErrors: [], observation })
   const detected = (status: 'ok' | 'unavailable'): MaterialityObservation =>
     ({ ...observation([{ file: target.files[0], mechanism: 'challenge' }]), status, evaluations: status === 'ok' ? [] : undefined })
 
@@ -168,5 +170,27 @@ describe('独立レビュー指摘（code review round 2）の回帰', () => {
   it('fingerprint は title を含む', () => {
     const base = { model: 'm', detection: 'd', evaluation: 'e', diff: 'x', base: 'b' }
     expect(inputFingerprint({ ...base, title: 'a' })).not.toBe(inputFingerprint({ ...base, title: 'b' }))
+  })
+})
+
+describe('classifyApiError（quota / 認証は即停止の対象）', () => {
+  it.each([
+    ['[GoogleGenerativeAI Error]: Error fetching from https://x: [429 Too Many Requests] Resource has been exhausted', 'quota', 429],
+    ['[GoogleGenerativeAI Error]: [402 Payment Required] credit balance', 'quota', 402],
+    ['RESOURCE_EXHAUSTED: quota exceeded', 'quota', null],
+    ['[GoogleGenerativeAI Error]: [403 Forbidden] API key not valid', 'auth', 403],
+    ['GEMINI_API_KEY が設定されていません。.env を確認してください。', 'auth', null],
+    ['[GoogleGenerativeAI Error]: [503 Service Unavailable] overloaded', 'transient', 503],
+    ['fetch failed', 'transient', null],
+    ['Gemini からの応答が空でした', 'other', null],
+  ])('%s → %s', (message, errorClass, httpStatus) => {
+    expect(classifyApiError(message)).toEqual({ errorClass, httpStatus })
+  })
+})
+
+describe('promptVersion', () => {
+  it('instructions が変われば版が変わる', () => {
+    expect(promptVersion({ detection: 'a', evaluation: 'b' })).not.toEqual(promptVersion({ detection: 'a2', evaluation: 'b' }))
+    expect(promptVersion({ detection: 'a', evaluation: 'b' }).detection).toMatch(/^[0-9a-f]{12}$/)
   })
 })

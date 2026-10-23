@@ -11,7 +11,11 @@
  *           重み（F=1, N=|N|/n）付きの評価対象を frame.json に書く
  *   pack    --repo <path>   label 用 packet（diff・base 記録抜粋。detector の出力は含めない）を labels-input.jsonl に書く
  *   mutants --repo <path>   e405c7c7^ に対する mutant diff を mutants.json に書く
- *   detect  --repo <path> frame の全件 + known positives + mutants を検出し results.jsonl に追記する
+ *   plan    --repo <path>   API を呼ばずに、呼び出し件数と detection prompt の大きさを見積もる
+ *   detect  --repo <path> [--min-interval-ms 20000] [--max-calls 60]
+ *           frame の全件 + known positives + mutants を **逐次・間隔付き・上限付き**で検出し results.jsonl に追記する。
+ *           quota / 課金 / 認証の失敗が1回でも出たら即停止する（retry しない）。API の失敗は errors.jsonl に別記録する。
+ *           上限で止まったら同じ引数で再実行すれば、同じ入力の済み run を飛ばして続きから進む
  *   score   --labels <labels.json>        重み付き recall / precision / routine flag rate（bootstrap 95% CI）と再現性を report.json に書く
  */
 
@@ -21,6 +25,7 @@ import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSyn
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import {
+  buildDetectionPrompt,
   computeMaterialitySignals,
   DESIGN_MATERIALITY_SCHEMA_VERSION,
   DESIGN_RECORD_ROOTS,
@@ -33,7 +38,7 @@ import {
   type ReviewProvider,
 } from '../src/metaReviewer/designMateriality.js'
 
-export const EVAL_SCRIPT_VERSION = 1
+export const EVAL_SCRIPT_VERSION = 2
 const DEFAULT_SEED = 20261023
 /** v3.1: repeat は3回で固定（score 側の「ちょうど N 本」と同じ値を使う） */
 const REPEATS = 3
@@ -289,12 +294,73 @@ export interface DetectionRecord {
   kind: 'frame' | 'positive' | 'mutant'
   run: number
   model: string
+  /** prompt 本文の版（両 instructions の sha256 先頭12桁） */
+  promptVersion: PromptVersion
   /** sha256(model | 両 prompt 本文 | title | diff | base)。同じ item の repeat が同じ入力かを確かめる */
   inputFingerprint: string
   /** cost: 待機時間と prompt の大きさ（detection + correctness） */
   latencyMs: number
   promptChars: number
+  /** API の失敗。検出結果（observation）とは別に記録し、unavailable が API 側か応答の形かを後で分ける */
+  apiErrors: ApiErrorRecord[]
   observation: MaterialityObservation
+}
+
+export interface PromptVersion { detection: string; evaluation: string }
+
+export function promptVersion(instructions: { detection: string; evaluation: string }): PromptVersion {
+  const h = (t: string) => createHash('sha256').update(t).digest('hex').slice(0, 12)
+  return { detection: h(instructions.detection), evaluation: h(instructions.evaluation) }
+}
+
+export type ApiErrorClass = 'quota' | 'auth' | 'transient' | 'other'
+
+export interface ApiErrorRecord {
+  stage: 'detection' | 'evaluation'
+  errorClass: ApiErrorClass
+  httpStatus: number | null
+  /** sanitizeMessage 済み */
+  message: string
+}
+
+/**
+ * Gemini SDK のエラーメッセージ（`[GoogleGenerativeAI Error]: ... [429 Too Many Requests] ...`）を分類する。
+ * quota（429 / 402 / RESOURCE_EXHAUSTED / quota / billing / credit）と auth（401 / 403 / API key）は**即停止**の対象。
+ */
+export function classifyApiError(message: string): { errorClass: ApiErrorClass; httpStatus: number | null } {
+  const status = message.match(/\[(\d{3})\b/)?.[1] ?? message.match(/\b([45]\d\d)\b/)?.[1]
+  const httpStatus = status === undefined ? null : Number(status)
+  if (httpStatus === 429 || httpStatus === 402 || /RESOURCE_EXHAUSTED|quota|billing|credit/i.test(message)) return { errorClass: 'quota', httpStatus }
+  if (httpStatus === 401 || httpStatus === 403 || /API key|PERMISSION_DENIED|UNAUTHENTICATED|GEMINI_API_KEY/i.test(message)) return { errorClass: 'auth', httpStatus }
+  if ((httpStatus !== null && httpStatus >= 500) || /timeout|ECONNRESET|ETIMEDOUT|fetch failed|network/i.test(message)) return { errorClass: 'transient', httpStatus }
+  return { errorClass: 'other', httpStatus }
+}
+
+export interface WorkItem {
+  kind: DetectionRecord['kind']
+  itemId: string
+  run: number
+  title: string
+  diff: string
+  base: string
+}
+
+/**
+ * 呼び出し順に並べた評価対象。frame は 1 回、repeat 対象は known positives・mutants・N の先頭 20 件（v3.1）。
+ * plan（API を呼ばない見積もり）と detect が同じ一覧を使う。
+ */
+export function buildWorkList(repo: string, frame: Frame, mutants: readonly Mutant[]): WorkItem[] {
+  const work: WorkItem[] = []
+  const commit = (kind: WorkItem['kind'], sha: string, run: number, title: string): WorkItem =>
+    ({ kind, itemId: sha, run, title, diff: commitDiff(repo, sha), base: `${sha}^1` })
+  for (const item of frame.items) work.push(commit('frame', item.sha, 0, item.subject))
+  const repeatNegatives = frame.items.filter((i) => i.stratum === 'N').slice(0, 20)
+  for (let run = 0; run < REPEATS; run++) {
+    for (const p of KNOWN_POSITIVES) work.push(commit('positive', p.sha, run, git(repo, ['log', '-1', '--format=%s', p.sha]).trim()))
+    for (const m of mutants) work.push({ kind: 'mutant', itemId: m.id, run, title: m.description, diff: m.diff, base: m.base })
+    if (run > 0) for (const n of repeatNegatives) work.push(commit('frame', n.sha, run, n.subject))
+  }
+  return work
 }
 
 export function inputFingerprint(parts: { model: string; detection: string; evaluation: string; title: string; diff: string; base: string }): string {
@@ -544,14 +610,58 @@ async function main(): Promise<void> {
     return
   }
 
-  if (cmd === 'detect') {
-    const { callGeminiForReview } = await import('../src/metaReviewer/geminiClient.js')
+  if (cmd === 'plan' || cmd === 'detect') {
     const model = process.env.GEMINI_MODEL?.trim() || 'gemini-2.5-flash'
-    let promptChars = 0
-    const provider: ReviewProvider = (prompt) => { promptChars += prompt.length; return callGeminiForReview(prompt, model) }
     const instructions = readInstructions(path.resolve(__dirname, '../../..'))
     const frame = JSON.parse(readFileSync(file('frame.json'), 'utf-8')) as Frame
     const mutants = JSON.parse(readFileSync(file('mutants.json'), 'utf-8')) as Mutant[]
+    const work = buildWorkList(repo, frame, mutants)
+
+    if (cmd === 'plan') {
+      // API を呼ばずに、detection prompt の件数と大きさを出す（correctness は候補が出た item だけ・最大で同数）
+      const sizes = work.map((w) => {
+        const signals = computeMaterialitySignals(w.diff)
+        const excerpts = extractBaseRecordExcerpts(gitRecordReader(repo, w.base), excerptTokens(w.diff, signals))
+        return buildDetectionPrompt(instructions.detection, { title: w.title, diff: w.diff, signals, excerpts }).length
+      }).sort((x, y) => x - y)
+      const total = sizes.reduce((n, x) => n + x, 0)
+      console.log(JSON.stringify({
+        model,
+        promptVersion: promptVersion(instructions),
+        detectionCalls: sizes.length,
+        maxEvaluationCalls: sizes.length,
+        detectionPromptChars: { total, p50: sizes[Math.floor(sizes.length / 2)], p95: sizes[Math.floor(sizes.length * 0.95)], max: sizes[sizes.length - 1] },
+      }, null, 2))
+      return
+    }
+
+    // **低優先度・上限付き。** 逐次1本、呼び出し間隔の下限、1回の起動あたりの呼び出し上限、
+    // quota / 課金 / 認証の失敗が1回でも出たら即停止（retry しない。共有 quota を食い潰さない）
+    const minIntervalMs = Number(a['min-interval-ms'] ?? '20000')
+    const maxCalls = Number(a['max-calls'] ?? '60')
+    const { callGeminiForReview } = await import('../src/metaReviewer/geminiClient.js')
+    const { sanitizeMessage } = await import('../src/metaReviewer/geminiRouter.js')
+    let calls = 0
+    let lastCallAt = 0
+    let stopReason: string | undefined
+    let current: { stageIndex: number; apiErrors: ApiErrorRecord[]; promptChars: number } = { stageIndex: 0, apiErrors: [], promptChars: 0 }
+    const provider: ReviewProvider = async (prompt) => {
+      const wait = lastCallAt + minIntervalMs - Date.now()
+      if (wait > 0) await new Promise((r) => setTimeout(r, wait))
+      lastCallAt = Date.now()
+      calls++
+      const stage = current.stageIndex++ === 0 ? 'detection' : 'evaluation'
+      current.promptChars += prompt.length
+      try {
+        return await callGeminiForReview(prompt, model)
+      } catch (err) {
+        const message = sanitizeMessage(err instanceof Error ? err.message : String(err))
+        const classified = classifyApiError(message)
+        current.apiErrors.push({ stage, ...classified, message })
+        if (classified.errorClass === 'quota' || classified.errorClass === 'auth') stopReason = `${classified.errorClass} error at ${stage}`
+        throw err
+      }
+    }
     // 再開は **同じ入力**の run だけを済みとみなす（model や prompt を変えて再開すると別の run として足される）
     const done = new Set(existsSync(file('results.jsonl'))
       ? readFileSync(file('results.jsonl'), 'utf-8').split('\n').filter(Boolean).map((l) => {
@@ -559,29 +669,34 @@ async function main(): Promise<void> {
         return `${r.kind}:${r.itemId}:${r.run}:${r.inputFingerprint}`
       })
       : [])
-    const record = async (kind: DetectionRecord['kind'], itemId: string, run: number, title: string, diff: string, base: string) => {
-      const fingerprint = inputFingerprint({ model, detection: instructions.detection, evaluation: instructions.evaluation, title, diff, base })
-      if (done.has(`${kind}:${itemId}:${run}:${fingerprint}`)) return
-      promptChars = 0
+    let skipped = 0
+    for (const w of work) {
+      const fingerprint = inputFingerprint({ model, detection: instructions.detection, evaluation: instructions.evaluation, title: w.title, diff: w.diff, base: w.base })
+      if (done.has(`${w.kind}:${w.itemId}:${w.run}:${fingerprint}`)) { skipped++; continue }
+      if (stopReason) break
+      // detection + correctness の2本を使い切れない残りでは始めない（途中で止めて半端な run を残さない）
+      if (calls + 2 > maxCalls) { stopReason = `call budget ${maxCalls} reached`; break }
+      current = { stageIndex: 0, apiErrors: [], promptChars: 0 }
       const started = Date.now()
       const observation = await observeDesignMateriality({
-        title, diff, records: gitRecordReader(repo, base),
+        title: w.title, diff: w.diff, records: gitRecordReader(repo, w.base),
         detectionInstructions: instructions.detection, evaluationInstructions: instructions.evaluation,
       }, provider)
       const entry: DetectionRecord = {
-        itemId, kind, run, model, inputFingerprint: fingerprint, latencyMs: Date.now() - started, promptChars, observation,
+        itemId: w.itemId, kind: w.kind, run: w.run, model, promptVersion: promptVersion(instructions),
+        inputFingerprint: fingerprint, latencyMs: Date.now() - started, promptChars: current.promptChars,
+        apiErrors: current.apiErrors, observation,
+      }
+      // quota / 認証で止めた run は検出結果として残さない（API の失敗であって「未検出」ではない）。errors.jsonl にだけ残す
+      if (stopReason && current.apiErrors.some((e) => e.errorClass === 'quota' || e.errorClass === 'auth')) {
+        appendFileSync(file('errors.jsonl'), `${JSON.stringify(entry)}\n`)
+        break
       }
       appendFileSync(file('results.jsonl'), `${JSON.stringify(entry)}\n`)
-      console.log(`${kind} ${itemId} run=${run} ${observation.status}${observation.reason ? ` (${observation.reason})` : ''} material=${observation.detection?.material ?? '-'}`)
+      if (current.apiErrors.length > 0) appendFileSync(file('errors.jsonl'), `${JSON.stringify({ itemId: w.itemId, kind: w.kind, run: w.run, apiErrors: current.apiErrors })}\n`)
+      console.log(`${w.kind} ${w.itemId} run=${w.run} ${observation.status}${observation.reason ? ` (${observation.reason})` : ''} material=${observation.detection?.material ?? '-'}`)
     }
-    // frame は 1 回。repeat 対象は known positives・mutants・N の先頭 20 件（v3.1）
-    for (const item of frame.items) await record('frame', item.sha, 0, item.subject, commitDiff(repo, item.sha), `${item.sha}^1`)
-    const repeatNegatives = frame.items.filter((i) => i.stratum === 'N').slice(0, 20)
-    for (let run = 0; run < REPEATS; run++) {
-      for (const p of KNOWN_POSITIVES) await record('positive', p.sha, run, git(repo, ['log', '-1', '--format=%s', p.sha]).trim(), commitDiff(repo, p.sha), `${p.sha}^1`)
-      for (const m of mutants) await record('mutant', m.id, run, m.description, m.diff, m.base)
-      for (const n of repeatNegatives.slice(0, run === 0 ? 0 : 20)) await record('frame', n.sha, run, n.subject, commitDiff(repo, n.sha), `${n.sha}^1`)
-    }
+    console.log(`detect: calls=${calls} skipped(done)=${skipped}${stopReason ? ` stopped: ${stopReason}` : ' complete'}`)
     return
   }
 
