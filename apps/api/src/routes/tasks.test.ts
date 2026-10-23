@@ -1364,6 +1364,49 @@ describe('Task API', () => {
       })
     })
 
+    it('keeps the Implement verification profile on the resumed Job', async () => {
+      await withApp(async (app) => {
+        const project = await createProject(app)
+        const task = await createTask(app, project.id, {
+          title: 'Resume a profiled implementation',
+          description: 'Update only the allowed API files.',
+        })
+        // profile はサーバー側 producer だけが付ける（POST /api/jobs は受けない）ので、storage で作る。
+        const { getStorage } = await import('../storage/index.js')
+        const blockedJob = getStorage().jobs.create({
+          taskId: task.id,
+          projectId: task.projectId,
+          agentRole: 'developer_ai',
+          status: 'blocked',
+          safeCommand: {
+            kind: 'test',
+            workingDir: '/workspace/target',
+            params: { verificationProfile: 'implement' },
+          },
+          aiCliProvider: 'codex',
+          aiCliPrompt: 'Original rejected prompt',
+          aiCliMode: 'implement',
+        })
+        const instruction = 'Keep the verification profile.'
+        await createAlignedDesignReviewEvidence(task.id, buildResumeAiCliPrompt(task, instruction))
+
+        const res = await app.inject({
+          method: 'POST',
+          url: `/api/tasks/${task.id}/resume`,
+          payload: { instruction },
+        })
+
+        expect(res.statusCode).toBe(201)
+        const resumedJob = parseBody<Job>(res.body)
+        expect(resumedJob.workflowStepKey).toBe(`resume:${blockedJob.id}:1`)
+        expect(resumedJob.safeCommand).toEqual({
+          kind: 'test',
+          workingDir: '/workspace/target',
+          params: { verificationProfile: 'implement' },
+        })
+      })
+    })
+
     it('creates a queued job, terminalizes its blocked source, and does not start a second recovery', async () => {
       await withApp(async (app) => {
         const project = await createProject(app, { status: 'running' })

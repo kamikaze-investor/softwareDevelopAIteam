@@ -79,6 +79,13 @@ const RESOLVERS: Record<CommandKind, Resolver> = {
   }),
 
   test: (params) => {
+    // Implement Job の検証は typecheck → test。script 名は固定で、params から組み立てない。
+    if (params?.verificationProfile === 'implement') {
+      return {
+        argv: ['pnpm', 'run', 'verify:implement'],
+        description: 'pnpm run verify:implement',
+      }
+    }
     const base = ['pnpm', 'test']
     if (params?.testPattern) {
       // testPatternはalphanumericと/.-_のみ許可
