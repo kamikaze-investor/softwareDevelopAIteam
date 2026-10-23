@@ -62,7 +62,9 @@ vi.mock('./execution/runContainedCommand.js', async () => {
 import {
   TestContainmentInfrastructureError,
   clearContainedCommandOverride,
+  forwardToExecFileSync,
   setContainedCommandOverride,
+  type ExecFileSyncLike,
 } from './execution/containedCommandTestBridge.js'
 
 describe('Technical Abort cleanup manifest', () => {
@@ -1036,6 +1038,116 @@ describe('runJob', () => {
     )
     expect(commitCall).toBeDefined()
     expect((commitCall![2] as { timeout?: number }).timeout).toBe(120_000)
+  })
+
+  // 2026-10-23 implement stall: 一律 120s では全件 pass する 147s の `pnpm test` が毎回 kill された。
+  describe('SafeCommand の kind 別実行予算と safe_command_timeout', () => {
+    afterEach(() => {
+      clearContainedCommandOverride()
+    })
+
+    /** main SafeCommand（attemptId が safe-command-*）だけを捕まえ、他の containment 呼び出しは従来どおり転送する。 */
+    function captureSafeCommand(
+      respond: (timeoutMs: number | undefined) => Record<string, unknown> | undefined,
+    ): Array<number | undefined> {
+      const budgets: Array<number | undefined> = []
+      setContainedCommandOverride(async (options) => {
+        if (options.attemptId.startsWith('safe-command-')) {
+          budgets.push(options.timeoutMs)
+          const response = respond(options.timeoutMs)
+          if (response !== undefined) return response
+        }
+        return forwardToExecFileSync(execFileSyncMock as unknown as ExecFileSyncLike, options)
+      })
+      return budgets
+    }
+
+    it.each([
+      ['test', ['pnpm', 'run', 'test'], 600_000],
+      ['build', ['pnpm', 'run', 'build'], 600_000],
+      ['typecheck', ['pnpm', 'run', 'typecheck'], 300_000],
+      ['lint', ['pnpm', 'run', 'lint'], 120_000],
+      ['git_status', ['git', 'status', '--short'], 120_000],
+    ] as const)('%s は %i ms の予算で containment に渡される', async (kind, argv, expected) => {
+      resolveCommandMock.mockReturnValue({ argv: [...argv], description: kind })
+      execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => gitFallback(args))
+      const budgets = captureSafeCommand(() => undefined)
+
+      await runJob(createJob({ safeCommand: { kind, workingDir: '/workspace/target' } }), createPolicy())
+
+      expect(budgets).toEqual([expected])
+    })
+
+    it('timed-out SafeCommand は failed + safeCommandFailureKind=safe_command_timeout、stderr に実予算を出す', async () => {
+      resolveCommandMock.mockReturnValue({ argv: ['pnpm', 'run', 'test'], description: 'pnpm test' })
+      execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => gitFallback(args))
+      captureSafeCommand(() => ({
+        outcome: 'clean', signal: 'SIGKILL', killedDescendants: true, drainMs: 0,
+        exitCode: null, stdout: '', stderr: '', timedOut: true,
+      }))
+
+      const result = await runJob(
+        createJob({ safeCommand: { kind: 'test', workingDir: '/workspace/target' } }),
+        createPolicy(),
+      )
+
+      expect(result.status).toBe('failed')
+      expect(result.exitCode).toBe(1)
+      expect(result.safeCommandFailureKind).toBe('safe_command_timeout')
+      expect(result.providerFailureKind).toBeUndefined()
+      expect(result.stderr).toContain('command timed out after 600000ms (test budget)')
+    })
+
+    it('ordinary non-zero exit (not a timeout) does not set safeCommandFailureKind', async () => {
+      resolveCommandMock.mockReturnValue({ argv: ['pnpm', 'run', 'test'], description: 'pnpm test' })
+      execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => gitFallback(args))
+      captureSafeCommand(() => ({
+        outcome: 'clean', signal: null, killedDescendants: false, drainMs: 0,
+        exitCode: 1, stdout: '', stderr: '1 test failed', timedOut: false,
+      }))
+
+      const result = await runJob(
+        createJob({ safeCommand: { kind: 'test', workingDir: '/workspace/target' } }),
+        createPolicy(),
+      )
+
+      expect(result.status).toBe('failed')
+      expect(result.safeCommandFailureKind).toBeUndefined()
+    })
+
+    it('persistJobResult は safe_command_timeout を既存 failureMetadata.kind へ保存する', async () => {
+      const patchJob = vi.fn().mockResolvedValue(true)
+      await persistJobResult('job-1', {
+        status: 'failed',
+        exitCode: 1,
+        safeCommandFailureKind: 'safe_command_timeout',
+        guardResult: { permissionAllowed: true, fileChangeAllowed: true, fileViolations: [] },
+        startedAt: '2026-10-23T00:00:00.000Z',
+        completedAt: '2026-10-23T00:02:00.000Z',
+      }, 'failed', { patchJob })
+
+      expect(patchJob).toHaveBeenCalledWith('job-1', expect.objectContaining({
+        status: 'failed',
+        failureMetadata: expect.objectContaining({ kind: 'safe_command_timeout' }),
+      }))
+    })
+
+    it('regression: persistJobResult still stores provider_timeout unchanged', async () => {
+      const patchJob = vi.fn().mockResolvedValue(true)
+      await persistJobResult('job-1', {
+        status: 'failed',
+        exitCode: 1,
+        providerFailureKind: 'provider_timeout',
+        workspaceState: 'unchanged',
+        guardResult: { permissionAllowed: true, fileChangeAllowed: true, fileViolations: [] },
+        startedAt: '2026-10-23T00:00:00.000Z',
+        completedAt: '2026-10-23T00:02:00.000Z',
+      }, 'failed', { patchJob })
+
+      expect(patchJob).toHaveBeenCalledWith('job-1', expect.objectContaining({
+        failureMetadata: expect.objectContaining({ kind: 'provider_timeout', workspaceState: 'unchanged' }),
+      }))
+    })
   })
 
   it('git_commit job generates RollbackInfo', async () => {
