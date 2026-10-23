@@ -1,6 +1,6 @@
 import { describe, expect, it, beforeAll, afterAll, afterEach, vi } from 'vitest'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
@@ -770,5 +770,31 @@ describe('Challenge の同一性と「既に在る」の判定（独立レビュ
 
   it('「既に在る」で、canonical な初回 Job がレビューした prompt のものなら released', async () => {
     expect(await challengeWith('__CANONICAL__', INITIAL_WORKFLOW_JOB_EXISTS)).toBe('challenge_aligned')
+  })
+})
+
+describe('Critic runner は TARGET_ROOT 未設定でも target root で AI CLI を動かす（2026-10-23 Production）', () => {
+  it('TARGET_ROOT が無いとき workingDir は /workspace/target（Stable の runner workingDir ではない）', async () => {
+    const { storage, taskId } = seed()
+    const saved = process.env.TARGET_ROOT
+    let captured: { workingDir?: string } | undefined
+    try {
+      delete process.env.TARGET_ROOT
+      await runConflictResolutionRound(storage, taskId, deps(SUPPORTED_CRITIQUE, {
+        readLedger: () => LEDGER,
+        runnerDeps: {
+          runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: '/srv/ai-team/stable-checkout',
+          execute: async (input: string) => {
+            captured = JSON.parse(input) as { workingDir?: string }
+            return { ok: true, stdout: JSON.stringify(SUPPORTED_CRITIQUE), timedOut: false }
+          },
+        },
+      }) as never)
+    } finally {
+      if (saved === undefined) delete process.env.TARGET_ROOT
+      else process.env.TARGET_ROOT = saved
+    }
+
+    expect(captured?.workingDir).toBe(resolve('/workspace/target'))
   })
 })

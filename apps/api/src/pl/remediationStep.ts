@@ -85,6 +85,7 @@ import {
   extractItemDescription,
 } from '../ctoAi/roadmapAdoption'
 import type { IStorage } from '../storage/interface'
+import { configuredTargetRoot } from '../utils/pathGuard'
 import { ADOPTION_REPOSITORY_MAP, authorizeAdoptionScope, resolveLedgerPath } from './adoptionStep'
 
 /**
@@ -767,7 +768,9 @@ export async function runRemediationStep(
         ledgerBody,
       }),
     ].join('\n'),
-    workingDir: process.env.TARGET_ROOT ?? runnerDeps.workingDir,
+    // AI CLI は TARGET_ROOT 配下でしか動かない（AiCliAdapter の workingDir 検査）。TARGET_ROOT 未設定時の
+    // fallback を Stable の repoRoot にすると Production では必ず拒否される（2026-10-23 実測）。
+    workingDir: configuredTargetRoot(),
     // この VPS では Codex が repo を読むために必要（deprecated な暫定経路）。
     useLegacyLandlockSandbox: candidate.provider === 'codex',
   })
