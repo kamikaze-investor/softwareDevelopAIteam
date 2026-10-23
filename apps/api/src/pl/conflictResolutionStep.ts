@@ -43,7 +43,7 @@ import {
   type FindingAssessment,
 } from '@ai-team/shared'
 import { getValidRoadmapItems } from '@ai-team/worker/scripts/roadmap/roadmapParser.js'
-import { requestText } from '../aiExplain/cheapAiClient'
+import { PL_ADOPTION_PROPOSAL_AGENT, requestText } from '../aiExplain/cheapAiClient'
 import {
   buildDefaultCoordinatorDeps,
   createAndExecuteDesignReview,
@@ -425,6 +425,19 @@ export interface ConflictResolutionDeps {
 
 /** PL の修正に使えるトークン数。既存 `PL_ADOPTION_MAX_TOKENS` と同じ桁に収める。 */
 const PL_REVISION_MAX_TOKENS = 900
+
+/**
+ * PL revision の既定呼び出し。**JSON だけを返す専用 agent を選ぶ。**
+ *
+ * 既定 agent は tool を持つため、モデルが tool 呼び出しを `<tool_call>` の**本文**として返し、
+ * JSON が1つも出ない（2026-10-23 本番 `#2cae0d07`: Critic 2 Round とも `unparsable_revision`。
+ * 同じ prompt の実測で既定 agent は 2/2 が `<tool_call>` 本文、専用 agent は 2/2 が parse 可能）。
+ * adoption proposal と同じ症状なので、同じ agent を使う（agent の prompt は「要求された JSON を1つだけ返す」
+ * という汎用の指示で、adoption 固有の内容を持たない）。
+ */
+export function defaultPlRevise(system: string, user: string): Promise<string> {
+  return requestText(system, user, { retryTransientOnce: true, agent: PL_ADOPTION_PROPOSAL_AGENT }, PL_REVISION_MAX_TOKENS)
+}
 
 /**
  * 同一 (material spec, finding) に対する再評価キー。
@@ -814,8 +827,7 @@ async function runPlRevision(
   const taskId = subject.task.id
   const base = { stage: 'pl_revision' as const, taskId }
 
-  const revise = deps.revise
-    ?? ((system: string, user: string) => requestText(system, user, { retryTransientOnce: true }, PL_REVISION_MAX_TOKENS))
+  const revise = deps.revise ?? defaultPlRevise
 
   let raw: string
   try {
