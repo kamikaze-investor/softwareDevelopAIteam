@@ -62,12 +62,16 @@ import {
 import { formatResumeErrorMessage, RESUME_ERROR_MESSAGE_FALLBACK } from '../../lib/resumeErrorMessage'
 import { readApiRejection, submitTaskRecovery } from '../../lib/taskRecovery'
 import {
-  ABORT_REQUEST_CONFIRM_MESSAGE,
-  abortActionView,
+  ONE_TAP_ABORT_BUTTON_LABEL,
+  ONE_TAP_ABORT_CONFIRM_TITLE,
+  ONE_TAP_ABORT_DEFAULT_DEPS,
+  ONE_TAP_ABORT_PROGRESS_TEXT,
   canShowAbortUI,
-  createAbortApprovalRequest,
-  submitTaskAbort,
+  createOneTapAbortRunner,
+  oneTapAbortConfirmMessage,
+  oneTapAbortView,
 } from '../../lib/taskAbort'
+import type { OneTapAbortStage } from '../../lib/taskAbort'
 import { POLLING_INTERVAL_MS, usePolling } from '../../lib/usePolling'
 import { TASK_NUMBER_TEXT_STYLE, taskNumberLabel } from '../../lib/taskNumber'
 
@@ -993,60 +997,53 @@ function StoredReviewRecoverySection({
 interface AbortSectionProps {
   isSubmitting: boolean
   jobs: Job[]
-  /** 直前の操作結果（作成した承認依頼 id・実行結果）。画面を離れるまで表示する */
+  /** 直前の操作結果（実行結果・止まった段階の文言）。画面を離れるまで表示する */
   lastResult: string | null
-  onCreateRequest: () => void
-  onExecute: (approvalRequestId: string) => void
+  /** ワンタップ中止（起票 → 人の承認 → 実行を 1 回の確認で） */
+  onAbort: () => void
+  /** ワンタップ中止の実行中の段階（進行状況の文言を出す）。実行中でなければ null */
+  progress: OneTapAbortStage | null
   task: TaskDetail
 }
 
 /**
- * 既存の manual abort（park）経路。表示条件は `canShowAbortUI()`、ボタン状態は `abortActionView()`。
- * **承認はこの画面ではしない**（承認一覧の human-only PATCH のまま）。
+ * 既存の manual abort（park）経路を 1 ボタンで辿る。表示条件は `canShowAbortUI()`、
+ * 何を順に呼ぶかは `oneTapAbortView()`、連鎖は `runOneTapAbort()`（承認は承認一覧と同じ human-only PATCH）。
  */
 function AbortSection({
   isSubmitting,
   jobs,
   lastResult,
-  onCreateRequest,
-  onExecute,
+  onAbort,
+  progress,
   task,
 }: AbortSectionProps): ReactElement | null {
   if (!canShowAbortUI(task, jobs)) return null
-  const view = abortActionView(task.humanTaskDecisions)
-  const approval = view.approval
+  const oneTap = oneTapAbortView(task.humanTaskDecisions)
 
   return (
     <View style={styles.section}>
-      <Text style={styles.sectionTitle}>Task を中止（park）</Text>
+      <Text style={styles.sectionTitle}>タスクを中止</Text>
       <View style={styles.resumeBox}>
-        <Text style={styles.resumeHelpText}>{view.note}</Text>
+        <Text style={styles.resumeHelpText}>{oneTap.note}</Text>
         <TouchableOpacity
-          disabled={isSubmitting || !view.canCreateRequest}
-          onPress={onCreateRequest}
-          style={[
-            styles.resumeSubmitButton,
-            styles.recoverButton,
-            (isSubmitting || !view.canCreateRequest) && styles.resumeSubmitButtonDisabled,
-          ]}
-        >
-          <Text style={styles.resumeSubmitButtonText}>中止の承認依頼を作成</Text>
-        </TouchableOpacity>
-        <TouchableOpacity
-          disabled={isSubmitting || approval.kind !== 'approved'}
-          onPress={() => { if (approval.kind === 'approved') onExecute(approval.approvalRequestId) }}
+          disabled={isSubmitting}
+          onPress={onAbort}
           style={[
             styles.resumeSubmitButton,
             styles.recoverButton,
             styles.abortExecuteButton,
-            (isSubmitting || !view.canExecute) && styles.resumeSubmitButtonDisabled,
+            isSubmitting && styles.resumeSubmitButtonDisabled,
           ]}
         >
           {isSubmitting && (
             <ActivityIndicator color="#fff" size="small" />
           )}
-          <Text style={styles.resumeSubmitButtonText}>承認済みの中止を実行</Text>
+          <Text style={styles.resumeSubmitButtonText}>{ONE_TAP_ABORT_BUTTON_LABEL}</Text>
         </TouchableOpacity>
+        {progress !== null && (
+          <Text style={[styles.resumeHelpText, styles.abortResultText]}>{ONE_TAP_ABORT_PROGRESS_TEXT[progress]}</Text>
+        )}
         {lastResult !== null && (
           <Text style={[styles.resumeHelpText, styles.abortResultText]}>{lastResult}</Text>
         )}
@@ -1510,6 +1507,7 @@ export default function TaskDetailScreen(): ReactElement {
   const [isSubmittingRecovery, setIsSubmittingRecovery] = useState(false)
   const [isSubmittingAbort, setIsSubmittingAbort] = useState(false)
   const [lastAbortResult, setLastAbortResult] = useState<string | null>(null)
+  const [abortProgress, setAbortProgress] = useState<OneTapAbortStage | null>(null)
 
   const loadTaskDetail = useCallback(async (): Promise<void> => {
     if (taskId === null || taskId.length === 0) {
@@ -1684,59 +1682,37 @@ export default function TaskDetailScreen(): ReactElement {
     )
   }, [isSubmittingRecovery, submitRecovery])
 
-  // 中止（park）: 起票と実行は別操作。**起票の後に承認・実行を連鎖させない**（承認は承認一覧で人が行う）。
-  const submitAbortRequest = useCallback(async (): Promise<void> => {
-    if (taskId === null || taskId.length === 0) return
+  // ワンタップ中止: CEO が自分で始めた中止なので、1 回の確認の後ろで起票 → 人の承認 → 実行を順に呼ぶ（lib の runOneTapAbort）。
+  // runner は二重送信を API の手前で止める（描画の反映前の 2 回押し対策）。
+  const oneTapAbortRunner = useMemo(
+    () => createOneTapAbortRunner({ ...ONE_TAP_ABORT_DEFAULT_DEPS, onProgress: setAbortProgress }),
+    [],
+  )
+
+  const submitOneTapAbort = useCallback(async (): Promise<void> => {
+    if (taskId === null || taskId.length === 0 || data === null) return
+    const view = oneTapAbortView(data.task.humanTaskDecisions)
     setIsSubmittingAbort(true)
     try {
-      const result = await createAbortApprovalRequest(taskId)
-      if (!result.ok) {
-        setLastAbortResult(result.message)
-        Alert.alert('承認依頼の作成失敗', result.message)
-        return
-      }
-      const message = `中止の承認依頼 ${result.approvalRequestId} を作成しました。`
-        + '承認一覧で承認したあと、この画面に戻って「承認済みの中止を実行」を押してください。'
-      setLastAbortResult(message)
-      Alert.alert('中止の承認依頼を作成', message)
-    } finally {
-      await loadTaskDetail()
-      setIsSubmittingAbort(false)
-    }
-  }, [loadTaskDetail, taskId])
-
-  const handleCreateAbortRequest = useCallback((): void => {
-    if (isSubmittingAbort) return
-    Alert.alert('中止の承認依頼を作成', ABORT_REQUEST_CONFIRM_MESSAGE, [
-      { style: 'cancel', text: 'キャンセル' },
-      { onPress: () => { void submitAbortRequest() }, text: '作成' },
-    ])
-  }, [isSubmittingAbort, submitAbortRequest])
-
-  const submitAbort = useCallback(async (approvalRequestId: string): Promise<void> => {
-    if (taskId === null || taskId.length === 0) return
-    setIsSubmittingAbort(true)
-    try {
-      const result = await submitTaskAbort(taskId, approvalRequestId)
+      const result = await oneTapAbortRunner.run(taskId, view.approval)
+      if (result === null) return
       setLastAbortResult(result.message)
-      Alert.alert(result.ok ? 'Task を中止（park）' : '中止失敗', result.message)
+      Alert.alert(result.ok ? 'タスクを中止' : '中止失敗', result.message)
     } finally {
+      setAbortProgress(null)
       await loadTaskDetail()
       setIsSubmittingAbort(false)
     }
-  }, [loadTaskDetail, taskId])
+  }, [data, loadTaskDetail, oneTapAbortRunner, taskId])
 
-  const handleExecuteAbort = useCallback((approvalRequestId: string): void => {
-    if (isSubmittingAbort) return
-    Alert.alert(
-      '承認済みの中止を実行',
-      'このTaskを完了扱いにせず中止（park）しますか？Roadmapの残作業は消えません。',
-      [
-        { style: 'cancel', text: 'キャンセル' },
-        { onPress: () => { void submitAbort(approvalRequestId) }, style: 'destructive', text: '実行' },
-      ],
-    )
-  }, [isSubmittingAbort, submitAbort])
+  const handleOneTapAbort = useCallback((): void => {
+    if (isSubmittingAbort || oneTapAbortRunner.isRunning() || data === null) return
+    const view = oneTapAbortView(data.task.humanTaskDecisions)
+    Alert.alert(ONE_TAP_ABORT_CONFIRM_TITLE, oneTapAbortConfirmMessage(data.task, view), [
+      { style: 'cancel', text: 'キャンセル' },
+      { onPress: () => { void submitOneTapAbort() }, style: 'destructive', text: 'タスクを中止' },
+    ])
+  }, [data, isSubmittingAbort, oneTapAbortRunner, submitOneTapAbort])
 
   const handleSubmitResumeInstruction = useCallback((): void => {
     const trimmedInstruction = resumeInstruction.trim()
@@ -1848,8 +1824,8 @@ export default function TaskDetailScreen(): ReactElement {
             isSubmitting={isSubmittingAbort}
             jobs={data.jobs}
             lastResult={lastAbortResult}
-            onCreateRequest={handleCreateAbortRequest}
-            onExecute={handleExecuteAbort}
+            onAbort={handleOneTapAbort}
+            progress={abortProgress}
             task={data.task}
           />
           <JobHistorySection jobs={data.jobs} />
