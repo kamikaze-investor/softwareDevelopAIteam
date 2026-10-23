@@ -232,10 +232,11 @@ export type ConflictRecoveryRowKind = 'judgment' | 'technical'
  * 構造が壊れていた）も、未知の outcome も、`outcome=` の無い旧形式の行も判定予算を消費する。
  * schema を守らない応答で追加の抽選を得させないためである（独立レビュー指摘）。
  *
- * 例外は1つだけ: critic 行に `fspec=` が付いた旧形式（pl_revision を別 stage にする前）は、
- * 同じ Round の2行目（critiqued の後に書かれた適用結果）である。判定として数えると1 Round を
- * 2回分数える（二重計上）ので判定には数えない。Challenge の行は `stage=challenge` に載るので
- * critic の予算にはそもそも入らない。
+ * 旧形式の行に特例は置かない（allowlist だけで分類する）。critic 行に `fspec=` が付いた旧形式
+ * （pl_revision を別 stage にする前の2行目）を特例で技術扱いにすると、未知の outcome まで
+ * fail-open になる（独立レビュー指摘）。Production に該当行は無く（2026-10-23 実測）、仮にあっても
+ * 予算を早く使い切る側（fail-closed）に倒れるだけである。Challenge の行は `stage=challenge` に
+ * 載るので critic の予算にはそもそも入らない。
  *
  * 旧来の行は削除せず、この関数で**読み替える**だけである（DB migration なし）。
  */
@@ -246,7 +247,6 @@ export function classifyConflictRecoveryRow(
   const text = detail ?? ''
   const outcome = conflictRowOutcome(text)
   if (outcome !== undefined && TECHNICAL_FAILURE_OUTCOMES.includes(outcome)) return 'technical'
-  if (stage === 'critic' && outcome !== 'critiqued' && /\bfspec=\S+/.test(text)) return 'technical'
   return 'judgment'
 }
 

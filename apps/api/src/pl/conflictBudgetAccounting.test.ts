@@ -142,8 +142,10 @@ describe('classifyConflictRecoveryRow — 判定 / 技術的失敗の唯一の�
     ['remediation', 'outcome=ledger_unreadable', 'technical'],
     ['remediation', 'outcome=no_independent_flagship', 'technical'],
     ['remediation', 'stage=remediation outcome=exception', 'technical'],
-    // 旧形式（pl_revision を別 stage にする前）の critic 行の fspec= は同じ Round の2行目。二重計上しない
-    ['critic', 'stage=critic proposed=h fspec=abc rejected_fspec=- outcome=adopting', 'technical'],
+    // 旧形式の critic 行（fspec= 付き）にも特例を置かない（allowlist だけで分類・fail-closed）。
+    // Production には該当行が0件（2026-10-23 実測）。未知・旧形式の outcome は判定予算を消費する
+    ['critic', 'stage=critic proposed=h fspec=abc rejected_fspec=- outcome=adopting', 'judgment'],
+    ['critic', 'stage=critic fspec=x outcome=some_future_outcome', 'judgment'],
     // 判定: parse 済みの結果
     ['critic', 'stage=critic provider=codex model=m disputes=0 binding_disputes=0 outcome=critiqued', 'judgment'],
     ['critic', 'stage=critic provider=codex model=m outcome=runner_failed_after_critique', 'judgment'],
