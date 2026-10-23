@@ -25,6 +25,8 @@ import {
   findRemediationSubject,
   stageEntries,
   PL_MAX_REMEDIATION_ATTEMPTS,
+  PL_MAX_TECHNICAL_FAILURES_PER_STAGE,
+  tallyConflictStage,
   REMEDIATION_SYSTEM_PROMPT,
   buildRemediationPrompt,
   runRemediationStep,
@@ -539,10 +541,11 @@ describe('著者の独立性 — 自分の却下案を自分で書き直させ�
       })
     }
 
-    // 予算も尽きているので、まず attempts_exhausted で止まることを確かめる。
+    // runner_failed は判定ではないので判定予算は残っている（2026-10-23 `#2cae0d07`）。
+    // よって予算ではなく、著者分離（両 flagship が既に使われた）で止まる。
     const result = await runRemediationStep(storage, taskId, deps())
 
-    expect(result.status).toBe('attempts_exhausted')
+    expect(result.status).toBe('no_independent_model')
   })
 })
 
@@ -692,7 +695,10 @@ describe('有界性と記録', () => {
     expect(countRemediationAttempts(storage, taskId)).toBe(1)
   })
 
-  it('上限に達したら実行せず attempts_exhausted を返す', async () => {
+  it('runner 失敗は判定予算ではなく技術的失敗上限で打ち切り、上限後は実行せず attempts_exhausted を返す', async () => {
+    // 以前は runner_failed ×PL_MAX_REMEDIATION_ATTEMPTS で判定予算が尽きていた（判定 0 件で terminal。
+    // 2026-10-23 `#2cae0d07`）。runner_failed は判定ではないので、別の上限
+    // PL_MAX_TECHNICAL_FAILURES_PER_STAGE で有界にする（無制限には再試行しない）。
     const { storage, taskId } = seedConflictedTask()
     let executions = 0
     const failing = deps({
@@ -705,13 +711,42 @@ describe('有界性と記録', () => {
       },
     })
 
-    for (let i = 0; i < PL_MAX_REMEDIATION_ATTEMPTS; i += 1) {
+    for (let i = 0; i < PL_MAX_TECHNICAL_FAILURES_PER_STAGE; i += 1) {
       await runRemediationStep(storage, taskId, failing)
     }
+    // 3回目は著者分離で no_independent_flagship になり得るが、それも技術的失敗として数える。
+    const tally = tallyConflictStage(storage, taskId, 'remediation')
+    expect(tally).toEqual({ judgments: 0, technicalFailures: PL_MAX_TECHNICAL_FAILURES_PER_STAGE })
+    const executionsAtCap = executions
     const beyond = await runRemediationStep(storage, taskId, failing)
+
+    expect(executions).toBe(executionsAtCap)
+    expect(beyond.status).toBe('attempts_exhausted')
+    expect(beyond.reason).toContain('technical failures exhausted the stage')
+  })
+
+  it('parse 済みの提案（abandon）は判定予算を消費し、PL_MAX_REMEDIATION_ATTEMPTS 回で attempts_exhausted', async () => {
+    const { storage, taskId } = seedConflictedTask()
+    let executions = 0
+    const abandoning = deps({
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async () => {
+          executions += 1
+          return { ok: true, stdout: JSON.stringify({ ...PROPOSAL, abandon: true }), timedOut: false }
+        },
+      },
+    })
+
+    for (let i = 0; i < PL_MAX_REMEDIATION_ATTEMPTS; i += 1) {
+      expect((await runRemediationStep(storage, taskId, abandoning)).status).toBe('abandon_recommended')
+    }
+    const beyond = await runRemediationStep(storage, taskId, abandoning)
 
     expect(executions).toBe(PL_MAX_REMEDIATION_ATTEMPTS)
     expect(beyond.status).toBe('attempts_exhausted')
+    expect(tallyConflictStage(storage, taskId, 'remediation'))
+      .toEqual({ judgments: PL_MAX_REMEDIATION_ATTEMPTS, technicalFailures: 0 })
   })
 
   it('ledger が読めない場合も試行として記録する（通知ループを作らない）', async () => {

@@ -182,6 +182,86 @@ export function stageEntries(
     })
 }
 
+/**
+ * 1つの stage で、判定（judgment）を生まなかった技術的失敗を許す回数。
+ *
+ * **判定予算（`PL_MAX_CRITIC_ROUNDS` / `PL_MAX_REMEDIATION_ATTEMPTS`）とは別に数える。**
+ * 以前は stage の全行を判定予算として数えていたため、runner が即座に落ちただけの行
+ * （判定を1つも生んでいない）で予算が尽き、Task が判定 0 件のまま `terminal` に取り残された
+ * （2026-10-23 Production `#2cae0d07`: critic runner_failed ×2 + remediation runner_failed ×2）。
+ *
+ * それでも技術的失敗は**無制限には再試行しない**。stage ごとにこの上限で打ち切り、
+ * 打ち切られた stage は使えないものとして扱う（critic → remediation へ進む / remediation → terminal）。
+ */
+export const PL_MAX_TECHNICAL_FAILURES_PER_STAGE = 3
+
+/** 予算を持つ CONFLICT 復旧 stage。challenge / pl_revision は独自の予算を持たない。 */
+export type BudgetedConflictStage = 'critic' | 'remediation'
+
+/** CONFLICT 復旧 audit 行の分類。 */
+export type ConflictRecoveryRowKind = 'judgment' | 'technical'
+
+/**
+ * 既存の CONFLICT 復旧 audit 行を「判定」と「技術的失敗」に分ける。**唯一の分類表**。
+ *
+ * **判定 = runner が parse 済みの結果を返した行**（肯定的な証拠がある行だけ）:
+ *   - critic: `outcome=critiqued`（Critique が parse できた）。Challenge の行は `stage=challenge`
+ *     に載り、critiqued の**後**にしか書かれない（同じ Round の続き）ので critic の予算には数えない。
+ *     数えると1 Round で2回分を消費する（pl_revision を別 stage にしたのと同じ理由）
+ *   - remediation: `outcome=abandon`（parse 済みの提案が「捨てる」と結論した）と、
+ *     `applyRevisedSpec()` が書く `fspec=` 付きの行（not_different / Gate の failureCode /
+ *     adopting）。後者は提案が parse でき、その spec key が計算できたことの証拠である
+ *
+ * **技術的失敗 = parse 済みの結果が無いまま記録された行**（それ以外すべて）:
+ *   runner_failed / exception / critique_unusable / unusable / item_not_in_ledger /
+ *   ledger_unreadable / no_independent_flagship、`outcome=` の無い旧形式の行など。
+ *
+ * 未知の outcome を技術的失敗側へ倒すのは、判定の証拠が無い行で判定予算を消費させないため。
+ * それでも `PL_MAX_TECHNICAL_FAILURES_PER_STAGE` で有界なので、無限に再試行はしない。
+ *
+ * 旧来の行は削除せず、この関数で**読み替える**だけである（DB migration なし）。
+ */
+export function classifyConflictRecoveryRow(
+  stage: BudgetedConflictStage,
+  detail: string | undefined,
+): ConflictRecoveryRowKind {
+  const text = detail ?? ''
+  const outcome = /\boutcome=(\S+)/.exec(text)?.[1]
+  if (stage === 'critic') {
+    // critic 行の `fspec=` は pl_revision を別 stage にする前の旧形式で、同じ Round の2行目である。
+    // 判定として数えると1 Round を2回分数える（二重計上）ので、critiqued だけを数える。
+    return outcome === 'critiqued' ? 'judgment' : 'technical'
+  }
+  if (outcome === 'abandon') return 'judgment'
+  if (/\bfspec=\S+/.test(text)) return 'judgment'
+  return 'technical'
+}
+
+export interface ConflictStageTally {
+  judgments: number
+  technicalFailures: number
+}
+
+/** stage の判定数と技術的失敗数を既存 audit から数える（新しい state は持たない）。 */
+export function tallyConflictStage(
+  storage: IStorage,
+  taskId: string,
+  stage: BudgetedConflictStage,
+): ConflictStageTally {
+  const tally: ConflictStageTally = { judgments: 0, technicalFailures: 0 }
+  for (const entry of stageEntries(storage, taskId, stage)) {
+    if (classifyConflictRecoveryRow(stage, entry.detail) === 'judgment') tally.judgments += 1
+    else tally.technicalFailures += 1
+  }
+  return tally
+}
+
+/** stage がまだ使えるか: 判定予算が残り、かつ技術的失敗が上限に達していない。 */
+export function isConflictStageAvailable(tally: ConflictStageTally, maxJudgments: number): boolean {
+  return tally.judgments < maxJudgments
+    && tally.technicalFailures < PL_MAX_TECHNICAL_FAILURES_PER_STAGE
+}
+
 function priorProvidersForStage(
   storage: IStorage,
   taskId: string,
@@ -413,6 +493,9 @@ function remediationKey(taskId: string): string {
  * 全行を数えると **Critic Round が Remediation の予算を食い潰す** —— 実際にそうなっていて、
  * Critic を2 Round 行った時点で Remediation へ到達できなくなっていた（テストで検出）。
  * stage ごとに予算が独立していることが、段階フローの前提である。
+ *
+ * **これは記録された行数であり、予算ではない。** 予算は判定と技術的失敗を分けて数える
+ * `tallyConflictStage()` / `hasRemediationBudgetLeft()` が持つ（2026-10-23 `#2cae0d07`）。
  */
 export function countRemediationAttempts(storage: IStorage, taskId: string): number {
   return stageEntries(storage, taskId, 'remediation').length
@@ -428,7 +511,10 @@ export function countRemediationAttempts(storage: IStorage, taskId: string): num
  * いまの呼び出し元は Human Recovery の `nextDriver` 判定と `triageBlocked()` の CEO 案内。
  */
 export function hasRemediationBudgetLeft(storage: IStorage, taskId: string): boolean {
-  return countRemediationAttempts(storage, taskId) < PL_MAX_REMEDIATION_ATTEMPTS
+  return isConflictStageAvailable(
+    tallyConflictStage(storage, taskId, 'remediation'),
+    PL_MAX_REMEDIATION_ATTEMPTS,
+  )
 }
 
 /**
@@ -663,14 +749,17 @@ export async function runRemediationStep(
     return { status: 'not_applicable', taskId, reason: 'task is not stopped by a design review CONFLICT' }
   }
 
-  const attempts = countRemediationAttempts(storage, taskId)
-  if (attempts >= PL_MAX_REMEDIATION_ATTEMPTS) {
+  const tally = tallyConflictStage(storage, taskId, 'remediation')
+  if (!isConflictStageAvailable(tally, PL_MAX_REMEDIATION_ATTEMPTS)) {
     return {
       status: 'attempts_exhausted',
       taskId,
       roadmapId: initialSubject.roadmapId,
       failureCode: 'attempts_exhausted',
-      reason: `independent remediation already ran ${attempts} time(s) for this task`,
+      reason: tally.judgments >= PL_MAX_REMEDIATION_ATTEMPTS
+        ? `independent remediation already produced ${tally.judgments} judgment(s) for this task`
+        : `independent remediation hit ${tally.technicalFailures} technical failure(s) without a judgment`
+          + ` (limit ${PL_MAX_TECHNICAL_FAILURES_PER_STAGE}); technical failures exhausted the stage`,
     }
   }
 

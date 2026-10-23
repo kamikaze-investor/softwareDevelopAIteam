@@ -188,7 +188,22 @@ describe('selectConflictStage — 既存 state の observer', () => {
     expect(selectConflictStage(storage, taskId).stage).toBe('remediation')
   })
 
-  it('Critic も Remediation も尽きたら terminal', () => {
+  it('Critic も Remediation も判定予算が尽きたら terminal（runner_failed ではなく parse 済みの提案で尽きる）', () => {
+    // 以前は remediation runner_failed ×2 で terminal としていたが、それは判定 0 件の取り残し
+    // （2026-10-23 `#2cae0d07`）を固定していた。判定予算は parse 済みの提案だけが消費する。
+    const { storage, taskId } = seed()
+    for (let i = 0; i < PL_MAX_CRITIC_ROUNDS; i += 1) {
+      recordRemediationFailure(storage, taskId, 'stage=critic outcome=critiqued')
+    }
+    recordRemediationFailure(storage, taskId, 'stage=remediation outcome=abandon')
+    recordRemediationFailure(storage, taskId, 'stage=remediation proposed=h fspec=abc rejected_fspec=- outcome=not_different')
+
+    const selection = selectConflictStage(storage, taskId)
+    expect(selection.stage).toBe('terminal')
+    expect(selection.reason).toBe('critic rounds and remediation attempts are both exhausted')
+  })
+
+  it('Critic 判定が尽き remediation runner_failed ×2 だけなら remediation がまだ使える', () => {
     const { storage, taskId } = seed()
     for (let i = 0; i < PL_MAX_CRITIC_ROUNDS; i += 1) {
       recordRemediationFailure(storage, taskId, 'stage=critic outcome=critiqued')
@@ -197,7 +212,7 @@ describe('selectConflictStage — 既存 state の observer', () => {
       recordRemediationFailure(storage, taskId, 'stage=remediation outcome=runner_failed')
     }
 
-    expect(selectConflictStage(storage, taskId).stage).toBe('terminal')
+    expect(selectConflictStage(storage, taskId).stage).toBe('remediation')
   })
 
   it('**challenge は selector から返らない**（固定 stage ではなく条件分岐）', () => {
