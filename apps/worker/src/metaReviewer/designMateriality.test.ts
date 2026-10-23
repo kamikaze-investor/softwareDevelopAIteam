@@ -372,3 +372,10 @@ describe('独立レビュー指摘（code review round 2）の回帰', () => {
     expect(computeMaterialitySignals(diff)).toEqual([])
   })
 })
+
+describe('独立レビュー指摘（code review round 3）の回帰', () => {
+  it("1行 enum のコメント内の `'` を引用符と誤らない", () => {
+    const diff = fileDiff('apps/api/src/x.ts', ["-export enum E { A = 1 /* don't */, B /* it's */ }", "+export enum E { A = 1 /* don't */ }"])
+    expect(kinds(computeMaterialitySignals(diff))).toEqual(['contract_member_removed:B'])
+  })
+})

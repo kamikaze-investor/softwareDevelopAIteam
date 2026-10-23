@@ -129,8 +129,13 @@ function contractMembers(lines: ReadonlyArray<string | null>): { removed: Map<st
     // 1行 enum（`enum Stage { Critic, Challenge }`）は opener と member が同じ行にある
     const inlineEnum = body.match(/\benum\s+\w+\s*\{([^}]*)\}/)
     if (inlineEnum) {
-      // 初期化子の文字列リテラル内の `,` で切らないよう、先に文字列を空にする
-      for (const member of inlineEnum[1].replace(/(['"`])(?:\\.|(?!\1).)*\1/g, '""').split(',')) {
+      // 初期化子の文字列リテラル内の `,` で切らないよう、先にコメント（中の `'` を引用符と誤らないため）、
+      // 次に文字列を空にする
+      const stripped = inlineEnum[1]
+        .replace(/\/\*[\s\S]*?\*\//g, ' ')
+        .replace(/(['"`])(?:\\.|(?!\1).)*\1/g, '""')
+        .replace(/\/\/.*$/, '')
+      for (const member of stripped.split(',')) {
         const m = member.match(/^\s*([A-Za-z_]\w*)/)
         if (m) found.push(['enum', m[1]])
       }
