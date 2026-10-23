@@ -158,8 +158,15 @@ export function awaitingPromotionAuditKey(
  * v3（2026-10-16 監査 RC4/RC6）は RISK_RULES の HIGH 対象を広げ、承認の action 束縛を締めただけで、
  * git_commit の ALLOW はより厳しくなる方向にしか変わっていない。よって v3 の ALLOW も同じ証明になる。
  * Production の既存 evidence は v2 なので両方を受け付ける。
+ *
+ * v4（2026-10-23）は Design Review の同一設計での判定反転（`design_review_reversed`）を fail closed に
+ * 加えただけで、git_commit の ALLOW はより厳しくなる方向にしか変わっていない。よって v4 の ALLOW も同じ証明になる。
  */
-export const CANDIDATE_COMMIT_EVIDENCE_POLICY_VERSIONS: ReadonlySet<string> = new Set(['gate-policy-v2', 'gate-policy-v3'])
+export const CANDIDATE_COMMIT_EVIDENCE_POLICY_VERSIONS: ReadonlySet<string> = new Set([
+  'gate-policy-v2',
+  'gate-policy-v3',
+  'gate-policy-v4',
+])
 
 /** Human Approval path: source Job の linked approval が Candidate への CONSUMED な git_commit。 */
 function hasConsumedCandidateApproval(storage: IStorage, taskId: string, sourceJob: Job): boolean {
