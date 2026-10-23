@@ -140,7 +140,22 @@ const PL_PROPOSAL_AUTHOR_MODEL = CHEAP_AI_CONFIG.model
  * 「元設計者へ解決案生成を戻さない」という本経路の前提そのものが崩れる（独立レビュー指摘）。
  *
  * 材料は自前の audit 行の provenance だけである（新しいテーブルは作らない）。
+ *
+ * **著者は提案を書いた判定行の provider だけである。** runner_failed / preflight 失敗の provider は
+ * 提案を1つも書いていないので著者ではない。数えると、判定 0 件のまま両 flagship が著者として
+ * 除外され、Remediation が `no_independent_flagship` でしか終われなくなる（2026-10-23 `#2cae0d07`）。
+ * 分類は `classifyConflictRecoveryRow()` の1箇所だけを使う。
+ *
+ * `unusable`（応答はあったが構造が壊れていた）は判定予算を消費するが、著者には数えない。
+ * 著者独立性の目的は「却下された設計を書いた側に書き直させない」ことで、壊れた応答は
+ * 提出も却下もされる設計を含まないからである。parse 済みの提案（abandon / fspec 行 /
+ * runner 失敗後に stdout から parse できた提案 / 適用中の例外）を書いた provider は除外される。
  */
+function priorRemediationAuthors(storage: IStorage, taskId: string): string[] {
+  return priorProvidersForStage(storage, taskId, 'remediation', { authorsOnly: true })
+}
+
+/** この chain で Remediation に使った provider（Preference の順位付け用。著者判定には使わない）。 */
 function priorRemediationProviders(storage: IStorage, taskId: string): string[] {
   return priorProvidersForStage(storage, taskId, 'remediation')
 }
@@ -182,13 +197,115 @@ export function stageEntries(
     })
 }
 
+/**
+ * 1つの stage で、判定（judgment）を生まなかった技術的失敗を許す回数。
+ *
+ * **判定予算（`PL_MAX_CRITIC_ROUNDS` / `PL_MAX_REMEDIATION_ATTEMPTS`）とは別に数える。**
+ * 以前は stage の全行を判定予算として数えていたため、runner が即座に落ちただけの行
+ * （判定を1つも生んでいない）で予算が尽き、Task が判定 0 件のまま `terminal` に取り残された
+ * （2026-10-23 Production `#2cae0d07`: critic runner_failed ×2 + remediation runner_failed ×2）。
+ *
+ * それでも技術的失敗は**無制限には再試行しない**。stage ごとにこの上限で打ち切り、
+ * 打ち切られた stage は使えないものとして扱う（critic → remediation へ進む / remediation → terminal）。
+ */
+export const PL_MAX_TECHNICAL_FAILURES_PER_STAGE = 3
+
+/** 予算を持つ CONFLICT 復旧 stage。challenge / pl_revision は独自の予算を持たない。 */
+export type BudgetedConflictStage = 'critic' | 'remediation'
+
+/** CONFLICT 復旧 audit 行の分類。 */
+export type ConflictRecoveryRowKind = 'judgment' | 'technical'
+
+/**
+ * 既存の CONFLICT 復旧 audit 行を「判定」と「技術的失敗」に分ける。**唯一の分類表**。
+ *
+ * **技術的失敗は明示した allowlist だけである**（`TECHNICAL_FAILURE_OUTCOMES`）。いずれも
+ * model が応答を返す前に止まった行で、記録している箇所は次のとおり:
+ *   - `runner_failed` … critic / remediation の runner が ok=false で、stdout にも完全な結果が無い
+ *   - `exception` … PL ループが step の例外を記録する（`executionLoop.ts` remediateConflict。
+ *     step がこの試行を何も記録していなかったときだけ書かれる）
+ *   - `item_not_in_ledger` / `ledger_unreadable` … model を呼ぶ前の ledger 読み取り失敗
+ *     （remediation: `runRemediationStep`、critic: `runConflictResolutionRound` の readLedgerBody）
+ *   - `no_independent_flagship` … remediation の model 選択（preflight）で候補が無い
+ *
+ * **それ以外はすべて判定（fail-closed）。** `critique_unusable` / `unusable`（model は応答したが
+ * 構造が壊れていた）も、未知の outcome も、`outcome=` の無い旧形式の行も判定予算を消費する。
+ * schema を守らない応答で追加の抽選を得させないためである（独立レビュー指摘）。
+ *
+ * 旧形式の行に特例は置かない（allowlist だけで分類する）。critic 行に `fspec=` が付いた旧形式
+ * （pl_revision を別 stage にする前の2行目）を特例で技術扱いにすると、未知の outcome まで
+ * fail-open になる（独立レビュー指摘）。Production に該当行は無く（2026-10-23 実測）、仮にあっても
+ * 予算を早く使い切る側（fail-closed）に倒れるだけである。Challenge の行は `stage=challenge` に
+ * 載るので critic の予算にはそもそも入らない。
+ *
+ * 旧来の行は削除せず、この関数で**読み替える**だけである（DB migration なし）。
+ */
+export function classifyConflictRecoveryRow(
+  stage: BudgetedConflictStage,
+  detail: string | undefined,
+): ConflictRecoveryRowKind {
+  const text = detail ?? ''
+  const outcome = conflictRowOutcome(text)
+  if (outcome !== undefined && TECHNICAL_FAILURE_OUTCOMES.includes(outcome)) return 'technical'
+  return 'judgment'
+}
+
+function conflictRowOutcome(detail: string | undefined): string | undefined {
+  return /\boutcome=(\S+)/.exec(detail ?? '')?.[1]
+}
+
+/** 判定を生まなかった技術的失敗として数える outcome（明示 allowlist。未知の outcome は判定扱い）。 */
+export const TECHNICAL_FAILURE_OUTCOMES: readonly string[] = [
+  'runner_failed',
+  'exception',
+  'item_not_in_ledger',
+  'ledger_unreadable',
+  'no_independent_flagship',
+]
+
+/**
+ * 判定のうち、model が応答したが構造化された結果にならなかったもの。予算は消費するが、
+ * 提案を1つも書いていないので Remediation の著者には数えない（`priorRemediationAuthors()`）。
+ */
+const MALFORMED_RESPONSE_OUTCOMES: readonly string[] = ['unusable', 'critique_unusable']
+
+export interface ConflictStageTally {
+  judgments: number
+  technicalFailures: number
+}
+
+/** stage の判定数と技術的失敗数を既存 audit から数える（新しい state は持たない）。 */
+export function tallyConflictStage(
+  storage: IStorage,
+  taskId: string,
+  stage: BudgetedConflictStage,
+): ConflictStageTally {
+  const tally: ConflictStageTally = { judgments: 0, technicalFailures: 0 }
+  for (const entry of stageEntries(storage, taskId, stage)) {
+    if (classifyConflictRecoveryRow(stage, entry.detail) === 'judgment') tally.judgments += 1
+    else tally.technicalFailures += 1
+  }
+  return tally
+}
+
+/** stage がまだ使えるか: 判定予算が残り、かつ技術的失敗が上限に達していない。 */
+export function isConflictStageAvailable(tally: ConflictStageTally, maxJudgments: number): boolean {
+  return tally.judgments < maxJudgments
+    && tally.technicalFailures < PL_MAX_TECHNICAL_FAILURES_PER_STAGE
+}
+
 function priorProvidersForStage(
   storage: IStorage,
   taskId: string,
   stage: 'critic' | 'remediation' | 'challenge' | 'pl_revision',
+  options: { authorsOnly?: boolean } = {},
 ): string[] {
   const providers: string[] = []
   for (const entry of stageEntries(storage, taskId, stage)) {
+    if (options.authorsOnly === true
+      && (stage === 'critic' || stage === 'remediation')
+      && (classifyConflictRecoveryRow(stage, entry.detail) !== 'judgment'
+        || MALFORMED_RESPONSE_OUTCOMES.includes(conflictRowOutcome(entry.detail) ?? ''))) continue
     const provider = /\bprovider=([\w-]+)/.exec(entry.detail ?? '')?.[1]
     if (provider !== undefined && !providers.includes(provider)) providers.push(provider)
   }
@@ -413,6 +530,9 @@ function remediationKey(taskId: string): string {
  * 全行を数えると **Critic Round が Remediation の予算を食い潰す** —— 実際にそうなっていて、
  * Critic を2 Round 行った時点で Remediation へ到達できなくなっていた（テストで検出）。
  * stage ごとに予算が独立していることが、段階フローの前提である。
+ *
+ * **これは記録された行数であり、予算ではない。** 予算は判定と技術的失敗を分けて数える
+ * `tallyConflictStage()` / `hasRemediationBudgetLeft()` が持つ（2026-10-23 `#2cae0d07`）。
  */
 export function countRemediationAttempts(storage: IStorage, taskId: string): number {
   return stageEntries(storage, taskId, 'remediation').length
@@ -428,7 +548,10 @@ export function countRemediationAttempts(storage: IStorage, taskId: string): num
  * いまの呼び出し元は Human Recovery の `nextDriver` 判定と `triageBlocked()` の CEO 案内。
  */
 export function hasRemediationBudgetLeft(storage: IStorage, taskId: string): boolean {
-  return countRemediationAttempts(storage, taskId) < PL_MAX_REMEDIATION_ATTEMPTS
+  return isConflictStageAvailable(
+    tallyConflictStage(storage, taskId, 'remediation'),
+    PL_MAX_REMEDIATION_ATTEMPTS,
+  )
 }
 
 /**
@@ -663,14 +786,17 @@ export async function runRemediationStep(
     return { status: 'not_applicable', taskId, reason: 'task is not stopped by a design review CONFLICT' }
   }
 
-  const attempts = countRemediationAttempts(storage, taskId)
-  if (attempts >= PL_MAX_REMEDIATION_ATTEMPTS) {
+  const tally = tallyConflictStage(storage, taskId, 'remediation')
+  if (!isConflictStageAvailable(tally, PL_MAX_REMEDIATION_ATTEMPTS)) {
     return {
       status: 'attempts_exhausted',
       taskId,
       roadmapId: initialSubject.roadmapId,
       failureCode: 'attempts_exhausted',
-      reason: `independent remediation already ran ${attempts} time(s) for this task`,
+      reason: tally.judgments >= PL_MAX_REMEDIATION_ATTEMPTS
+        ? `independent remediation already produced ${tally.judgments} judgment(s) for this task`
+        : `independent remediation hit ${tally.technicalFailures} technical failure(s) without a judgment`
+          + ` (limit ${PL_MAX_TECHNICAL_FAILURES_PER_STAGE}); technical failures exhausted the stage`,
     }
   }
 
@@ -720,7 +846,8 @@ export async function runRemediationStep(
   const selection = selectRemediationModel({
     // 1回目は PL（vendor 未解決）、2回目以降は前回の Remediation 著者も除外対象になる。
     // **Remediation 著者は Task Design を書いた側**なので、ここは hard 側で正しい。
-    authorProviders: [PL_PROPOSAL_AUTHOR_PROVIDER, ...priorProviders],
+    // 著者は判定（parse 済みの提案）を生んだ provider だけ。runner 失敗は著者ではない。
+    authorProviders: [PL_PROPOSAL_AUTHOR_PROVIDER, ...priorRemediationAuthors(storage, taskId)],
     // **vendor が解決できない相手にも、model 単位の分離は必ず効かせる。**
     authorModels: [PL_PROPOSAL_AUTHOR_MODEL],
     // 初回 implement Job の Design Review は常に `changedFiles: []` で走る
@@ -791,7 +918,15 @@ export async function runRemediationStep(
 
   // **試行は必ず記録する。** 記録しないと上限が効かず、同じ失敗を無限に繰り返せる。
   if (!execution.ok) {
-    recordRemediation(storage, taskId, `${provenance} outcome=runner_failed`)
+    // **stdout に完全な提案があれば、それは判定である**（会計のみ。採用・適用はしない）。
+    // runner が提案を書いた後に落ちた場合を技術的失敗として数えると、parse 済みの提案が
+    // 判定予算を消費せず、その provider も著者として残らない（独立レビュー指摘）。
+    const parsedBeforeFailure = execution.stdout !== '' && parseRemediationProposal(execution.stdout) !== undefined
+    recordRemediation(
+      storage,
+      taskId,
+      `${provenance} outcome=${parsedBeforeFailure ? 'runner_failed_after_proposal' : 'runner_failed'}`,
+    )
     return {
       status: 'remediation_failed',
       taskId,
@@ -835,18 +970,33 @@ export async function runRemediationStep(
   // ── 修正版 spec を適用する（guard → Gate → 採用 → fresh Review の共有経路）──
   //
   // **PL revision と同じ関数を通す。** 誰が spec を書いたかで関門が変わってはならない。
-  const outcome = await applyRevisedSpec(storage, {
-    subject,
-    ledgerBody,
-    submittedScope: buildRemediatedScope(proposal),
-    rawScope: proposal.implementationScope,
-    allowedPaths: proposal.allowedPaths,
-    acceptanceCriteria: proposal.acceptanceCriteria,
-    riskOpinionLevel: 'INDEPENDENT_REMEDIATION',
-    rationale: proposal.resolution,
-    provenance: provenance,
-    ...(deps.adopt !== undefined ? { adopt: deps.adopt } : {}),
-  })
+  //
+  // **parse 済みの提案は、後段が throw しても判定として残す。** `applyRevisedSpec()` が
+  // `fspec=` 行を書く前（Gate・storage・hash の準備中）に落ちると、PL ループは provider の無い
+  // `outcome=exception`（技術的失敗）しか書けず、判定予算も著者記録も失われる（独立レビュー指摘）。
+  // 既に判定行が書かれていれば足さない（二重計上しない）。PL ループ側は試行数が増えていれば
+  // exception 行を書かないので、ここで1行になる。
+  const rowsBeforeApply = countConflictAttempts(storage, taskId)
+  let outcome: ApplyRevisedSpecOutcome
+  try {
+    outcome = await applyRevisedSpec(storage, {
+      subject,
+      ledgerBody,
+      submittedScope: buildRemediatedScope(proposal),
+      rawScope: proposal.implementationScope,
+      allowedPaths: proposal.allowedPaths,
+      acceptanceCriteria: proposal.acceptanceCriteria,
+      riskOpinionLevel: 'INDEPENDENT_REMEDIATION',
+      rationale: proposal.resolution,
+      provenance: provenance,
+      ...(deps.adopt !== undefined ? { adopt: deps.adopt } : {}),
+    })
+  } catch (error: unknown) {
+    if (countConflictAttempts(storage, taskId) === rowsBeforeApply) {
+      recordRemediation(storage, taskId, `${provenance} outcome=proposal_parsed_apply_exception`)
+    }
+    throw error
+  }
 
   const common = {
     taskId,

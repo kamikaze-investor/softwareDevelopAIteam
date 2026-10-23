@@ -63,7 +63,11 @@ import {
   isReachableByAutonomousLoop,
   recoveryReleasesProjectSlot,
 } from '../humanRecovery/recoveryAudit'
-import { countRemediationAttempts, PL_MAX_REMEDIATION_ATTEMPTS } from './remediationStep'
+import {
+  PL_MAX_REMEDIATION_ATTEMPTS,
+  PL_MAX_TECHNICAL_FAILURES_PER_STAGE,
+  tallyConflictStage,
+} from './remediationStep'
 import { findTechnicalResumeImplementation } from './technicalResumePolicy'
 import {
   predictHumanRecoveryDriver,
@@ -547,6 +551,13 @@ function hasLiveJob(facts: Facts): boolean {
  * 同じ run に対して Triage と Remediation が違う結論を出す。
  * 読めない・再計算できないものは `undefined`（＝ CONFLICT と決めつけない。fail-closed）。
  */
+/** Remediation 予算の事実表示。予算は判定数、技術的失敗は別の上限で数える。 */
+function remediationBudgetFact(storage: IStorage, taskId: string): string {
+  const tally = tallyConflictStage(storage, taskId, 'remediation')
+  return `${tally.judgments}/${PL_MAX_REMEDIATION_ATTEMPTS}`
+    + ` (technical_failures=${tally.technicalFailures}/${PL_MAX_TECHNICAL_FAILURES_PER_STAGE})`
+}
+
 function recomputedDecisionOf(storage: IStorage, taskId: string | undefined): string | undefined {
   if (taskId === undefined) return undefined
   const run = storage.designReviewRuns.findLatestByTaskId(taskId)
@@ -746,7 +757,8 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
           ? [{
             fact: 'remediation.attempts',
             id: item.taskId,
-            value: `${countRemediationAttempts(storage, item.taskId)}/${PL_MAX_REMEDIATION_ATTEMPTS}`,
+            // 予算は判定数で、技術的失敗は別の上限で数える（`classifyConflictRecoveryRow()`）。
+            value: remediationBudgetFact(storage, item.taskId),
           }]
           : []),
       ],

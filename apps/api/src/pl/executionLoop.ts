@@ -91,9 +91,6 @@ import {
 import { requestTechnicalAbort } from './abortTask'
 import {
   countConflictAttempts,
-  countRemediationAttempts,
-  findRemediationSubject,
-  PL_MAX_REMEDIATION_ATTEMPTS,
   recordRemediationFailure,
   runRemediationStep,
   type PlRemediationDeps,
@@ -471,7 +468,7 @@ function isActionableNow(storage: IStorage, item: AttentionItem, resumeInstructi
     // `hasEscalated()` は Task の生涯にわたる記録で、キー（`task_ready_without_job:<taskId>`）は
     // 変わらない。CONFLICT はまず notify-only で1回 Escalate されるため、ここを素通しに
     // しないと **Remediation が構造的に一度も走れない**（既に止まっている本番 Task も含む）。
-    // 予算は `countRemediationAttempts()` が却下テキスト単位で別に持つので、
+    // 予算は `selectConflictStage()` が却下テキスト単位で別に持つので、
     // 通知が鳴り続けることはない。
     && (!hasEscalated(storage, targetKeyOf(item)) || isRemediableConflict(storage, item))
     && !hasExhaustedTargetTechnicalRecovery(storage, item)
@@ -767,8 +764,10 @@ function attemptHistoryFor(storage: IStorage, targetKey: string): string[] {
  */
 function isRemediableConflict(storage: IStorage, item: AttentionItem): boolean {
   if (item.kind !== 'task_ready_without_job' || item.taskId === undefined) return false
-  if (findRemediationSubject(storage, item.taskId) === undefined) return false
-  return countRemediationAttempts(storage, item.taskId) < PL_MAX_REMEDIATION_ATTEMPTS
+  // **予算判定は `selectConflictStage()` へ一本化する**（subject の有無もそこが見る）。
+  // 判定数と技術的失敗数は `classifyConflictRecoveryRow()` で分けて数え、どれかの stage が
+  // まだ使えるなら対象にする。判定 0 件の runner_failed だけで対象外にしない（2026-10-23 `#2cae0d07`）。
+  return selectConflictStage(storage, item.taskId).stage !== 'terminal'
 }
 
 /**
@@ -802,7 +801,7 @@ async function remediateConflict(
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error)
     // **例外も Remediation の試行として数える。** PL target 側だけに記録すると
-    // `countRemediationAttempts()` が 0 のままで対象から外れず、再現する例外
+    // 試行が0行のままで対象から外れず、再現する例外
     // （runner の spawn 失敗等）を毎 tick 繰り返す。
     //
     // ただし **step 側が既にこの試行を計上していたら足さない。** step は採用を await する前に

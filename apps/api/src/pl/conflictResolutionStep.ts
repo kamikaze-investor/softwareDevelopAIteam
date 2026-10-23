@@ -64,15 +64,17 @@ import { ADOPTION_REPOSITORY_MAP, resolveLedgerPath } from './adoptionStep'
 import {
   applyRevisedSpec,
   buildDefaultRemediationDeps,
-  countRemediationAttempts,
   findRemediationSubject,
+  isConflictStageAvailable,
   PL_MAX_REMEDIATION_ATTEMPTS,
+  PL_MAX_TECHNICAL_FAILURES_PER_STAGE,
   priorCriticModels,
   priorCriticProviders,
   recordRemediationFailure,
   runRemediationStep,
   shortSpecKey,
   stageEntries,
+  tallyConflictStage,
   type PlRemediationDeps,
   type RemediationSubject,
 } from './remediationStep'
@@ -91,8 +93,14 @@ export type ConflictStage = 'critic' | 'pl_revision' | 'challenge' | 'remediatio
 export interface ConflictStageSelection {
   stage: ConflictStage
   reason: string
+  /** critic stage の判定数（`outcome=critiqued`）。 */
   criticRounds: number
+  /** remediation stage の判定数（parse 済みの提案）。 */
   remediationAttempts: number
+  /** 判定を生まなかった critic 行の数。 */
+  criticTechnicalFailures: number
+  /** 判定を生まなかった remediation 行の数。 */
+  remediationTechnicalFailures: number
 }
 
 /**
@@ -102,20 +110,40 @@ export interface ConflictStageSelection {
  * 固定 stage ではないからである（CEO 指示 2026-09-18）。
  */
 export function selectConflictStage(storage: IStorage, taskId: string): ConflictStageSelection {
-  const criticRounds = stageEntries(storage, taskId, 'critic').length
-  const remediationAttempts = countRemediationAttempts(storage, taskId)
-  const base = { criticRounds, remediationAttempts }
+  // **予算は判定だけを数える。** runner が判定を返さなかった行（runner_failed 等）は
+  // stage ごとの技術的失敗として別に数え、`PL_MAX_TECHNICAL_FAILURES_PER_STAGE` で打ち切る
+  // （分類は `classifyConflictRecoveryRow()` の1箇所だけ。2026-10-23 `#2cae0d07`）。
+  const critic = tallyConflictStage(storage, taskId, 'critic')
+  const remediation = tallyConflictStage(storage, taskId, 'remediation')
+  const base = {
+    criticRounds: critic.judgments,
+    remediationAttempts: remediation.judgments,
+    criticTechnicalFailures: critic.technicalFailures,
+    remediationTechnicalFailures: remediation.technicalFailures,
+  }
 
   if (findRemediationSubject(storage, taskId) === undefined) {
     return { stage: 'terminal', reason: 'task is not stopped by a design review CONFLICT', ...base }
   }
-  if (criticRounds < PL_MAX_CRITIC_ROUNDS) {
-    return { stage: 'critic', reason: `critic round ${criticRounds + 1}/${PL_MAX_CRITIC_ROUNDS}`, ...base }
+  if (isConflictStageAvailable(critic, PL_MAX_CRITIC_ROUNDS)) {
+    return { stage: 'critic', reason: `critic round ${critic.judgments + 1}/${PL_MAX_CRITIC_ROUNDS}`, ...base }
   }
-  if (remediationAttempts < PL_MAX_REMEDIATION_ATTEMPTS) {
+  if (isConflictStageAvailable(remediation, PL_MAX_REMEDIATION_ATTEMPTS)) {
     return {
       stage: 'remediation',
-      reason: 'critic-assisted revision did not resolve it; escalating to independent remediation',
+      reason: critic.judgments >= PL_MAX_CRITIC_ROUNDS
+        ? 'critic-assisted revision did not resolve it; escalating to independent remediation'
+        : `critic stage hit ${critic.technicalFailures} technical failure(s) without a judgment;`
+          + ' escalating to independent remediation',
+      ...base,
+    }
+  }
+  if (remediation.judgments < PL_MAX_REMEDIATION_ATTEMPTS) {
+    // 判定予算は残っているが、技術的失敗が上限に達した。既存の terminal 経路のまま、理由だけ区別する。
+    return {
+      stage: 'terminal',
+      reason: `technical failures exhausted the remediation stage (${remediation.technicalFailures}`
+        + `/${PL_MAX_TECHNICAL_FAILURES_PER_STAGE} without a judgment)`,
       ...base,
     }
   }
@@ -698,7 +726,13 @@ async function runCriticRound(
 
   // **試行は必ず記録する**（記録しないと Round 予算が効かない）。
   if (!execution.ok) {
-    recordRemediationFailure(storage, taskId, `${provenance} outcome=runner_failed`)
+    // stdout に完全な Critique があれば判定として数える（会計のみ。その Critique は使わない）。
+    const parsedBeforeFailure = execution.stdout !== '' && parseCritique(execution.stdout) !== undefined
+    recordRemediationFailure(
+      storage,
+      taskId,
+      `${provenance} outcome=${parsedBeforeFailure ? 'runner_failed_after_critique' : 'runner_failed'}`,
+    )
     return {
       ...base,
       status: 'critic_failed',
