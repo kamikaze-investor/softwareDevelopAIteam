@@ -1,0 +1,1542 @@
+[
+ {
+  "sha": "01dce486c63e8a2538311676ad00734b614c5689",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "The visible diff changes escalation audit outcomes and Project completion semantics while adding normative approval and Project-lifecycle rules.",
+  "narrowRationale": "Several mechanisms and normative meanings change, but their owning constitution, rules, and roadmap records are updated together."
+ },
+ {
+  "sha": "020b054d2c6dc96506aa27fee1890a9e6c4260fc",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines"
+  ],
+  "rationale": "Manual abort may now park a dirty-baseline task after a clean observation at its start commit, while archived projects are excluded from workspace ownership.",
+  "narrowRationale": "It repairs the documented manual-abort exit after operator cleanup while retaining known-good observation, start-commit binding, approval consumption, and cross-project ownership checks."
+ },
+ {
+  "sha": "025f8a476fa0e98d1512916e4809b2067e594465",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "replaces",
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "Approval authority is tightened around human actor evidence and atomic decisions, changing resume, abort, recovery, and triage eligibility.",
+  "narrowRationale": "It strengthens the existing approval authority by atomically binding decisions to human credentials and preserving approved recovery paths."
+ },
+ {
+  "sha": "02e117b958deb845c7b8ac59ad1fcc0b505fbda2",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "The visible diff redefines DA trigger (2) around Approval Tuple semantics and introduces new normative classification and review rules.",
+  "narrowRationale": "The meta-review authority policy is redefined, but the owning prompt and checklist are updated in the same commit."
+ },
+ {
+  "sha": "06616d958e258d4f3a37ac27b0fb3b58d5402cb4",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "The visible truncated diff adds a validated same-identity CONFLICT recovery path and changes follow-up remediation and adoption reachability.",
+  "narrowRationale": "It adds a validated recovery path while preserving the recorded server-owned Task identity contract."
+ },
+ {
+  "sha": "068422fe09aa6ab6520f9351ddef67402ac28434",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "replaces",
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "It replaces nested resume lineage with fixed-anchor generations and adds validation, rejection inheritance, and a new API failure outcome.",
+  "narrowRationale": "The fixed-anchor resume lineage and rejection semantics are new mechanisms documented in the owning approval rules in the same commit."
+ },
+ {
+  "sha": "0798026d9a3ddd61b62dd54040ac945c515d6737",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "Adds a containment-cleanup recovery contract while redefining existing quarantine comparison and roadmap-adoption scope requirements.",
+  "narrowRationale": "It adds production findings and future recovery requirements without disabling an approved responsibility."
+ },
+ {
+  "sha": "092ea57f706c49023269ac8a42ae1525039f4be1",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines"
+  ],
+  "rationale": "Redefines the Meta Reviewer authority boundary so approved authority changes reach Human Decision unless they exceed scope or contain a technical defect.",
+  "narrowRationale": "The authority-classification rule is updated in its owning policy documents to match an already approved canonical boundary."
+ },
+ {
+  "sha": "0cb6a2e95cbf37c174152eb0e912f4c9aff317dc",
+  "material": false,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [],
+  "rationale": "Adds production evidence and impact analysis to an existing finding without changing its prescribed mechanism.",
+  "narrowRationale": "It adds production evidence to an existing finding without changing its prescribed mechanism."
+ },
+ {
+  "sha": "0ce7bff2255e57943a5746121534155dc9a65348",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "The visible truncated diff introduces Operator Request APIs, persistence, PL processing, MCP access, and a new restricted credential authority boundary while modifying existing auth and loop mechanisms.",
+  "narrowRationale": "It introduces a new constrained Operator boundary and interface rather than removing an existing approved responsibility."
+ },
+ {
+  "sha": "0d0f146bf1637ce17b502aeae9b9427915c1fc33",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [],
+  "rationale": null,
+  "narrowRationale": "It makes approval replacement and technical-cleanup generations atomic and race-safe while preserving the documented approval and abort responsibilities.",
+  "secondPassOnly": true
+ },
+ {
+  "sha": "107b0987f9652d423e94d59b2ab80b54a822dd71",
+  "material": false,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [],
+  "rationale": "It only records a planned roadmap finding and prospective remediation directions without changing an operative normative rule or implementation.",
+  "narrowRationale": "It only adds a planned roadmap responsibility and does not remove or redefine an existing approved one."
+ },
+ {
+  "sha": "12844e9c272428021650ce11cef31ed34537d5b2",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "It makes rejected git commits return toward implementation, prevents identical rejected diffs from reopening approval, and adds a fail-closed recovery outcome.",
+  "narrowRationale": "It restores the recorded binding effect of a CEO rejection and adds fail-closed recovery outcomes rather than displacing an approved mechanism."
+ },
+ {
+  "sha": "13d22ef66639a40f0e59e6289f95b140edf177d3",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines"
+  ],
+  "rationale": "It changes the quarantine-clearance gate by treating empty dirty baselines as clean-equivalent while retaining commit and actual-difference checks.",
+  "narrowRationale": "It fixes quarantine-clearance equivalence while retaining the established fail-closed safety responsibility."
+ },
+ {
+  "sha": "163e47e3214e1e7ed081d427bfdd6643297ed1dc",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines"
+  ],
+  "rationale": "It expands the failure-classification conditions that route provider output into the quota branch.",
+  "narrowRationale": "It fixes quota classification for approved provider signatures while preserving fail-closed handling and the existing failure classes."
+ },
+ {
+  "sha": "1ad656aad332c5e670be87ab44c0e02f88446f3e",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "replaces",
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "Introduces durable workspace baselines and quarantine APIs while replacing crash recovery with proof-based ownership release.",
+  "narrowRationale": "It additively establishes crash-safe baseline verification and quarantine rather than removing a recorded responsibility."
+ },
+ {
+  "sha": "1f77bb1fb719b676f46dd177344f5b87f13e8046",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "replaces",
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "Replaces binary provider-failure handling with a four-class policy that changes retry and Copilot-fallback branches.",
+  "narrowRationale": "The four-way failure classification refines fallback behavior while retaining fail-closed handling for authentication, configuration, and unknown failures."
+ },
+ {
+  "sha": "20a178d58559b992d2b4381237f87cc0482645bc",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines"
+  ],
+  "rationale": "The roadmap policy defers Stage B by CEO decision, rejects the proposed read-only profile for now, and designates Mobile as the formal PL-operation channel.",
+  "narrowRationale": "It defers Stage B by updating the owning roadmap record itself, so no responsibility is lost contrary to that record."
+ },
+ {
+  "sha": "229d23162dac4812edbf4a74c3c139822abf8aa1",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": true,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "The visible truncated diff restricts Job success transitions to Worker outbox delivery and changes expired approval decisions to transition to EXPIRED with a new API result contract.",
+  "narrowRationale": "It newly restricts the Job success transition to Worker outbox delivery, changing an existing authority boundary without updating its owning design record."
+ },
+ {
+  "sha": "26f1cdeedb476c034932b929f217b3e03020cc20",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "It redefines roadmap adoption eligibility so only planned items pass every candidate, API, and Gate path, while adding a normative Review Class B record.",
+  "narrowRationale": "It consistently enforces the recorded planned-only adoption rule and merely registers Review Class B as deferred rather than changing authority."
+ },
+ {
+  "sha": "2759a762ded3d4fb7799c8c1533d6f462b61f2cd",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "Introduces an escalation-triggered workspace-cleanup branch and redefines the Job PATCH response and API/Worker cleanup responsibilities.",
+  "narrowRationale": "It implements the recorded workspace-cleanup responsibility using the existing bounded revert mechanism."
+ },
+ {
+  "sha": "277e53e691c2b66e687d3c3afa770bc8e315e6d0",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "The roadmap changes normative review responsibilities and redefines when an external Decision Engine may be reconsidered, including additional evolution triggers.",
+  "narrowRationale": "The roadmap redefines review triggers and responsibility boundaries in the owning design record itself, so no recorded responsibility is silently lost."
+ },
+ {
+  "sha": "28dff725b14b910e786e0bab5a7114a2b07b099c",
+  "material": false,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [],
+  "rationale": "Only corrects documentation to describe the already-existing approval transaction and auto-requeue behavior.",
+  "narrowRationale": "It only corrects documentation to reflect the already-existing approval auto-resume behavior."
+ },
+ {
+  "sha": "2a2a07378d2b2563c28e8a6bdba76abd1ba8a159",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "replaces",
+   "redefines"
+  ],
+  "rationale": "The visible truncated diff replaces lineage parsing with a shared walker and makes approved resumed reviews reach git_commit and REJECT recovery.",
+  "narrowRationale": "It restores resumed-review continuation and updates the owning roadmap record in the same diff."
+ },
+ {
+  "sha": "2cdddb2aefb109059d6bee80a037dc91a7091b5a",
+  "material": false,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [],
+  "rationale": "Corrects which existing diagnostic text is displayed without changing state, authority, or API shape.",
+  "narrowRationale": "It fixes diagnostic selection so the existing stop reason is reported correctly."
+ },
+ {
+  "sha": "31a16ebd58130acba52c944e1fe59272d93bbaef",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "The diff adds the approved abort-and-park workflow with cleanup reporting and transactional state changes while redefining existing repair, continuation, task-update, and approval-gate behavior for parked tasks.",
+  "narrowRationale": "The CEO-gated abort and parking workflow is a new responsibility rather than removal of an established one."
+ },
+ {
+  "sha": "32af3bd5d97e2177b0de73b6916454673b866bae",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "replaces",
+   "redefines"
+  ],
+  "rationale": "It replaces the one-hop legacy git_commit resume limit with a bounded multi-hop recovery path, changing which rejected jobs can resume.",
+  "narrowRationale": "Legacy resume reachability changes from one hop to bounded multi-hop traversal, with the new approved rule recorded in the same diff."
+ },
+ {
+  "sha": "32d44236f768a0f06e9edbc879fc9e996d2b239c",
+  "material": true,
+  "introducesOnly": true,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "introduces"
+  ],
+  "rationale": "Adds a normative M3 release gate with required lifecycle steps and conditions for removing the temporary completion policy.",
+  "narrowRationale": "It adds a new E2E requirement and records evidence without displacing an approved responsibility."
+ },
+ {
+  "sha": "349abcf62d366731453ac2af96c726bd06346591",
+  "material": false,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [],
+  "rationale": "This adds an operational evidence record and follow-up observations without changing system contracts or behavior.",
+  "narrowRationale": "The diff records operational evidence and follow-up observations without changing an established responsibility or Authority boundary."
+ },
+ {
+  "sha": "382db5694f096a4543de5c8b12c476f1f56a2bce",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "replaces",
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "The mobile abort workflow is replaced with one confirmed sequence that creates, human-approves, and executes an abort.",
+  "narrowRationale": "The abort workflow is consolidated behind one confirmation, but the recorded human-only approval authority, approval binding, consumption, and park effect remain intact."
+ },
+ {
+  "sha": "3ae1dc42b05f04ee9d7d8547796e9301652823e2",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "Design-review evidence validity, pending-review recovery, handoff authority, and PL episode identity are redefined around run lineage.",
+  "narrowRationale": "It preserves Design Review recovery while preventing stale evidence and judgment-free attempts from incorrectly terminating or escalating the recorded workflow."
+ },
+ {
+  "sha": "3ddbaa0813d4cbf246b8d794bd5caf6c55384c08",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "It redefines local_static_bearer as a production tunnel boundary and introduces systemd-managed gateway and tunnel-client deployment mechanisms.",
+  "narrowRationale": "The Secure MCP Tunnel deployment and authentication reachability are introduced with the owning roadmap decision updated in the same commit."
+ },
+ {
+  "sha": "3f611d18f4eab5aaab71d6c5fb74bc044f16d6c4",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "It extends manual abort to directly rejected blocked git_commit jobs and adds an atomic blocked-to-failed-to-park recovery transition.",
+  "narrowRationale": "The manual-abort path for directly rejected commits is additive and its approval boundary is documented in the same diff."
+ },
+ {
+  "sha": "430bd11a468de0810b61257c3f948ecf0d543077",
+  "material": false,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [],
+  "rationale": "The visible changes repair retry lineage so successful provider-timeout retries follow the already documented post-implement review contract.",
+  "narrowRationale": "This restores the existing post-implementation review responsibility for successful retries rather than replacing an approved mechanism."
+ },
+ {
+  "sha": "43aabea3bd34ac9d99d0d0a8d69e2704c82f268f",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "The diff expands secret-scan repair eligibility to implementation reports and adds a new persisted refusal-reason contract and ownership classification path.",
+  "narrowRationale": "It adds a repair-eligibility case while preserving the existing refusal and repair responsibilities."
+ },
+ {
+  "sha": "442d8da5826816fc75fd1f24f41014b5afee0a58",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "Adds fail-closed review-disagreement requirements and new constraints on how the existing git_commit resume mechanism may be repaired.",
+  "narrowRationale": "It adds planned recovery constraints and findings but does not remove or redefine an established mechanism."
+ },
+ {
+  "sha": "485d451cbd36aa9b9c2c315ad3d5987377505d30",
+  "material": false,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [],
+  "rationale": "Adds an investigation finding and observations without changing an operative mechanism or normative contract.",
+  "narrowRationale": "It adds a new investigation responsibility without displacing an approved mechanism."
+ },
+ {
+  "sha": "49a92639301fe1757730ba45bf8e5eaf9e46d44e",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines"
+  ],
+  "rationale": "Expands the dirty-worktree admission gate so exact review-to-git-commit jobs can be claimed.",
+  "narrowRationale": "It restores the intended git-commit workflow reachability while retaining the existing fail-closed boundary."
+ },
+ {
+  "sha": "4a0fbaf6ed34626970cb63ef88dae2017d80eb8a",
+  "material": false,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [],
+  "rationale": "Fixes fail-open handling of values outside the existing StrategicDecision contract while preserving its documented fail-closed semantics.",
+  "narrowRationale": "This fixes a documented fail-open bug so unknown decisions obey the existing fail-closed review contract."
+ },
+ {
+  "sha": "517448261d8860b7938008cb36a762e82e63c721",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines"
+  ],
+  "rationale": "It changes adoption candidate eligibility and makes escalation terminate an attempt window, allowing later adoption retries.",
+  "narrowRationale": "It fixes candidate filtering and retry-window liveness without removing a recorded responsibility."
+ },
+ {
+  "sha": "533735ce120465fc2514e2dac6c17522aecf45f0",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines"
+  ],
+  "rationale": "The visible diff redefines workspace ownership so a finished Task's stale blocked Job conditionally releases ownership based on fail-closed worktree checks.",
+  "narrowRationale": "It refines workspace ownership for stale blocked Jobs while preserving fail-closed ownership and documenting the new rule in the owning roadmap record."
+ },
+ {
+  "sha": "54f64913fe03b0d1dc7dfdf13407535983e5e32f",
+  "material": true,
+  "introducesOnly": true,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "introduces"
+  ],
+  "rationale": "Introduces a normative investigation rule requiring Current Truth verification and preservation of conflicting local work.",
+  "narrowRationale": "It additively introduces a Current Truth investigation rule without displacing an existing responsibility."
+ },
+ {
+  "sha": "56fff41b9ad98f9a78c79b64327ab2a80894b5f2",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "The visible truncated diff introduces a normative engineering principle and exported slug while extending existing principle routing and review-checklist selection.",
+  "narrowRationale": "It introduces a new normative principle and review guidance without removing an established mechanism."
+ },
+ {
+  "sha": "58254333b343cd46cb7f6e577276de534197811d",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "replaces",
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "Replaces direct command execution with per-job cgroup containment and introduces quarantine transitions for unsafe containment or reconciliation outcomes.",
+  "narrowRationale": "Containment and quarantine replace execution internals while preserving and strengthening the Worker's execution-safety responsibility."
+ },
+ {
+  "sha": "5c1ad38fefdaee54f1ac6514a6796b5bb522a46a",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "replaces",
+   "redefines"
+  ],
+  "rationale": "Replaces fatal log-persistence branches with nonfatal handling, changing successful executions from failed to successful Job outcomes.",
+  "narrowRationale": "It fixes log-persistence failures incorrectly overriding the real Job result while preserving the documented logging responsibility."
+ },
+ {
+  "sha": "5d52836e7480d4db2b16449af0596bc1f1cee5fb",
+  "material": false,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [],
+  "rationale": "Records operational verification evidence and remaining work without altering the PL execution-loop design.",
+  "narrowRationale": "It records operational verification and remaining evidence gaps without replacing the PL loop design."
+ },
+ {
+  "sha": "5d88047855dbe89e973e298a1c6bfb06030b1cdc",
+  "material": false,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [],
+  "rationale": "Aligns abort-task ownership checks with the existing proof-based workspace ownership contract, correcting an inconsistent implementation.",
+  "narrowRationale": "The abort path is corrected to use the already-established workspace-ownership semantics while retaining fail-closed proof requirements."
+ },
+ {
+  "sha": "5fb82dbbb51500db5474420502455912bb8d7732",
+  "material": true,
+  "introducesOnly": true,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "introduces"
+  ],
+  "rationale": "Introduces exported timeout bounds and a structured cheap-AI result contract without changing the existing retry policy.",
+  "narrowRationale": "It adds the planned timeout contract and structured result API without replacing an existing approved mechanism."
+ },
+ {
+  "sha": "6102f6e4d1bd67bd3d3d071f288922a0ca9a00d7",
+  "material": true,
+  "introducesOnly": true,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "introduces"
+  ],
+  "rationale": "It adds a new Mobile Operator Chat pathway that can submit questions and requests through the existing Operator Interface.",
+  "narrowRationale": "It adds a Mobile Operator Chat client over existing interfaces without removing or weakening any recorded responsibility or Authority boundary."
+ },
+ {
+  "sha": "622d086e278c2aa1822fc3edaf3b512ff235494a",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": true,
+  "kinds": [
+   "removes",
+   "replaces",
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "Replaces the roadmap generation/review topology, removes the old generation route, and redefines review evidence and provider-separation gates.",
+  "narrowRationale": "The recorded critical Codex independent-review mechanism for roadmaps is replaced by Claude integration review without updating that owning record."
+ },
+ {
+  "sha": "62a9ceea12965f626f4268c59b123e7295fabe1e",
+  "material": false,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [],
+  "rationale": "The roadmap edit only corrects whether cgroup containment is already implemented or planned, without changing a normative rule or mechanism.",
+  "narrowRationale": "This only corrects the documented implementation phase of containment without removing or weakening the continuation policy."
+ },
+ {
+  "sha": "62cceed937116f201f630b7942cd310ffe0982e5",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "Introduces a normative engineering-principles contract and new review vocabulary while injecting that contract into existing implementation and repair prompts.",
+  "narrowRationale": "It introduces a new constitutional engineering principle and review contract without displacing an existing responsibility."
+ },
+ {
+  "sha": "67a7db6108f747cf1b033aabfb7ea3c506d8b389",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "It adds PL as an authority-proven resume actor and makes technical resume an executable recovery path with distinct budget and review rules.",
+  "narrowRationale": "PL technical resume is an additive repair of the documented broken recovery path and preserves human-only authority overrides."
+ },
+ {
+  "sha": "6a87610714d741fc2f3f83019d3b8574ccc058f4",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": true,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "The visible truncated diff extends abort authority and lifecycle handling to atomically park blocked tasks whose jobs are terminal.",
+  "narrowRationale": "It expands the binding effect of an existing abort_task approval to park blocked Tasks with terminal Jobs."
+ },
+ {
+  "sha": "6d3626fc04d952cfcae70dbae0868411f65d142a",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": true,
+  "kinds": [
+   "redefines"
+  ],
+  "rationale": "The visible truncated diff changes Claude Code authentication from forwarded API credentials to subscription login and revises its failure-classification behavior.",
+  "narrowRationale": "It removes the documented Worker CLAUDE_API_KEY forwarding mechanism in favor of subscription credentials without updating the owning design record."
+ },
+ {
+  "sha": "6e0609f5c67fb5e20669fdc6cdf8d9e76eca4950",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "removes"
+  ],
+  "rationale": "Removes the deferred PL Console design constraints, responsibility boundaries, authority safeguards, and staged integration requirements.",
+  "narrowRationale": "The removed roadmap items were explicitly unreviewed rather than deliberately approved, and their intentional withdrawal is recorded in the same diff."
+ },
+ {
+  "sha": "6fb4fb81bee073d8cbd47157fe5d69c1da5e61af",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines"
+  ],
+  "rationale": "Makes cleanup and its manual or parser-backed verification an explicit mandatory MVP exit gate.",
+  "narrowRationale": "It strengthens an existing cleanup obligation as an MVP exit criterion rather than removing it."
+ },
+ {
+  "sha": "70c4018c85f967729d80d095b9cbabf81029f2b3",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "Workspace ownership and job claim reachability are redefined by a new fail-closed fallback that attributes inheritable dirty state to blocked tasks.",
+  "narrowRationale": "It adds fallback workspace ownership while preserving existing ownership precedence and recording its accepted limitation in the roadmap."
+ },
+ {
+  "sha": "70da78c7d980e1eef7004724baef113c536ea237",
+  "material": false,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [],
+  "rationale": "Records E2E evidence and tentative roadmap findings without establishing a settled normative mechanism or contract.",
+  "narrowRationale": "It records E2E evidence and adds follow-up responsibilities while leaving existing approved mechanisms intact."
+ },
+ {
+  "sha": "70f79cf9e0b36760a112b86e62041aa014c826d8",
+  "material": false,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [],
+  "rationale": "Corrects Gemini model-and-effort configuration and canary coverage without changing the documented review or fallback contract.",
+  "narrowRationale": "The provider fixes restore intended review operation, while the additional PL Console rules are additive."
+ },
+ {
+  "sha": "71492db771d31386bca3ef29ae976c128f10ed53",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "replaces",
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "Project start changes from request-owned synchronous execution to a persisted staged backend workflow with restart recovery, terminal states, and resumable execution.",
+  "narrowRationale": "It moves project-start execution to a resumable backend workflow while preserving its initialization responsibility and documenting the new contract in the diff."
+ },
+ {
+  "sha": "714b1bb7e1dae2e8b86a7da18c64b7cffb4e3864",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": true,
+  "kinds": [
+   "replaces",
+   "redefines"
+  ],
+  "rationale": "The normative Meta Reviewer policy changes DA trigger 1 from document edits to semantic policy changes, narrowing when CEO approval is required.",
+  "narrowRationale": "It narrows an existing CEO-approval trigger from document edits to semantic changes without updating the cited canonical specification."
+ },
+ {
+  "sha": "727ef97502e445df6e32c4acfa84a1e6f6778fc3",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "removes",
+   "redefines"
+  ],
+  "rationale": "Removes continuation retries from project GET handlers and makes Worker reconciliation the sole fallback after resume-time failure.",
+  "narrowRationale": "GET-based continuation recovery is removed, but the same diff records the replacement Worker-reconcile design."
+ },
+ {
+  "sha": "78a2df1b29d934ce711ff9662ddeecc5a7f83bcd",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "introduces",
+   "redefines"
+  ],
+  "rationale": "It adds persisted principle verdict contracts and APIs while extending existing review and principle-selection mechanisms.",
+  "narrowRationale": "It introduces principle-selection, verdict, persistence, and API contracts without removing an established approved mechanism."
+ },
+ {
+  "sha": "7e58c6596792ccebe62ed0a850b604d61163bc64",
+  "material": false,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [],
+  "rationale": "The visible truncated diff only adds lifecycle E2E tests, stubs, and test harness infrastructure.",
+  "narrowRationale": "The diff adds lifecycle test infrastructure and coverage without changing production responsibilities."
+ },
+ {
+  "sha": "7edb1c758b766b1eedda96abe49f7cb102ef9c9f",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "replaces",
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "The normative Decision Authority classification is changed to use base-branch canonical tuples, with a new mechanism for supplying those rules to reviewers.",
+  "narrowRationale": "It redefines Decision Authority classification, but updates the owning normative reviewer prompt and checklist to the new base-rule design in the same diff."
+ },
+ {
+  "sha": "7f63f45cecbe60c9f4a9d84e79f114ce2e0f3e3c",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "Introduces Mobile Push as a notification mechanism and redefines LINE and Slack as bootstrap or fallback channels.",
+  "narrowRationale": "The same diff records the new Mobile Push notification design and the revised role of existing channels."
+ },
+ {
+  "sha": "8236fa1b01882a2491102033e6fe3d9722ec6d52",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "Redefines Copilot prompt transport by introducing a size-gated stdin branch for oversized prompts.",
+  "narrowRationale": "It fixes oversized-prompt transport while preserving the established meta-review contract and restrictions."
+ },
+ {
+  "sha": "828878a52afff27a94a424ceabc4833c70b72ffd",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "introduces"
+  ],
+  "rationale": "It introduces an approval-gated API action, evidence verification, exported result contract, and state-transition path for reconciling external completion.",
+  "narrowRationale": "It adds an approval-gated external-completion path while retaining the existing completion transition and granting no new implementation authority."
+ },
+ {
+  "sha": "832244dd304f16ef10bf6d8d537220cb9b5e6976",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": true,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "It removes mandatory human approval for fully evidenced LOW/MEDIUM git_commit actions and introduces the deterministic Safety Evidence gate.",
+  "narrowRationale": "It removes the recorded universal human-approval requirement for git_commit on evidenced LOW/MEDIUM paths without updating that owning record in the diff."
+ },
+ {
+  "sha": "84134665d42f15861e527d6e823e6e203960dbfb",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": true,
+  "kinds": [
+   "replaces",
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "The Codex capture mechanism moves outside the target repository and gains fail-closed containment verification and process-owned cleanup boundaries.",
+  "narrowRationale": "It moves the documented last-message capture mechanism outside the working repository without updating the decision record that specifies the old location."
+ },
+ {
+  "sha": "8521420e5bc709744997ed5ca0a62f732227b1d1",
+  "material": false,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [],
+  "rationale": "Only adds mobile display-state tests for existing watchdog episode matching behavior.",
+  "narrowRationale": "Only tests are added to pin the existing watchdog episode-matching behavior."
+ },
+ {
+  "sha": "854235d443400131c10b79847c469b0a39eabdce",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": true,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "It adds a PL-authorized technical abort path that can clean and park eligible tasks without CEO approval, redefining abort authority and lifecycle transitions.",
+  "narrowRationale": "It allows technical evidence to authorize abort and park without the previously required approved abort_task decision, changing who authorizes that action."
+ },
+ {
+  "sha": "8571dd0857249dc47052f0fe505c8a3c58900e6a",
+  "material": false,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [],
+  "rationale": "The change only logs an already-retryable exception while explicitly preserving the pending state transition and return contract.",
+  "narrowRationale": "The only runtime change adds logging while explicitly preserving the pending retry state and continuation contract."
+ },
+ {
+  "sha": "87cbfe5af9a1c72adcda49cf2c3561f1f21d635b",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": true,
+  "kinds": [
+   "replaces",
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "Replaces immediate roadmap-review failure on conflict with a bounded feedback-driven regeneration and rereview recovery loop.",
+  "narrowRationale": "A recorded immediate fail-closed 422 outcome for roadmap CONFLICT is redefined into bounded regeneration without updating the cited owning record."
+ },
+ {
+  "sha": "89f303e8a1ed2a60d269ad491b1cf52a4aa1c177",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "replaces",
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "The diff generalizes the review pipeline contract from task IDs to task-or-roadmap subjects and introduces roadmap-specific review, evidence, focus, and load mechanisms.",
+  "narrowRationale": "It adds roadmap review as a new subject while retaining the established task-review path."
+ },
+ {
+  "sha": "90657311e68247294fe141380ea3f0e97784a3dc",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "Human Resume admission, recovery authority, review-unavailable handling, and escalation behavior are consolidated into new shared lifecycle rules.",
+  "narrowRationale": "It centralizes resume admission and treats REVIEW_UNAVAILABLE as absence of judgment, preserving rather than removing the approved review and recovery mechanisms."
+ },
+ {
+  "sha": "92aafca4658c2eb6f3599bef0fa6c0661508df08",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "The visible diff adds an exported task-category contract and expands roadmap admission to reject category and structured-constraint violations before persistence.",
+  "narrowRationale": "It adds deterministic constraint enforcement and a task-category contract without removing any previously approved validation responsibility."
+ },
+ {
+  "sha": "95d767b00ccf450b4849d53343dfaa65f44ca4f3",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": true,
+  "kinds": [
+   "redefines"
+  ],
+  "rationale": "Redefines repair-path reachability so an authorized refusal-recovery generation may continue after changes_requested under stored provenance checks.",
+  "narrowRationale": "It redefines the recorded repair-generation authority boundary by allowing qualifying human or PL technical-resume provenance to advance an origin-root generation."
+ },
+ {
+  "sha": "997e6067ce5319c91068e28a4a95bb2a8bc2cafb",
+  "material": true,
+  "introducesOnly": true,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "introduces"
+  ],
+  "rationale": "Introduces a decision record establishing MVP completion and a normative operational boundary against direct edits to active or blocked workspaces.",
+  "narrowRationale": "The decision record additively establishes MVP completion and an accepted operational boundary without removing an earlier mechanism."
+ },
+ {
+  "sha": "9cb5e0813e3dfdb09e5769a61e8568fe44859835",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "A shared Human Recovery admission contract and TaskDetail API are introduced while existing recovery reachability and roadmap policy are changed.",
+  "narrowRationale": "It centralizes and exposes recovery admission without removing any approved recovery responsibility, and its roadmap policy-state change is recorded in the same diff."
+ },
+ {
+  "sha": "9e41530a36b818da3fe6658f9a7e861eba80924f",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "Approval action binding, Gate policy versioning, command consumption, review recovery authority, and durable Outbox recovery contracts are changed.",
+  "narrowRationale": "It tightens approval action binding, evidence lineage, and Outbox recovery in accordance with the recorded Gate and lifecycle contracts."
+ },
+ {
+  "sha": "9e797168cf83e69cd574e6dfda232cfee3f68207",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "It changes reviewer decision inputs and normative escalation rules while adding principle_conflict and PR-body fields to exported review contracts.",
+  "narrowRationale": "The commit adds canonical-principle delivery and review vocabulary while updating the corresponding roadmap and review contracts."
+ },
+ {
+  "sha": "ac462202a5be052270e57eecb35e6deeca829b46",
+  "material": true,
+  "introducesOnly": true,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "introduces"
+  ],
+  "rationale": "Introduces a normative supervision contract, admission policy, lifecycle states, recovery limits, ownership rules, and durable supervised-run design.",
+  "narrowRationale": "It establishes an additive supervision contract and explicitly records its revised scope and implementation decisions."
+ },
+ {
+  "sha": "ac4e71edde344aebfea926528e395844e5eb419b",
+  "material": false,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [],
+  "rationale": "Only updates an incident-remediation record from pending to completed.",
+  "narrowRationale": "It only records completion of an already prescribed revert-and-reland process."
+ },
+ {
+  "sha": "af60412d54d355f0ff5e9b228c5a8af489668eab",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "removes",
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "It introduces autonomous roadmap adoption while removing the up-front design-review gate and redefining strategic-alignment evidence, scope authority, and escalation conditions.",
+  "narrowRationale": "The PL adoption authority and relocated design-review gate are explicitly recorded in the updated policy and roadmap while CEO-ledger binding remains enforced."
+ },
+ {
+  "sha": "b01b9c387d3571d8490b13887c518d5f23f962dd",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "Introduces interactive definition-gap resolution and structured constraints, redefining when a project may transition to running and generate its roadmap.",
+  "narrowRationale": "The readiness gate and structured-constraint contract are additive and the roadmap record is updated in the same diff."
+ },
+ {
+  "sha": "b0d6f036a27b3bb50e0e22b3233056db28aa27c4",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "Resolves project completion as a computed state and adds normative ownership, recovery, cleanup, and MVP-blocker rules.",
+  "narrowRationale": "It adds and reconciles roadmap responsibilities without retiring an approved responsibility."
+ },
+ {
+  "sha": "b4bf101ee9661777935ef2e4ea6dbc7f766da9e3",
+  "material": false,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [],
+  "rationale": "This fixes parsing of null optional values by normalizing them to the existing absent-field contract without changing exported review types or downstream state behavior.",
+  "narrowRationale": "The parser change makes optional review fields honor their existing absence semantics while retaining strict validation for required and malformed values."
+ },
+ {
+  "sha": "b55e1a566c2c0b0f6df9f602ecd81a472386f0c0",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines"
+  ],
+  "rationale": "It broadens blocked-task repair admission to canonical repair successors while preserving human-authorized generation and attempt-limit semantics.",
+  "narrowRationale": "It expands repair admission only within proven human-authorized generations and updates the owning roadmap with the revised contract."
+ },
+ {
+  "sha": "b589e16acfdb84ab9b7bc62ae1ca3b3789299100",
+  "material": false,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [],
+  "rationale": "The diff only marks an already-shipped race fix complete and records its behavior in project-status documentation.",
+  "narrowRationale": "This is completion-status bookkeeping for an already shipped fix and explicitly records that the established containment classifications remain unchanged."
+ },
+ {
+  "sha": "b5f5b120fc75af52541fa0c16be9bc9a638ede50",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "introduces",
+   "redefines"
+  ],
+  "rationale": "It inserts a structured Blocked triage stage that selects among four recovery lanes and changes when diagnosis, execution, or escalation is reached.",
+  "narrowRationale": "It adds structured blocked triage and routing while preserving the existing Mandatory Gate as the sole execution authority."
+ },
+ {
+  "sha": "b80895ac0476821c0e448c44982cf6e97863cd32",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "Containment cleanup is redefined to include a bounded retry and state-revalidation recovery path for transient cgroup removal failures.",
+  "narrowRationale": "It fixes transient cleanup failures while retaining bounded fail-closed containment behavior."
+ },
+ {
+  "sha": "baf7eabbec0299e04dcf877b45267d50b8df89f1",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "It transfers authority-only approval enforcement from Meta Review blocking to CODEOWNERS review and adds a fail-closed ownership gate.",
+  "narrowRationale": "Human Decision Authority moves to CODEOWNERS review, but the owning meta-review policy documents are revised to that design in the same commit."
+ },
+ {
+  "sha": "bb46910f1b07270a0cc39ce47f505a3e468de796",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "The system-state mechanism now observes terminal design-review runs and exposes failed reviews as project status and attention, supported by a new storage query contract.",
+  "narrowRationale": "It fixes observability of failed reviews without changing the review or state-transition contract."
+ },
+ {
+  "sha": "bb5b20635365cdc0cc0fb74424c5ffc0a931a00f",
+  "material": false,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [],
+  "rationale": "This only updates configured Gemini model identifiers to currently available equivalents without changing the review contract or routing mechanism.",
+  "narrowRationale": "It updates unavailable model identifiers while preserving the established review roles and routing behavior."
+ },
+ {
+  "sha": "bbe3b74672158901f327e49b1c8ca89adc47d381",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "replaces",
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "CONFLICT recovery now budgets parsed judgments separately from bounded technical failures and changes stage reachability and provider exclusion.",
+  "narrowRationale": "It preserves the recorded bounded conflict-recovery responsibility while correcting accounting so only judgments consume judgment budgets and technical failures remain separately bounded."
+ },
+ {
+  "sha": "be6617786786f98331030c4af4627ca234aa6b08",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "replaces",
+   "introduces"
+  ],
+  "rationale": "It replaces raw model-answer passthrough with a structured response contract and adds a fail-closed internal-representation gate.",
+  "narrowRationale": "It replaces raw approval-Q&A output with a structured fail-closed contract and adds policy rules without weakening an approved responsibility."
+ },
+ {
+  "sha": "bedf189bf7d4d21761a356b38ebb4388cdec968e",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "replaces",
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "It replaces CLI timeout handling and adds a bounded retry/recovery branch specifically for PL provider inference.",
+  "narrowRationale": "It adds bounded PL-provider retry and stronger timeout containment while updating the owning roadmap to record the new design."
+ },
+ {
+  "sha": "c1bdbcf835a624b38cb8e393483fa750c11e7cde",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "introduces",
+   "redefines"
+  ],
+  "rationale": "It adds a stored-review recovery route and human-recovery generation root backed by one-time approval consumption, changing repair-budget lifecycle behavior.",
+  "narrowRationale": "It introduces a stored-review recovery route and human-recovery generation while documenting its approval and budget boundaries in the same diff."
+ },
+ {
+  "sha": "c4fcf02d43d77557e6eecdc7ba3acdcb3601d67d",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "Introduces a deterministic roadmap validation gate and redefines allowedPaths to accept only repository-relative path forms.",
+  "narrowRationale": "It additively introduces a deterministic repository-relative allowedPaths validation contract without weakening an approved responsibility."
+ },
+ {
+  "sha": "cadd18cd91e7cc16bcc07cdc7e1fe27da063057b",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "replaces",
+   "redefines"
+  ],
+  "rationale": "It replaces the single-ancestor repair exception with a bounded lineage rule that excludes consecutive blocked ancestors subject to a human-authority boundary.",
+  "narrowRationale": "It changes blocked-ancestor exclusion semantics but updates the owning roadmap to the same bounded, authority-aware rule."
+ },
+ {
+  "sha": "cbbc07e5839b6be2d3c29b058020c62340d0dab0",
+  "material": true,
+  "introducesOnly": true,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "introduces"
+  ],
+  "rationale": "It adds a narrowly scoped startup reconciliation mechanism that transitions two verified historical Jobs from blocked to failed with audit records.",
+  "narrowRationale": "The one-time terminalization is narrowly CEO-approved, evidence-checked, audited, and leaves the general fail-closed ownership rule intact."
+ },
+ {
+  "sha": "cc8dfdc0909fc4a4ef4c96767c6e6d27b66f33cc",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "The visible truncated diff adds an awaiting-promotion audit contract and changes adoption eligibility to block follow-ups for qualifying Candidate completions.",
+  "narrowRationale": "It adds awaiting-promotion handling and simultaneously documents the new promotion contract."
+ },
+ {
+  "sha": "ce7e1f0505669c3420c4d7c1bbd2e96a7024562a",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "It adds an exported cliEffort option and changes existing Gemini CLI and deploy-canary invocation contracts to pass --effort.",
+  "narrowRationale": "It only adds an optional exported CLI-effort capability and leaves existing callers unchanged."
+ },
+ {
+  "sha": "ce9df9b1fc0f033c7ff104051157ce6cb774899e",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "replaces",
+   "redefines"
+  ],
+  "rationale": "Replaces direct-child termination with process-group cleanup and redefines the review runner timeout and failure-recording behavior.",
+  "narrowRationale": "It hardens the existing bounded runner mechanism and updates the owning roadmap record rather than removing its responsibility."
+ },
+ {
+  "sha": "cf21322c05e419073f89d0082419bf2fffef0d46",
+  "material": false,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [],
+  "rationale": "This only records completed implementation and review progress in the roadmap without changing a normative rule.",
+  "narrowRationale": "It only records completed work and implementation evidence in the roadmap."
+ },
+ {
+  "sha": "cfa3410194439ffd88f8b762d31c2524dbf0031a",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "It changes roadmap adoption from permanent post-execution exclusion to bounded follow-up Tasks with new identity, eligibility, and atomic-admission rules.",
+  "narrowRationale": "It adds bounded follow-up task identities and atomically guarded adoption rules while recording the approved design in the roadmap."
+ },
+ {
+  "sha": "d0244d3c6f1213c856db22a339f498572ff957d8",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "It makes the Task Contract part of canonical implement, repair, and resume prompts, changing the enforced inputs and provenance of those mechanisms.",
+  "narrowRationale": "Delivering the Task Contract to implement and repair prompts adds the recorded roadmap responsibility without displacing an approved one."
+ },
+ {
+  "sha": "d06436df853cfdb88ed0333db08ae6508b9c5def",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "introduces",
+   "redefines"
+  ],
+  "rationale": "It introduces the persistent and manual PL decision-loop mechanisms and removes the up-front approval requirement for bounded Design Review re-kicks.",
+  "narrowRationale": "It changes the re-kick approval boundary, but the same diff records the CEO-approved boundary and its invariants in the owning roadmap."
+ },
+ {
+  "sha": "d2aeaee584abf473fe4783a3ce0c5c64fecf952e",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines"
+  ],
+  "rationale": "It changes repair admission so a qualifying Design Review run answered by a later human resume no longer blocks repair.",
+  "narrowRationale": "It redefines repair admission for human-answered review runs and records that new rule in the owning roadmap in the same diff."
+ },
+ {
+  "sha": "d3a467a86219c66e21d9f6191eae3ad18ed2b2dd",
+  "material": false,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [],
+  "rationale": "Fixes missing QA context in one existing repair-prompt path without changing recovery admission, authority, lifecycle, or API contracts.",
+  "narrowRationale": "It additively supplies stored QA evidence to repair prompts without changing admission or approval authority."
+ },
+ {
+  "sha": "d4480dafc3b4e70bb0d2da6b77cf6397b2a0a1e8",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines"
+  ],
+  "rationale": "It expands quota classification conditions so explicit credit exhaustion reaches the existing provider-fallback mechanism.",
+  "narrowRationale": "It corrects failure classification and records the clarified rule in the owning roadmap item."
+ },
+ {
+  "sha": "d483fd9284f329e5d6082fea0c7d7f1967b3a46a",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "It changes resume handoff to atomically transition the source Job from blocked to failed and adds startup reconciliation for legacy rows.",
+  "narrowRationale": "Resume now terminalizes its source Job, and the same diff updates the roadmap record and retains compatibility for legacy rows."
+ },
+ {
+  "sha": "d7594d0d0f77eaa211d0ce2a565c40f1fcf60767",
+  "material": false,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [],
+  "rationale": "The diff only adds a derived Task identifier label to mobile presentation surfaces.",
+  "narrowRationale": "This only adds human-readable Task identifiers to mobile views and does not alter any operational responsibility or Authority boundary."
+ },
+ {
+  "sha": "d7b3ee15795f2f445ae768d7b8165bdb9e46ea17",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "removes",
+   "replaces",
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "The commit substantially changes Approval Gate execution, consumption constraints, technical-stop handling, PL recovery, and exported refusal contracts.",
+  "narrowRationale": "The Gate and recovery changes harden and implement the approved lifecycle design, including human provenance and fail-closed technical stops, rather than removing its responsibilities."
+ },
+ {
+  "sha": "dc628be447c32868e9173c6a2fe1247a18989516",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": true,
+  "kinds": [
+   "replaces",
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "It adds review retry cooldowns and pinned resume provenance while redefining human-only approval, resume, escalation, and abort lifecycle rules.",
+  "narrowRationale": "It makes the previously recorded legacy CEO Approval evidence mechanism permanently unusable by having ceo_approval checks always refuse, without updating the owning roadmap design."
+ },
+ {
+  "sha": "dde26ee89bfe11b673c26099b0a0f40a5e734e8e",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "The watchdog API and persistence contract gain episode-level idempotency, uniqueness enforcement, distinct response semantics, and retry behavior after failed recording.",
+  "narrowRationale": "It adds durable stall-episode idempotency without removing the established watchdog detection and reporting responsibility."
+ },
+ {
+  "sha": "df347505ec888fde75fdce3070d0df46eb4304fe",
+  "material": true,
+  "introducesOnly": true,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "introduces"
+  ],
+  "rationale": "Introduces the future PL Console architecture, ownership split, staged mechanisms, and CEO approval boundary.",
+  "narrowRationale": "It introduces only future PL Console responsibilities and guardrails."
+ },
+ {
+  "sha": "df9bfa900628e44610a29bc21353488c4aa3159c",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines"
+  ],
+  "rationale": "It makes roadmap state the normative adoption authority and changes candidate reachability from every non-done item to planned items only.",
+  "narrowRationale": "It redefines roadmap state as the normative source of current adoptability and updates the owning policy record in the same diff."
+ },
+ {
+  "sha": "df9fd44bf2517e6d8e8fa510c202842a766d55a4",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "replaces",
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "Replaces the unsupported Claude reviewer branch with a fail-closed adapter while adding an explicit gate that limits its reachability.",
+  "narrowRationale": "The Claude reviewer mechanism is added while an explicit gate preserves the existing task-review topology."
+ },
+ {
+  "sha": "e077daecfc273a9e435be4d3a6075a8e686980e4",
+  "material": true,
+  "introducesOnly": true,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "introduces"
+  ],
+  "rationale": "The diff adds a new active normative policy governing Codex task scope, model selection, retries, tool responsibilities, and quota handling.",
+  "narrowRationale": "It introduces new Codex usage rules without displacing an existing approved responsibility."
+ },
+ {
+  "sha": "e1587c289485b542d56e90befb57aa3fd0a41e97",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "It introduces an evidence-gated recovery sweep and extends the existing continuation poll to create missing initial implementation Jobs.",
+  "narrowRationale": "It adds a gated recovery sweep without displacing the recorded Design Review or remediation responsibilities."
+ },
+ {
+  "sha": "e3cf9830b1db37c9c70ee95d47ee0a91cb3c50d2",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "It changes approval lifecycle behavior so actionable approvals become SUPERSEDED when their source job is terminalized, including startup reconciliation.",
+  "narrowRationale": "Superseding approvals attached to terminal Jobs repairs stale actionable state rather than removing a deliberately recorded responsibility."
+ },
+ {
+  "sha": "e457a2b17e723ec1e16f01e157e96aceb892a057",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "It changes job-transition API outcomes, blocked-row workspace ownership, external-completion admission, and PL notification behavior.",
+  "narrowRationale": "The ownership and reconciliation changes repair stranded lifecycle states while retaining quarantine protection and the documented abort-before-reconcile responsibility."
+ },
+ {
+  "sha": "ea34b691627991f96b681af13091eb1b47f79b92",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "It establishes active-approval replacement and cleanup-generation contracts and changes technical-abort state transitions and liveness accounting.",
+  "narrowRationale": "The stricter claim, completion, archive, and workspace-owner contracts protect existing lifecycle responsibilities rather than disabling an approved mechanism."
+ },
+ {
+  "sha": "f040f2f9b2b26fc7e3abdc8451e4b57145042357",
+  "material": true,
+  "introducesOnly": true,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "introduces"
+  ],
+  "rationale": "Introduces the mandatory gate authority policy and a persistent VPS PL decision-loop mechanism with defined responsibilities and escalation limits.",
+  "narrowRationale": "It adds new mandatory-gate and VPS PL-loop design responsibilities without removing an established mechanism."
+ },
+ {
+  "sha": "f351687745194eec02e408c470525ece88606c85",
+  "material": false,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [],
+  "rationale": "The diff preserves successful-run stderr for bounded diagnostics and logging while leaving review decisions and lifecycle behavior unchanged.",
+  "narrowRationale": "It retains bounded stderr diagnostics and logging without changing review authority or outcomes."
+ },
+ {
+  "sha": "f4bcb1ac36d424ad08c0e75aec4c0671791cedeb",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "removes",
+   "replaces",
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "Lifecycle state ownership, job admission, human-decision evidence, stranded-task detection, and resume contracts are extensively reworked.",
+  "narrowRationale": "The new lifecycle-owned status, actor-provenance, and workspace-admission rules close races while preserving the documented human authority and recovery responsibilities."
+ },
+ {
+  "sha": "f54f83e361cd66cbb8725956a5cd35c17c395682",
+  "material": true,
+  "introducesOnly": true,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "introduces"
+  ],
+  "rationale": "The milestone record introduces an operational responsibility rule making Mobile AIteamOS the default owner for changes verifiable by tests and independent review.",
+  "narrowRationale": "It records the responsibility shift and new follow-up work in the owning roadmap rather than silently removing an approved mechanism."
+ },
+ {
+  "sha": "f5d4b7bd3cc96a394cd62c3307f760d902694cb5",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "It redefines escalation delivery from retry-window to incident-level deduplication and introduces structured failure classification plus a system-state field.",
+  "narrowRationale": "It fixes notification deduplication while preserving retries, escalation audits, and ongoing failure visibility."
+ },
+ {
+  "sha": "f6a21a398228fa4d877df0d109c37ca805398ce0",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines"
+  ],
+  "rationale": "The visible truncated diff adds a tightly gated recovery edge allowing qualifying blocked resumed implementations to enter repair.",
+  "narrowRationale": "It restores the recorded repair responsibility for a narrowly validated resumed-review case."
+ },
+ {
+  "sha": "f9a02e45c991ccfe1ec8ad794c230a06df062360",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "replaces",
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "It replaces task-wide repair counting with lineage generations and makes only server-proven human resumes reset the repair budget.",
+  "narrowRationale": "It establishes credential-derived resume authority and per-lineage repair budgets without removing a previously approved responsibility."
+ },
+ {
+  "sha": "fcfd732df6e83b2f52f34b5dd59a3ac1d757c42c",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "replaces",
+   "redefines",
+   "introduces"
+  ],
+  "rationale": "The visible truncated diff replaces permissive context-pack reads with an allowlisted API contract and fail-closed containment mechanisms.",
+  "narrowRationale": "It makes context-pack reads conform to the recorded target-root and secret-file safety boundary."
+ },
+ {
+  "sha": "ffe5e7814cb43dd9c02d854a4f30cfbd32175886",
+  "material": true,
+  "introducesOnly": false,
+  "approvedResponsibilityAtRisk": false,
+  "kinds": [
+   "redefines"
+  ],
+  "rationale": "The roadmap normatively redefines the responsibility boundary between same-provider attempt budgeting and alternate-provider re-review.",
+  "narrowRationale": "The diff adds a documented division of responsibility between two roadmap items without removing or transferring an existing mechanism."
+ }
+]
