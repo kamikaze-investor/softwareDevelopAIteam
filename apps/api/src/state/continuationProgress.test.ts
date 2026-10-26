@@ -49,7 +49,7 @@ function progressAt(s: Seeded, nowMs: number) {
 
 function startedAt(s: Seeded): number {
   const continuation = s.storage.taskContinuations.findById(s.continuationId)
-  return Math.max(Date.parse(continuation?.createdAt ?? ''), Date.parse(s.project.updatedAt))
+  return Date.parse(continuation?.createdAt ?? '')
 }
 
 function createCanonicalRun(s: Seeded, overrides: { designText?: string; changedFiles?: string[] } = {}) {
@@ -129,6 +129,14 @@ describe('evaluateContinuationProgress — 503 ではなく実際の遷移で前
     expect(progressAt(s, jobMs + CONTINUATION_SETTLEMENT_GRACE_MS - 1).stuckForMs).toBe(0)
     expect(progressAt(s, jobMs + CONTINUATION_SETTLEMENT_GRACE_MS + 6 * MIN).stuckForMs).toBe(6 * MIN)
     expect(progressAt(s, jobMs + CONTINUATION_SETTLEMENT_GRACE_MS + MIN).detail).toContain('has not settled')
+  })
+
+  it('Project の名前変更などの書き込みは前進ではなく、停滞の時計を戻さない', () => {
+    const s = seed()
+    const t0 = startedAt(s)
+    s.storage.projects.update(s.project.id, { name: 'renamed' })
+
+    expect(progressAt(s, t0 + 6 * MIN).stuckForMs).toBe(6 * MIN)
   })
 
   it('Project が running でない（CEO の pause）間は停滞に数えない', () => {

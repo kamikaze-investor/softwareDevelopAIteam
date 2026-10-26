@@ -64,10 +64,11 @@ export function evaluateContinuationProgress(
   nowMs: number,
 ): ContinuationProgress {
   const facts: string[] = [`continuation ${continuation.id} pending since ${continuation.createdAt}`]
-  // 起点は continuation の作成と Project の最後の更新（running への遷移を含む）の遅いほう。
-  // pause 中の待ちは CEO の判断なので停滞に数えない。読めなければ continuation の作成時刻（fail-closed）。
-  const createdMs = parseMs(continuation.createdAt) ?? 0
-  const episodeStartMs = Math.max(createdMs, parseMs(project.updatedAt) ?? createdMs)
+  // 起点は continuation の作成時刻。Project の `updatedAt` は使わない: 名前の変更や同じ status の再 PATCH でも
+  // 書き換わるので、前進ではない書き込みが停滞の時計を戻し続けうる（独立レビュー指摘）。running への遷移時刻の
+  // 記録は無いので、pause 中は下で 0 を返すだけにし、再開直後に前進が無ければ早めに鳴る側へ倒す（fail-safe）。
+  // 読めなければ 0（= 十分古い）として扱う（fail-closed）。
+  const episodeStartMs = parseMs(continuation.createdAt) ?? 0
   const stuckSince = (sinceMs: number): number => Math.max(0, nowMs - Math.max(episodeStartMs, sinceMs))
 
   if (project.status !== 'running') {
@@ -144,4 +145,38 @@ export function evaluateContinuationProgress(
     parseMs(canonical.createdAt) ?? 0,
   )
   return { taskId: task.id, stuckForMs: stuckSince(lastActivityMs), detail: facts.join('; ') }
+}
+
+/** Worker の reconcile 応答に載せる、running Project の pending continuation 1件分の事実。 */
+export interface ContinuationProgressReport {
+  continuationId: string
+  projectId: string
+  taskId: string | undefined
+  /** 検証された前進が無い時間（ms）。 */
+  stuckForMs: number
+}
+
+/**
+ * running Project の pending continuation について「前進が無い時間」を返す（読み取りのみ）。
+ *
+ * **Worker の独立した backstop の材料。** Worker は poll cycle ごとに reconcile route を呼んでいるので、
+ * その応答に載せれば、PL loop（無効・latch）や escalation の配達に依存せずに Worker が停滞を知れる。
+ * 時刻は永続化済みの記録から計算するので、Worker の再起動で失われない。pause 中に作られて Outbox から
+ * 消えた continuation も、再開後はここに現れる（Outbox の滞留だけでは見えない形）。
+ */
+export function reportContinuationProgress(storage: IStorage, nowMs: number): ContinuationProgressReport[] {
+  const reports: ContinuationProgressReport[] = []
+  for (const project of storage.projects.findAll()) {
+    if (project.status !== 'running') continue
+    for (const continuation of storage.taskContinuations.findPendingByProjectId(project.id)) {
+      const progress = evaluateContinuationProgress(storage, continuation, project, nowMs)
+      reports.push({
+        continuationId: continuation.id,
+        projectId: project.id,
+        taskId: progress.taskId,
+        stuckForMs: progress.stuckForMs,
+      })
+    }
+  }
+  return reports
 }

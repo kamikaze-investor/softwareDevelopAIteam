@@ -405,7 +405,12 @@ describe('POST /api/task-continuations/reconcile', () => {
       // sweepはawaitされない。design reviewは最大120sかかりうるため、ここを待つと
       // Worker側がOutbox再送にもqueued Job取得にも到達できなくなる。
       expect(res.statusCode).toBe(202)
-      expect(JSON.parse(res.body)).toMatchObject({ accepted: true })
+      // Worker の独立した backstop の材料として、pending continuation の「前進が無い時間」を載せる
+      // （sweep の前に計算した読み取りのみの値）。
+      expect(JSON.parse(res.body)).toMatchObject({
+        accepted: true,
+        continuations: [expect.objectContaining({ taskId: nextTask.id, stuckForMs: expect.any(Number) })],
+      })
 
       // 応答時点で design review はまだ解放していない = sweep は未完了。
       await reviewStarted
