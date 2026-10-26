@@ -330,9 +330,14 @@ export function addUsage(into: TokenUsage, add: TokenUsage): void {
 /**
  * CI Meta Review の `callGeminiForReview`（geminiClient.ts）と **同じ設定**で呼び、token 使用量も返す。
  * geminiClient は本文だけを返し usage を捨てるため、費用の実測にはここで SDK を直接呼ぶ。
- * 設定（REST API・temperature 0.1・maxOutputTokens 8192・responseMimeType なし）を変えるときは両方を揃える。
+ * 設定（REST API・temperature 0.1・responseMimeType なし）は geminiClient と揃える。**maxOutputTokens だけは違う**:
+ * gemini-2.5 系は thinking も出力上限に数えるため、8192 では thinking で上限に達し JSON が途中で切れた
+ * （M5 trial 40302787189: 出力 8187 token のうち本文 327）。detector は live の Meta Review ではないので、自前の上限を持つ
  * API key は環境変数 GEMINI_API_KEY からだけ読み、記録にもログにも出さない。
  */
+/** detector の出力上限（thinking を含む）。live Meta Review の 8192 とは別 */
+export const DETECTOR_MAX_OUTPUT_TOKENS = 24_576
+
 export async function callGeminiWithUsage(
   prompt: string,
   model: string,
@@ -343,7 +348,7 @@ export async function callGeminiWithUsage(
   const { GoogleGenerativeAI } = await import('@google/generative-ai')
   const client = new GoogleGenerativeAI(apiKey).getGenerativeModel({
     model,
-    generationConfig: { temperature: 0.1, maxOutputTokens: 8192 },
+    generationConfig: { temperature: 0.1, maxOutputTokens: DETECTOR_MAX_OUTPUT_TOKENS },
   })
   // client 側の timeout で request を打ち切る（observeDesignMateriality の待機上限より短くし、待つのをやめた request が残らないようにする）
   const result = await client.generateContent(prompt, opts.timeoutMs === undefined ? undefined : { timeout: opts.timeoutMs })

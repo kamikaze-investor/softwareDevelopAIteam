@@ -545,7 +545,8 @@ export function parseDetection(raw: string, signals: readonly MaterialitySignal[
   return { ok: true, value: { material: json.material, candidates, signalDisposition: dispositions } }
 }
 
-const RESPONSIBILITY = ['preserved', 'moved', 'lost', 'unclear'] as const
+// introduced: 既存のものに触れず新しい責務・機構を足す候補（kind=introduces）。保たれる / 移る / 失われる のどれでもない
+const RESPONSIBILITY = ['preserved', 'moved', 'lost', 'introduced', 'unclear'] as const
 const RECORD_CONSISTENCY = ['consistent', 'contradicts_unupdated_record', 'no_record'] as const
 const PROVENANCE = ['yes', 'no', 'unknown'] as const
 

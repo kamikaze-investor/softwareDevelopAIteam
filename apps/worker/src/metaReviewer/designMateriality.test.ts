@@ -461,3 +461,9 @@ it('mechanism の key があって不正な値なら、subject 名の key で救
   })
   expect(parseDetection(raw, signals)).toEqual({ ok: false, reason: 'invalid_candidate:mechanism' })
 })
+
+it('introduces の候補は responsibility=introduced を受け付ける（M5 trial 2026-10-26）', () => {
+  const cands = [{ id: 'c2', kind: 'introduces' as const, subject: 'mechanism' as const, mechanism: 'one-tap abort', file: 'f.ts', evidence: 'e' }]
+  const parsed = parseEvaluation(JSON.stringify({ evaluations: [{ candidateId: 'c2', responsibility: 'introduced', recordConsistency: 'no_record', ceoDirectedProvenance: 'yes' }] }), cands)
+  expect(parsed.ok && parsed.value[0].responsibility).toBe('introduced')
+})
