@@ -7,6 +7,7 @@ import {
   observeDesignMateriality,
   parseDetection,
   parseEvaluation,
+  RAW_EXCERPT_CHARS,
   signalId,
   stripStringsAndComments,
   type BaseRecordReader,
@@ -230,7 +231,7 @@ describe('parseDetection — strict', () => {
     ['S1 に disposition が無い', { material: true, candidates: [candidate], signalDisposition: [] }, 'signal_not_disposed'],
     ['存在しない candidate を指す', { material: true, candidates: [candidate], signalDisposition: [{ signalId: sid, disposition: 'supports_candidate:c9', reason: '' }] }, 'unknown_disposition'],
     ['detection が正しさを判断する disposition（behavior_preserving）は受け付けない', { material: false, candidates: [], signalDisposition: [{ signalId: sid, disposition: 'behavior_preserving', reason: '' }] }, 'unknown_disposition'],
-    ['未知の kind', { material: true, candidates: [{ ...candidate, kind: 'tweaks' }], signalDisposition: [] }, 'invalid_candidate'],
+    ['未知の kind', { material: true, candidates: [{ ...candidate, kind: 'tweaks' }], signalDisposition: [] }, 'invalid_candidate:kind'],
   ])('%s → 不成立', (_label, body, reason) => {
     expect(parseDetection(JSON.stringify(body), signals)).toEqual({ ok: false, reason })
   })
@@ -394,5 +395,37 @@ describe('独立レビュー指摘（code review round 4）の回帰', () => {
     [String.raw`A = 'it\'s', B // tail, C`, 'A = "", B '],
   ])('stripStringsAndComments(%s)', (input, expected) => {
     expect(stripStringsAndComments(input)).toBe(expected)
+  })
+})
+
+describe('M5 trial (2026-10-26) の解析失敗への対応', () => {
+  const signals = computeMaterialitySignals(fileDiff('apps/api/src/x.ts', ["-  | 'challenge_aligned'"]))
+  const sid = signals[0].id
+  const base = { id: 'c1', kind: 'removes', subject: 'mechanism', mechanism: 'm', file: 'apps/api/src/x.ts' }
+
+  it('候補の evidence が欠けても空文字で受け付ける（採点に使う欄は厳格なまま）', () => {
+    const raw = JSON.stringify({ material: true, candidates: [base], signalDisposition: [{ signalId: sid, disposition: 'supports_candidate:c1', reason: '' }] })
+    const parsed = parseDetection(raw, signals)
+    expect(parsed.ok && parsed.value.candidates[0].evidence).toBe('')
+    expect(parseDetection(JSON.stringify({ material: true, candidates: [{ ...base, file: '' }], signalDisposition: [] }), signals))
+      .toEqual({ ok: false, reason: 'invalid_candidate:file' })
+  })
+
+  it('評価の newOwner・所見が欠けても受け付け、判定の欄が不正なら欄名を返す', () => {
+    const cands = [{ ...base, kind: 'removes' as const, subject: 'mechanism' as const, evidence: '' }]
+    const ok = parseEvaluation(JSON.stringify({ evaluations: [{ candidateId: 'c1', responsibility: 'lost', recordConsistency: 'no_record', ceoDirectedProvenance: 'no' }] }), cands)
+    expect(ok.ok && ok.value[0]).toMatchObject({ newOwner: null, correctness: '', provenanceEvidence: '' })
+    expect(parseEvaluation(JSON.stringify({ evaluations: [{ candidateId: 'c1', responsibility: 'gone', recordConsistency: 'no_record', ceoDirectedProvenance: 'no' }] }), cands))
+      .toEqual({ ok: false, reason: 'invalid_evaluation:responsibility' })
+  })
+
+  it('解析できなかった応答は先頭だけを rawResponseExcerpt に残す', async () => {
+    const diff = fileDiff('apps/api/src/x.ts', ["-  | 'challenge_aligned'"])
+    const records = { listRecordFiles: () => [], read: () => undefined }
+    const raw = `{"material": true, "candidates": [{"id": "c1", "kind": "modifies"}], "signalDisposition": []}${'x'.repeat(5000)}`
+    const observation = await observeDesignMateriality({ title: 't', diff, records, detectionInstructions: 'D', evaluationInstructions: 'E' }, async () => raw)
+    expect(observation.reason).toBe('parse:invalid_candidate:kind')
+    expect(observation.rawResponseExcerpt?.stage).toBe('detection')
+    expect(observation.rawResponseExcerpt?.text.length).toBe(RAW_EXCERPT_CHARS)
   })
 })
