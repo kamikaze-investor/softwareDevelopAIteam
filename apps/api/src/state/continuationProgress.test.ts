@@ -4,7 +4,7 @@ import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import { buildInitialImplementAiCliPrompt, initialWorkflowStepKey } from '../ctoAi/initialImplementWorkflow'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
-import { CONTINUATION_LIVE_RUN_BOUND_MS, CONTINUATION_SETTLEMENT_GRACE_MS, evaluateContinuationProgress } from './continuationProgress'
+import { CONTINUATION_LIVE_RUN_BOUND_MS, CONTINUATION_SETTLEMENT_GRACE_MS, evaluateContinuationProgress, reportContinuationProgress } from './continuationProgress'
 import { buildSystemState, DEFAULT_STALL_HINT_MS } from './systemState'
 import { resetPlLoopInFlightForTest, runPlTick } from '../pl/executionLoop'
 
@@ -193,5 +193,19 @@ describe('PL — 停滞した continuation は1回だけ通知し、前進中は
     await tick(s, claimedAt + 4 * MIN, notified)
 
     expect(notified).toHaveLength(0)
+  })
+})
+
+describe('reportContinuationProgress — 1件の評価失敗で報告全体を消さない', () => {
+  it('評価できない continuation は作成からの経過を「前進なし」として報告し、他の行も残す', async () => {
+
+    const s = seed()
+    const original = s.storage.designReviewRuns.findByTaskId.bind(s.storage.designReviewRuns)
+    s.storage.designReviewRuns.findByTaskId = (() => { throw new Error('poisoned row') }) as typeof original
+    const t0 = startedAt(s)
+
+    const reports = reportContinuationProgress(s.storage, t0 + 12 * MIN)
+
+    expect(reports).toEqual([expect.objectContaining({ continuationId: s.continuationId, stuckForMs: 12 * MIN })])
   })
 })

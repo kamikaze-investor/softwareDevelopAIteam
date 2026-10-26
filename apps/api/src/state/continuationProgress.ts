@@ -169,13 +169,18 @@ export function reportContinuationProgress(storage: IStorage, nowMs: number): Co
   for (const project of storage.projects.findAll()) {
     if (project.status !== 'running') continue
     for (const continuation of storage.taskContinuations.findPendingByProjectId(project.id)) {
-      const progress = evaluateContinuationProgress(storage, continuation, project, nowMs)
-      reports.push({
-        continuationId: continuation.id,
-        projectId: project.id,
-        taskId: progress.taskId,
-        stuckForMs: progress.stuckForMs,
-      })
+      // 1件の評価失敗で報告全体を消さない（1件の壊れた行が全 continuation の backstop を黙らせる）。
+      // 評価できない行は、作成からの経過時間をそのまま「前進なし」として報告する（fail-closed）。
+      let stuckForMs: number
+      let taskId = continuation.nextTaskId
+      try {
+        const progress = evaluateContinuationProgress(storage, continuation, project, nowMs)
+        stuckForMs = progress.stuckForMs
+        taskId = progress.taskId
+      } catch {
+        stuckForMs = Math.max(0, nowMs - (parseMs(continuation.createdAt) ?? 0))
+      }
+      reports.push({ continuationId: continuation.id, projectId: project.id, taskId, stuckForMs })
     }
   }
   return reports
