@@ -21,6 +21,7 @@
  * 評価対象に含める（`FindingAssessment`）。
  */
 
+import { parseFirstJsonObject } from './firstJsonObject'
 import type { MetaReviewFocus } from './types/meta_review'
 
 /**
@@ -173,15 +174,9 @@ function parseFindingAssessment(value: unknown): FindingAssessment | undefined {
  * `uncertainties` だけは空配列を許す（「無い」という主張は成立する）。
  */
 export function parseCritique(raw: string): Critique | undefined {
-  const match = raw.match(/```json\s*([\s\S]+?)\s*```/) ?? raw.match(/(\{[\s\S]+\})/)
-  if (!match) return undefined
-
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(match[1] ?? match[0])
-  } catch {
-    return undefined
-  }
+  // 最初の完全な JSON object だけを取り出す（後ろの余計な `}` や補足文で全体を捨てない）。
+  const parsed = parseFirstJsonObject(raw)
+  if (parsed === undefined) return undefined
 
   const obj = asRecord(parsed)
   if (!obj) return undefined
