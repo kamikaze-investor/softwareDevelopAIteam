@@ -1928,6 +1928,34 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
 
       (2026-10-22 roadmap integrity audit: 本文の「REJECT が Human Resume で洗浄される」は修正済み: REJECTED な git_commit への Human Resume は source implement へ戻る（`apps/api/src/storage/sqlite.ts:2178` 以降、`approval_rules.md`「CEO が REJECT した git_commit から修正へ戻る経路」2026-10-15）。残る範囲は同じ差分への verdict の揺れそのもの（本文 2026-10-15 の追加実測）だけ)
 
+      **【2026-10-23 / 2026-10-26 追記: CI Meta Review の同一 SHA 反転と risk 評価の揺れ（実測。本項目へ統合し、新規 item は作らない）】**
+
+      **同一 head SHA・同一 base での判定反転が 7 件**あり、**すべて BLOCKED → APPROVED**、`run_attempt=1`
+      だった（PR #404・#402・#401・#398・#388・#384 ほか）。どの反転の直前にも、同じ手順が踏まれていた。
+
+      1. PR 本文に「Authority basis …（for Meta Review）」の主張が追記された（prompt が +0.7〜1.4k 文字増える）。
+      2. AIteamOS-bot が数秒で close / reopen した（workflow に `edited` trigger は無い）。
+
+      APPROVED の後、2〜6 分で merge されている。
+
+      PR 本文は prompt 上で untrusted と明記しているが、実際には判定を変えている。
+      もう一つの反転源は **Gemini の no-verdict → Copilot（別 vendor）への fallback**（#404・#384）。
+
+      **risk 評価の揺れ（PR #406、2026-10-26）**: 実質同一の diff で risk が high → critical に変わった。
+      status は approved のまま。DA の判定理由も run ごとに入れ替わった。
+
+      **記録されていないもの**: model・stage・base / head・prompt hash は result file にも PR comment にも
+      残らないため、反転の理由を後から説明できない。
+
+      **小さい対策候補（未実施。CI gate を変えるものは CEO 判断）**:
+
+      1. provenance の記録（model・stage・base・head・sha256(prompt)・body hash）。merge 挙動は変えない
+      2. 同一 (base, head) での最も保守的な判定の束縛
+      3. PR 本文を判定入力から外す、または head SHA ごとに固定する
+      4. no-verdict 時の別 vendor fallback を止める
+
+      **運用ルール（即時）**: BLOCKED に対して PR 本文の編集 + close / reopen で再実行しない。
+
 <!-- roadmap:id=project-auto-worker-core-split state=deferred -->
 1. [ ] **Worker安全コアの物理分離** — CONTROL REPOSITORY保護対象を「安全コア」単位へ縮小する。
       実行・Approval・Risk Scan・fail-closedは保護対象として残し、Context Pack構築・Task選定・
