@@ -508,12 +508,12 @@ export function parseDetection(raw: string, signals: readonly MaterialitySignal[
 
   const candidates: MaterialityCandidate[] = []
   for (const c of json.candidates as Array<Record<string, unknown>>) {
-    // 採点に使う欄（id・kind・subject・mechanism・file）は厳格。evidence は自由記述なので欠けても空文字にする
+    // 採点に使う欄（id・kind・subject・mechanism・file・evidence。target 照合は mechanism + evidence を読む）は厳格
     const bad = !c ? 'candidate' : !isString(c.id) ? 'id' : !oneOf(CANDIDATE_KINDS, c.kind) ? 'kind'
       : !oneOf(CANDIDATE_SUBJECTS, c.subject) ? 'subject' : !isString(c.mechanism) ? 'mechanism'
-      : !isString(c.file) ? 'file' : !(c.evidence === undefined || typeof c.evidence === 'string') ? 'evidence' : undefined
+      : !isString(c.file) ? 'file' : !isString(c.evidence) ? 'evidence' : undefined
     if (bad) return { ok: false, reason: `invalid_candidate:${bad}` }
-    candidates.push({ id: c.id as string, kind: c.kind as MaterialityCandidate['kind'], subject: c.subject as MaterialityCandidate['subject'], mechanism: c.mechanism as string, file: c.file as string, evidence: (c.evidence as string | undefined) ?? '' })
+    candidates.push({ id: c.id as string, kind: c.kind as MaterialityCandidate['kind'], subject: c.subject as MaterialityCandidate['subject'], mechanism: c.mechanism as string, file: c.file as string, evidence: c.evidence as string })
   }
   if (json.material !== candidates.length > 0) return { ok: false, reason: 'material_mismatch' }
   const candidateIds = new Set(candidates.map((c) => c.id))

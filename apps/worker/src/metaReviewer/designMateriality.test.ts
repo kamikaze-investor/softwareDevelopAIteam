@@ -403,10 +403,9 @@ describe('M5 trial (2026-10-26) の解析失敗への対応', () => {
   const sid = signals[0].id
   const base = { id: 'c1', kind: 'removes', subject: 'mechanism', mechanism: 'm', file: 'apps/api/src/x.ts' }
 
-  it('候補の evidence が欠けても空文字で受け付ける（採点に使う欄は厳格なまま）', () => {
+  it('候補の evidence は target 照合に使うので必須のまま。欠けたら欄名を返す', () => {
     const raw = JSON.stringify({ material: true, candidates: [base], signalDisposition: [{ signalId: sid, disposition: 'supports_candidate:c1', reason: '' }] })
-    const parsed = parseDetection(raw, signals)
-    expect(parsed.ok && parsed.value.candidates[0].evidence).toBe('')
+    expect(parseDetection(raw, signals)).toEqual({ ok: false, reason: 'invalid_candidate:evidence' })
     expect(parseDetection(JSON.stringify({ material: true, candidates: [{ ...base, file: '' }], signalDisposition: [] }), signals))
       .toEqual({ ok: false, reason: 'invalid_candidate:file' })
   })
