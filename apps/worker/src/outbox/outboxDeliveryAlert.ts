@@ -160,3 +160,34 @@ export function continuationsToAlert(
     .filter((report) => report.stuckForMs >= OUTBOX_CONTINUATION_PENDING_ALERT_MS && !alreadyAlerted.has(report.continuationId))
     .map((report) => report.continuationId)
 }
+
+/**
+ * continuation の「前進なし」報告が**取れない**状態の継続（API 不達・応答の形の崩れ・route の失敗）。
+ *
+ * 報告が取れない間は上の backstop が働かない。そこへ「pause 中に作られて Outbox から消えた continuation」
+ * と「PL が働いていない」が重なると、本当の停滞が永久に無音になりうる（独立レビュー指摘）。報告が取れない
+ * 時間を正の差分だけで積み上げ、`OUTBOX_CONTINUATION_PENDING_ALERT_MS` に達したら1回だけ通知する。
+ * 報告が1回でも取れたら戻す。
+ */
+export interface ReportOutageState {
+  elapsedMs: number
+  lastEvaluatedAtMs: number | undefined
+  alertSent: boolean
+}
+
+export function initialReportOutageState(): ReportOutageState {
+  return { elapsedMs: 0, lastEvaluatedAtMs: undefined, alertSent: false }
+}
+
+export function nextReportOutageState(
+  state: ReportOutageState,
+  reportAvailable: boolean,
+  timing: OutboxCycleTiming,
+): { state: ReportOutageState; shouldAlert: boolean } {
+  if (reportAvailable) return { state: initialReportOutageState(), shouldAlert: false }
+  const previousMs = state.lastEvaluatedAtMs ?? timing.cycleStartedAtMs
+  const elapsedMs = state.elapsedMs + Math.max(0, timing.nowMs - previousMs)
+  const next: ReportOutageState = { elapsedMs, lastEvaluatedAtMs: timing.nowMs, alertSent: state.alertSent }
+  if (next.alertSent || elapsedMs < OUTBOX_CONTINUATION_PENDING_ALERT_MS) return { state: next, shouldAlert: false }
+  return { state: { ...next, alertSent: true }, shouldAlert: true }
+}

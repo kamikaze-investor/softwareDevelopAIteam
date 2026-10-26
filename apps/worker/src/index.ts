@@ -51,6 +51,8 @@ import * as outboxStore from './outbox/outboxStore.js'
 import {
   continuationsToAlert,
   initialOutboxAlertState,
+  initialReportOutageState,
+  nextReportOutageState,
   isContinuationPendingResponse,
   nextOutboxAlertState,
   parseContinuationProgressReports,
@@ -1126,6 +1128,8 @@ export async function pollJobs(): Promise<never> {
   let outboxAlert = initialOutboxAlertState()
   // API の報告に基づく continuation の backstop で通知済みの continuation（1件につき1回）。
   const alertedContinuations = new Set<string>()
+  // continuation の報告が取れない状態の継続（取れない間は上の backstop が働かないので、それ自体を通知する）。
+  let reportOutage = initialReportOutageState()
 
   while (true) {
     try {
@@ -1146,7 +1150,14 @@ export async function pollJobs(): Promise<never> {
       // else 側に置くと、Outbox に配送できない event が1件でも残っている間 continuation が
       // 一切進まなくなる。Job intake を止める理由（workspace 競合）は continuation 回収には
       // 当てはまらない（実際に次 Job を作るかどうかは API 側の既存 gate が決める）。
+      const reconcileStartedAtMs = Date.now()
       const continuationReports = await reconcileTaskContinuations()
+      const outage = nextReportOutageState(reportOutage, continuationReports !== undefined, {
+        cycleStartedAtMs: reconcileStartedAtMs,
+        nowMs: Date.now(),
+      })
+      reportOutage = outage.state
+      if (outage.shouldAlert) await notifyContinuationReportUnavailable()
       // **独立した backstop**（CEO 決定 2026-10-27）。診断と復旧の一次の担い手は API / PL で、前進が無いまま
       // 5 分を超えると `continuation_pending` として扱う。ここは PL loop・escalation の配達・Outbox の滞留に
       // 依存せず、API が永続化済みの記録から計算した「前進が無い時間」だけを見る。重複通知は許容する。
@@ -1727,6 +1738,25 @@ async function notifyContinuationStalled(continuationId: string): Promise<void> 
         + 'The PL diagnosis may not have run or may not have reached anyone; check the continuation_pending attention.',
       sourceType: 'task_continuation',
       sourceId: continuationId,
+    })
+  } catch (err: unknown) {
+    console.error(`[Worker] CRITICAL通知エラー: ${formatUnknownError(err)}`)
+  }
+}
+
+/**
+ * continuation の「前進なし」報告が 10 分以上取れていないことの通知。報告が取れない間は continuation の
+ * backstop が働かないので、PL も働いていなければ本当の停滞が無音になる。それを防ぐための通知。
+ */
+async function notifyContinuationReportUnavailable(): Promise<void> {
+  try {
+    await sendAlert({
+      severity: 'critical',
+      title: 'Task continuation progress cannot be verified',
+      body: 'The Worker has not received a usable continuation progress report from the API for at least 10 minutes. '
+        + 'A stalled continuation may go unnoticed until reports resume.',
+      sourceType: 'task_continuation',
+      sourceId: 'continuation_progress_report',
     })
   } catch (err: unknown) {
     console.error(`[Worker] CRITICAL通知エラー: ${formatUnknownError(err)}`)

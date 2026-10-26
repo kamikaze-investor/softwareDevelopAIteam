@@ -1907,11 +1907,17 @@ describe('Outbox 滞留通知 — continuation が恒久的に壊れていても
   it('continuation pending の 503 だけが 10 分を超えて続けば CRITICAL を1回出す', async () => {
     vi.useFakeTimers()
     vi.stubGlobal('fetch', fetchMock)
-    fetchMock.mockImplementation(async (url: string | URL | Request) => (
-      String(url).includes('/api/jobs/job-1')
-        ? new Response(JSON.stringify({ id: 'job-1', outbox: { eventId: 'e1', deduplicated: false } }), { status: 503 })
-        : new Response(JSON.stringify([]), { status: 200 })
-    ))
+    // reconcile は有効な報告（停滞なし）を返す: Outbox 側の backstop だけを見る。
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const target = String(url)
+      if (target.includes('/api/jobs/job-1')) {
+        return new Response(JSON.stringify({ id: 'job-1', outbox: { eventId: 'e1', deduplicated: false } }), { status: 503 })
+      }
+      if (target.includes('/api/task-continuations/reconcile')) {
+        return new Response(JSON.stringify({ accepted: true, continuations: [] }), { status: 202 })
+      }
+      return new Response(JSON.stringify([]), { status: 200 })
+    })
     outboxMocks.hasPending.mockReturnValue(true)
     outboxMocks.resendPending.mockImplementation(async (patchFn: (id: string, p: unknown) => Promise<boolean>) => {
       await patchFn('job-1', { status: 'success', eventId: 'e1', payloadHash: 'h' })
@@ -1995,5 +2001,24 @@ describe('continuation の独立した backstop — API の「前進なし」報
     await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST * 3)
 
     expect(notifierMocks.sendAlert).not.toHaveBeenCalled()
+  })
+})
+
+describe('continuation の報告が取れない状態 — 取れないこと自体を 10 分で1回通知する', () => {
+  it('reconcile が報告を返さない状態が 10 分続けば CRITICAL を1回出す（Outbox が空でも）', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockImplementation(async () => new Response(JSON.stringify([]), { status: 200 }))
+    outboxMocks.hasPending.mockReturnValue(false)
+
+    void pollJobs()
+    await flushPollCycle()
+    await vi.advanceTimersByTimeAsync(9 * 60 * 1000)
+    const titles = (): string[] => notifierMocks.sendAlert.mock.calls.map(([payload]) => (payload as { title?: string }).title ?? '')
+    expect(titles()).not.toContain('Task continuation progress cannot be verified')
+
+    await vi.advanceTimersByTimeAsync(2 * 60 * 1000)
+    await vi.advanceTimersByTimeAsync(2 * 60 * 1000)
+    expect(titles().filter((title) => title === 'Task continuation progress cannot be verified')).toHaveLength(1)
   })
 })

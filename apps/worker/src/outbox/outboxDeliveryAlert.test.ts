@@ -6,6 +6,8 @@ import {
   OUTBOX_BLOCKED_ALERT_CYCLES,
   OUTBOX_CONTINUATION_PENDING_ALERT_MS,
   continuationsToAlert,
+  initialReportOutageState,
+  nextReportOutageState,
   parseContinuationProgressReports,
   type OutboxAlertState,
   type OutboxResendCycle,
@@ -136,5 +138,30 @@ describe('continuation の独立した backstop（API の報告に基づく）',
     expect(parseContinuationProgressReports({ continuations: [{ continuationId: 'c1', stuckForMs: '5' }] })).toBeUndefined()
     expect(parseContinuationProgressReports({ continuations: [{ continuationId: '', stuckForMs: 5 }] })).toBeUndefined()
     expect(parseContinuationProgressReports(null)).toBeUndefined()
+  })
+})
+
+describe('continuation の報告が取れない状態の継続', () => {
+  it('10 分続いたら1回だけ通知し、報告が取れたら戻す', async () => {
+
+    let state = initialReportOutageState()
+    let alerts = 0
+    let nowMs = 0
+    const step = (available: boolean): void => {
+      const cycleStartedAtMs = nowMs
+      nowMs += 5_000
+      const r = nextReportOutageState(state, available, { cycleStartedAtMs, nowMs })
+      state = r.state
+      if (r.shouldAlert) alerts += 1
+    }
+    for (let i = 0; i < 119; i += 1) step(false)
+    expect(alerts).toBe(0)
+    step(false)
+    expect(alerts).toBe(1)
+    for (let i = 0; i < 50; i += 1) step(false)
+    expect(alerts).toBe(1)
+    step(true)
+    for (let i = 0; i < 120; i += 1) step(false)
+    expect(alerts).toBe(2)
   })
 })
