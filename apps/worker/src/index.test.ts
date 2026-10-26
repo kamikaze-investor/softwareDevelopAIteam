@@ -1806,3 +1806,97 @@ describe('Outbox 滞留通知 — continuation pending の 503 は想定内（ou
     )
   })
 })
+
+describe('Outbox 滞留通知 — 本当の失敗を抑止しない（Tier B 独立レビュー観点）', () => {
+  const resendTwo = (): void => {
+    outboxMocks.resendPending.mockImplementation(async (patchFn: (id: string, p: unknown) => Promise<boolean>) => {
+      await patchFn('job-1', { status: 'success', eventId: 'e1', payloadHash: 'h1' })
+      await patchFn('job-2', { status: 'success', eventId: 'e2', payloadHash: 'h2' })
+    })
+  }
+
+  async function runCycles(cycles: number): Promise<void> {
+    void pollJobs()
+    await flushPollCycle()
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST * cycles)
+    await Promise.resolve()
+  }
+
+  it('本文が JSON でない 503 は本当の失敗として 3 cycle で CRITICAL', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockImplementation(async (url: string | URL | Request) => (
+      String(url).includes('/api/jobs/job-1')
+        ? new Response('<html>503 Service Unavailable</html>', { status: 503 })
+        : new Response(JSON.stringify([]), { status: 200 })
+    ))
+    outboxMocks.hasPending.mockReturnValue(true)
+    outboxMocks.resendPending.mockImplementation(async (patchFn: (id: string, p: unknown) => Promise<boolean>) => {
+      await patchFn('job-1', { status: 'success', eventId: 'e1', payloadHash: 'h' })
+    })
+
+    await runCycles(3)
+
+    expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(1)
+  })
+
+  it('同じ cycle に continuation pending と本当の失敗が混じれば、従来どおり 3 cycle で CRITICAL', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const target = String(url)
+      if (target.includes('/api/jobs/job-1')) {
+        return new Response(JSON.stringify({ id: 'job-1', outbox: { eventId: 'e1', deduplicated: false } }), { status: 503 })
+      }
+      if (target.includes('/api/jobs/job-2')) return new Response(JSON.stringify({ error: 'down' }), { status: 500 })
+      return new Response(JSON.stringify([]), { status: 200 })
+    })
+    outboxMocks.hasPending.mockReturnValue(true)
+    resendTwo()
+
+    // 1 cycle に PATCH が2本（各3回 retry + backoff）あるので、時間ではなく完了した再送 cycle 数で確かめる。
+    // 再送の呼び出しが N+1 回目に入った時点で N cycle 分の判定は済んでいる。
+    void pollJobs()
+    await flushPollCycle()
+    const advanceUntilResendCalls = async (calls: number): Promise<void> => {
+      for (let i = 0; i < 40 && outboxMocks.resendPending.mock.calls.length < calls; i += 1) {
+        await vi.advanceTimersByTimeAsync(500)
+      }
+    }
+    await advanceUntilResendCalls(3)
+    expect(outboxMocks.resendPending.mock.calls.length).toBe(3)
+    expect(notifierMocks.sendAlert).not.toHaveBeenCalled()
+    await advanceUntilResendCalls(4)
+    expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(1)
+  })
+
+  it('別の Job の eventId を返す 503 は continuation pending とみなさない（eventId は完全一致）', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockImplementation(async (url: string | URL | Request) => (
+      String(url).includes('/api/jobs/job-1')
+        ? new Response(JSON.stringify({ id: 'job-1', outbox: { eventId: 'e1-other', deduplicated: false } }), { status: 503 })
+        : new Response(JSON.stringify([]), { status: 200 })
+    ))
+    outboxMocks.hasPending.mockReturnValue(true)
+    outboxMocks.resendPending.mockImplementation(async (patchFn: (id: string, p: unknown) => Promise<boolean>) => {
+      await patchFn('job-1', { status: 'success', eventId: 'e1', payloadHash: 'h' })
+    })
+
+    await runCycles(3)
+
+    expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(1)
+  })
+
+  it('再送の例外（resendPending 自体の失敗）は本当の失敗として 3 cycle で CRITICAL', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }))
+    outboxMocks.hasPending.mockReturnValue(true)
+    outboxMocks.resendPending.mockRejectedValue(new Error('outbox db locked'))
+
+    await runCycles(3)
+
+    expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(1)
+  })
+})
