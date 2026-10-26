@@ -15,6 +15,7 @@
     "roadmap:update": "pnpm --filter @ai-team/worker exec tsx scripts/roadmap/cli.ts update",
     "roadmap:sync": "pnpm --filter @ai-team/worker exec tsx scripts/roadmap/cli.ts sync",
     "roadmap:check": "pnpm --filter @ai-team/worker exec tsx scripts/roadmap/cli.ts check",
+    "cross-task-audit": "pnpm --filter @ai-team/worker exec tsx scripts/crossTaskAudit/cli.ts",
     "verify": "pnpm -r typecheck && pnpm -r test && pnpm roadmap:check"
   },
   "engines": {
