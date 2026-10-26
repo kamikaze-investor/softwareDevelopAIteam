@@ -2,7 +2,7 @@
  * Design materiality の offline 評価（M5）。CI からは呼ばれず、判定にも影響しない。
  *
  * production の検出部品（apps/worker/src/metaReviewer/designMateriality.ts）をそのまま使い、
- * 再実装しない。provider は CI の Meta Review と同じ Gemini REST API（`callGeminiForReview`）。
+ * 再実装しない。provider は CI の Meta Review と同じ Gemini REST API・同じ生成設定（`callGeminiWithUsage`。usage を取るため）。
  * GEMINI_API_KEY は実行者が環境変数で渡す（この script は .env を読まない）。
  *
  * subcommands（`tsx apps/worker/scripts/designMaterialityEval.ts <cmd> --out <dir> ...`）:
@@ -12,7 +12,7 @@
  *   pack    --repo <path>   label 用 packet（diff・base 記録抜粋。detector の出力は含めない）を labels-input.jsonl に書く
  *   mutants --repo <path>   e405c7c7^ に対する mutant diff を mutants.json に書く
  *   plan    --repo <path>   API を呼ばずに、呼び出し件数と detection prompt の大きさを見積もる
- *   detect  --repo <path> [--min-interval-ms 20000] [--max-calls 60]
+ *   detect  --repo <path> [--min-interval-ms 20000] [--max-calls 60] [--yield-to-workflow meta-review.yml]
  *           frame の全件 + known positives + mutants を **逐次・間隔付き・上限付き**で検出し results.jsonl に追記する。
  *           quota / 課金 / 認証の失敗が1回でも出たら即停止する（retry しない）。API の失敗は errors.jsonl に別記録する。
  *           上限で止まったら同じ引数で再実行すれば、同じ入力の済み run を飛ばして続きから進む
@@ -301,9 +301,110 @@ export interface DetectionRecord {
   /** cost: 待機時間と prompt の大きさ（detection + correctness） */
   latencyMs: number
   promptChars: number
+  /** API が返した token 数（detection + correctness の合計。無い記録は旧形式） */
+  usage?: TokenUsage
   /** API の失敗。検出結果（observation）とは別に記録し、unavailable が API 側か応答の形かを後で分ける */
   apiErrors: ApiErrorRecord[]
   observation: MaterialityObservation
+}
+
+export interface TokenUsage {
+  calls: number
+  promptTokens: number
+  /** 応答 token（candidates）。thinking を含む課金対象の出力は totalTokens - promptTokens */
+  candidatesTokens: number
+  totalTokens: number
+}
+
+export function emptyUsage(): TokenUsage {
+  return { calls: 0, promptTokens: 0, candidatesTokens: 0, totalTokens: 0 }
+}
+
+export function addUsage(into: TokenUsage, add: TokenUsage): void {
+  into.calls += add.calls
+  into.promptTokens += add.promptTokens
+  into.candidatesTokens += add.candidatesTokens
+  into.totalTokens += add.totalTokens
+}
+
+/**
+ * CI Meta Review の `callGeminiForReview`（geminiClient.ts）と **同じ設定**で呼び、token 使用量も返す。
+ * geminiClient は本文だけを返し usage を捨てるため、費用の実測にはここで SDK を直接呼ぶ。
+ * 設定（REST API・temperature 0.1・maxOutputTokens 8192・responseMimeType なし）を変えるときは両方を揃える。
+ * API key は環境変数 GEMINI_API_KEY からだけ読み、記録にもログにも出さない。
+ */
+export async function callGeminiWithUsage(
+  prompt: string,
+  model: string,
+  opts: { timeoutMs?: number } = {},
+): Promise<{ text: string; usage: TokenUsage }> {
+  const apiKey = process.env.GEMINI_API_KEY
+  if (!apiKey) throw new Error('GEMINI_API_KEY is not configured')
+  const { GoogleGenerativeAI } = await import('@google/generative-ai')
+  const client = new GoogleGenerativeAI(apiKey).getGenerativeModel({
+    model,
+    generationConfig: { temperature: 0.1, maxOutputTokens: 8192 },
+  })
+  // client 側の timeout で request を打ち切る（observeDesignMateriality の待機上限より短くし、待つのをやめた request が残らないようにする）
+  const result = await client.generateContent(prompt, opts.timeoutMs === undefined ? undefined : { timeout: opts.timeoutMs })
+  const text = result.response.text()
+  if (!text) throw new Error('Gemini returned an empty response')
+  const meta = result.response.usageMetadata
+  return {
+    text,
+    usage: {
+      calls: 1,
+      promptTokens: meta?.promptTokenCount ?? 0,
+      candidatesTokens: meta?.candidatesTokenCount ?? 0,
+      totalTokens: meta?.totalTokenCount ?? 0,
+    },
+  }
+}
+
+/** client 側の request timeout。detect は観測の待機上限をこれ + 呼び出し間隔 + 10s にする */
+export const PROVIDER_REQUEST_TIMEOUT_MS = 60_000
+
+export type FetchLike = (url: string, init: { headers: Record<string, string> }) => Promise<{ ok: boolean; json(): Promise<unknown> }>
+
+/**
+ * 同じ key を使う workflow（CI Meta Review）が queued / in_progress の間は呼び出しを待つ（上限付き）。
+ * 共有 quota を本番 CI と同時に使わないための譲り合いで、**safety gate ではない**: 確認に失敗したら待たずに進む。
+ * GITHUB_REPOSITORY / GITHUB_TOKEN が無い（ローカル実行）なら何もしない。
+ */
+export async function yieldToWorkflow(
+  workflowFile: string,
+  opts: { fetchImpl?: FetchLike; pollMs?: number; maxWaitMs?: number; log?: (line: string) => void } = {},
+): Promise<{ waitedMs: number; reason: 'idle' | 'max_wait' | 'check_failed' | 'not_configured' }> {
+  const repo = process.env.GITHUB_REPOSITORY
+  const token = process.env.GITHUB_TOKEN
+  if (!repo || !token) return { waitedMs: 0, reason: 'not_configured' }
+  const fetchImpl = opts.fetchImpl ?? (fetch as unknown as FetchLike)
+  const pollMs = opts.pollMs ?? 30_000
+  const maxWaitMs = opts.maxWaitMs ?? 15 * 60_000
+  const started = Date.now()
+  const busy = async (): Promise<boolean | undefined> => {
+    try {
+      let total = 0
+      for (const status of ['queued', 'in_progress']) {
+        const res = await fetchImpl(`https://api.github.com/repos/${repo}/actions/workflows/${workflowFile}/runs?status=${status}&per_page=1`, {
+          headers: { authorization: `Bearer ${token}`, accept: 'application/vnd.github+json' },
+        })
+        if (!res.ok) return undefined
+        total += Number((await res.json() as { total_count?: number }).total_count ?? 0)
+      }
+      return total > 0
+    } catch {
+      return undefined
+    }
+  }
+  for (;;) {
+    const state = await busy()
+    if (state === undefined) return { waitedMs: Date.now() - started, reason: 'check_failed' }
+    if (!state) return { waitedMs: Date.now() - started, reason: 'idle' }
+    if (Date.now() - started >= maxWaitMs) return { waitedMs: Date.now() - started, reason: 'max_wait' }
+    opts.log?.(`waiting: ${workflowFile} is running`)
+    await new Promise((r) => setTimeout(r, pollMs))
+  }
 }
 
 export interface PromptVersion { detection: string; evaluation: string }
@@ -661,29 +762,48 @@ async function main(): Promise<void> {
     // quota / 課金 / 認証の失敗が1回でも出たら即停止（retry しない。共有 quota を食い潰さない）
     const minIntervalMs = Number(a['min-interval-ms'] ?? '20000')
     const maxCalls = Number(a['max-calls'] ?? '60')
-    const { callGeminiForReview } = await import('../src/metaReviewer/geminiClient.js')
     const { sanitizeMessage } = await import('../src/metaReviewer/geminiRouter.js')
     let calls = 0
     let lastCallAt = 0
     let stopReason: string | undefined
-    let current: { stageIndex: number; apiErrors: ApiErrorRecord[]; promptChars: number } = { stageIndex: 0, apiErrors: [], promptChars: 0 }
-    const provider: ReviewProvider = async (prompt) => {
-      const wait = lastCallAt + minIntervalMs - Date.now()
-      if (wait > 0) await new Promise((r) => setTimeout(r, wait))
-      lastCallAt = Date.now()
-      calls++
-      const stage = current.stageIndex++ === 0 ? 'detection' : 'evaluation'
-      current.promptChars += prompt.length
-      try {
-        return await callGeminiForReview(prompt, model)
-      } catch (err) {
-        const message = sanitizeMessage(err instanceof Error ? err.message : String(err))
-        const classified = classifyApiError(message)
-        current.apiErrors.push({ stage, ...classified, message })
-        if (classified.errorClass === 'quota' || classified.errorClass === 'auth') stopReason = `${classified.errorClass} error at ${stage}`
-        throw err
-      }
+    let current: { stageIndex: number; apiErrors: ApiErrorRecord[]; promptChars: number; usage: TokenUsage } = { stageIndex: 0, apiErrors: [], promptChars: 0, usage: emptyUsage() }
+    const yieldTo = a['yield-to-workflow']
+    // **同時実行1を client 側でも保証する。** provider 呼び出し全体（間隔待ち + request）を1つの in-flight として扱い、
+    // 観測が待つのをやめた（timeout）呼び出しが残っていれば、次を始める前に決着を待つ
+    let inflight: Promise<unknown> = Promise.resolve()
+    const provider: ReviewProvider = (prompt) => {
+      // 記録先はこの呼び出しを始めた時点の観測。遅れて決着しても後の観測を汚さない
+      const ctx = current
+      const stage: ApiErrorRecord['stage'] = ctx.stageIndex++ === 0 ? 'detection' : 'evaluation'
+      const previous = inflight
+      const run = (async () => {
+        await previous.catch(() => undefined)
+        if (stopReason) {
+          ctx.apiErrors.push({ stage, errorClass: 'other', httpStatus: null, message: `not sent: ${stopReason}` })
+          throw new Error(`not sent: ${stopReason}`)
+        }
+        const wait = lastCallAt + minIntervalMs - Date.now()
+        if (wait > 0) await new Promise((r) => setTimeout(r, wait))
+        lastCallAt = Date.now()
+        calls++
+        ctx.promptChars += prompt.length
+        try {
+          const { text, usage } = await callGeminiWithUsage(prompt, model, { timeoutMs: PROVIDER_REQUEST_TIMEOUT_MS })
+          addUsage(ctx.usage, usage)
+          return text
+        } catch (err) {
+          const message = sanitizeMessage(err instanceof Error ? err.message : String(err))
+          const classified = classifyApiError(message)
+          ctx.apiErrors.push({ stage, ...classified, message })
+          if (classified.errorClass === 'quota' || classified.errorClass === 'auth') stopReason = `${classified.errorClass} error at ${stage}`
+          throw err
+        }
+      })()
+      inflight = run
+      return run
     }
+    // 観測の待機上限は「間隔待ち + request timeout」より長くする（通常の呼び出しを timeout 扱いにしない）
+    const observationTimeoutMs = minIntervalMs + PROVIDER_REQUEST_TIMEOUT_MS + 10_000
     // 再開は **同じ入力**の run だけを済みとみなす（model や prompt を変えて再開すると別の run として足される）
     const done = new Set(existsSync(file('results.jsonl'))
       ? readFileSync(file('results.jsonl'), 'utf-8').split('\n').filter(Boolean).map((l) => {
@@ -695,22 +815,29 @@ async function main(): Promise<void> {
     for (const w of work) {
       const fingerprint = inputFingerprint({ model, detection: instructions.detection, evaluation: instructions.evaluation, title: w.title, diff: w.diff, base: w.base })
       if (done.has(`${w.kind}:${w.itemId}:${w.run}:${fingerprint}`)) { skipped++; continue }
+      await inflight.catch(() => undefined)
       if (stopReason) break
       // detection + correctness の2本を使い切れない残りでは始めない（途中で止めて半端な run を残さない）
       if (calls + 2 > maxCalls) { stopReason = `call budget ${maxCalls} reached`; break }
-      current = { stageIndex: 0, apiErrors: [], promptChars: 0 }
+      // CI Meta Review が走っている間は item を始めない（時間を測られる provider 呼び出しの外で待つ）
+      if (yieldTo) {
+        const y = await yieldToWorkflow(yieldTo, { log: (line) => console.log(line) })
+        if (y.waitedMs > 0 || y.reason !== 'idle') console.log(`yield: ${y.reason} after ${Math.round(y.waitedMs / 1000)}s`)
+      }
+      current = { stageIndex: 0, apiErrors: [], promptChars: 0, usage: emptyUsage() }
       const started = Date.now()
       const observation = await observeDesignMateriality({
         title: w.title, diff: w.diff, records: gitRecordReader(repo, w.base),
         detectionInstructions: instructions.detection, evaluationInstructions: instructions.evaluation,
-      }, provider)
+      }, provider, observationTimeoutMs)
       const entry: DetectionRecord = {
         itemId: w.itemId, kind: w.kind, run: w.run, model, promptVersion: promptVersion(instructions),
         inputFingerprint: fingerprint, latencyMs: Date.now() - started, promptChars: current.promptChars,
-        apiErrors: current.apiErrors, observation,
+        usage: current.usage, apiErrors: current.apiErrors, observation,
       }
-      // quota / 認証で止めた run は検出結果として残さない（API の失敗であって「未検出」ではない）。errors.jsonl にだけ残す
-      if (stopReason && current.apiErrors.some((e) => e.errorClass === 'quota' || e.errorClass === 'auth')) {
+      // quota / 認証で止まった後に終わった run は検出結果に入れない（API 側の失敗であって「未検出」ではない）
+      await inflight.catch(() => undefined)
+      if (stopReason) {
         appendFileSync(file('errors.jsonl'), `${JSON.stringify(entry)}\n`)
         break
       }
@@ -749,6 +876,8 @@ async function main(): Promise<void> {
         promptCharsP50: percentile(records.map((r) => r.promptChars), 0.5),
         promptCharsP95: percentile(records.map((r) => r.promptChars), 0.95),
         evaluationCallRate: records.length === 0 ? null : records.filter((r) => r.observation.evaluationPromptHash !== undefined).length / records.length,
+        // 実測の token 数（API が返した usageMetadata）。費用はこの合計に単価を掛けて報告側で出す
+        usage: records.reduce((u, r) => { if (r.usage) addUsage(u, r.usage); return u }, emptyUsage()),
       },
       historical: scoreFrame(frame, labels, records),
       repeatability: {

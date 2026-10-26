@@ -1,10 +1,15 @@
 import { describe, expect, it } from 'vitest'
-import type { MaterialityObservation } from '../src/metaReviewer/designMateriality.js'
+import { OBSERVATION_TIMEOUT_MS, type MaterialityObservation } from '../src/metaReviewer/designMateriality.js'
 import {
+  addUsage,
   buildFrame,
+  callGeminiWithUsage,
+  emptyUsage,
   classifyApiError,
   correctnessFlags,
   promptVersion,
+  PROVIDER_REQUEST_TIMEOUT_MS,
+  yieldToWorkflow,
   inputFingerprint,
   runState,
   sampleWithoutReplacement,
@@ -220,4 +225,68 @@ describe('correctnessFlags（狭い予測）', () => {
   it('評価が得られていない run は false', () => {
     expect(correctnessFlags(obs('removes', { responsibility: 'lost' }, 'unavailable'))).toBe(false)
   })
+})
+
+describe('token usage', () => {
+  it('addUsage は合計する', () => {
+    const u = emptyUsage()
+    addUsage(u, { calls: 1, promptTokens: 100, candidatesTokens: 20, totalTokens: 150 })
+    addUsage(u, { calls: 1, promptTokens: 10, candidatesTokens: 2, totalTokens: 15 })
+    expect(u).toEqual({ calls: 2, promptTokens: 110, candidatesTokens: 22, totalTokens: 165 })
+  })
+
+  it('callGeminiWithUsage は key が無ければ API を呼ばずに失敗し、その失敗は auth に分類される', async () => {
+    const saved = process.env.GEMINI_API_KEY
+    delete process.env.GEMINI_API_KEY
+    try {
+      await expect(callGeminiWithUsage('p', 'm')).rejects.toThrow('GEMINI_API_KEY is not configured')
+      expect(classifyApiError('GEMINI_API_KEY is not configured').errorClass).toBe('auth')
+    } finally {
+      if (saved !== undefined) process.env.GEMINI_API_KEY = saved
+    }
+  })
+})
+
+describe('yieldToWorkflow（共有 key の譲り合い。safety gate ではない）', () => {
+  const env = { GITHUB_REPOSITORY: process.env.GITHUB_REPOSITORY, GITHUB_TOKEN: process.env.GITHUB_TOKEN }
+  const restore = () => {
+    for (const [k, v] of Object.entries(env)) if (v === undefined) delete process.env[k]; else process.env[k] = v
+  }
+  const fake = (counts: number[]) => {
+    let i = 0
+    return async () => ({ ok: true, json: async () => ({ total_count: counts[Math.min(i++, counts.length - 1)] }) })
+  }
+
+  it('GitHub の設定が無ければ待たない', async () => {
+    delete process.env.GITHUB_REPOSITORY
+    try { await expect(yieldToWorkflow('meta-review.yml')).resolves.toEqual({ waitedMs: 0, reason: 'not_configured' }) } finally { restore() }
+  })
+
+  it('run が無くなるまで待つ', async () => {
+    process.env.GITHUB_REPOSITORY = 'o/r'; process.env.GITHUB_TOKEN = 't'
+    try {
+      // queued, in_progress の順に問い合わせる: 1回目は in_progress=1、2回目は両方 0
+      const result = await yieldToWorkflow('meta-review.yml', { fetchImpl: fake([0, 1, 0, 0]), pollMs: 1 })
+      expect(result.reason).toBe('idle')
+    } finally { restore() }
+  })
+
+  it('上限まで待っても終わらなければ進む', async () => {
+    process.env.GITHUB_REPOSITORY = 'o/r'; process.env.GITHUB_TOKEN = 't'
+    try {
+      await expect(yieldToWorkflow('meta-review.yml', { fetchImpl: fake([1]), pollMs: 1, maxWaitMs: 5 })).resolves.toMatchObject({ reason: 'max_wait' })
+    } finally { restore() }
+  })
+
+  it('確認に失敗したら待たずに進む', async () => {
+    process.env.GITHUB_REPOSITORY = 'o/r'; process.env.GITHUB_TOKEN = 't'
+    try {
+      const failing = async () => { throw new Error('network') }
+      await expect(yieldToWorkflow('meta-review.yml', { fetchImpl: failing })).resolves.toMatchObject({ reason: 'check_failed' })
+    } finally { restore() }
+  })
+})
+
+it('client 側の request timeout は、最小間隔と足しても既定の観測待機上限より短い', () => {
+  expect(20_000 + PROVIDER_REQUEST_TIMEOUT_MS).toBeLessThan(OBSERVATION_TIMEOUT_MS)
 })
