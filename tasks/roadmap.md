@@ -10409,6 +10409,60 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       **再評価（`observation-closes-loop`）**: 3 回目の監査記録に「仕組みの評価」節を置き、
       発火回数・finding の採用率（false positive）・escaped・コストから、継続 / 発火条件の変更 / 集計 script の要否 / 廃止を決める。
 
+<!-- roadmap:id=codeowner-review-not-enforced-by-ruleset state=deferred -->
+0. [ ] **master Ruleset の code-owner review が GitHub で強制されていない（`required_approving_review_count=0`）** —
+      2026-10-26登録（PR #413 の merge 時に PL が実測。`deferred`: Safety boundary の設定変更なので CEO 判断。PL は自動採用しない）。
+
+      **実測（2026-10-26、bot `AIteamOS-bot` の read-only API）**:
+      - master Ruleset（id 17202177、enforcement=active、bypass_actors 無し、bot の `current_user_can_bypass=never`）は
+        `require_code_owner_review: true` だが `required_approving_review_count: 0`
+      - PR #413 は CODEOWNERS 対象の `AGENTS.md` を変更しているのに、review 0 件・required checks 成功の時点で
+        `mergeStateStatus=CLEAN` になり、`reviewDecision` は空（`REVIEW_REQUIRED` にならない）。
+        CODEOWNERS の構文エラーは 0 件（`codeowners/errors`）
+      - **実際に PR #413 は GitHub 上の review 0 件のまま bot が squash merge できた**（`112a7a5a`。CEO の承認は chat の MERGE_GO のみ）。つまり code-owner の承認なしで bot が merge できる。identity 分離（2026-10-20）以降に merge された
+        CODEOWNERS 対象 PR（#379・#394・#406・#408・#411・#414）はすべて CEO の APPROVED review が付いており、
+        例外は #413 だけで、CEO の明示的な chat 承認（MERGE_GO）に基づく。承認の無い merge は観測されていない。**現状は運用慣行で守られている**
+
+      **なぜ問題か（既存決定どうしの不整合）**:
+      - 2026-10-08 CEO 決定（`.github/CODEOWNERS` 冒頭コメント・`autoReview.ts`）は、Meta Review の
+        `requiresCeoApproval` を「CODEOWNERS と Ruleset の code-owner review」に委ね、CODEOWNERS 対象が無い場合だけ
+        Meta Review 自身が fail closed する。**委ねた先が強制されていない**ので、Human Decision Authority の最終確認が
+        GitHub 上では任意になっている
+      - 一方、本ファイルの 2026-08 時点の記述（`project-auto-worker-trust-boundary` 付近「CODEOWNERS / classic branch
+        protection / Approval Gate の関係」）は `required_approving_review_count=0` での運用と「CODEOWNERS は文書化」を
+        前提にしており、10-08 決定で前提が変わった後に整合されていない
+
+      **選択肢（CEO 判断。AI credential は Ruleset を変更できない — 本ファイル 667 行付近の実測どおり）**:
+      - (A) count を 1 にする: CODEOWNERS 対象外の通常 PR にも承認が要り、AI の自律 merge が止まる（Priority 2 の autonomy KPI に逆行）
+      - (B) 「CODEOWNERS 対象の path を変える PR は、head SHA に code-owner の APPROVED review があること」を検査する
+        required status check を足す（workflow は CODEOWNERS 対象なので Code Owner が追加する）。通常 PR は止めない
+      - (C) 現状維持（慣行で守る）と明記し、10-08 決定の文言を「強制ではない」に合わせる
+
+      **PL の推奨**: (B)。Human Gate を増やさず、既に CEO が毎回行っている review を機械的に必須化するだけで、
+      CEO の操作回数は変わらない。
+
+<!-- roadmap:id=materiality-parser-greedy-json-reintroduced state=planned -->
+0. [ ] **#409 が除いた「最初の `{` から最後の `}`」JSON 抽出が、#406 の materiality parser で再導入され M5 の recall を黙って下げる** —
+      2026-10-26登録（Cross-Task Drift Audit `cross_task_audit_2026_10_26b.md` の `xta-97567fd-01`・`02`。PL が実行で再現済み）。
+
+      **確認された事実**:
+      - `apps/worker/src/metaReviewer/designMateriality.ts` の `extractJsonObject()` は最後の fence（言語不問）を取り、
+        `indexOf('{')`〜`lastIndexOf('}')` を `JSON.parse` する。正しい detection JSON の後ろに `}` が1つ付くと
+        `parseDetection()` は `no_json` を返す（2026-10-26 PL 実行で再現。#409 の commit message にある Production 応答形と同じ）
+      - parse 失敗は `unavailable` になり、M5 評価（`designMaterialityEval.ts`）では「検出しなかった」として数えられる
+      - 同じ意味（model 応答から JSON object を1つ取り出す）の owner は `packages/shared/src/firstJsonObject.ts` の
+        `parseFirstJsonObject()`（#409）。worker は既に `@ai-team/shared` に依存している
+      - 同じ class が `apps/api/src/pl/operatorRequestStep.ts`（2026-09-28 から）にも残る。adoption parser は #409 が意図的に範囲外にした
+
+      **方向**: `extractJsonObject()` を `parseFirstJsonObject()` への委譲にする（fence 選択の差は委譲側の仕様に合わせ、
+      M5 の既存 label・結果との比較可能性を記録する）。`operatorRequestStep.ts` も同じ owner へ寄せる。
+      **M5 評価を進めている作業と同じファイルなので、その作業の owner が着手するのが自然**（並行編集しない）。
+
+      **Acceptance Criteria**: 末尾に余分な `}` / 散文中の `{}` が付いた正しい応答が parse できる（テストで固定。修正前に失敗を確認）/
+      JSON 抽出の実装が shared の1つだけになる / M5 の結果に parse 修正前後の差を記録する。
+
+      **やらないこと**: parser 以外の detection・評価ロジックの変更。adoption parser の変更（#409 の範囲判断を維持）。
+
 <!-- roadmap:id=monitoring-tiering-watchdog-monitor-pl state=planned -->
 3. [ ] **監視責務の段階分離（Deterministic Watchdog → Lightweight Monitor → VPS PL）— VPS PL 完成後の最適化** — 2026-09-14登録。
       **【着手条件（CEO 指示・2026-09-14）: `vps-pl-execution-loop` の最小実装と VPS 上の実運用 E2E が
