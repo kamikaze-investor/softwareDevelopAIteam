@@ -28,14 +28,24 @@ export const OUTBOX_BLOCKED_ALERT_CYCLES = 3
  * 一致する eventId は「Job の結果は永続化された」ことの証明であって「continuation が進んでいる」ことの
  * 証明ではない。continuation が恒久的に壊れていても、この時間で必ず CRITICAL になる。
  * 正常な continuation（2026-09-11 実測 36 秒）の十数倍で、Design Review runner の期限（300 秒）を超える。
+ *
+ * **数え方**（独立レビュー round 2 指摘）:
+ * - 起点は滞留した最初の cycle の**開始**時刻（再送 batch の前）。batch が長くても起点はずれない
+ * - 経過時間は、評価ごとの差分のうち**正の分だけ**を積み上げる。壁時計が巻き戻っても、失うのは
+ *   その1回の差分だけで、以後は普通に進む（巻き戻し幅だけ通知が遅れることはない）。進む方向の
+ *   跳びは通知を早めるだけ（安全側）
+ * - 判定は再送 batch の後にしかできないので、上限は「この時間 + 最後の batch 1回分」である
+ *   （1行あたり最大 PATCH 3回 × 5 秒 + backoff 1.5 秒）。従来の 3 cycle 判定と同じ性質
  */
 export const OUTBOX_CONTINUATION_PENDING_ALERT_MS = 10 * 60 * 1000
 
 export interface OutboxAlertState {
   /** pending が連続して残った poll cycle 数。 */
   streak: number
-  /** この滞留が始まった時刻（ms）。滞留していなければ undefined。 */
-  stallStartedAtMs: number | undefined
+  /** この滞留で積み上げた経過時間（ms。正の差分だけの合計）。 */
+  elapsedMs: number
+  /** 最後に評価した時刻（ms）。滞留していなければ undefined。 */
+  lastEvaluatedAtMs: number | undefined
   /** この滞留の中で、continuation pending 以外の失敗が1回でもあったか。 */
   sawGenuineFailure: boolean
   /** この滞留で既に通知したか（1回の滞留につき1回だけ通知する）。 */
@@ -43,7 +53,7 @@ export interface OutboxAlertState {
 }
 
 export function initialOutboxAlertState(): OutboxAlertState {
-  return { streak: 0, stallStartedAtMs: undefined, sawGenuineFailure: false, alertSent: false }
+  return { streak: 0, elapsedMs: 0, lastEvaluatedAtMs: undefined, sawGenuineFailure: false, alertSent: false }
 }
 
 export interface OutboxResendCycle {
@@ -56,22 +66,31 @@ export interface OutboxResendCycle {
   onlyContinuationPending: boolean
 }
 
+/** この cycle の時刻。`cycleStartedAtMs` は再送 batch の前、`nowMs` は判定の時点。 */
+export interface OutboxCycleTiming {
+  cycleStartedAtMs: number
+  nowMs: number
+}
+
 export function nextOutboxAlertState(
   state: OutboxAlertState,
   cycle: OutboxResendCycle,
-  nowMs: number,
+  timing: OutboxCycleTiming,
 ): { state: OutboxAlertState; shouldAlert: boolean } {
   if (!cycle.pendingRemains) return { state: initialOutboxAlertState(), shouldAlert: false }
 
+  // 滞留の最初の cycle は batch の開始から数える。以後は前回の判定時刻から。
+  const previousMs = state.lastEvaluatedAtMs ?? timing.cycleStartedAtMs
   const next: OutboxAlertState = {
     streak: state.streak + 1,
-    stallStartedAtMs: state.stallStartedAtMs ?? nowMs,
+    elapsedMs: state.elapsedMs + Math.max(0, timing.nowMs - previousMs),
+    lastEvaluatedAtMs: timing.nowMs,
     sawGenuineFailure: state.sawGenuineFailure || !cycle.onlyContinuationPending,
     alertSent: state.alertSent,
   }
   const due = next.sawGenuineFailure
     ? next.streak >= OUTBOX_BLOCKED_ALERT_CYCLES
-    : nowMs - (next.stallStartedAtMs ?? nowMs) >= OUTBOX_CONTINUATION_PENDING_ALERT_MS
+    : next.elapsedMs >= OUTBOX_CONTINUATION_PENDING_ALERT_MS
   if (next.alertSent || !due) return { state: next, shouldAlert: false }
   return { state: { ...next, alertSent: true }, shouldAlert: true }
 }

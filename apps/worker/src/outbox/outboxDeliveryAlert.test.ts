@@ -15,8 +15,9 @@ function run(cycles: readonly OutboxResendCycle[], stepMs = 5_000): { alerts: nu
   let alerts = 0
   let nowMs = 1_000_000
   for (const cycle of cycles) {
+    const cycleStartedAtMs = nowMs
     nowMs += stepMs
-    const result = nextOutboxAlertState(state, cycle, nowMs)
+    const result = nextOutboxAlertState(state, cycle, { cycleStartedAtMs, nowMs })
     state = result.state
     if (result.shouldAlert) alerts += 1
   }
@@ -40,16 +41,51 @@ describe('nextOutboxAlertState', () => {
 
   it('continuation pending だけでも、滞留開始から 10 分を超えたら1回だけ CRITICAL（通知を消さない）', () => {
     const cyclesFor = (ms: number, stepMs: number): number => Math.floor(ms / stepMs)
-    // 最初の cycle が滞留開始。そこから 10 分未満なら鳴らない。
-    expect(run(Array(cyclesFor(OUTBOX_CONTINUATION_PENDING_ALERT_MS, 5_000)).fill(continuation)).alerts).toBe(0)
-    expect(run(Array(cyclesFor(OUTBOX_CONTINUATION_PENDING_ALERT_MS, 5_000) + 1).fill(continuation)).alerts).toBe(1)
+    // 起点は最初の cycle の開始。10 分に届く cycle で1回だけ鳴る。
+    expect(run(Array(cyclesFor(OUTBOX_CONTINUATION_PENDING_ALERT_MS, 5_000) - 1).fill(continuation)).alerts).toBe(0)
+    expect(run(Array(cyclesFor(OUTBOX_CONTINUATION_PENDING_ALERT_MS, 5_000)).fill(continuation)).alerts).toBe(1)
     expect(run(Array(cyclesFor(OUTBOX_CONTINUATION_PENDING_ALERT_MS, 5_000) + 50).fill(continuation)).alerts).toBe(1)
   })
 
   it('cycle が長くなっても（retry・backoff・pending 行の増加）上限は壁時計で決まる', () => {
     // 1 cycle 20 秒なら 10 分は 30 cycle。cycle 数の閾値だと 40 分かかっていた形。
-    expect(run(Array(30).fill(continuation), 20_000).alerts).toBe(0)
-    expect(run(Array(31).fill(continuation), 20_000).alerts).toBe(1)
+    expect(run(Array(29).fill(continuation), 20_000).alerts).toBe(0)
+    expect(run(Array(30).fill(continuation), 20_000).alerts).toBe(1)
+  })
+
+  it('最初の batch が 10 分を超えれば、最初の判定で鳴る（起点は batch の開始）', () => {
+    const first = nextOutboxAlertState(initialOutboxAlertState(), continuation, {
+      cycleStartedAtMs: 0,
+      nowMs: OUTBOX_CONTINUATION_PENDING_ALERT_MS + 1,
+    })
+    expect(first.shouldAlert).toBe(true)
+  })
+
+  it('壁時計が巻き戻っても、失うのはその1回の差分だけ（巻き戻し幅だけ遅れない）', () => {
+    let state = initialOutboxAlertState()
+    let alerted = false
+    let nowMs = 10_000_000
+    // 5 分進めたあと、時計を 1 時間巻き戻す。その後は 5 秒ずつ進む。
+    for (const [startDelta, step] of [[0, 300_000], [-3_600_000, 5_000]] as const) {
+      nowMs += startDelta
+      const cycleStartedAtMs = nowMs
+      nowMs += step
+      const r = nextOutboxAlertState(state, continuation, { cycleStartedAtMs, nowMs })
+      state = r.state
+      alerted ||= r.shouldAlert
+    }
+    let cycles = 0
+    while (!alerted && cycles < 200) {
+      const cycleStartedAtMs = nowMs
+      nowMs += 5_000
+      const r = nextOutboxAlertState(state, continuation, { cycleStartedAtMs, nowMs })
+      state = r.state
+      alerted = r.shouldAlert
+      cycles += 1
+    }
+    // 残り 5 分 = 60 cycle 前後で鳴る（巻き戻した 1 時間を待たない）。
+    expect(alerted).toBe(true)
+    expect(cycles).toBeLessThanOrEqual(61)
   })
 
   it('滞留の途中で本当の失敗が1回でも混じれば、従来の閾値に戻る', () => {

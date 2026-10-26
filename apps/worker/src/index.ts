@@ -1125,6 +1125,7 @@ export async function pollJobs(): Promise<never> {
         // 1件も再送しなかった・例外になった・別の失敗が混じった場合は本当の失敗として扱う。
         let resendCount = 0
         let onlyContinuationPending = true
+        const cycleStartedAtMs = Date.now()
         try {
           await outboxStore.resendPending(async (jobId, payload) => {
             const result = await patchJobWithRetry(jobId, payload)
@@ -1140,7 +1141,7 @@ export async function pollJobs(): Promise<never> {
         const alertDecision = nextOutboxAlertState(outboxAlert, {
           pendingRemains: outboxStore.hasPending(),
           onlyContinuationPending: resendCount > 0 && onlyContinuationPending,
-        }, Date.now())
+        }, { cycleStartedAtMs, nowMs: Date.now() })
         outboxAlert = alertDecision.state
         if (alertDecision.shouldAlert) await notifyOutboxDeliveryBlocked()
       } else {
