@@ -1173,7 +1173,21 @@ export async function pollJobs(): Promise<never> {
         }
       }
 
-      if (outboxStore.hasPending()) {
+      // **Outbox が読めないことも本当の配送失敗として扱う（fail-closed）。** 読めない（SQLite の lock・破損・I/O）
+      // まま下の汎用 catch へ抜けると、滞留の判定が一度も進まず CRITICAL が永久に出ない（独立レビュー指摘）。
+      // 読めない間は「pending が残っている」とみなして queued Job を取らない（従来も例外でこの cycle を飛ばしていた）。
+      let outboxReadFailed = false
+      const outboxHasPending = (): boolean => {
+        try {
+          return outboxStore.hasPending()
+        } catch (err: unknown) {
+          outboxReadFailed = true
+          console.error(`[Worker] Outbox読み取りエラー: ${formatUnknownError(err)}。配送できていないものとして扱います`)
+          return true
+        }
+      }
+
+      if (outboxHasPending()) {
         console.warn('[Worker] Pending Outbox events remain; skipping queued Job fetch for this poll cycle.')
         // 稼働中も未送信結果を再送する。新しいscheduler/watchdog/retry frameworkは追加せず、
         // 既存のpoll cycleに相乗りする。
@@ -1195,9 +1209,10 @@ export async function pollJobs(): Promise<never> {
           console.error(`[Worker] Outbox再送エラー: ${formatUnknownError(err)}。次のpollで再試行します`)
         }
 
+        const pendingRemains = outboxHasPending()
         const alertDecision = nextOutboxAlertState(outboxAlert, {
-          pendingRemains: outboxStore.hasPending(),
-          onlyContinuationPending: resendCount > 0 && onlyContinuationPending,
+          pendingRemains,
+          onlyContinuationPending: !outboxReadFailed && resendCount > 0 && onlyContinuationPending,
         }, { cycleStartedAtMs, nowMs: Date.now() })
         outboxAlert = alertDecision.state
         if (alertDecision.shouldAlert) await notifyOutboxDeliveryBlocked()

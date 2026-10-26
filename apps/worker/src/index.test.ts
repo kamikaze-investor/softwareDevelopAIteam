@@ -2022,3 +2022,25 @@ describe('continuation の報告が取れない状態 — 取れないこと自�
     expect(titles().filter((title) => title === 'Task continuation progress cannot be verified')).toHaveLength(1)
   })
 })
+
+describe('Outbox が読めない状態も本当の配送失敗として 3 cycle で CRITICAL', () => {
+  it('hasPending() が毎回 throw しても、汎用 catch に吸われず CRITICAL を1回出す', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockImplementation(async (url: string | URL | Request) => (
+      String(url).includes('/api/task-continuations/reconcile')
+        ? new Response(JSON.stringify({ accepted: true, continuations: [] }), { status: 202 })
+        : new Response(JSON.stringify([]), { status: 200 })
+    ))
+    outboxMocks.hasPending.mockImplementation(() => { throw new Error('SQLITE_BUSY: database is locked') })
+    outboxMocks.resendPending.mockRejectedValue(new Error('SQLITE_BUSY: database is locked'))
+
+    void pollJobs()
+    await flushPollCycle()
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST * 4)
+
+    const blocked = notifierMocks.sendAlert.mock.calls
+      .filter(([payload]) => (payload as { title?: string }).title === 'Worker Outbox resend is blocked')
+    expect(blocked).toHaveLength(1)
+  })
+})
