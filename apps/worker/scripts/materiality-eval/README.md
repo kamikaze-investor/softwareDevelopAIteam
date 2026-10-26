@@ -12,13 +12,12 @@ They were frozen **before** any detector run, and the detector never reads them.
 
 ## Running M5 (manual workflow)
 
-`materiality-eval.workflow.yml` is the reviewed workflow for running `detect` on the existing `GEMINI_API_KEY` repo secret. It has gone through three independent review rounds and the last one approved it.
+`detect` runs in a manually dispatched GitHub Actions workflow (`.github/workflows/materiality-eval.yml`) that uses the existing Gemini API key repo secret. That workflow went through three independent review rounds and the last one approved it.
 
-The AI bot's GitHub token deliberately has no `workflow` scope, so a human (the Code Owner) installs the file:
+The workflow file is **not part of this directory**. The AI bot's GitHub token deliberately has no `workflow` scope, so the Code Owner adds the reviewed file in a PR of their own.
 
-1. Copy the file unchanged to `.github/workflows/materiality-eval.yml` on master. The file is inert at its current path.
-2. Trial run: Actions → "Materiality M5 evaluation (manual)" → Run workflow with `max_calls` = 4.
-3. Full run: repeat with `max_calls` = 60, passing the previous run id as `previous_run_id` each time, until the step summary says `complete`.
+1. Trial run: Actions → "Materiality M5 evaluation (manual)" → Run workflow with `max_calls` = 4.
+2. Full run: repeat with `max_calls` = 60, passing the previous run id as `previous_run_id` each time, until the step summary says `complete`.
 
 **Bounds** (enforced by the workflow and the evaluator):
 - one run at a time;
@@ -27,4 +26,4 @@ The AI bot's GitHub token deliberately has no `workflow` scope, so a human (the 
 - an immediate stop on any quota, billing or auth error;
 - waiting while a Meta Review run is queued or in progress.
 
-The key reaches only the detect step. It never appears in logs, artifacts or results.
+The API key reaches only the detect step. It never appears in logs, artifacts or results.
