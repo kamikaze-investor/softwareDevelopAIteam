@@ -765,7 +765,7 @@ function attemptHistoryFor(storage: IStorage, targetKey: string): string[] {
 function isRemediableConflict(storage: IStorage, item: AttentionItem): boolean {
   if (item.kind !== 'task_ready_without_job' || item.taskId === undefined) return false
   // **予算判定は `selectConflictStage()` へ一本化する**（subject の有無もそこが見る）。
-  // 判定数と技術的失敗数は `classifyConflictRecoveryRow()` で分けて数え、どれかの stage が
+  // 判定数と技術的失敗数は `tallyConflictStage()` が Round 単位で分けて数え、どれかの stage が
   // まだ使えるなら対象にする。判定 0 件の runner_failed だけで対象外にしない（2026-10-23 `#2cae0d07`）。
   return selectConflictStage(storage, item.taskId).stage !== 'terminal'
 }
