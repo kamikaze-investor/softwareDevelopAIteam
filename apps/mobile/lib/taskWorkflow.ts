@@ -557,6 +557,9 @@ export interface DerivedQaEvidence {
   details: string
 }
 
+/** typecheck の実行内容を決めるファイル（package.json の script と tsconfig）。 */
+const VERIFICATION_DEFINITION_FILE = /(^|\/)(package\.json|tsconfig[^/]*\.json)$/
+
 /**
  * implement Job の **SafeCommand 実行結果**から QA 事実を導く。
  *
@@ -584,6 +587,42 @@ export function deriveSafeCommandQaEvidence(implementJob: Job): DerivedQaEvidenc
     + ` exitCode=${implementJob.exitCode}.`
     + ' Worker が AI CLI 終了後に別途実行した結果であり、実装 AI の自己申告ではない。'
     + (implementJob.stdoutPath ? ` 完全なログ: ${implementJob.stdoutPath}` : '')
+
+  // `verificationProfile: 'implement'` の Job は Worker が `verify:implement`
+  // （typecheck → test。typecheck 失敗時は test へ進まない）を実行しており、exitCode 0 は両方の成功を意味する。
+  // profile の無い Job（導入前の Job を含む）は従来どおり typecheck を主張しない。
+  if (implementJob.safeCommand.params?.verificationProfile === 'implement') {
+    const profileEvidence = `${evidence} verificationProfile=implement (pnpm run verify:implement).`
+    // `verify:implement` と typecheck の中身は workspace の package.json / tsconfig で決まる。
+    // この Job 自身がそれらを変えていたら、走ったのが本来の typecheck だとは言えない（独立レビュー指摘）。
+    const verificationDefinitionChanged = (implementJob.changedFiles ?? [])
+      .filter((file) => VERIFICATION_DEFINITION_FILE.test(file.replace(/\\/g, '/')))
+    return [
+      {
+        jobId: implementJob.id,
+        type: 'unit_test',
+        status: 'passed',
+        summary: 'Worker SafeCommand (kind=test, profile=implement) passed',
+        details: profileEvidence,
+      },
+      verificationDefinitionChanged.length === 0
+        ? {
+            jobId: implementJob.id,
+            type: 'typecheck',
+            status: 'passed',
+            summary: 'Worker SafeCommand (kind=test, profile=implement) passed typecheck',
+            details: profileEvidence,
+          }
+        : {
+            jobId: implementJob.id,
+            type: 'typecheck',
+            status: 'skipped',
+            summary: 'Typecheck result not claimed: this Job changed the verification definition',
+            details: `${profileEvidence} この Job が ${verificationDefinitionChanged.join(', ')} を変更しているため、`
+              + '実行された script が本来の typecheck であったとは Job レコードから言えない。',
+          },
+    ]
+  }
 
   return [
     {
