@@ -48,6 +48,7 @@ import { buildApiAuthHeaders } from './utils/apiAuth.js'
 import { startWatchdog } from './watchdog/watchdog.js'
 import { sendAlert } from './notifier/notifier.js'
 import * as outboxStore from './outbox/outboxStore.js'
+import { initialOutboxAlertState, isContinuationPendingResponse, nextOutboxAlertState } from './outbox/outboxDeliveryAlert.js'
 
 const API_BASE = process.env.API_BASE_URL ?? 'http://localhost:3000'
 const POLL_INTERVAL_MS = readPollInterval()
@@ -518,6 +519,11 @@ export interface PatchJobResult {
    * 応答が失われた場合とは違い、Job は API 側で queued のまま確定している。
    */
   refusedCode?: typeof JOB_CLAIM_REFUSED_CODE
+  /**
+   * 最後の応答が「受理済み・continuation pending」の 503 だった（`isContinuationPendingResponse`）。
+   * event は Outbox に保持されたまま再送される。滞留通知の閾値を分けるためだけに使う。
+   */
+  continuationPending?: boolean
 }
 
 /**
@@ -541,8 +547,11 @@ export async function patchJobWithRetry(
   const sleepImpl = options.sleepImpl ?? sleep
   const backoffMs = options.backoffMs ?? PATCH_BACKOFF_MS
   const requestBody = JSON.stringify(payload)
+  const sentEventId = (payload as { eventId?: unknown }).eventId
+  let lastContinuationPending = false
 
   for (let attempt = 0; attempt < 3; attempt += 1) {
+    lastContinuationPending = false
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? PATCH_TIMEOUT_MS)
     try {
@@ -581,6 +590,20 @@ export async function patchJobWithRetry(
         }
         if (code === JOB_CLAIM_REFUSED_CODE) return { ok: false, refusedCode: JOB_CLAIM_REFUSED_CODE }
       }
+      // continuation pending の 503 は従来どおり retry する（挙動は変えない）。分類だけを残す。
+      if (response.status === 503) {
+        let body: unknown
+        try {
+          body = await response.json()
+        } catch {
+          body = undefined
+        }
+        lastContinuationPending = isContinuationPendingResponse(
+          503,
+          body,
+          typeof sentEventId === 'string' ? sentEventId : undefined,
+        )
+      }
     } catch {
       // A network error and an AbortController timeout are both retryable here.
     } finally {
@@ -592,7 +615,7 @@ export async function patchJobWithRetry(
     }
   }
 
-  return { ok: false }
+  return lastContinuationPending ? { ok: false, continuationPending: true } : { ok: false }
 }
 
 /** 既存のテストダブルが素の boolean を返すのを壊さないため、両方を受け付ける。 */
@@ -1069,8 +1092,8 @@ export async function reconcileSupervisedRuns(): Promise<void> {
 export async function pollJobs(): Promise<never> {
   // pendingが連続して残ったpoll cycle数。起動直後もこの1ループに合流するため、
   // startup専用の別ループは持たない（start()は本関数を即座に呼ぶだけ）。
-  let pendingOutboxStreak = 0
-  let pendingOutboxAlertSent = false
+  // 滞留通知の判定は `outbox/outboxDeliveryAlert.ts` の純粋関数に置く（continuation pending の 503 は想定内）。
+  let outboxAlert = initialOutboxAlertState()
 
   while (true) {
     try {
@@ -1098,25 +1121,30 @@ export async function pollJobs(): Promise<never> {
         // 稼働中も未送信結果を再送する。新しいscheduler/watchdog/retry frameworkは追加せず、
         // 既存のpoll cycleに相乗りする。
         // 1 pollにつき1 resend batch。失敗時はpendingを保持し、tight loopせず次pollで再試行する。
+        // この cycle の再送がすべて「受理済み・continuation pending」の 503 だったかを数える。
+        // 1件も再送しなかった・例外になった・別の失敗が混じった場合は本当の失敗として扱う。
+        let resendCount = 0
+        let onlyContinuationPending = true
         try {
-          await outboxStore.resendPending(async (jobId, payload) => (await patchJobWithRetry(jobId, payload)).ok)
+          await outboxStore.resendPending(async (jobId, payload) => {
+            const result = await patchJobWithRetry(jobId, payload)
+            resendCount += 1
+            if (!result.ok && result.continuationPending !== true) onlyContinuationPending = false
+            return result.ok
+          })
         } catch (err: unknown) {
+          onlyContinuationPending = false
           console.error(`[Worker] Outbox再送エラー: ${formatUnknownError(err)}。次のpollで再試行します`)
         }
 
-        if (outboxStore.hasPending()) {
-          pendingOutboxStreak += 1
-          if (pendingOutboxStreak >= 3 && !pendingOutboxAlertSent) {
-            pendingOutboxAlertSent = true
-            await notifyOutboxDeliveryBlocked()
-          }
-        } else {
-          pendingOutboxStreak = 0
-          pendingOutboxAlertSent = false
-        }
+        const alertDecision = nextOutboxAlertState(outboxAlert, {
+          pendingRemains: outboxStore.hasPending(),
+          onlyContinuationPending: resendCount > 0 && onlyContinuationPending,
+        })
+        outboxAlert = alertDecision.state
+        if (alertDecision.shouldAlert) await notifyOutboxDeliveryBlocked()
       } else {
-        pendingOutboxStreak = 0
-        pendingOutboxAlertSent = false
+        outboxAlert = initialOutboxAlertState()
         // **abort_task の cleanup 要求を先に処理する。**
         // 対象 Job は所有権を保持しているので、どのみち `fetchQueuedJob()` は何も返さない。
         // 先に観測を報告して所有権を解放できるようにしておく。

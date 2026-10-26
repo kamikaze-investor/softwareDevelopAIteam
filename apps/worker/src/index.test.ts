@@ -1737,3 +1737,72 @@ describe('P1 Phase 2: containment 失敗時の quarantine（B3）', () => {
     })).rejects.toThrow('unrelated bug')
   })
 })
+
+describe('Outbox 滞留通知 — continuation pending の 503 は想定内（outbox-blocked-critical-false-alarm）', () => {
+  const continuation503 = (eventId: string): Response => new Response(
+    JSON.stringify({ id: 'job-1', status: 'success', outbox: { eventId, deduplicated: false } }),
+    { status: 503 },
+  )
+
+  it('送った eventId を返す 503 は continuationPending として返す（retry は従来どおり）', async () => {
+    fetchMock.mockImplementation(async () => continuation503('e1'))
+
+    const result = await retryingPatchJob()('job-1', { status: 'success', eventId: 'e1', payloadHash: 'h' } as never)
+
+    expect(result).toEqual({ ok: false, continuationPending: true })
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+  })
+
+  it('eventId を伴わない 503（proxy・障害）は continuationPending にしない', async () => {
+    fetchMock.mockImplementation(async () => new Response(JSON.stringify({ error: 'Service Unavailable' }), { status: 503 }))
+
+    const result = await retryingPatchJob()('job-1', { status: 'success', eventId: 'e1', payloadHash: 'h' } as never)
+
+    expect(result).toEqual({ ok: false })
+  })
+
+  it('再送がすべて continuation pending の 503 なら、正常な continuation の長さ（7 cycle）では CRITICAL を出さない', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockImplementation(async (url: string | URL | Request) => (
+      String(url).includes('/api/jobs/job-1') ? continuation503('e1') : new Response(JSON.stringify([]), { status: 200 })
+    ))
+    outboxMocks.hasPending.mockReturnValue(true)
+    outboxMocks.resendPending.mockImplementation(async (patchFn: (id: string, p: unknown) => Promise<boolean>) => {
+      await patchFn('job-1', { status: 'success', eventId: 'e1', payloadHash: 'h' })
+    })
+
+    void pollJobs()
+    await flushPollCycle()
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST * 7)
+    await Promise.resolve()
+
+    expect(notifierMocks.sendAlert).not.toHaveBeenCalled()
+    // 従来の閾値（3 cycle）を十分に超えて滞留しても鳴らない（retry の backoff も fake timer を消費する）。
+    expect(outboxMocks.resendPending.mock.calls.length).toBeGreaterThan(3)
+  })
+
+  it('本当の配送失敗（eventId の無い 503）は従来どおり 3 cycle で CRITICAL', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockImplementation(async (url: string | URL | Request) => (
+      String(url).includes('/api/jobs/job-1')
+        ? new Response(JSON.stringify({ error: 'down' }), { status: 503 })
+        : new Response(JSON.stringify([]), { status: 200 })
+    ))
+    outboxMocks.hasPending.mockReturnValue(true)
+    outboxMocks.resendPending.mockImplementation(async (patchFn: (id: string, p: unknown) => Promise<boolean>) => {
+      await patchFn('job-1', { status: 'success', eventId: 'e1', payloadHash: 'h' })
+    })
+
+    void pollJobs()
+    await flushPollCycle()
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST * 3)
+    await Promise.resolve()
+
+    expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(1)
+    expect(notifierMocks.sendAlert).toHaveBeenCalledWith(
+      expect.objectContaining({ severity: 'critical', title: 'Worker Outbox resend is blocked' }),
+    )
+  })
+})
