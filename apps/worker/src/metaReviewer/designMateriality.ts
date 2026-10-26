@@ -507,12 +507,18 @@ export function parseDetection(raw: string, signals: readonly MaterialitySignal[
   if (!Array.isArray(json.candidates) || !Array.isArray(json.signalDisposition)) return { ok: false, reason: 'missing_arrays' }
 
   const candidates: MaterialityCandidate[] = []
-  for (const c of json.candidates as Array<Record<string, unknown>>) {
-    if (!c || !isString(c.id) || !oneOf(CANDIDATE_KINDS, c.kind) || !oneOf(CANDIDATE_SUBJECTS, c.subject)
-      || !isString(c.mechanism) || !isString(c.file) || !isString(c.evidence)) {
-      return { ok: false, reason: 'invalid_candidate' }
-    }
-    candidates.push({ id: c.id, kind: c.kind, subject: c.subject, mechanism: c.mechanism, file: c.file, evidence: c.evidence })
+  for (const raw of json.candidates as Array<Record<string, unknown>>) {
+    // model は subject が mechanism 以外だと説明を subject 名の key（"design_contract": "…" 等）に書くことがある
+    // （M5 trial 2026-10-26 で3件とも）。同じ内容なので、mechanism の key が**無いときだけ** mechanism として読む
+    const c = raw && !Object.hasOwn(raw, 'mechanism') && oneOf(CANDIDATE_SUBJECTS, raw.subject) && isString(raw[raw.subject])
+      ? { ...raw, mechanism: raw[raw.subject] }
+      : raw
+    // 採点に使う欄（id・kind・subject・mechanism・file・evidence。target 照合は mechanism + evidence を読む）は厳格
+    const bad = !c ? 'candidate' : !isString(c.id) ? 'id' : !oneOf(CANDIDATE_KINDS, c.kind) ? 'kind'
+      : !oneOf(CANDIDATE_SUBJECTS, c.subject) ? 'subject' : !isString(c.mechanism) ? 'mechanism'
+      : !isString(c.file) ? 'file' : !isString(c.evidence) ? 'evidence' : undefined
+    if (bad) return { ok: false, reason: `invalid_candidate:${bad}` }
+    candidates.push({ id: c.id as string, kind: c.kind as MaterialityCandidate['kind'], subject: c.subject as MaterialityCandidate['subject'], mechanism: c.mechanism as string, file: c.file as string, evidence: c.evidence as string })
   }
   if (json.material !== candidates.length > 0) return { ok: false, reason: 'material_mismatch' }
   const candidateIds = new Set(candidates.map((c) => c.id))
@@ -560,26 +566,28 @@ export function parseEvaluation(raw: string, candidates: readonly MaterialityCan
   const json = extractJsonObject(raw) as Record<string, unknown> | undefined
   if (!json || !Array.isArray(json.evaluations)) return { ok: false, reason: 'no_evaluations' }
   const out: CandidateEvaluation[] = []
+  // 判定の欄（candidateId・responsibility・recordConsistency・ceoDirectedProvenance）は厳格。
+  // newOwner と自由記述の所見は欠けてもよい（newOwner は null、所見は空文字にする）
+  const optionalText = (v: unknown) => v === undefined || v === null || typeof v === 'string'
   for (const e of json.evaluations as Array<Record<string, unknown>>) {
-    if (!e || !isString(e.candidateId) || !oneOf(RESPONSIBILITY, e.responsibility)
-      || !(e.newOwner === null || typeof e.newOwner === 'string')
-      || !oneOf(RECORD_CONSISTENCY, e.recordConsistency) || !oneOf(PROVENANCE, e.ceoDirectedProvenance)
-      || typeof e.provenanceEvidence !== 'string' || typeof e.correctness !== 'string'
-      || typeof e.simplicity !== 'string' || typeof e.naturalness !== 'string') {
-      return { ok: false, reason: 'invalid_evaluation' }
-    }
+    const bad = !e ? 'evaluation' : !isString(e.candidateId) ? 'candidateId' : !oneOf(RESPONSIBILITY, e.responsibility) ? 'responsibility'
+      : !optionalText(e.newOwner) ? 'newOwner' : !oneOf(RECORD_CONSISTENCY, e.recordConsistency) ? 'recordConsistency'
+      : !oneOf(PROVENANCE, e.ceoDirectedProvenance) ? 'ceoDirectedProvenance'
+      : !['provenanceEvidence', 'correctness', 'simplicity', 'naturalness'].every((k) => optionalText(e[k])) ? 'text_field' : undefined
+    if (bad) return { ok: false, reason: `invalid_evaluation:${bad}` }
     // moved は移り先を名指しできて初めて moved である
     if (e.responsibility === 'moved' && !isString(e.newOwner)) return { ok: false, reason: 'moved_without_owner' }
+    const text = (v: unknown) => (typeof v === 'string' ? v : '')
     out.push({
-      candidateId: e.candidateId,
-      responsibility: e.responsibility,
-      newOwner: e.newOwner as string | null,
-      recordConsistency: e.recordConsistency,
-      ceoDirectedProvenance: e.ceoDirectedProvenance,
-      provenanceEvidence: e.provenanceEvidence,
-      correctness: e.correctness,
-      simplicity: e.simplicity,
-      naturalness: e.naturalness,
+      candidateId: e.candidateId as string,
+      responsibility: e.responsibility as CandidateEvaluation['responsibility'],
+      newOwner: isString(e.newOwner) ? e.newOwner : null,
+      recordConsistency: e.recordConsistency as CandidateEvaluation['recordConsistency'],
+      ceoDirectedProvenance: e.ceoDirectedProvenance as CandidateEvaluation['ceoDirectedProvenance'],
+      provenanceEvidence: text(e.provenanceEvidence),
+      correctness: text(e.correctness),
+      simplicity: text(e.simplicity),
+      naturalness: text(e.naturalness),
     })
   }
   const ids = out.map((e) => e.candidateId)
@@ -614,7 +622,11 @@ export interface MaterialityObservation {
   evaluationPromptHash?: string
   detection?: DetectionResult
   evaluations?: CandidateEvaluation[]
+  /** 応答を解析できなかったときだけ、その応答の先頭（RAW_EXCERPT_CHARS まで）を残す。原因を後から確かめるため */
+  rawResponseExcerpt?: { stage: 'detection' | 'evaluation'; text: string }
 }
+
+export const RAW_EXCERPT_CHARS = 3_000
 
 export const OBSERVATION_TIMEOUT_MS = 90_000
 
@@ -665,7 +677,7 @@ export async function observeDesignMateriality(
     if (detectionRaw === TIMEOUT) return { ...observation, reason: 'timeout' }
     if (typeof detectionRaw !== 'string') return { ...observation, reason: 'provider_error' }
     const detection = parseDetection(detectionRaw, signals)
-    if (!detection.ok) return { ...observation, reason: `parse:${detection.reason}` }
+    if (!detection.ok) return { ...observation, reason: `parse:${detection.reason}`, rawResponseExcerpt: { stage: 'detection', text: detectionRaw.slice(0, RAW_EXCERPT_CHARS) } }
     if (detection.value.candidates.length === 0) return { ...observation, status: 'ok', detection: detection.value, evaluations: [] }
 
     const evaluationPrompt = buildEvaluationPrompt(input.evaluationInstructions, {
@@ -676,7 +688,7 @@ export async function observeDesignMateriality(
     if (evaluationRaw === TIMEOUT) return { ...withDetection, reason: 'evaluation_timeout' }
     if (typeof evaluationRaw !== 'string') return { ...withDetection, reason: 'evaluation_provider_error' }
     const evaluations = parseEvaluation(evaluationRaw, detection.value.candidates)
-    if (!evaluations.ok) return { ...withDetection, reason: `evaluation_parse:${evaluations.reason}` }
+    if (!evaluations.ok) return { ...withDetection, reason: `evaluation_parse:${evaluations.reason}`, rawResponseExcerpt: { stage: 'evaluation', text: evaluationRaw.slice(0, RAW_EXCERPT_CHARS) } }
     return { ...withDetection, status: 'ok', evaluations: evaluations.value }
   } catch {
     return { ...base(), reason: 'internal_error' }
