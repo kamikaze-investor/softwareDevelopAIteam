@@ -1954,3 +1954,46 @@ describe('poll cycle 先頭の reconcile 呼び出しに期限がある（応答
     await expect(reconcileSupervisedRuns()).resolves.toBeUndefined()
   })
 })
+
+describe('continuation の独立した backstop — API の「前進なし」報告で1回だけ CRITICAL', () => {
+  function reconcileReport(stuckForMs: number): Response {
+    return new Response(JSON.stringify({ accepted: true, continuations: [{ continuationId: 'c1', projectId: 'p', stuckForMs }] }), { status: 202 })
+  }
+
+  it('前進なしが 10 分以上の continuation は、何 cycle 続いても1回だけ通知する（Outbox が空でも鳴る）', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockImplementation(async (url: string | URL | Request) => (
+      String(url).includes('/api/task-continuations/reconcile')
+        ? reconcileReport(11 * 60 * 1000)
+        : new Response(JSON.stringify([]), { status: 200 })
+    ))
+    outboxMocks.hasPending.mockReturnValue(false)
+
+    void pollJobs()
+    await flushPollCycle()
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST * 3)
+
+    const stalled = notifierMocks.sendAlert.mock.calls
+      .filter(([payload]) => (payload as { title?: string }).title === 'Task continuation has made no verified progress')
+    expect(stalled).toHaveLength(1)
+    expect(stalled[0]?.[0]).toMatchObject({ severity: 'critical', sourceType: 'task_continuation', sourceId: 'c1' })
+  })
+
+  it('前進なしが 10 分未満なら通知しない', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockImplementation(async (url: string | URL | Request) => (
+      String(url).includes('/api/task-continuations/reconcile')
+        ? reconcileReport(9 * 60 * 1000)
+        : new Response(JSON.stringify([]), { status: 200 })
+    ))
+    outboxMocks.hasPending.mockReturnValue(false)
+
+    void pollJobs()
+    await flushPollCycle()
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST * 3)
+
+    expect(notifierMocks.sendAlert).not.toHaveBeenCalled()
+  })
+})

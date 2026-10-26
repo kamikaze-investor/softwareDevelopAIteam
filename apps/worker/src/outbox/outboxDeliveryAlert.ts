@@ -114,3 +114,49 @@ export function isContinuationPendingResponse(status: number, body: unknown, sen
   const outbox = (body as { outbox?: { eventId?: unknown } } | null | undefined)?.outbox
   return typeof outbox?.eventId === 'string' && outbox.eventId === sentEventId
 }
+
+/**
+ * API が reconcile 応答で返す、running Project の pending continuation 1件分の事実
+ * （`apps/api/src/state/continuationProgress.ts` `reportContinuationProgress`）。
+ */
+export interface ContinuationProgressReport {
+  continuationId: string
+  /** 検証された前進が無い時間（ms）。API が永続化済みの記録から計算する。 */
+  stuckForMs: number
+}
+
+/**
+ * reconcile 応答から continuation の報告を読む。**形が崩れていれば undefined**（報告なし）として扱い、
+ * Outbox 側の backstop に任せる。1件でも不正な行があれば全体を捨てる（部分的に信じない）。
+ */
+export function parseContinuationProgressReports(body: unknown): ContinuationProgressReport[] | undefined {
+  const value = (body as { continuations?: unknown } | null | undefined)?.continuations
+  if (!Array.isArray(value)) return undefined
+  const reports: ContinuationProgressReport[] = []
+  for (const entry of value) {
+    const row = entry as { continuationId?: unknown; stuckForMs?: unknown } | null
+    if (typeof row?.continuationId !== 'string' || row.continuationId === ''
+      || typeof row.stuckForMs !== 'number' || !Number.isFinite(row.stuckForMs)) return undefined
+    reports.push({ continuationId: row.continuationId, stuckForMs: row.stuckForMs })
+  }
+  return reports
+}
+
+/**
+ * **独立した backstop**: API が「前進が無い」と報告する時間が `OUTBOX_CONTINUATION_PENDING_ALERT_MS` を
+ * 超えた continuation のうち、まだ通知していないもの。
+ *
+ * 時間は API が永続化済みの記録から計算するので、Worker の再起動で失われない（再起動後は同じ
+ * continuation を1回だけ通知し直しうる。重複は許容する: CEO 決定 2026-10-27）。PL loop が止まっていても、
+ * escalation が誰にも届いていなくても、reconcile route が応答する限りここで鳴る。pause 中に作られて
+ * Outbox から消えた continuation も、再開後は API の報告に現れる。
+ */
+export function continuationsToAlert(
+  reports: readonly ContinuationProgressReport[] | undefined,
+  alreadyAlerted: ReadonlySet<string>,
+): string[] {
+  if (reports === undefined) return []
+  return reports
+    .filter((report) => report.stuckForMs >= OUTBOX_CONTINUATION_PENDING_ALERT_MS && !alreadyAlerted.has(report.continuationId))
+    .map((report) => report.continuationId)
+}

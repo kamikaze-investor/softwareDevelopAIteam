@@ -5,6 +5,8 @@ import {
   nextOutboxAlertState,
   OUTBOX_BLOCKED_ALERT_CYCLES,
   OUTBOX_CONTINUATION_PENDING_ALERT_MS,
+  continuationsToAlert,
+  parseContinuationProgressReports,
   type OutboxAlertState,
   type OutboxResendCycle,
 } from './outboxDeliveryAlert'
@@ -109,5 +111,30 @@ describe('isContinuationPendingResponse', () => {
     expect(isContinuationPendingResponse(500, { outbox: { eventId: 'e1' } }, 'e1')).toBe(false)
     expect(isContinuationPendingResponse(503, undefined, 'e1')).toBe(false)
     expect(isContinuationPendingResponse(503, { outbox: { eventId: 'e1' } }, undefined)).toBe(false)
+  })
+})
+
+describe('continuation の独立した backstop（API の報告に基づく）', () => {
+  it('前進なしが 10 分を超えた continuation を、まだ通知していなければ返す', () => {
+    const reports = [
+      { continuationId: 'c1', stuckForMs: OUTBOX_CONTINUATION_PENDING_ALERT_MS },
+      { continuationId: 'c2', stuckForMs: OUTBOX_CONTINUATION_PENDING_ALERT_MS - 1 },
+      { continuationId: 'c3', stuckForMs: OUTBOX_CONTINUATION_PENDING_ALERT_MS + 5_000 },
+    ]
+
+    expect(continuationsToAlert(reports, new Set(['c3']))).toEqual(['c1'])
+  })
+
+  it('報告が無い（route の失敗・形の崩れ）なら何も返さない（Outbox 側の backstop に任せる）', () => {
+    expect(continuationsToAlert(undefined, new Set())).toEqual([])
+  })
+
+  it('reconcile 応答の形を検証し、1件でも不正なら全体を捨てる', () => {
+    expect(parseContinuationProgressReports({ accepted: true, continuations: [{ continuationId: 'c1', stuckForMs: 5 }] }))
+      .toEqual([{ continuationId: 'c1', stuckForMs: 5 }])
+    expect(parseContinuationProgressReports({ accepted: true })).toBeUndefined()
+    expect(parseContinuationProgressReports({ continuations: [{ continuationId: 'c1', stuckForMs: '5' }] })).toBeUndefined()
+    expect(parseContinuationProgressReports({ continuations: [{ continuationId: '', stuckForMs: 5 }] })).toBeUndefined()
+    expect(parseContinuationProgressReports(null)).toBeUndefined()
   })
 })
