@@ -10403,7 +10403,7 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
 
       **関連（重複しない境界）**:
       - `project-auto-incident-pattern-improvement`（planned）— 監査記録は同項目の durable input。反復 finding の clustering は同項目へ移す
-      - PR #406 design materiality detector（open）— 1 diff 内の責務の除去・導入。本項目は window の組合せで、member 検出を重複実装しない
+      - PR #406 design materiality detector（merge 済み・observe-only）— 1 diff 内の責務の除去・導入。本項目は window の組合せで、member 検出を重複実装しない
       - `docs/meta_reviewer/checklists/semantic_integrity.md` — owner / 表現の問いの正本。本項目は参照するだけ
 
       **再評価（`observation-closes-loop`）**: 3 回目の監査記録に「仕組みの評価」節を置き、

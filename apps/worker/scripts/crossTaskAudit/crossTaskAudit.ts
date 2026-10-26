@@ -12,7 +12,7 @@
 // Owners this module deliberately does NOT duplicate:
 // - syntax idioms (startsWith / split / latest row): docs/meta_reviewer/checklists/semantic_integrity.md
 //   (it calls them "clues, not evidence"); the Challenger is pointed there instead.
-// - removed / introduced contract members per diff: PR #406 design materiality detector.
+// - removed / introduced contract members per diff: apps/worker/src/metaReviewer/designMateriality.ts (#406).
 // - the authority surface: .github/CODEOWNERS (the 2026-10-08 canonical DA surface), read, not copied.
 
 export const AUDIT_RECORD_PATH_PATTERN = /^docs\/project_memory\/decisions\/cross_task_audit_[^/]+\.md$/

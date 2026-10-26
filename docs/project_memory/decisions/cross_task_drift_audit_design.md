@@ -30,7 +30,7 @@ runtime（`apps/api`）・Gate・status・scheduler・DB・Approval は一切変
 | step / post reviewer・safetyVerifier・shadow commit gate | Job ごと | 1 Job の diff | 観測のみ | ✗ |
 | Approval Gate risk review | Job gate ごと | changedFiles | rule ベースの risk | ✗ |
 | CI Meta Review | PR ごと | 1 PR の three-dot diff。`semantic_integrity.md` は「**material 外の全数調査は要求しない**」 | merge してよいか | ✗ |
-| #406 materiality detector（**OPEN・未 merge**） | diff ごと（offline 評価） | 1 diff | 責務の除去・置換・再定義・導入 | ✗ |
+| #406 materiality detector（2026-10-26 merge。observe-only・CI 未配線） | diff ごと（offline 評価） | 1 diff | 責務の除去・置換・再定義・導入 | ✗ |
 | Principle ledger + sensor | Design Review 記録直後 | 原則判定の統計 | 原則・閾値の較正 | 統計のみ |
 | PL tick sensor（`implementTimeoutSensor`）・blocked triage summary | tick / GET | 運用集計 | timeout 較正・停止理由 | 運用のみ |
 | Design Challenger（AGENTS.md 3-2） | 重要設計の初回・material redesign | 1 設計 | Correctness / Simplicity / Naturalness | ✗ |
@@ -45,7 +45,7 @@ runtime（`apps/api`）・Gate・status・scheduler・DB・Approval は一切変
 |---|---|
 | 実装後 review / Meta Review の入力に過去の変更を足す | 毎 Task・毎 PR のコストが増える（CEO 制約）。merge Gate を merge と無関係な問いに結合する。Meta Review は same-SHA で判定が反転した実績があり（review-shopping）、Gate に載せると揺れがそのまま停止要因になる |
 | Principle ledger の sensor として runtime に置く | 入力が原則判定の統計で、コード構造を持たない。runtime の DB は VPS にしか無く、diff を持たない |
-| #406 を window に適用する | 未 merge。問いが「1 diff が責務を変えたか」で、組合せの問いではない。除去・導入の検出は #406 の owner 領域として**重複実装しない** |
+| #406 を window に適用する | 問いが「1 diff が責務を変えたか」で、組合せの問いではない。除去・導入の検出は #406 の owner 領域として**重複実装しない** |
 | Improvement Planner（`project-auto-incident-pattern-improvement`）で行う | 未実装で、入力は Incident（失敗）である。構造ドリフトは失敗を起こす前に見つけたい。**ただし監査記録は同項目の入力として backfill 可能な形で残す**（5章） |
 | 手順書だけにする（Challenger 案） | 境界の判定・記録 chain の検証・DA routing を PL の記憶と判断に任せると、まさに「忘れる」「model の自己申告で DA が消える」が起きる。**機械で決められる部分だけ** script にした |
 
