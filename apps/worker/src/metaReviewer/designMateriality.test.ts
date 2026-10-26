@@ -451,3 +451,13 @@ describe('M5 trial rerun (2026-10-26): subject 名の key に書かれた説明'
       .toEqual({ ok: false, reason: 'invalid_candidate:mechanism' })
   })
 })
+
+it('mechanism の key があって不正な値なら、subject 名の key で救わない', () => {
+  const signals = computeMaterialitySignals(fileDiff('apps/api/src/x.ts', ["-  | 'challenge_aligned'"]))
+  const raw = JSON.stringify({
+    material: true,
+    candidates: [{ id: 'c1', kind: 'redefines', subject: 'design_contract', mechanism: 123, design_contract: 'fallback', file: 'f.ts', evidence: 'e' }],
+    signalDisposition: [{ signalId: signals[0].id, disposition: 'supports_candidate:c1', reason: '' }],
+  })
+  expect(parseDetection(raw, signals)).toEqual({ ok: false, reason: 'invalid_candidate:mechanism' })
+})
