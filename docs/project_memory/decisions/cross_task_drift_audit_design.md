@@ -143,3 +143,18 @@ Production 挙動（問い `production_divergence`）は、State API の既存 G
   6. 集計 script を作らない
 - 一部だけ採用: 「script を一切作らず手順書だけ」→ 機械で決められる部分（境界・chain 検証・DA 格上げ）は script にした（2章表の最終行）
 - 一部だけ採用: 「finding は Improvement Planner へ」→ 未実装なので記録を durable input として残し、当面は既存の監査統合の慣行で roadmap へ（5章）
+
+## 9. 集中レビュー（実装後）
+
+別 context の Claude（PL の推論は渡さず、diff だけを渡した）が実装を review し、must-fix 4 件を出した。すべて修正し、回帰テストを足した。
+
+1. evidence の書き方（`` `path`:10 ``、`path#L10`、`./path`、`:10:5`、Windows 区切り）で DA の格上げを回避できた →
+   `evidencePath()` で正規化し、CODEOWNERS pattern の部分一致も見る（格上げ方向にだけ倒れる）
+2. rename が新しい path だけを出し、authority surface からの移動を見落とした → `--no-renames`
+3. CODEOWNERS の照合が GitHub と違った（slash の無い pattern は任意の深さで当たる）→ GitHub の規則に合わせた
+4. base に既にある `x:y` literal を新しいものとして数えていた → `git grep -o` の出力をそのまま使う
+
+あわせて直したもの: Production 観測なしでは `production_divergence` を必ず uncertain にする / 記録 chain は base が head の
+真の祖先であることを要求する / 記録の marker は先頭の1つだけ読む（前回記録の引用で fork にしない）/ `--deployed` は window 内の
+first-parent commit に限る / fix chain は「前に merge された PR」の引用だけ / baseline も window と同じ filter /
+`--budget` の検証と trailer 分の予約 / diff header の解析 / ファイル引数は pnpm を実行した directory 基準。

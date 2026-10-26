@@ -46,8 +46,13 @@ export interface AuditRecord {
 
 const MARKER_PATTERN = /<!--\s*cross-task-audit\s+base=([0-9a-f]{40})\s+head=([0-9a-f]{40})\s*-->/g
 
-export function parseAuditMarkers(markdown: string): AuditMarker[] {
-  return [...markdown.matchAll(MARKER_PATTERN)].map((m) => ({ base: m[1]!, head: m[2]! }))
+/**
+ * A record's own marker is the FIRST one in the file. Later markers are quotations (e.g. a
+ * "previous finding" section citing the earlier record) and must not create a fake fork.
+ */
+export function parseAuditMarker(markdown: string): AuditMarker | null {
+  const m = [...markdown.matchAll(MARKER_PATTERN)][0]
+  return m ? { base: m[1]!, head: m[2]! } : null
 }
 
 export interface AuditChainResult {
@@ -61,11 +66,13 @@ export interface AuditChainResult {
  * A broken chain is reported, never repaired by guessing: a fork (two records claiming the same
  * base), a head that is not on first-parent master (squash / branch SHA), or a record whose base
  * is not the previous head all make the pointer untrustworthy, so latestHead is null and the
- * caller must pass --base explicitly.
+ * caller must pass --base explicitly. Each record must also move forward (base is a strict
+ * ancestor of head); otherwise a hand-edited chain could reopen an old window.
  */
 export function validateAuditChain(
   records: readonly AuditRecord[],
   isOnFirstParent: (sha: string) => boolean,
+  isStrictAncestor: (ancestor: string, descendant: string) => boolean,
 ): AuditChainResult {
   const issues: string[] = []
   if (records.length === 0) return { latestHead: null, issues }
@@ -73,6 +80,7 @@ export function validateAuditChain(
   for (const r of records) {
     if (!isOnFirstParent(r.marker.head)) issues.push(`${r.path}: head ${r.marker.head} is not on first-parent master`)
     if (!isOnFirstParent(r.marker.base)) issues.push(`${r.path}: base ${r.marker.base} is not on first-parent master`)
+    if (!isStrictAncestor(r.marker.base, r.marker.head)) issues.push(`${r.path}: base is not a strict ancestor of head`)
   }
   const byBase = new Map<string, AuditRecord[]>()
   for (const r of records) byBase.set(r.marker.base, [...(byBase.get(r.marker.base) ?? []), r])
@@ -167,16 +175,19 @@ export interface FixChainLink {
  * #407 and #408 on the CONFLICT-recovery path).
  */
 export function findFixChains(window: readonly WindowCommit[]): FixChainLink[] {
-  const prs = new Set(window.map((c) => prNumberOf(c.subject)).filter((n): n is number => n !== null))
+  // `git log` order is newest first; a change can only follow up on a change merged before it.
+  const oldestFirst = [...window].reverse()
+  const earlier = new Set<number>()
   const links: FixChainLink[] = []
-  for (const c of window) {
+  for (const c of oldestFirst) {
     const own = prNumberOf(c.subject)
     const cites = [...new Set([...`${c.subject}\n${c.body}`.matchAll(/#(\d+)\b/g)].map((m) => Number(m[1])))]
-      .filter((n) => n !== own && prs.has(n))
+      .filter((n) => n !== own && earlier.has(n))
       .sort((a, b) => a - b)
     if (cites.length > 0) links.push({ sha: c.sha, pr: own, cites })
+    if (own !== null) earlier.add(own)
   }
-  return links
+  return links.reverse()
 }
 
 export interface AddedLine {
@@ -246,12 +257,23 @@ export function parseCodeownersPatterns(codeowners: string): string[] {
     .map((l) => l.split(/\s+/)[0]!)
 }
 
+/**
+ * GitHub CODEOWNERS semantics: a pattern with no slash except a trailing one (`AGENTS.md`,
+ * `sandbox/`) matches at any depth; a leading slash or an inner slash anchors it at the root;
+ * a trailing slash or a plain path also covers everything below it.
+ */
 export function matchesCodeownersPattern(file: string, pattern: string): boolean {
-  const p = pattern.replace(/^\//, '')
-  if (p.endsWith('/')) return file.startsWith(p)
-  if (!p.includes('*')) return file === p || file.startsWith(`${p}/`)
-  const re = new RegExp(`^${p.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*\*/g, '\0').replace(/\*/g, '[^/]*').replace(/\0/g, '.*')}$`)
-  return re.test(file)
+  const anchored = pattern.startsWith('/') || pattern.replace(/\/$/, '').includes('/')
+  const body = pattern.replace(/^\//, '').replace(/\/$/, '')
+  const glob = body
+    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    .replace(/^\*\*\//, '\u0001')
+    .replace(/\*\*/g, '\u0000')
+    .replace(/\*/g, '[^/]*')
+    .replace(/\?/g, '[^/]')
+    .replace(/\u0001/, '(?:.*/)?')
+    .replace(/\u0000/g, '.*')
+  return new RegExp(`${anchored ? '^' : '(?:^|/)'}${glob}(?:$|/)`).test(file)
 }
 
 export function isAuthoritySurface(file: string, patterns: readonly string[]): boolean {
@@ -367,7 +389,7 @@ function requireString(o: Record<string, unknown>, key: string, at: string): str
  * Strict parse. A question with no finding counts as clean only when the Challenger lists it in
  * checkedClean; otherwise it is uncertain. Silence is never read as "no drift" (specs/23 §5).
  */
-export function parseChallengerResponse(raw: unknown): ParsedChallengerResponse {
+export function parseChallengerResponse(raw: unknown, options: { productionProvided: boolean }): ParsedChallengerResponse {
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) throw new ChallengerResponseError('response must be a JSON object')
   const o = raw as Record<string, unknown>
   if (!Array.isArray(o.findings)) throw new ChallengerResponseError('findings must be an array')
@@ -394,6 +416,8 @@ export function parseChallengerResponse(raw: unknown): ParsedChallengerResponse 
     }
   })
   const listed = Array.isArray(o.uncertainQuestions) ? o.uncertainQuestions.filter(isQuestionId) : []
+  // Without observation data, Production behaviour cannot have been checked, whatever the answer says.
+  if (!options.productionProvided && !listed.includes('production_divergence')) listed.push('production_divergence')
   const clean = Array.isArray(o.checkedClean) ? o.checkedClean.filter(isQuestionId) : []
   const answered = new Set(findings.map((f) => f.questionId))
   return {
@@ -405,8 +429,19 @@ export function parseChallengerResponse(raw: unknown): ParsedChallengerResponse 
 
 const AUTHORITY_TERMS = /\b(approval|approve[sd]?|authority|authori[sz]ation|permission|CODEOWNERS|tuple|human[- ]?(gate|decision)|self-approv\w*|gate[- ]?bypass)\b|承認|権限|人間/i
 
-function evidencePath(evidence: string): string {
-  return evidence.trim().replace(/^`|`$/g, '').replace(/:\d+(?:[-–]\d+)?$/, '')
+/**
+ * Reduces any evidence spelling to a repo-relative path: backticks, quotes, `./`, Windows
+ * separators, `#L10`, `:L10`, `:10:5`, `:10,20`, `:10 (note)` and trailing prose all go.
+ */
+export function evidencePath(evidence: string): string {
+  return evidence
+    .trim()
+    .replace(/[`'"]/g, '')
+    .replace(/\\/g, '/')
+    .replace(/^\.\//, '')
+    .replace(/#L?\d.*$/, '')
+    .replace(/:L?\d.*$/, '')
+    .split(/\s/)[0]!
 }
 
 /**
@@ -422,10 +457,14 @@ export function routeFindings(findings: readonly ChallengerFinding[], authorityP
   return findings.map((f, i) => {
     const daReasons: string[] = []
     if (f.routing === 'decision_authority') daReasons.push(f.daTrigger ? `challenger: ${f.daTrigger}` : 'challenger')
-    const surface = f.evidence.map(evidencePath).filter((p) => isAuthoritySurface(p, authorityPatterns))
-    if (surface.length > 0) daReasons.push(`authority surface: ${[...new Set(surface)].join(', ')}`)
+    if (f.routing !== 'decision_authority' && f.daTrigger) daReasons.push(`challenger daTrigger: ${f.daTrigger}`)
+    // Normalised path, plus a raw-substring check as defence in depth for spellings not foreseen.
+    const surface = f.evidence.filter(
+      (e) => isAuthoritySurface(evidencePath(e), authorityPatterns) || authorityPatterns.some((p) => p.replace(/^\/|\/$/g, '').length > 3 && e.replace(/\\/g, '/').includes(p.replace(/^\/|\/$/g, ''))),
+    )
+    if (surface.length > 0) daReasons.push(`authority surface: ${[...new Set(surface.map(evidencePath))].join(', ')}`)
     if (f.questionId === 'authority_tuple_drift') daReasons.push('question: authority_tuple_drift')
-    if (AUTHORITY_TERMS.test(f.claim)) daReasons.push('claim names approval / authority')
+    if (AUTHORITY_TERMS.test(`${f.claim}\n${f.falsifiableCheck}`)) daReasons.push('finding names approval / authority')
     return {
       ...f,
       id: `${idPrefix}-${String(i + 1).padStart(2, '0')}`,
@@ -479,24 +518,29 @@ export function buildPacket(input: PacketInput): Packet {
   head.push('', '## Window-introduced facts', '')
   head.push(`budget/cap/timeout constants: ${input.facts.budgetConstants.map((b) => `${b.name} (${b.file})`).join(', ') || 'none'}`)
   head.push(`audit operations: ${input.facts.auditOperations.map((o) => `${o.operation} (${o.file})`).join(', ') || 'none'}`)
-  head.push(`literals new in >= 2 layers: ${input.facts.crossLayerLiterals.slice(0, 40).map((l) => `${l.literal} [${l.layers.join(', ')}]`).join(', ') || 'none'}`)
+  const literals = input.facts.crossLayerLiterals
+  const shown = literals.slice(0, 40).map((l) => `${l.literal} [${l.layers.join(', ')}]`).join(', ')
+  head.push(`literals new in >= 2 layers: ${shown || 'none'}${literals.length > 40 ? ` (+${literals.length - 40} more not shown)` : ''}`)
   head.push('', '## Production observation', '')
   head.push(input.production ?? 'NOT PROVIDED. Answer production_divergence as uncertain; do not infer Production behaviour from code.')
 
-  let text = head.join('\n')
+  let text = `${head.join('\n')}\n\n## Combined window diff of hotspot files\n`
   const includedFiles: string[] = []
   const omittedFiles: string[] = []
   const diffs: string[] = []
+  // Room for the truncation trailer, which names every omitted path.
+  const trailerReserve = 300 + input.fileDiffs.reduce((n, d) => n + d.path.length + 2, 0)
+  let used = text.length + trailerReserve
   for (const d of input.fileDiffs) {
     const block = `\n\n### diff ${d.path}\n\n\`\`\`diff\n${d.diff}\n\`\`\``
-    if (text.length + diffs.join('').length + block.length > input.budgetChars) {
+    if (used + block.length > input.budgetChars) {
       omittedFiles.push(d.path)
       continue
     }
     diffs.push(block)
     includedFiles.push(d.path)
+    used += block.length
   }
-  text += '\n\n## Combined window diff of hotspot files\n'
   text += diffs.join('')
   text += '\n\n## Truncation\n\n'
   text += omittedFiles.length

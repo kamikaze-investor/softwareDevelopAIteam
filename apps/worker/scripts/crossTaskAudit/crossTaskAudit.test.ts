@@ -8,7 +8,8 @@ import {
   findFixChains,
   isAuthoritySurface,
   matchesCodeownersPattern,
-  parseAuditMarkers,
+  evidencePath,
+  parseAuditMarker,
   parseChallengerResponse,
   parseCodeownersPatterns,
   prNumberOf,
@@ -31,11 +32,23 @@ const commit = (n: number, files: string[], subject = `change ${n} (#${100 + n})
 describe('audit pointer', () => {
   it('parses the marker written in a record', () => {
     const md = `# Cross-Task Audit\n<!-- cross-task-audit base=${sha(1)} head=${sha(2)} -->\n`
-    expect(parseAuditMarkers(md)).toEqual([{ base: sha(1), head: sha(2) }])
+    expect(parseAuditMarker(md)).toEqual({ base: sha(1), head: sha(2) })
   })
 
   it('ignores markers whose SHAs are abbreviated', () => {
-    expect(parseAuditMarkers('<!-- cross-task-audit base=abc123 head=def456 -->')).toEqual([])
+    expect(parseAuditMarker('<!-- cross-task-audit base=abc123 head=def456 -->')).toBeNull()
+  })
+
+  it("takes only the record's own (first) marker, so quoting an earlier record is not a fork", () => {
+    const md = `<!-- cross-task-audit base=${sha(2)} head=${sha(3)} -->\n> previous: <!-- cross-task-audit base=${sha(1)} head=${sha(2)} -->`
+    expect(parseAuditMarker(md)).toEqual({ base: sha(2), head: sha(3) })
+  })
+
+  it('refuses a record that does not move forward (hand-edited chain reopening an old window)', () => {
+    const records = [{ path: 'a.md', marker: { base: sha(5), head: sha(2) } }]
+    const result = validateAuditChain(records, () => true, (a, d) => Number.parseInt(a, 16) < Number.parseInt(d, 16))
+    expect(result.latestHead).toBeNull()
+    expect(result.issues[0]).toContain('strict ancestor')
   })
 
   it('follows the chain to the latest head', () => {
@@ -43,7 +56,7 @@ describe('audit pointer', () => {
       { path: 'a.md', marker: { base: sha(1), head: sha(2) } },
       { path: 'b.md', marker: { base: sha(2), head: sha(3) } },
     ]
-    expect(validateAuditChain(records, () => true)).toEqual({ latestHead: sha(3), issues: [] })
+    expect(validateAuditChain(records, () => true, () => true)).toEqual({ latestHead: sha(3), issues: [] })
   })
 
   it('refuses a fork instead of guessing which record is latest', () => {
@@ -51,14 +64,14 @@ describe('audit pointer', () => {
       { path: 'a.md', marker: { base: sha(1), head: sha(2) } },
       { path: 'b.md', marker: { base: sha(1), head: sha(3) } },
     ]
-    const result = validateAuditChain(records, () => true)
+    const result = validateAuditChain(records, () => true, () => true)
     expect(result.latestHead).toBeNull()
     expect(result.issues.join('\n')).toContain('fork')
   })
 
   it('refuses a head that is not on first-parent master (squash or branch SHA)', () => {
     const records = [{ path: 'a.md', marker: { base: sha(1), head: sha(9) } }]
-    const result = validateAuditChain(records, (s) => s !== sha(9))
+    const result = validateAuditChain(records, (s) => s !== sha(9), () => true)
     expect(result.latestHead).toBeNull()
     expect(result.issues[0]).toContain('not on first-parent master')
   })
@@ -68,7 +81,7 @@ describe('audit pointer', () => {
       { path: 'a.md', marker: { base: sha(1), head: sha(2) } },
       { path: 'b.md', marker: { base: sha(5), head: sha(6) } },
     ]
-    expect(validateAuditChain(records, () => true).latestHead).toBeNull()
+    expect(validateAuditChain(records, () => true, () => true).latestHead).toBeNull()
   })
 })
 
@@ -113,12 +126,18 @@ describe('rankChurn', () => {
 
 describe('findFixChains', () => {
   it('links a change that cites earlier window PRs in its body', () => {
+    // git log order: newest first.
     const window = [
-      commit(7, ['a.ts'], 'x (#407)'),
-      commit(8, ['a.ts'], 'y (#408)'),
       commit(9, ['a.ts'], 'z (#409)', 'the JSON-only agent (#407) ... Under #408 that cost one round'),
+      commit(8, ['a.ts'], 'y (#408)'),
+      commit(7, ['a.ts'], 'x (#407)'),
     ]
     expect(findFixChains(window)).toEqual([{ sha: sha(9), pr: 409, cites: [407, 408] }])
+  })
+
+  it('does not treat a mention of a LATER PR as a fix chain', () => {
+    const window = [commit(2, ['a.ts'], 'later (#102)'), commit(1, ['a.ts'], 'earlier (#101)', 'superseded by #102')]
+    expect(findFixChains(window)).toEqual([])
   })
 
   it('ignores citations of PRs outside the window and self-citations', () => {
@@ -177,6 +196,15 @@ describe('authority surface from CODEOWNERS', () => {
 
   it('treats a leading slash as repo-root anchored', () => {
     expect(matchesCodeownersPattern('CLAUDE.md', '/CLAUDE.md')).toBe(true)
+    expect(matchesCodeownersPattern('apps/CLAUDE.md', '/CLAUDE.md')).toBe(false)
+  })
+
+  it('follows GitHub: a slash-free pattern matches at any depth, an inner slash anchors', () => {
+    expect(matchesCodeownersPattern('apps/api/AGENTS.md', 'AGENTS.md')).toBe(true)
+    expect(matchesCodeownersPattern('apps/worker/src/sandbox/x.ts', 'sandbox/')).toBe(true)
+    expect(matchesCodeownersPattern('x/apps/worker/src/guards/a.ts', 'apps/worker/src/guards/')).toBe(false)
+    expect(matchesCodeownersPattern('foo.ts', '**/foo.ts')).toBe(true)
+    expect(matchesCodeownersPattern('a/b/foo.ts', '**/foo.ts')).toBe(true)
   })
 })
 
@@ -223,7 +251,7 @@ const finding = (over: Partial<ChallengerFinding> = {}): ChallengerFinding => ({
 
 describe('parseChallengerResponse', () => {
   it('treats an unanswered, unlisted question as uncertain, never as clean', () => {
-    const r = parseChallengerResponse({ findings: [finding()], checkedClean: ['duplicate_owner'] })
+    const r = parseChallengerResponse({ findings: [finding()], checkedClean: ['duplicate_owner'] }, { productionProvided: true })
     expect(r.checkedClean).toEqual(['duplicate_owner'])
     expect(r.uncertainQuestions).not.toContain('duplicate_owner')
     expect(r.uncertainQuestions).not.toContain('surviving_failure_class')
@@ -232,16 +260,39 @@ describe('parseChallengerResponse', () => {
   })
 
   it('keeps a question uncertain when it is listed both clean and uncertain', () => {
-    const r = parseChallengerResponse({ findings: [], checkedClean: ['complexity_growth'], uncertainQuestions: ['complexity_growth'] })
+    const r = parseChallengerResponse({ findings: [], checkedClean: ['complexity_growth'], uncertainQuestions: ['complexity_growth'] }, { productionProvided: true })
     expect(r.checkedClean).toEqual([])
     expect(r.uncertainQuestions).toContain('complexity_growth')
   })
 
   it('rejects unknown question ids, missing evidence and bad routing', () => {
-    expect(() => parseChallengerResponse({ findings: [{ ...finding(), questionId: 'other' }] })).toThrow(ChallengerResponseError)
-    expect(() => parseChallengerResponse({ findings: [{ ...finding(), evidence: [] }] })).toThrow('evidence')
-    expect(() => parseChallengerResponse({ findings: [{ ...finding(), routing: 'ceo' }] })).toThrow('routing')
-    expect(() => parseChallengerResponse([])).toThrow('JSON object')
+    const opts = { productionProvided: true }
+    expect(() => parseChallengerResponse({ findings: [{ ...finding(), questionId: 'other' }] }, opts)).toThrow(ChallengerResponseError)
+    expect(() => parseChallengerResponse({ findings: [{ ...finding(), evidence: [] }] }, opts)).toThrow('evidence')
+    expect(() => parseChallengerResponse({ findings: [{ ...finding(), routing: 'ceo' }] }, opts)).toThrow('routing')
+    expect(() => parseChallengerResponse([], opts)).toThrow('JSON object')
+  })
+
+  it('keeps production_divergence uncertain without observation data, even if claimed clean', () => {
+    const r = parseChallengerResponse({ findings: [], checkedClean: ['production_divergence'] }, { productionProvided: false })
+    expect(r.checkedClean).not.toContain('production_divergence')
+    expect(r.uncertainQuestions).toContain('production_divergence')
+  })
+})
+
+describe('evidencePath', () => {
+  it.each([
+    'apps/api/src/pl/actionGate.ts:10',
+    '`apps/api/src/pl/actionGate.ts`:10',
+    'apps/api/src/pl/actionGate.ts#L10',
+    './apps/api/src/pl/actionGate.ts:10',
+    'apps/api/src/pl/actionGate.ts:10:5',
+    'apps/api/src/pl/actionGate.ts:L10',
+    'apps/api/src/pl/actionGate.ts:10,20',
+    'apps/api/src/pl/actionGate.ts:10 (gate)',
+    'apps\\api\\src\\pl\\actionGate.ts:10',
+  ])('normalises %s', (e) => {
+    expect(evidencePath(e)).toBe('apps/api/src/pl/actionGate.ts')
   })
 })
 
@@ -265,6 +316,17 @@ describe('routeFindings (mechanical, upgrade-only)', () => {
     expect(routeFindings([finding({ claim: 'An approval now binds to the command kind.' })], patterns, 'x')[0]!.routing).toBe('decision_authority')
     expect(routeFindings([finding({ claim: '承認の対象が変わった' })], patterns, 'x')[0]!.routing).toBe('decision_authority')
     expect(routeFindings([finding({ questionId: 'authority_tuple_drift' })], patterns, 'x')[0]!.routing).toBe('decision_authority')
+  })
+
+  it.each(['`apps/api/src/pl/actionGate.ts`:10', 'apps/api/src/pl/actionGate.ts#L10', './apps/api/src/pl/actionGate.ts:10:5', 'apps\\api\\src\\pl\\actionGate.ts:10'])(
+    'cannot dodge the upgrade with evidence spelled %s',
+    (e) => {
+      expect(routeFindings([finding({ evidence: [e] })], patterns, 'x')[0]!.routing).toBe('decision_authority')
+    },
+  )
+
+  it('upgrades a technical label that still carries a daTrigger', () => {
+    expect(routeFindings([finding({ daTrigger: 'AI authority expansion' })], patterns, 'x')[0]!.routing).toBe('decision_authority')
   })
 
   it('never downgrades a decision_authority label from the Challenger', () => {
