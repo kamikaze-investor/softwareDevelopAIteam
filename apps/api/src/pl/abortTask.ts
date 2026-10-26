@@ -50,24 +50,33 @@ import path from 'node:path'
 import {
   getBaseRoadmapId,
   holdsWorkspaceWhenBlocked,
+  isApprovalBlockingTechnicalAbort,
   isLiveJob,
+  isLiveApprovedApproval,
+  isLiveTaskScopedDecision,
+  isLiveWaitingApproval,
   isStaleBlockedJobCandidate,
   occupiesProject,
 } from '@ai-team/shared'
+import { withApprovalActorFacts } from '../designReview/resumeActor'
 import type { IStorage } from '../storage/interface'
+import { readApprovalActorClass } from '../designReview/resumeActor'
 import type { Job, JobWorkspaceBaseline, Task } from '@ai-team/shared'
 import { authorizePlAction, PlActionBlockedError } from './actionGate'
 import { buildSystemState, type AttentionItem } from '../state/systemState'
 import { protectedViolations, triageBlocked } from './blockedTriage'
 import { readAdoptionCandidates } from './adoptionStep'
 import { resolveLinkedGitCommitRejection } from '../linkedGitCommitRejection'
+import { escalateTaskToHuman } from '../designReview/repairFlow'
 import {
   hasTechnicalAbortMetadata,
   isEligibleTechnicalAbortDiagnosis,
   recordTechnicalAbortEvidence,
   recordTechnicalAbortRefusal,
   technicalAbortStateFingerprint,
+  technicalCleanupGenerationMatches,
   type AbortAuthorization,
+  type TechnicalAbortCleanupGeneration,
   type TechnicalAbortCleanupSummary,
 } from './technicalAbortEvidence'
 
@@ -94,6 +103,8 @@ export type AbortTaskResult =
       | 'FOREIGN_BLOCKED_JOB'
       | 'JOB_QUARANTINED'
       | 'OWNERSHIP_UNPROVEN'
+      | 'UNATTRIBUTED_DIRTY_WORKSPACE'
+      | 'TASK_STATE_CHANGED'
       | 'TECHNICAL_EVIDENCE_INELIGIBLE'
       | 'NOT_AUTHORIZED'
       | 'PARK_FAILED'
@@ -109,8 +120,80 @@ export type AbortTaskResult =
  * ここで独自に「blocked なら所有者」と決めていたため、2026-09-17 の Operational E2E では
  * done な Task の古い blocked 行 4本が production の abort を丸ごと塞いだ。
  */
-function holdsWorkspaceOwnership(task: { status: string }, job: Job): boolean {
+function holdsWorkspaceOwnership(task: { status: string; parked?: boolean }, job: Job): boolean {
   return holdsWorkspaceWhenBlocked(task, job)
+}
+
+/**
+ * Task の最新 Job が dirty な終了 fingerprint を残し、その後に同じ workingDir で別 Job が走っていなければ
+ * その Job を返す（＝その差分を所有・後始末する Job が無い）。
+ * `taskJobs` は `findByTaskId()` の順（created_at DESC）で、先頭が最新。
+ */
+function findUnattributedDirtyEnd(taskJobs: readonly Job[], otherJobs: readonly Job[]): Job | undefined {
+  const latest = taskJobs[0]
+  if (latest === undefined) return undefined
+  if (latest.failureMetadata?.workspaceEndFingerprint?.mode !== 'dirty') return undefined
+  const workingDir = latest.safeCommand?.workingDir
+  const supersededByLaterJob = otherJobs.some((job) =>
+    job.createdAt > latest.createdAt && job.safeCommand?.workingDir === workingDir)
+  return supersededByLaterJob ? undefined : latest
+}
+
+/**
+ * dirty refusal の escalation を書く直前（IMMEDIATE transaction の中）に、判定の前提をすべて読み直す。
+ * 崩れていれば理由を返す（undefined なら成立）。
+ * - Task: pending・roadmapActive・park されていない
+ * - 最新 Job: 判定した Job と同一で、status と dirty な終了 fingerprint が変わっていない
+ * - その後に同じ workingDir で走った Job が無い（`findUnattributedDirtyEnd` を同じ入力で再評価）
+ * - project に live Job が無い
+ * - 人の判断: 未期限の WAITING が無く、この abort を承認した request 以外に生きた Task 単位の判断が無い。
+ *   承認した request 自体はまだ使える APPROVED のまま
+ */
+/**
+ * `findUnattributedDirtyEnd` に渡す「この Task 以外の Job」。**Project を問わない**
+ * （Codex review c3-b round 2: workspace は Project 間で共有され得るので、別 Project の後続 Job が
+ * 同じ workingDir で走っていれば、その差分はもうこの Task のものとは言えない）。
+ */
+function laterJobCandidates(storage: IStorage, taskId: string): Job[] {
+  return storage.projects.findAll()
+    .flatMap((project) => storage.tasks.findByProjectId(project.id))
+    .filter((candidate) => candidate.id !== taskId)
+    .flatMap((candidate) => storage.jobs.findByTaskId(candidate.id))
+}
+
+function dirtyRefusalStillHolds(
+  storage: IStorage,
+  current: Task,
+  expectedJob: Job,
+  approvalRequestId: string,
+): string | undefined {
+  if (current.status !== 'pending') return `task is ${current.status}, not pending`
+  if (current.roadmapActive !== true) return 'task is no longer roadmap-active'
+  if (storage.tasks.isParked(current.id)) return 'task was parked'
+  const taskJobs = storage.jobs.findByTaskId(current.id)
+  const latest = taskJobs[0]
+  if (latest?.id !== expectedJob.id) return 'the latest job changed'
+  if (latest.status !== expectedJob.status) return `latest job is ${latest.status}`
+  if (JSON.stringify(latest.failureMetadata?.workspaceEndFingerprint)
+    !== JSON.stringify(expectedJob.failureMetadata?.workspaceEndFingerprint)) {
+    return 'the latest job end fingerprint changed'
+  }
+  const projectJobs = storage.tasks.findByProjectId(current.projectId)
+    .flatMap((candidate) => storage.jobs.findByTaskId(candidate.id))
+  if (projectJobs.some((job) => isLiveJob(job))) return 'the project has a live job'
+  if (findUnattributedDirtyEnd(taskJobs, laterJobCandidates(storage, current.id)) === undefined) {
+    return 'a later job ran in the same workspace'
+  }
+  const nowMs = Date.now()
+  // APPROVED は approval_actor=human の行だけを人の判断として数える（C3-a の型付き事実。統合時に合わせる）
+  const approvals = withApprovalActorFacts(storage, storage.approvalRequests.findByTaskId(current.id))
+  if (approvals.some((approval) => isLiveWaitingApproval(approval, nowMs))) return 'a human decision is waiting'
+  if (approvals.some((approval) => approval.id !== approvalRequestId && isLiveTaskScopedDecision(approval, nowMs))) {
+    return 'another live task-scoped human decision exists'
+  }
+  const authorizing = approvals.find((approval) => approval.id === approvalRequestId)
+  if (!isLiveApprovedApproval(authorizing, nowMs)) return 'the authorizing approval is no longer live'
+  return undefined
 }
 
 function recordAbortAuthorizationConflict(
@@ -274,7 +357,10 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
   const cleanupTargets = isTerminalBlockedTask ? [taskJobs[0]] : owning
 
   // 他 Task が workspace を所有したままなら park しても workspace は解放されない。
+  // park 状態を shared 述語へ渡す（park された Task の非 quarantine blocked 行は stale 候補。
+  // claim guard / Worker と同じ意味。lifecycle repair C2）。
   const otherTasks = projectTasks.filter((candidate) => candidate.id !== task.id)
+    .map((candidate) => ({ ...candidate, parked: storage.tasks.isParked(candidate.id) }))
   const foreign = otherTasks.flatMap((candidate) =>
     storage.jobs.findByTaskId(candidate.id).filter((job) => holdsWorkspaceOwnership(candidate, job)))
   if (foreign.length > 0) {
@@ -323,6 +409,52 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
           `task ${staleCandidates[0].taskId} has a blocked job (${staleCandidates[0].id}) left over `
           + 'from a finished task, and this task has no job whose cleanup would prove the workspace '
           + 'is clean; refusing to park without that proof',
+      }
+    }
+
+    // **所有者の居ない dirty workspace の上で黙って park しない**（2026-10-17 F-1）。
+    // cleanup の当てが無い（blocked な所有 Job が無い）のに、この Task の最新 Job が終了時に dirty な
+    // workspace を報告していて、その後に同じ workingDir で走った Job も無いなら、その差分は誰の
+    // 所有でもないまま残る。park すると次の採用がその差分の上で始まり quarantine される。
+    // 判定材料は Worker が報告した既存の `workspaceEndFingerprint` だけで、ファイルには触れない
+    // （何も破棄しない）。fingerprint の無い legacy 行は従来どおり（証明材料が無いので判定しない）。
+    //
+    // 拒否だけだと Task は pending + 最新 Job failed のまま残り、resume（最新 Job が blocked、または
+    // Task が blocked で最新 Job が failed を要求）も recover（Task が blocked を要求）も通らない行き止まりになる
+    // （Codex review c3-b P2）。既存の `escalateTaskToHuman()` で Task を blocked へ上げ、b8d0fc5d と同じ
+    // 「blocked Task + 最新 Job failed」形にする。Human Resume（指示付き）が admit され、attention は通常の
+    // blocked Task のものになる。escalateTaskToHuman は done / park 済みの Task を動かさない。
+    const dirtyLeftover = findUnattributedDirtyEnd(taskJobs, laterJobCandidates(storage, task.id))
+    if (dirtyLeftover !== undefined) {
+      const workingDir = dirtyLeftover.safeCommand?.workingDir
+      // **判定に使った事実を、blocked へ上げるのと同じ IMMEDIATE transaction の中で読み直す**
+      // （Codex review c3-b round 2）。崩れていれば何も書かずに TASK_STATE_CHANGED を返す。
+      const escalation = escalateTaskToHuman(
+        storage,
+        task.id,
+        `abort_task refused: job ${dirtyLeftover.id} left an unowned dirty workspace (UNATTRIBUTED_DIRTY_WORKSPACE)`,
+        {
+          precondition: (current) => dirtyRefusalStillHolds(storage, current, dirtyLeftover, input.approvalRequestId),
+        },
+      )
+      if (escalation.result !== 'blocked') {
+        return {
+          ok: false,
+          code: 'TASK_STATE_CHANGED',
+          reason:
+            `task ${task.id} changed while the abort was being decided (${
+              escalation.result === 'precondition_failed' ? escalation.reason : escalation.result
+            }); nothing was written, re-read the task and decide again`,
+        }
+      }
+      return {
+        ok: false,
+        code: 'UNATTRIBUTED_DIRTY_WORKSPACE',
+        reason:
+          `job ${dirtyLeftover.id} ended with a dirty workspace in ${workingDir} and no job holds it for cleanup; `
+          + 'parking would leave those changes unowned for the next adoption. The task was escalated to blocked: '
+          + 'use Human Resume (with an instruction) to continue from that workspace',
+        details: { escalatedTaskStatus: storage.tasks.findById(task.id)?.status },
       }
     }
 
@@ -389,7 +521,19 @@ export function abortTask(storage: IStorage, input: AbortTaskInput): AbortTaskRe
 
 export type CompleteAbortCleanupResult =
   | { ok: true; taskId: string; jobId: string }
-  | { ok: false; code: 'NOT_REQUESTED' | 'NOT_FOUND' | 'VERIFICATION_FAILED' | 'PRECONDITION_FAILED'; reason: string }
+  | {
+    ok: false
+    code:
+      | 'NOT_REQUESTED'
+      | 'NOT_FOUND'
+      | 'VERIFICATION_FAILED'
+      | 'PRECONDITION_FAILED'
+      | 'HUMAN_DECISION_CONFLICT'
+      | 'CLEANUP_SUPERSEDED'
+      | 'STORAGE_BUSY'
+      | 'GENERATION_MISMATCH'
+    reason: string
+  }
 
 function recordManualRejectedGitCommitRefusal(
   storage: IStorage,
@@ -456,6 +600,8 @@ export function completeAbortCleanup(
     /** technical cleanup が deletion 前に観測した exact dirty/clean baseline。 */
     preCleanupObservation?: JobWorkspaceBaseline
     cleanupSummary?: TechnicalAbortCleanupSummary
+    /** technical cleanup の報告で必須: 報告が名指す cleanup generation。 */
+    cleanupGeneration?: TechnicalAbortCleanupGeneration
     /** Worker が cleanup 前に拒否した場合。API は refusal audit だけを残し、状態を変えない。 */
     refusalCode?: string
   },
@@ -503,15 +649,27 @@ export function completeAbortCleanup(
       reason: `job ${input.jobId}'s abort cleanup request has no verifiable authorization`,
     }
   }
+  // 古い generation の報告（取り消し後に同じ carrier へ新しい technical request が出た後の再送や、
+  // 遅れて届いた拒否）は現在の generation のものとして扱わない。cleanup の失敗ではないので
+  // quarantine も refusal 記録もせず、現在の generation はそのまま残す。結果の報告だけでなく
+  // Worker の拒否（refusalCode）も対象: 古い拒否が新しい generation を退役・quarantine させない
+  // （Codex review 57f2cf6）。退役させる書き込み自体も storage で同じ一致を atomic に再確認する。
+  if (
+    authorization.kind === 'technical_evidence'
+    && !technicalCleanupGenerationMatches(metadata, input.cleanupGeneration)
+  ) {
+    return generationMismatch(input.jobId)
+  }
   if (input.refusalCode !== undefined) {
     if (authorization.kind === 'technical_evidence') {
+      const retired = retireTechnicalAbortCleanupForGeneration(storage, job, input.cleanupGeneration, input.refusalCode)
+      if (!retired) return generationMismatch(input.jobId)
       recordTechnicalAbortRefusal(storage, {
         taskId: job.taskId,
         evidenceId: authorization.evidenceId,
         code: input.refusalCode,
         stage: 'worker_cleanup',
       })
-      retireTechnicalAbortCleanup(storage, job, input.refusalCode)
     } else {
       recordManualRejectedGitCommitRefusal(storage, job, input.refusalCode)
     }
@@ -519,13 +677,14 @@ export function completeAbortCleanup(
   }
   if (input.observation === undefined) {
     if (authorization.kind === 'technical_evidence') {
+      const retired = retireTechnicalAbortCleanupForGeneration(storage, job, input.cleanupGeneration, 'FINAL_OBSERVATION_MISSING')
+      if (!retired) return generationMismatch(input.jobId)
       recordTechnicalAbortRefusal(storage, {
         taskId: job.taskId,
         evidenceId: authorization.evidenceId,
         code: 'FINAL_OBSERVATION_MISSING',
         stage: 'worker_cleanup',
       })
-      retireTechnicalAbortCleanup(storage, job, 'FINAL_OBSERVATION_MISSING')
     } else {
       recordManualRejectedGitCommitRefusal(storage, job, 'FINAL_OBSERVATION_MISSING')
     }
@@ -546,19 +705,47 @@ export function completeAbortCleanup(
       ? { preCleanupObservation: input.preCleanupObservation }
       : {}),
     ...(input.cleanupSummary !== undefined ? { cleanupSummary: input.cleanupSummary } : {}),
+    ...(input.cleanupGeneration !== undefined ? { cleanupGeneration: input.cleanupGeneration } : {}),
   }
   const released = task?.status === 'blocked'
     ? storage.jobs.parkBlockedTaskWithTerminalJobs(releaseInput)
     : storage.jobs.releaseBlockedJobAndParkTask(releaseInput)
   if (!released.ok) {
+    if (released.code === 'GENERATION_MISMATCH') {
+      // transaction 内で generation が変わっていた。何も変えていない（quarantine しない）。
+      return { ok: false, code: 'GENERATION_MISMATCH', reason: released.reason }
+    }
+    if (released.code === 'STORAGE_BUSY') {
+      // 別 connection の write（人の承認・後続 Job など）と lock 競合しただけで、transaction は何も変えていない。
+      // 再試行可能なので cleanup generation はそのまま残し、quarantine も refusal 記録もしない
+      // （Codex review 527668d: 競合した人の判断が quarantine を引き起こさないように）。
+      return { ok: false, code: 'STORAGE_BUSY', reason: released.reason }
+    }
+    if (released.code === 'HUMAN_DECISION_CONFLICT' || released.code === 'CLEANUP_SUPERSEDED') {
+      // 人の判断（live WAITING / APPROVED / 後から CONSUMED）または後続の Job が先にある。cleanup 自体の
+      // 失敗ではないので retireTechnicalAbortCleanup() で carrier を quarantine しない —— quarantine すると
+      // その判断に続く人の abort / resume / repair まで塞ぐ（Codex review cb1f2db / 84fe348）。
+      // この cleanup generation は storage が同じ transaction で取り消し済み（再送は NOT_REQUESTED）。
+      // ここでは拒否の事実だけを audit に残す。
+      if (authorization.kind === 'technical_evidence') {
+        recordTechnicalAbortRefusal(storage, {
+          taskId: job.taskId,
+          evidenceId: authorization.evidenceId,
+          code: released.code,
+          stage: 'final_transaction',
+        })
+      }
+      return { ok: false, code: released.code, reason: released.reason }
+    }
     if (authorization.kind === 'technical_evidence') {
+      const retired = retireTechnicalAbortCleanupForGeneration(storage, job, input.cleanupGeneration, released.code)
+      if (!retired) return generationMismatch(input.jobId)
       recordTechnicalAbortRefusal(storage, {
         taskId: job.taskId,
         evidenceId: authorization.evidenceId,
         code: released.code,
         stage: 'final_transaction',
       })
-      retireTechnicalAbortCleanup(storage, job, released.code)
     } else {
       recordManualRejectedGitCommitRefusal(storage, job, released.code)
     }
@@ -570,6 +757,32 @@ export function completeAbortCleanup(
   }
 
   return { ok: true, taskId: job.taskId, jobId: job.id }
+}
+
+function generationMismatch(jobId: string): CompleteAbortCleanupResult {
+  return {
+    ok: false,
+    code: 'GENERATION_MISMATCH',
+    reason: `job ${jobId}'s report names a different technical cleanup generation`,
+  }
+}
+
+/**
+ * completeAbortCleanup() の退役（marker 削除 + quarantine）。報告の generation が carrier の現在の
+ * marker と一致するときだけ、storage の単一 transaction で書く。一致しなければ false（何も変えない）。
+ */
+function retireTechnicalAbortCleanupForGeneration(
+  storage: IStorage,
+  job: Job,
+  generation: TechnicalAbortCleanupGeneration | undefined,
+  refusalCode: string,
+): boolean {
+  if (generation === undefined) return false
+  return storage.jobs.retireTechnicalAbortCleanupForGeneration({
+    jobId: job.id,
+    generation,
+    quarantineReason: `technical abort cleanup refused (${refusalCode})`,
+  })
 }
 
 function retireTechnicalAbortCleanup(storage: IStorage, job: Job, refusalCode: string): void {
@@ -717,7 +930,21 @@ export function requestTechnicalAbort(
       reason: `Worker does not service ${task.status} Task + ${latestJob.status} Job cleanup carriers`,
     }
   }
-  const activeApproval = storage.approvalRequests.findActiveByTaskId(task.id)
+  // 止めるのは「人の判断が生きている」request だけ: 期限内の WAITING（判断待ち）と APPROVED
+  // （下された人の判断。技術的 cleanup で上書きしない）。期限切れ WAITING は誰も待っておらず
+  // 承認もできないので、ここで拒否すると Technical Abort が恒久的に塞がる（2026-10-16 監査 A2）。
+  // 期限解釈は shared `isLiveWaitingApproval` / `isLiveApprovedApproval` に一本化する。最新1件ではなく
+  // 全行を見るのは、新しい期限切れ WAITING の陰に古い APPROVED が残る legacy 状態でも人の判断を見落とさないため。
+  // 期限切れの APPROVED は consume できない（gate と同じ遅延判定）ので、もう誰の authority でもない。
+  // それを数えると、期限切れ未消費の承認 1 行で Technical Abort が恒久的に拒否される（2026-10-16 監査 B-2）。
+  // 判定は最終 transaction（storage `completeTechnicalAbortCleanup`）と同じ shared の1つ（H-2 / T-1）:
+  // 期限内または期限の読めない WAITING、決定主体が human の APPROVED だけが止める。
+  const nowMs = Date.now()
+  const activeApproval = storage.approvalRequests.findByTaskId(task.id)
+    .find((request) => isApprovalBlockingTechnicalAbort(
+      { ...request, approvalActor: readApprovalActorClass(storage, request.id) },
+      { nowMs },
+    ))
   if (activeApproval !== undefined) {
     recordTechnicalAbortRefusal(storage, {
       taskId: task.id,
@@ -940,13 +1167,18 @@ function technicalOwnershipFailure(
   }
 
   for (const project of storage.projects.findAll()) {
+    // claim guard（`anotherTaskHoldsWorkspace()`）と同じ所有者の範囲: archived Project の行は数えない
+    // （quarantine 行も含めて。claim guard も archived の行を見ない）。archived Project は Worker が claim せず、
+    // archive は live Job / blocked 所有者があると拒否されるので、残る行は legacy の取り残しである。
+    // 最終 transaction（storage の findWorkspaceUserAnywhere）も同じ範囲を使う（Codex review P2）。
+    if (project.status === 'archived') continue
     for (const otherTask of storage.tasks.findByProjectId(project.id)) {
       if (otherTask.id === task.id) continue
       for (const job of storage.jobs.findByTaskId(otherTask.id)) {
         if (job.safeCommand?.workingDir !== workingDir) continue
         if (
           isLiveJob(job)
-          || holdsWorkspaceOwnership(otherTask, job)
+          || holdsWorkspaceOwnership({ ...otherTask, parked: storage.tasks.isParked(otherTask.id) }, job)
           || occupiesProject(otherTask)
         ) {
           return {
@@ -1025,6 +1257,12 @@ function hasTaskEscalation(storage: IStorage, taskId: string, taskJobs: readonly
   }
   for (const approval of storage.approvalRequests.findByTaskId(taskId)) {
     targetKeys.add(`approval_waiting:${approval.id}`)
+  }
+  // Design Review の attention は run 単位の referenceId を持つ（同じ Task の2回目の episode を
+  // 別対象にするため）。上の `${kind}:${taskId}` は referenceId 導入前に書かれた audit 用に残す。
+  for (const run of storage.designReviewRuns.findByTaskId(taskId)) {
+    targetKeys.add(`design_review_failed:${run.id}`)
+    targetKeys.add(`design_review_idle:${run.id}`)
   }
 
   const recoveryIds = storage.auditLog

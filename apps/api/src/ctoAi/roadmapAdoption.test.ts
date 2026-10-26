@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
+import { GATE_POLICY_VERSION } from '../routes/approvalGate'
+import { CANDIDATE_COMMIT_EVIDENCE_POLICY_VERSIONS } from './roadmapAdoption'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
@@ -192,6 +194,8 @@ describe('adoptRoadmapItem — 実行済み項目への follow-up（CEO 判断 2
       dryRun: false,
     } as Parameters<IStorage['jobs']['create']>[0])
     storage.jobs.update(sourceJob.id, { commitHash: 'candidate-commit' })
+    // createForJob は running / blocked の Job にしか結び付けない（承認は Job 実行中に発行される）。
+    storage.jobs.update(sourceJob.id, { status: 'running' })
     const approval = storage.approvalRequests.createForJob({
       taskId: first.taskId,
       targetBranch: options.targetBranch ?? 'candidate/self-dev',
@@ -205,6 +209,7 @@ describe('adoptRoadmapItem — 実行済み項目への follow-up（CEO 判断 2
       expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
       invalidIf: ['commit changes', 'diff changes'],
     }, sourceJob.id)
+    storage.jobs.update(sourceJob.id, { status: 'success' })
     if (!approval.ok) throw new Error(`failed to bind approval: ${approval.reason}`)
     storage.tasks.update(first.taskId, { status: 'done' })
     storage.taskContinuations.create({
@@ -1221,6 +1226,8 @@ describe('checkRoadmapCompletionAwaitingPromotion — Safety Evidence path（#34
       storage.jobs.update(sourceJobId, { commitHash: 'candidate-commit' })
     }
     if (overrides.linkedApprovalStatus !== undefined) {
+      // createForJob は running / blocked の Job にしか結び付けない（承認は Job 実行中に発行される）。
+      storage.jobs.update(sourceJobId, { status: 'running' })
       const approval = storage.approvalRequests.createForJob({
         taskId: first.taskId,
         targetBranch: 'candidate/self-dev',
@@ -1234,6 +1241,7 @@ describe('checkRoadmapCompletionAwaitingPromotion — Safety Evidence path（#34
         expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
         invalidIf: ['commit changes', 'diff changes'],
       }, sourceJobId)
+      storage.jobs.update(sourceJobId, { status: 'success' })
       if (!approval.ok) throw new Error(`failed to bind approval: ${approval.reason}`)
     }
     const evidenceJobId = overrides.onOtherJob === true ? createGitCommitJob() : sourceJobId
@@ -1264,6 +1272,15 @@ describe('checkRoadmapCompletionAwaitingPromotion — Safety Evidence path（#34
     return { storage, projectId, taskId: first.taskId, sourceJobId }
   }
 
+  // gate-policy-v3（2026-10-16）・v4（2026-10-23）以降の evidence と、Production に残る v2 の evidence を同じ証明として扱う。
+  it.each(['gate-policy-v2', 'gate-policy-v3', 'gate-policy-v4'])('%s の bind 済み ALLOW evidence はどちらも promotion 待ちとして検出する', async (policyVersion) => {
+    const { storage, projectId, taskId, sourceJobId } = await withEvidenceCompletion({ policyVersion })
+
+    expect(checkRoadmapCompletionAwaitingPromotion(storage, projectId, 'first-item', LEDGER_IDS)).toEqual([
+      { taskId, sourceJobId, candidateCommitHash: 'candidate-commit' },
+    ])
+  })
+
   it('source Job 自身の bind 済み ALLOW evidence があれば promotion 待ちとして検出し、seam も follow-up を拒否する', async () => {
     const { storage, projectId, taskId, sourceJobId } = await withEvidenceCompletion()
 
@@ -1282,7 +1299,8 @@ describe('checkRoadmapCompletionAwaitingPromotion — Safety Evidence path（#34
     ['evidence が別 Job のもの', { onOtherJob: true }],
     ['decision が ALLOW でない', { decision: 'BLOCKED' }],
     ['bindingVerification が authoritative でない', { bindingVerification: 'diff_text_hash' }],
-    ['policyVersion が gate-policy-v2 でない', { policyVersion: 'gate-policy-v1' }],
+    ['policyVersion が gate-policy-v2 / v3 / v4 でない', { policyVersion: 'gate-policy-v1' }],
+    ['policyVersion が未知の版（v5）', { policyVersion: 'gate-policy-v5' }],
     ['targetBranch が Candidate でない', { targetBranch: 'master' }],
     ['source Job に commitHash が無い', { sourceWithoutCommitHash: true }],
     ['source Job に CONSUMED でない approval（APPROVED）が link されている', { linkedApprovalStatus: 'APPROVED' }],
@@ -1317,6 +1335,8 @@ describe('checkRoadmapCompletionAwaitingPromotion — Safety Evidence path（#34
       dryRun: false,
     } as Parameters<IStorage['jobs']['create']>[0])
     storage.jobs.update(sourceJob.id, { commitHash: 'candidate-commit' })
+    // createForJob は running / blocked の Job にしか結び付けない（承認は Job 実行中に発行される）。
+    storage.jobs.update(sourceJob.id, { status: 'running' })
     const approval = storage.approvalRequests.createForJob({
       taskId: first.taskId,
       targetBranch: 'candidate/self-dev',
@@ -1330,6 +1350,7 @@ describe('checkRoadmapCompletionAwaitingPromotion — Safety Evidence path（#34
       expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
       invalidIf: ['commit changes', 'diff changes'],
     }, sourceJob.id)
+    storage.jobs.update(sourceJob.id, { status: 'success' })
     if (!approval.ok) throw new Error(`failed to bind approval: ${approval.reason}`)
     storage.tasks.update(first.taskId, { status: 'done' })
     storage.taskContinuations.create({
@@ -1339,5 +1360,13 @@ describe('checkRoadmapCompletionAwaitingPromotion — Safety Evidence path（#34
     expect(checkRoadmapCompletionAwaitingPromotion(storage, projectId, 'first-item', LEDGER_IDS)).toEqual([
       { taskId: first.taskId, sourceJobId: sourceJob.id, candidateCommitHash: 'candidate-commit' },
     ])
+  })
+})
+
+// gate の policy version を上げたら、awaiting-promotion 判定が受け入れる version 集合も更新しないと、
+// Candidate の done 作業が再び follow-up として採用され得る（#310 の形）。両者をここで結び付ける。
+describe('awaiting-promotion policy versions', () => {
+  it('accept the current gate policy version', () => {
+    expect(CANDIDATE_COMMIT_EVIDENCE_POLICY_VERSIONS.has(GATE_POLICY_VERSION)).toBe(true)
   })
 })

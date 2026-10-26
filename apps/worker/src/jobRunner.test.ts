@@ -62,7 +62,9 @@ vi.mock('./execution/runContainedCommand.js', async () => {
 import {
   TestContainmentInfrastructureError,
   clearContainedCommandOverride,
+  forwardToExecFileSync,
   setContainedCommandOverride,
+  type ExecFileSyncLike,
 } from './execution/containedCommandTestBridge.js'
 
 describe('Technical Abort cleanup manifest', () => {
@@ -1038,6 +1040,116 @@ describe('runJob', () => {
     expect((commitCall![2] as { timeout?: number }).timeout).toBe(120_000)
   })
 
+  // 2026-10-23 implement stall: 一律 120s では全件 pass する 147s の `pnpm test` が毎回 kill された。
+  describe('SafeCommand の kind 別実行予算と safe_command_timeout', () => {
+    afterEach(() => {
+      clearContainedCommandOverride()
+    })
+
+    /** main SafeCommand（attemptId が safe-command-*）だけを捕まえ、他の containment 呼び出しは従来どおり転送する。 */
+    function captureSafeCommand(
+      respond: (timeoutMs: number | undefined) => Record<string, unknown> | undefined,
+    ): Array<number | undefined> {
+      const budgets: Array<number | undefined> = []
+      setContainedCommandOverride(async (options) => {
+        if (options.attemptId.startsWith('safe-command-')) {
+          budgets.push(options.timeoutMs)
+          const response = respond(options.timeoutMs)
+          if (response !== undefined) return response
+        }
+        return forwardToExecFileSync(execFileSyncMock as unknown as ExecFileSyncLike, options)
+      })
+      return budgets
+    }
+
+    it.each([
+      ['test', ['pnpm', 'run', 'test'], 600_000],
+      ['build', ['pnpm', 'run', 'build'], 600_000],
+      ['typecheck', ['pnpm', 'run', 'typecheck'], 300_000],
+      ['lint', ['pnpm', 'run', 'lint'], 120_000],
+      ['git_status', ['git', 'status', '--short'], 120_000],
+    ] as const)('%s は %i ms の予算で containment に渡される', async (kind, argv, expected) => {
+      resolveCommandMock.mockReturnValue({ argv: [...argv], description: kind })
+      execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => gitFallback(args))
+      const budgets = captureSafeCommand(() => undefined)
+
+      await runJob(createJob({ safeCommand: { kind, workingDir: '/workspace/target' } }), createPolicy())
+
+      expect(budgets).toEqual([expected])
+    })
+
+    it('timed-out SafeCommand は failed + safeCommandFailureKind=safe_command_timeout、stderr に実予算を出す', async () => {
+      resolveCommandMock.mockReturnValue({ argv: ['pnpm', 'run', 'test'], description: 'pnpm test' })
+      execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => gitFallback(args))
+      captureSafeCommand(() => ({
+        outcome: 'clean', signal: 'SIGKILL', killedDescendants: true, drainMs: 0,
+        exitCode: null, stdout: '', stderr: '', timedOut: true,
+      }))
+
+      const result = await runJob(
+        createJob({ safeCommand: { kind: 'test', workingDir: '/workspace/target' } }),
+        createPolicy(),
+      )
+
+      expect(result.status).toBe('failed')
+      expect(result.exitCode).toBe(1)
+      expect(result.safeCommandFailureKind).toBe('safe_command_timeout')
+      expect(result.providerFailureKind).toBeUndefined()
+      expect(result.stderr).toContain('command timed out after 600000ms (test budget)')
+    })
+
+    it('ordinary non-zero exit (not a timeout) does not set safeCommandFailureKind', async () => {
+      resolveCommandMock.mockReturnValue({ argv: ['pnpm', 'run', 'test'], description: 'pnpm test' })
+      execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => gitFallback(args))
+      captureSafeCommand(() => ({
+        outcome: 'clean', signal: null, killedDescendants: false, drainMs: 0,
+        exitCode: 1, stdout: '', stderr: '1 test failed', timedOut: false,
+      }))
+
+      const result = await runJob(
+        createJob({ safeCommand: { kind: 'test', workingDir: '/workspace/target' } }),
+        createPolicy(),
+      )
+
+      expect(result.status).toBe('failed')
+      expect(result.safeCommandFailureKind).toBeUndefined()
+    })
+
+    it('persistJobResult は safe_command_timeout を既存 failureMetadata.kind へ保存する', async () => {
+      const patchJob = vi.fn().mockResolvedValue(true)
+      await persistJobResult('job-1', {
+        status: 'failed',
+        exitCode: 1,
+        safeCommandFailureKind: 'safe_command_timeout',
+        guardResult: { permissionAllowed: true, fileChangeAllowed: true, fileViolations: [] },
+        startedAt: '2026-10-23T00:00:00.000Z',
+        completedAt: '2026-10-23T00:02:00.000Z',
+      }, 'failed', { patchJob })
+
+      expect(patchJob).toHaveBeenCalledWith('job-1', expect.objectContaining({
+        status: 'failed',
+        failureMetadata: expect.objectContaining({ kind: 'safe_command_timeout' }),
+      }))
+    })
+
+    it('regression: persistJobResult still stores provider_timeout unchanged', async () => {
+      const patchJob = vi.fn().mockResolvedValue(true)
+      await persistJobResult('job-1', {
+        status: 'failed',
+        exitCode: 1,
+        providerFailureKind: 'provider_timeout',
+        workspaceState: 'unchanged',
+        guardResult: { permissionAllowed: true, fileChangeAllowed: true, fileViolations: [] },
+        startedAt: '2026-10-23T00:00:00.000Z',
+        completedAt: '2026-10-23T00:02:00.000Z',
+      }, 'failed', { patchJob })
+
+      expect(patchJob).toHaveBeenCalledWith('job-1', expect.objectContaining({
+        failureMetadata: expect.objectContaining({ kind: 'provider_timeout', workspaceState: 'unchanged' }),
+      }))
+    })
+  })
+
   it('git_commit job generates RollbackInfo', async () => {
     resolveCommandMock.mockReturnValue({
       argv: ['git', 'commit', '-m', 'test'],
@@ -1986,6 +2098,63 @@ describe('runJob — Notifier / CEO通知 integration (Step 3D)', () => {
     )
   })
 
+  // D2: 技術的不整合の re_check は「承認無効」と通知しない。理由を stderr に残す（PL triage が自動 resume しない）
+  it.each([
+    'risk_rule_skew: local CRITICAL > API HIGH (worker/api rule skew); technical Gate inconsistency, not an approval decision',
+    'approval_contract_violation: decision=BLOCKED continuationPolicy=continue nextAction=wait_for_approval; technical Gate inconsistency, not an approval decision',
+  ])('技術的不整合の re_check（%s）→ 技術停止の通知・stderr に理由・コマンド未実行', async (reason) => {
+    callGateCheckMock.mockResolvedValue(makeBlockedResponse(`req-3d-tech-${reason.slice(0, 12)}`))
+    resolvePolicyMock.mockReturnValue({ policy: 're_check', reason, apiAvailable: true })
+
+    const result = await runJob(createJob(), createPolicy())
+
+    expect(result.status).toBe('blocked')
+    expect(result.gatePolicy).toBe('re_check')
+    expect(result.stderr).toBe(reason)
+    expect(resolveCommandMock).not.toHaveBeenCalled()
+    expect(callConsumeMock).not.toHaveBeenCalled()
+    const payload = sendAlertMock.mock.calls[0][0]
+    expect(payload.title).toContain('Gate の技術的不整合')
+    expect(payload.title).not.toContain('承認無効')
+    expect(payload.body).toContain('承認の判断ではありません')
+    expect(payload.body).toContain('承認待ちの承認があればそれを承認し、無ければ resume してください')
+    expect(payload.sourceType).toBe('gate_technical_stop')
+  })
+
+  // G-2: call_consume の id の食い違いは gateClient を通り（構造は正しい）、本物の resolvePolicy が
+  // re_check approval_contract_violation にする。Job は failed ではなく見える blocked の技術停止になる。
+  it('call_consume の承認 id の食い違い → 本物の resolvePolicy で blocked + approval_contract_violation（failed にしない・consume しない）', async () => {
+    const actual = await vi.importActual<typeof import('./guards/gatePolicy.js')>('./guards/gatePolicy.js')
+    resolvePolicyMock.mockImplementation(actual.resolvePolicy)
+    callGateCheckMock.mockResolvedValue({
+      ...ALLOW_PROCEED_RESPONSE,
+      outcome: { decision: 'ALLOW' as const, riskLevel: 'LOW', consumedRequestId: 'req-g2' },
+      nextAction: { action: 'call_consume' as const, consumedRequestId: 'req-g2', message: 'consume it' },
+      approvalRequest: makeApprovalRequest('req-other'),
+    })
+
+    const result = await runJob(createJob(), createPolicy())
+
+    expect(result.status).toBe('blocked')
+    expect(result.gatePolicy).toBe('re_check')
+    expect(result.stderr).toMatch(/^approval_contract_violation: /)
+    expect(callConsumeMock).not.toHaveBeenCalled()
+    expect(resolveCommandMock).not.toHaveBeenCalled()
+  })
+
+  it('STALE の re_check は従来どおり「承認無効」と通知し、stderr は付けない', async () => {
+    callGateCheckMock.mockResolvedValue(makeBlockedResponse('req-3d-stale'))
+    resolvePolicyMock.mockReturnValue({ policy: 're_check', reason: 'Approval is stale. Re-run gate/check to start a new approval flow.', apiAvailable: true })
+
+    const result = await runJob(createJob(), createPolicy())
+
+    expect(result.status).toBe('blocked')
+    expect(result.stderr).toBeUndefined()
+    const payload = sendAlertMock.mock.calls[0][0]
+    expect(payload.title).toContain('承認無効')
+    expect(payload.sourceType).toBe('gate_stale')
+  })
+
   // 2. block_until_approved の title に safeCommand.kind が含まれる
   it('block_until_approved の title に safeCommand.kind が含まれる', async () => {
     callGateCheckMock.mockResolvedValue(makeBlockedResponse('req-3d-002'))
@@ -2018,6 +2187,27 @@ describe('runJob — Notifier / CEO通知 integration (Step 3D)', () => {
     expect(payload.body).toContain('task-notif-3d')
     expect(payload.body).toContain('job-notif-3d')
     expect(payload.body).toContain('req-3d-003')
+  })
+
+  // 技術停止の dedup は理由コードごと: 同じ承認依頼でも原因が違えばそれぞれ通知し、同じ原因は 1 回だけ。
+  it('同一 approvalRequestId でも技術停止の原因が違えば両方通知し、同じ原因の 2 回目は通知しない', async () => {
+    const ID = 'req-3d-tech-dedup'
+    callGateCheckMock.mockResolvedValue(makeBlockedResponse(ID))
+    const skew = 'risk_rule_skew: local CRITICAL > API HIGH (worker/api rule skew); technical Gate inconsistency, not an approval decision'
+    const contract = 'approval_contract_violation: decision=BLOCKED continuationPolicy=continue nextAction=wait_for_approval; technical Gate inconsistency, not an approval decision'
+
+    resolvePolicyMock.mockReturnValue({ policy: 're_check', reason: skew, apiAvailable: true })
+    await runJob(createJob(), createPolicy())
+    expect(sendAlertMock).toHaveBeenCalledTimes(1)
+
+    resolvePolicyMock.mockReturnValue({ policy: 're_check', reason: contract, apiAvailable: true })
+    await runJob(createJob(), createPolicy())
+    expect(sendAlertMock).toHaveBeenCalledTimes(2)
+    expect(sendAlertMock.mock.calls[1][0].body).toContain('approval_contract_violation')
+
+    resolvePolicyMock.mockReturnValue({ policy: 're_check', reason: skew, apiAvailable: true })
+    await runJob(createJob(), createPolicy())
+    expect(sendAlertMock).toHaveBeenCalledTimes(2)
   })
 
   // 4. 同一 approvalRequestId の block_until_approved は 2 回目通知されない（dedup）

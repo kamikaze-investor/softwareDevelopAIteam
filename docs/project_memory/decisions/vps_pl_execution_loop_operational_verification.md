@@ -1,6 +1,6 @@
 # VPS PL Execution Loop — Operational Verification（2026-09-14）
 
-`vps-pl-execution-loop` の production 実測記録。**本項目はまだ完了ではない**（末尾の「未実証」参照）。
+`vps-pl-execution-loop` の production 実測記録。**本項目は 2026-09-14 時点ではまだ完了ではなかった**（末尾の「未実証」参照。2026-10-22 注: 現在の状態は `tasks/roadmap.md` の `vps-pl-execution-loop` の `state=` を正とする）。
 
 ## 環境
 

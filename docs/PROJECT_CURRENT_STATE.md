@@ -232,6 +232,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Meta Reviewer structured-output robustness / false-BLOCKED の解消**
 - **Interactive Project Definition / Readiness
 - **Design Review CONFLICT Recovery
+- **Roadmap Generation Constraint Compliance**（2026-09-01登録。Phase 1c 2回目の試行
 - **Project Pause / Continuation-Control Gap
 - **Codex `--output-last-message`一時ファイルが対象リポジトリ内に作られる**
 - **既存Task系Codex independent reviewがrepoを読めていない（degradation）**（2026-09-07登録、
@@ -264,19 +265,28 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **cheap AI（説明・質問経路）の latency と timeout 契約**
 - **VPS 運用手順の Current Truth 文書を canonical にする**
 - **`done` item の中に埋もれた 2026-09-13 の訂正が未実施のまま、生成ブロックからも見えない**
+- **Mandatory Gate Policy
 - **VPS 上で PL 判断ループを動かす（PL 不在の単一障害点を除去）**
+- **十分に制約された LOW-risk Candidate commit を自動承認してよいかを評価する（評価のみ。今は緩和しない）**
 - **承認画面の「AIに質問する」が内部表現（tool call・検索用プロンプト）をCEOへ表示した**
 - **File Change Guard の block メッセージに `allowedPaths` が出ず、原因を誤読する**
+- **採用した Task を「実装せずに閉じる」正式な状態が無い**
 - **Blocked Resolution Triage: Blocked の原因を構造化して分類し、既存の解決レーンへ渡す**
 - **initial implement prompt に Task の allowedPaths / Acceptance Criteria が渡らず、実装 AI が境界を知らないまま作業して File Change Guard で事後停止する**
 - **自律採用した項目が「MVP後へ延期」という古い本文のせいで Design Review に CONFLICT される**
+- **CEO / PL に届く停止理由が、実際の原因を指していない**
 - **Human Resume 後も古い blocked Job が Attention を占有し、後継の新しい失敗が PL に見えない（D2）**
 - **low-load の Design Review が VPS で一度も判定に届かず、届かない理由も `focus set mismatch` に化けていた**
 - **approved になった Human Resume review から git_commit が作られず、Task が行き止まりになる（D4）**
 - **Human Resume で再実行された review の `changes_requested` が repair にも escalation にも渡らない（D1）**
 - **期限切れ git_commit Approval の定常 resume が lineage を深くし、CEO REJECT 後の再実装経路を自ら閉じる
+- **review Job が実装内容のせいで送信前チェック（Secret Scan）に拒否されると、resume も repair も再実装へ届かず Task が恒久的に止まる**
 - **Human Resume で回答済みの repair Design Review run が「最新だから」という理由で repair admission を止め続ける（D3）**
 - **repair 予算が Task 全体の件数で数えられ、独立した失敗が同じ予算を食っていた／人の再開でも予算が戻らなかった**
+- **未設定値から作った credential hash が「形式上正しいもの」として通り、空 token を受理する**
+- **legacy `API_TOKEN` → ADMIN / WORKER split credential cutover の正式 owner（CEO / Operator 判断）**
+- **Cross-Task Drift Audit: 個々には妥当な変更の組合せによる構造ドリフトを、決まった境界で反証する**
+- **Mobile 内の運用指示窓口（Operator Chat）**
 - **`failed` な Job は `attention` に出ないため、Task が止まったまま PL から見えない**
 - **PL が次の Roadmap 項目を自分で選んで採用できるようにする（自律ループの最後の外部依存）**
 - **Principle Registry の一本化と、Review での原則単位の遵守判定・適用記録**
@@ -284,54 +294,51 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **一度 consume された `changes_requested` review が、履歴を変えずには canonical repair へ戻せない**
 - **repair handoff が、成功した source Job の結果を `failed` へ書き換えていた**
 - **repair chain の successor が、durable な結果を残したのに誰にも引き継がれない（No Lost Completion 横断監査）**
+- **`canonical-domain-meaning` が初回実装 prompt と repair prompt に載らない**
 
 **未完了・保留項目:**
 - **障害復旧E2E・自律実行有効化**（state: planned）
 - CEO Alignment Checkpoint: Phase完了・主要機能完成時にサマリーと当初計画との差分をCEOへ通知する。（state: planned）
-- **Safety / Authority 変更に対する Independent Review の判定が安定しない**（state: planned）
+- **Safety / Authority 変更に対する Independent Review の判定が安定しない**（state: deferred）
 - **Worker安全コアの物理分離**（state: deferred）
 - **Context Pack実接続**（state: deferred）
 - **複数Worker対応**（state: deferred）
 - **AI Resource Allocation / Capacity管理**（2026-08-14監査により新規登録。現状Repository上に（state: deferred）
 - **ヒヤリハット・反復非効率検知（state: planned）
-- **Roadmap Generation Constraint Compliance**（2026-09-01登録。Phase 1c 2回目の試行（state: in_progress）
 - **evidence登録後〜Task sync前のcrashでRoadmapが再生成されうる**（2026-09-08登録。（state: planned）
-- **Whole-Roadmap Reviewのsub-stageをAPIへ報告する**（2026-09-08登録。PR Cのscope判断から派生）。（state: planned）
+- **Whole-Roadmap Reviewのsub-stageをAPIへ報告する**（2026-09-08登録。PR Cのscope判断から派生）。（state: deferred）
 - **workflow progressionをblockするbackground taskを、進捗・完了監視なしで走らせない**（state: planned）
 - **DELEG-001: `delegate-watchdog.sh` の respawn が旧childを確実に終了できず、recovery attemptを二重計上する**（state: planned）
 - **M1-b: どの Task にも帰属できない dirty workspace（orphan dirty）を復旧する手段が無い**（state: planned）
 - **fallback workspace ownership は content identity を証明しない（CEO受容済みの既知制約）**（state: deferred）
 - **implement Job が受入条件を機械的に検証せず、条件を満たさない成果物が `success` になる**（state: planned）
 - **正常な continuation 中に `Worker Outbox resend is blocked` の CRITICAL が誤発報する**（state: planned）
-- **continuation reconcile の非blocking指摘2件（Independent Review NON-BLOCKING）**（state: planned）
+- **continuation reconcile の非blocking指摘2件（Independent Review NON-BLOCKING）**（state: deferred）
 - **Codex sandboxをdeprecated Landlockに依存しない経路へ移行する**（2026-09-07登録、（state: planned）
 - **OpenCode repo-aware feasibility reviewer（保留）**（2026-09-07登録。Step 2 provider（state: deferred）
 - **最小かつ制限された remote 公開能力（push / PR）**（state: planned）
 - **Roadmap 採用経路の残作業3件（`roadmap-item-adoption` の後続）**（state: planned）
 - **Maintenance Lane v0 = Tier B: 自分では触れない変更を、正本を手放さずに管理する**（state: planned）
 - **Project 単位 workspace 分離（Multi-Project の前提・最優先）**（state: planned）
-- **Harness Bake-off / Execution Runtime Evaluation（CEO HOLD: 明示解除まで着手しない）**（state: planned）
-- **Containment adversarial escape（cgroup migration / git external helper）（state: planned）
-- **Worker unit の cgroup delegation を明示契約にする（systemd contract hardening・低〜中優先）**（state: planned）
-- **Containment success path の可観測性（低優先 hardening）**（state: planned）
+- **Harness Bake-off / Execution Runtime Evaluation（CEO HOLD: 明示解除まで着手しない）**（state: deferred）
+- **Containment adversarial escape（cgroup migration / git external helper）（state: deferred）
+- **Worker unit の cgroup delegation を明示契約にする（systemd contract hardening・低〜中優先）**（state: deferred）
+- **Containment success path の可観測性（低優先 hardening）**（state: deferred）
 - **Failure Explanation の事前生成と CEO 向け構造化（次段改善）（state: planned）
 - **Worker 自身から `GET /api/jobs` へ 401 が継続している（原因未特定・記録段階）**（state: planned）
 - **Role / Provider / Model Registry（役割別ルーティング設定表）**（state: planned）
-- **Gemini 3.7 Flash Free Tier Worker適合性調査**（state: planned）
+- **Gemini 3.7 Flash Free Tier Worker適合性調査**（state: deferred）
 - **`continue_safe_work_only` が AI CLI のコード変更を止めていない**（state: planned）
 - **実装済みと記録されているレビュー / Gate 層が Job 経路に配線されておらず、うち1つは gate 緩和の理由になった**（state: planned）
 - **`allowedPaths` が空配列だと File Change Guard の範囲チェックが丸ごと無効になる**（state: planned）
 - **VPS runtime / env の文書と tooling を Current Truth に整合させる**（state: planned）
 - **「新しい Current Truth を追記しつつ古い記述を残す」ことで 1 ファイルに 2 つの真実が同居する問題を、既存ルール・既存生成処理・既存 validation の改善で止める**（state: planned）
-- **governance / spec / decision 文書の Current Truth 一括更新（実装は変更しない）**（state: planned）
-- **2026-09-15 監査由来の低優先 cleanup（P3 一括。単独で着手せず、近くを触る通常開発のついでに片付ける）**（state: planned）
+- **governance / spec / decision 文書の Current Truth 一括更新（実装は変更しない）**（state: deferred）
+- **2026-09-15 監査由来の低優先 cleanup（P3 一括。単独で着手せず、近くを触る通常開発のついでに片付ける）**（state: deferred）
 - **横断状態読み出し API（Console より先に、状態が取れることを優先）**（state: in_progress）
-- **Mandatory Gate Policy（state: in_progress）
 - **Review Class B（強化AIレビュー）: 通常AI判断とCEO必須判断の中間を埋める（Tier Bとは別概念・CEO承認が着手条件）**（state: deferred）
-- **十分に制約された LOW-risk Candidate commit を自動承認してよいかを評価する（評価のみ。今は緩和しない）**（state: planned）
 - **承認画面のQ&Aは Repository を調べられない。調査が要る質問の正式な行き先が無い**（state: planned）
 - **external completion reconcile の根拠2つが、まだ機械照合になっていない**（state: planned）
-- **採用した Task を「実装せずに閉じる」正式な状態が無い**（state: planned）
 - **adopt 済み Task が task-kind Design Review で CONFLICT し Job が 0 件のとき、訂正して再レビューする正式な経路が無い**（state: deferred）
 - **Design Review の却下が durable に記録されず、却下履歴を後から辿れない**（state: deferred）
 - **採用経路に「却下済みと実質同じ提案か」の検査が無く、同じ設計を何度でも再審査させられる**（state: deferred）
@@ -340,19 +347,14 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **一度実行した Roadmap 項目に残作業があると、誰も次の Task を作れない（continuation dead-end）**（state: in_progress）
 - **blocked になった Job の変更を、後から安全に取り消す材料が残っていない**（state: deferred）
 - **`approval_gate` evidence は action へ束縛されず、Gate 経路では使い切られない**（state: deferred）
-- **`⚠️ CONTROL REPOSITORY（state: planned）
+- **`⚠️ CONTROL REPOSITORY（state: deferred）
 - **Job の `failureMetadata` が実行をまたいで残り、前の失敗の印が次の実行に付いたままになる**（state: planned）
-- **CEO / PL に届く停止理由が、実際の原因を指していない**（state: planned）
-- **review Job が実装内容のせいで送信前チェック（Secret Scan）に拒否されると、resume も repair も再実装へ届かず Task が恒久的に止まる**（state: planned）
-- **未設定値から作った credential hash が「形式上正しいもの」として通り、空 token を受理する**（state: in_progress）
-- **legacy `API_TOKEN` → ADMIN / WORKER split credential cutover の正式 owner（CEO / Operator 判断）**（state: deferred）
 - **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る**（state: planned）
 - **Design Review runner が本番経路でのみ 120s timeout する（Root Cause 未確定）**（state: planned）
 - **Review provider が枯渇したとき、別 provider へ正式に再審査を依頼できるようにする**（state: planned）
 - **traversal / loop に termination guarantee があるかの横断監査（read-only）**（state: planned）
 - **監視責務の段階分離（Deterministic Watchdog → Lightweight Monitor → VPS PL）（state: planned）
 - **ChatGPT から AIteamOS を inspect / audit / explain できるようにする（MCP）**（state: deferred）
-- **Mobile 内の運用指示窓口（Operator Chat）**（state: planned）
 - **CEO Escalation を AIteamOS Mobile Push で届ける（将来の正式第一通知チャネル）**（state: planned）
 - **PL Console候補の評価（調査のみ・コード変更なし）**（state: deferred）
 - **隔離PoC（AIteamOS本体と非接続）**（state: deferred）
@@ -363,8 +365,26 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **段階投入（feature flag / canary / 段階配信）が無い**（state: deferred）
 - **Principle Registry の適用範囲拡張と、実データによる閾値の自己再評価**（state: planned）
 - **Design Review CONFLICT で止まった採用を、独立した flagship AI が作り直す（Independent Remediation）**（state: in_progress）
-- **Remediation の試行受付が原子的でない（複数 API プロセス前提でのみ問題になる）**（state: planned）
+- **CONFLICT recovery の「この試行は判定か」に owner が2つあり、#2cae0d07 と同じ停止が別 outcome で残る**（state: planned）
+- **Remediation の試行受付が原子的でない（複数 API プロセス前提でのみ問題になる）**（state: deferred）
 - **System One Decision Layer の一般化（Principle 以外の Question category / 外部 Decision Engine 評価）**（state: deferred）
+- **Lifecycle 横断監査（RC1〜RC6）と一括修復 W1〜W7: 同じ意味を経路ごとに別の表現・述語で判定していた**（state: in_progress）
+- **Approval の consume と `git commit` の間でクラッシュすると、復旧が repair（新しい Approval 要求）にしか無い**（state: deferred）
+- **M1: HIGH の技術的 git_commit を、強化した Safety Evidence（ベンダー分離の独立レビュー）で通す**（state: deferred）
+- **M2: `RISK_RULES` の部分文字列一致が誤検知する（authorBadge / tokenizer / dropdown / guardian）**（state: deferred）
+- **M3: DA trigger 3/4/5 の決定論的検出（新規依存・外部サービス、新規 public route、不可逆 migration）**（state: deferred）
+- **M4: Approval consume の不変条件が足りない**（state: deferred）
+- **M5: commit 直前に branch を再確認し、resulting-commit binding が失敗したら Task を完了させない**（state: deferred）
+- **M6: `blockedTriage` の残りの rule を技術制約 lane へ移し、「技術的・自動再開なし・CEO 判断なし」の PL lane を足す**（state: deferred）
+- **M8: レビュー不一致・安全方向の判定不能・Meta Review UNCERTAIN だけを理由に CEO へ回してよいか（state: deferred）
+- **Promotion 済みの roadmap id を `planned` に戻すと、恒久的に「promotion 待ち」のままになる**（state: deferred）
+- **Candidate HEAD が動いた後の WAITING git_commit Approval が、CEO の承認後にしか stale と分からない（1回のタップが3回になる）**（state: deferred）
+- **Escalation の cleanup は escalate した Job 自身の manifest だけを戻し、以前の repair attempt の汚れは blocked owner に残る**（state: deferred）
+- **HIGH の git_commit が block されても Worker 側の alert が出ない**（state: deferred）
+- **dirty baseline を持つ blocked 行（例: reject された git_commit）の手動 abort が完了しない**（state: deferred）
+- **Candidate を Lifecycle 一括修復後の master へ同期する（`b8d0fc5d` が正規の経路で終わった後）**（state: deferred）
+- **abort の帰属判定が Job の作成時刻を文字列のまま比べている**（state: deferred）
+- **RiskLevel の順位表が複数箇所に重複している**（state: deferred）
 
 詳細は `tasks/roadmap.md`「スマホ操作MVP残タスク」を参照。
 <!-- AUTO-GENERATED:ROADMAP_CURRENT_STATE:END -->

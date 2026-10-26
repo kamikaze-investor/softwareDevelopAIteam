@@ -6,7 +6,6 @@ import type { ReactElement } from 'react'
 import { useCallback, useEffect, useState } from 'react'
 import type {
   ApprovalExplanationResponse,
-  ApprovalGateStatus,
   ApprovalQuestionResponse,
   ApprovalQuestionTurn,
   ApprovalRequest,
@@ -30,6 +29,7 @@ import {
 } from 'react-native'
 
 import { apiFetch } from '../lib/api'
+import { TASK_NUMBER_TEXT_STYLE, taskNumberLabel } from '../lib/taskNumber'
 import { approvalIdLabel, approvalTargetDescription, copyApprovalId } from '../lib/approvalIdentity'
 import {
   fetchPendingApprovals,
@@ -39,13 +39,15 @@ import {
   setCachedApprovals,
 } from '../lib/approvalsCache'
 import type { ApprovalWithProject } from '../lib/approvalsCache'
+import {
+  approvalGateDecisionPath,
+  buildApprovalGateDecisionBody,
+} from '../lib/approvalGateDecision'
+import type { ApprovalGateDecisionStatus } from '../lib/approvalGateDecision'
+import { formatApprovalDecisionErrorMessage } from '../lib/resumeErrorMessage'
 import { POLLING_INTERVAL_MS, usePolling } from '../lib/usePolling'
 
 type DecisionStatus = 'approved' | 'rejected'
-type ApprovalGateDecisionStatus = Extract<
-  ApprovalGateStatus,
-  'APPROVED' | 'REJECTED'
->
 
 type RejectTarget =
   | { type: 'policy'; item: ApprovalWithProject }
@@ -178,6 +180,11 @@ function formatApprovalGateStatus(status: string): string {
       return 'ステータス: 反映済み'
     case 'EXPIRED':
       return 'ステータス: 期限切れ'
+    // Task 詳細の APPROVAL_STATUS_LABEL と同じ語を使う（同じ状態を画面ごとに別の名前で呼ばない）。
+    case 'STALE':
+      return 'ステータス: 無効化'
+    case 'SUPERSEDED':
+      return 'ステータス: 置き換え済み'
     default:
       return `ステータス: ${status}`
   }
@@ -478,7 +485,16 @@ export default function ApprovalsScreen(): ReactElement {
       })
 
       if (!response.ok) {
-        throw new Error(`Failed to update approval: ${response.status}`)
+        // この route も HUMAN_ONLY_ROUTES（2026-10-17）。403 の code ごとの文言を出す。
+        let code: string | null = null
+        try {
+          const body = (await response.json()) as { code?: unknown }
+          code = typeof body.code === 'string' ? body.code : null
+        } catch {
+          code = null
+        }
+        Alert.alert('エラー', formatApprovalDecisionErrorMessage(code))
+        return
       }
 
       await loadPolicyApprovals()
@@ -494,16 +510,25 @@ export default function ApprovalsScreen(): ReactElement {
   ): Promise<void> {
     try {
       const response = await apiFetch(
-        `/api/approval-requests/${requestId}/status`,
+        approvalGateDecisionPath(requestId),
         {
-          body: JSON.stringify({ reason, status }),
+          body: JSON.stringify(buildApprovalGateDecisionBody(status, reason)),
           headers: { 'Content-Type': 'application/json' },
           method: 'PATCH',
         },
       )
 
       if (!response.ok) {
-        throw new Error(`Failed to update approval request: ${response.status}`)
+        // 403 HUMAN_ONLY_ROUTE_REQUIRES_SPLIT_CREDENTIALS 等は code ごとの文言で出す（C-02）。
+        let code: string | null = null
+        try {
+          const body = (await response.json()) as { code?: unknown }
+          code = typeof body.code === 'string' ? body.code : null
+        } catch {
+          code = null
+        }
+        Alert.alert('エラー', formatApprovalDecisionErrorMessage(code))
+        return
       }
 
       await loadApprovalRequests()
@@ -740,6 +765,9 @@ export default function ApprovalsScreen(): ReactElement {
               <Text style={styles.itemTitle}>
                 AIがしようとしていること: {formatRequestedActionSummary(item.requestedAction)}
               </Text>
+              {taskNumberLabel(item.taskId) !== null && (
+                <Text style={TASK_NUMBER_TEXT_STYLE} selectable>対象の{taskNumberLabel(item.taskId)}</Text>
+              )}
 
               {riskSummary.map((label) => (
                 <Text key={label} style={styles.metaText}>

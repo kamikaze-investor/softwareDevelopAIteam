@@ -201,7 +201,11 @@ function isGateCheckResponse(value: unknown): value is GateCheckResponse {
     if (typeof nextAction.consumedRequestId !== 'string' || nextAction.consumedRequestId.length === 0) {
       return false
     }
+    // ここは構造だけを見る（G-2）。consume する承認の id が応答内で一致しているか（outcome / nextAction /
+    // approvalRequest）は契約の整合であり、resolvePolicy の整合検査が re_check（approval_contract_violation）にする。
+    // ここで弾くと技術障害（failed Job）になり、見える blocked の技術停止にならない。
   }
+  if (v.approvalRequest !== undefined && !asRecord(v.approvalRequest)) return false
 
   return true
 }

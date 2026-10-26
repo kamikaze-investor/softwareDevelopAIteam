@@ -1,10 +1,10 @@
-import { describe, expect, it, beforeEach, beforeAll, afterAll } from 'vitest'
+import { describe, expect, it, beforeEach, afterEach, beforeAll, afterAll, vi } from 'vitest'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
-import { buildSystemState } from '../state/systemState'
+import { buildSystemState, DEFAULT_STALL_HINT_MS } from '../state/systemState'
 import {
   PL_MAX_ATTEMPTS_PER_TARGET,
   PL_MAX_TECHNICAL_RESUMES_PER_TASK,
@@ -19,16 +19,19 @@ import {
   runPlTick,
   parseEscalationDelivery,
   verifyOutcome,
+  allowedActionsFor,
+  hasWiredPlExecutor,
   type PlDiagnosisInput,
   type PlEscalationChannelResult,
   type PlLoopDeps,
 } from './executionLoop'
 import { findProposalDiagnostics, PL_MAX_ADOPTION_ATTEMPTS } from './adoptionStep'
-import { parseTriageAuditDetail } from './blockedTriage'
-import { readResumeActorClasses } from '../designReview/resumeActor'
+import { parseTriageAuditDetail, triageBlocked } from './blockedTriage'
+import { readResumeActorClasses, recordApprovalActor } from '../designReview/resumeActor'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { prepareRepairFlow } from '../designReview/repairFlow'
 import type { JobRefusalMetadata } from '@ai-team/shared'
+import { advanceWallClock, passDesignReviewRetryCooldown } from '../designReview/retryCooldownTestClock'
 
 /**
  * ここで固定しているのは「PL が自分の権限で動かない」ことと「操作したら必ず確かめる」ことである。
@@ -108,6 +111,9 @@ function recordTargetAttempts(storage: IStorage, targetKey: string, count: numbe
 beforeEach(() => {
   resetPlLoopInFlightForTest()
 })
+
+// retry cooldown を明けさせるために壁時計を進めたテストの後始末（retryCooldownTestClock.ts）。
+afterEach(() => { vi.useRealTimers() })
 
 describe('PL resume prompt', () => {
   it('keeps the same Task Contract and adds the PL resume instruction', () => {
@@ -546,6 +552,8 @@ describe('runPlTick — Execute / Verify', () => {
     const { storage, runId } = seedIdleDesignReview()
     // 3 attempt すべて消費した状態にする
     for (let i = 0; i < 3; i += 1) {
+      // attempt の間の retry cooldown（retryCooldown.ts）を時計で明けさせる。
+      passDesignReviewRetryCooldown()
       const claim = storage.designReviewRuns.claim(runId, 3)
       if (claim.claimToken) storage.designReviewRuns.requeue(runId, claim.claimToken, 'timeout')
     }
@@ -909,7 +917,7 @@ describe('Recovery 成功の判定（対象が解消したか）', () => {
   })
 
   it('対象が残った technical recovery は試行上限で止まるが CEO へ上げない', async () => {
-    const { storage, taskId } = seedIdleDesignReview()
+    const { storage, runId } = seedIdleDesignReview()
     const escalations: string[] = []
     const d = deps({
       // 「成功した」と言うだけで何もしない実行 → 対象は消えない
@@ -927,7 +935,7 @@ describe('Recovery 成功の判定（対象が解消したか）', () => {
     expect(escalations).toEqual([])
 
     const exhaustionAudits = storage.auditLog
-      .findByEntity('pl_loop_target', `design_review_idle:${taskId}`)
+      .findByEntity('pl_loop_target', `design_review_idle:${runId}`)
       .filter((entry) => entry.result === 'technical_exhausted')
     expect(exhaustionAudits).toHaveLength(1)
     expect(exhaustionAudits[0]?.detail).toContain('scope=target')
@@ -936,7 +944,7 @@ describe('Recovery 成功の判定（対象が解消したか）', () => {
     resetPlLoopInFlightForTest()
     await runPlTick(storage, d)
     expect(storage.auditLog
-      .findByEntity('pl_loop_target', `design_review_idle:${taskId}`)
+      .findByEntity('pl_loop_target', `design_review_idle:${runId}`)
       .filter((entry) => entry.result === 'technical_exhausted')).toHaveLength(1)
   })
 })
@@ -1130,11 +1138,11 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
   })
 
   it('technical exhaustion は対象 Project だけを待たせ、別の idle Project の採用を止めない', async () => {
-    const { storage, taskId } = seedIdleDesignReview()
+    const { storage, taskId, runId } = seedIdleDesignReview()
     const exhaustedProjectId = storage.projects.findAll()[0]!.id
     recordTargetAttempts(
       storage,
-      `design_review_idle:${taskId}`,
+      `design_review_idle:${runId}`,
       PL_MAX_ATTEMPTS_PER_TARGET,
     )
     storage.projects.update(exhaustedProjectId, { status: 'paused' })
@@ -1167,9 +1175,11 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
       .toContain('technical recovery budget is exhausted')
   })
 
-  it('未 escalate の停滞は、別 Project の採用も従来どおり止める', async () => {
+  it('未 escalate の停滞は、別 Project の採用も止める。quarantine は1回 escalate された後は止めない', async () => {
     // 判断待ちの除外は Escalation 済みに限る。まだ誰にも上げていない停滞が残るうちは、
     // どの Project にも新しい仕事を増やさない（既存の意図）。
+    // W5: workspace_quarantined は以前 PL が一度も escalate しなかったため、ここで**永久に**
+    // 全採用を止めていた。今は最初の tick で CEO へ1回届け、次の tick から別 Project の採用を許す。
     const { storage, projectId, taskId } = seed()
     // running な Project は1つだけ（既存制約）。停滞している Project は paused にし、採用先を Other にする。
     // paused では task_ready_without_job が出ないため、status に関係なく出る workspace_quarantined を使う。
@@ -1185,19 +1195,597 @@ describe('runPlTick — 手が空いたら次の Roadmap 項目を採用する',
     storage.jobs.update(job.id, {
       failureMetadata: { quarantined: true, quarantineReason: 'workspace could not be proven quiescent' },
     })
-    // 前提: 未 escalate の workspace_quarantined が1件あり、PL は扱わない（actionable でない）
+    // 前提: 未 escalate の workspace_quarantined が1件ある
     expect(buildSystemState(storage, { now: () => NOW }).attention.map((a) => a.kind)).toEqual(['workspace_quarantined'])
     storage.projects.create({ name: 'Other', goal: 'g', designPhilosophy: [], status: 'running' })
     let adoptCalls = 0
-
-    const result = await runPlTick(storage, deps({
+    const escalations: string[] = []
+    const d = deps({
       readLedger: () => LEDGER,
       proposeAdoption: async () => PROPOSAL,
       adopt: async () => { adoptCalls += 1; return { ok: true as const, taskId: 'x', roadmapTaskKey: 'y', title: 't' } },
-    }))
+      escalate: async (p) => { escalations.push(p.title); return DELIVERED },
+    })
 
-    expect(result.status).toBe('idle')
+    // 1 tick 目: 未 escalate の停滞なので採用しない。その代わり CEO へ届ける。
+    const first = await runPlTick(storage, d)
+    expect(first.status).toBe('escalated')
     expect(adoptCalls).toBe(0)
+    expect(escalations).toHaveLength(1)
+
+    // 2 tick 目: escalate 済みは「CEO 判断待ち」。止めるのはその Project だけで、Other は採用できる。
+    resetPlLoopInFlightForTest()
+    await runPlTick(storage, d)
+    expect(adoptCalls).toBe(1)
+    expect(escalations).toHaveLength(1)
+  })
+
+  describe('workspace_held_by_stalled_owner (W5)', () => {
+    function seedHeldWorkspace(ownerStatus: 'running' | 'queued' | 'blocked'): {
+      storage: IStorage
+      ownerJobId: string
+      pausedProjectId: string
+    } {
+      const { storage, projectId, taskId } = seed()
+      storage.jobs.create({
+        taskId,
+        projectId,
+        agentRole: 'developer_ai',
+        status: 'queued',
+        workflowStepKey: `task:${taskId}:initial-implement`,
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        dryRun: false,
+      } as Parameters<IStorage['jobs']['create']>[0])
+      const paused = storage.projects.create({ name: 'Paused', goal: 'g', designPhilosophy: [], status: 'paused' })
+      const pausedTask = storage.tasks.create({
+        projectId: paused.id, title: 'P', description: '', status: 'pending', assignee: 'developer_ai', dependencies: [],
+      } as Parameters<IStorage['tasks']['create']>[0])
+      const owner = storage.jobs.create({
+        taskId: pausedTask.id,
+        projectId: paused.id,
+        agentRole: 'developer_ai',
+        status: ownerStatus,
+        workflowStepKey: `resume:prior-${pausedTask.id}:1`,
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        dryRun: false,
+      } as Parameters<IStorage['jobs']['create']>[0])
+      return { storage, ownerJobId: owner.id, pausedProjectId: paused.id }
+    }
+
+    it.each(['running', 'queued', 'blocked'] as const)(
+      'a paused Project %s owner + queued work in the running Project emits the attention',
+      (ownerStatus) => {
+        const { storage, ownerJobId, pausedProjectId } = seedHeldWorkspace(ownerStatus)
+
+        const held = buildSystemState(storage, { now: () => NOW }).attention
+          .filter((item) => item.kind === 'workspace_held_by_stalled_owner')
+
+        expect(held).toHaveLength(1)
+        expect(held[0]).toMatchObject({ projectId: pausedProjectId, jobId: ownerJobId, referenceId: ownerJobId })
+        expect(held[0]!.detail).toMatch(/^cause=inactive_project: /)
+      },
+    )
+
+    it('is not emitted when no running Project has queued work (a plain pause does not page)', () => {
+      const { storage } = seedHeldWorkspace('queued')
+      const runningProject = storage.projects.findAll().find((project) => project.status === 'running')!
+      for (const task of storage.tasks.findByProjectId(runningProject.id)) {
+        for (const job of storage.jobs.findByTaskId(task.id)) storage.jobs.update(job.id, { status: 'success' })
+      }
+
+      expect(buildSystemState(storage, { now: () => NOW }).attention
+        .some((item) => item.kind === 'workspace_held_by_stalled_owner')).toBe(false)
+    })
+
+    // lifecycle repair C2: done な Task の非 quarantine blocked 行（stale 候補）は API の所有者ではない。
+    // 解放は Worker の worktree 観測、dirty の保護は次の initial implement の baseline admission が担う。
+    // 以前は guard と attention がこの行を所有者と数え、Worker が解放した後も claim が永久に止まった。
+    it('a legacy done-Task blocked row is left to the Worker: the claim proceeds and no stalled-owner attention is emitted or escalated', async () => {
+      const { storage, projectId, taskId } = seed()
+      storage.jobs.create({
+        taskId,
+        projectId,
+        agentRole: 'developer_ai',
+        status: 'queued',
+        workflowStepKey: `task:${taskId}:initial-implement`,
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        dryRun: false,
+      } as Parameters<IStorage['jobs']['create']>[0])
+      const doneTask = storage.tasks.create({
+        projectId, title: 'Done', description: '', status: 'done', assignee: 'developer_ai', dependencies: [],
+      } as Parameters<IStorage['tasks']['create']>[0])
+      storage.jobs.create({
+        taskId: doneTask.id,
+        projectId,
+        agentRole: 'developer_ai',
+        status: 'blocked',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        dryRun: false,
+      } as Parameters<IStorage['jobs']['create']>[0])
+
+      expect(buildSystemState(storage, { now: () => NOW }).attention
+        .some((item) => item.kind === 'workspace_held_by_stalled_owner')).toBe(false)
+
+      const initial = storage.jobs.findByTaskId(taskId)
+        .find((job) => job.workflowStepKey === `task:${taskId}:initial-implement`)!
+      expect(storage.jobs.update(initial.id, { status: 'running' })?.status).toBe('running')
+    })
+
+    it('a quarantined done-Task blocked row is still an owner: the claim is refused and only workspace_quarantined pages', () => {
+      const { storage, projectId, taskId } = seed()
+      const queued = storage.jobs.create({
+        taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+        workflowStepKey: `task:${taskId}:initial-implement`,
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+      } as Parameters<IStorage['jobs']['create']>[0])
+      const doneTask = storage.tasks.create({
+        projectId, title: 'Done', description: '', status: 'done', assignee: 'developer_ai', dependencies: [],
+      } as Parameters<IStorage['tasks']['create']>[0])
+      const row = storage.jobs.create({
+        taskId: doneTask.id, projectId, agentRole: 'developer_ai', status: 'blocked',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+      } as Parameters<IStorage['jobs']['create']>[0])
+      storage.jobs.update(row.id, { failureMetadata: { quarantined: true, quarantineReason: 'unverified workspace' } })
+
+      expect(storage.jobs.update(queued.id, { status: 'running' })?.status).toBe('queued')
+      const kinds = buildSystemState(storage, { now: () => NOW }).attention.map((item) => item.kind)
+      expect(kinds).toContain('workspace_quarantined')
+      expect(kinds).not.toContain('workspace_held_by_stalled_owner')
+    })
+
+    it('a done-Task blocked row is not reported while no running-Project queued work would be refused', () => {
+      const { storage, projectId } = seed()
+      const doneTask = storage.tasks.create({
+        projectId, title: 'Done', description: '', status: 'done', assignee: 'developer_ai', dependencies: [],
+      } as Parameters<IStorage['tasks']['create']>[0])
+      storage.jobs.create({
+        taskId: doneTask.id, projectId, agentRole: 'developer_ai', status: 'blocked',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+      } as Parameters<IStorage['jobs']['create']>[0])
+
+      expect(buildSystemState(storage, { now: () => NOW }).attention
+        .some((item) => item.kind === 'workspace_held_by_stalled_owner')).toBe(false)
+    })
+
+    it('two Tasks in the running Project with non-initial queued Jobs: cause=multiple_live_owners, escalated once', async () => {
+      const { storage, projectId, taskId } = seed()
+      const otherTask = storage.tasks.create({
+        projectId, title: 'Other', description: '', status: 'pending', assignee: 'developer_ai', dependencies: [],
+      } as Parameters<IStorage['tasks']['create']>[0])
+      for (const ownerTaskId of [taskId, otherTask.id]) {
+        storage.jobs.create({
+          taskId: ownerTaskId,
+          projectId,
+          agentRole: 'developer_ai',
+          status: 'queued',
+          workflowStepKey: `resume:prior-${ownerTaskId}:1`,
+          safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+          dryRun: false,
+        } as Parameters<IStorage['jobs']['create']>[0])
+      }
+
+      const held = buildSystemState(storage, { now: () => NOW }).attention
+        .filter((item) => item.kind === 'workspace_held_by_stalled_owner')
+      expect(held).toHaveLength(1)
+      expect(held[0]!.detail).toMatch(/^cause=multiple_live_owners: /)
+      expect(held[0]!.referenceId).toMatch(/^owners:/)
+
+      const escalations: string[] = []
+      const d = deps({ escalate: async (p) => { escalations.push(p.title); return DELIVERED } })
+      const first = await runPlTick(storage, d)
+      resetPlLoopInFlightForTest()
+      await runPlTick(storage, d)
+
+      expect(first.status).toBe('escalated')
+      expect(escalations).toHaveLength(1)
+    })
+
+    it('a quarantined paused-Project owner is paged once (workspace_quarantined), not twice', async () => {
+      const { storage, ownerJobId } = seedHeldWorkspace('blocked')
+      storage.jobs.update(ownerJobId, {
+        failureMetadata: { quarantined: true, quarantineReason: 'workspace could not be proven quiescent' },
+      })
+
+      const kinds = buildSystemState(storage, { now: () => NOW }).attention.map((item) => item.kind)
+      expect(kinds).toContain('workspace_quarantined')
+      expect(kinds).not.toContain('workspace_held_by_stalled_owner')
+
+      const escalations: string[] = []
+      const d = deps({ escalate: async (p) => { escalations.push(p.title); return DELIVERED } })
+      for (let i = 0; i < 3; i += 1) {
+        resetPlLoopInFlightForTest()
+        await runPlTick(storage, d)
+      }
+      expect(escalations).toHaveLength(1)
+    })
+
+    describe('git_commit completion terminalizes the Task’s blocked rows only with clean evidence', () => {
+      function completingTask(): { storage: IStorage; projectId: string; doneTaskId: string; commitId: string; blockedId: string; queuedId: string } {
+        const { storage, projectId, taskId } = seed()
+        const queued = storage.jobs.create({
+          taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+          workflowStepKey: `task:${taskId}:initial-implement`,
+          safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+        } as Parameters<IStorage['jobs']['create']>[0])
+        const completing = storage.tasks.create({
+          projectId, title: 'Completing', description: '', status: 'in_progress', assignee: 'developer_ai', dependencies: [],
+        } as Parameters<IStorage['tasks']['create']>[0])
+        const blocked = storage.jobs.create({
+          taskId: completing.id, projectId, agentRole: 'developer_ai', status: 'blocked',
+          safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+        } as Parameters<IStorage['jobs']['create']>[0])
+        const commit = storage.jobs.create({
+          taskId: completing.id, projectId, agentRole: 'developer_ai', status: 'running',
+          safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, dryRun: false,
+        } as Parameters<IStorage['jobs']['create']>[0])
+        return { storage, projectId, doneTaskId: completing.id, commitId: commit.id, blockedId: blocked.id, queuedId: queued.id }
+      }
+
+      it('a clean end fingerprint at the committed HEAD terminalizes the blocked row (audited) and the claim proceeds', () => {
+        const { storage, doneTaskId, commitId, blockedId, queuedId } = completingTask()
+
+        const result = storage.jobs.persistCommitSuccessWithContinuation({
+          jobId: commitId,
+          update: {
+            status: 'success', exitCode: 0, commitHash: 'c0ffee',
+            failureMetadata: { workspaceEndFingerprint: { mode: 'clean', startCommitHash: 'c0ffee' } },
+          },
+        })
+
+        expect(result.ok).toBe(true)
+        expect(storage.tasks.findById(doneTaskId)?.status).toBe('done')
+        expect(storage.jobs.findById(blockedId)?.status).toBe('failed')
+        const audit = storage.auditLog.findByEntity('job', blockedId)
+          .filter((entry) => entry.operation === 'completion_terminalized')
+        expect(audit).toHaveLength(1)
+        expect(audit[0]!.detail).toContain(`committing_job_id=${commitId}`)
+        expect(storage.jobs.update(queuedId, { status: 'running' })?.status).toBe('running')
+      })
+
+      it('supersedes the WAITING approval linked to a blocked row it terminalizes, in the same transaction (audited)', () => {
+        const { storage, doneTaskId, commitId, blockedId } = completingTask()
+        const created = storage.approvalRequests.create({
+          taskId: doneTaskId,
+          targetBranch: 'candidate/self-dev',
+          targetCommit: 'abc1234',
+          targetDiffHash: 'hash',
+          riskLevel: 'LOW',
+          requestedAction: 'git_commit',
+          status: 'WAITING_FOR_USER',
+          expiresAt: '2099-01-01T00:00:00.000Z',
+          invalidIf: [],
+          changedFiles: ['docs/notes.md'],
+          triggeredRules: ['git_commit requires CEO approval (policy)'],
+        } as Parameters<IStorage['approvalRequests']['create']>[0])
+        storage.jobs.update(blockedId, { approvalId: created.id })
+        const approvalId = created.id
+
+        storage.jobs.persistCommitSuccessWithContinuation({
+          jobId: commitId,
+          update: {
+            status: 'success', exitCode: 0, commitHash: 'c0ffee',
+            failureMetadata: { workspaceEndFingerprint: { mode: 'clean', startCommitHash: 'c0ffee' } },
+          },
+        })
+
+        expect(storage.jobs.findById(blockedId)?.status).toBe('failed')
+        expect(storage.approvalRequests.findById(approvalId)?.status).toBe('SUPERSEDED')
+        const audit = storage.auditLog.findByEntity('approval_request', approvalId)
+          .filter((entry) => entry.operation === 'supersede')
+        expect(audit).toHaveLength(1)
+        expect(audit[0]!.detail).toContain(`source_job_id=${blockedId}`)
+      })
+
+      it.each([
+        ['a dirty end fingerprint', { workspaceEndFingerprint: { mode: 'dirty', startCommitHash: 'c0ffee', entries: [] } }],
+        ['a missing end fingerprint', {}],
+        ['a clean fingerprint at another HEAD', { workspaceEndFingerprint: { mode: 'clean', startCommitHash: 'other' } }],
+      ])('%s leaves the row; the API leaves it to the Worker observation (claim proceeds, no stalled-owner attention)', (_label, failureMetadata) => {
+        const { storage, commitId, blockedId, queuedId } = completingTask()
+
+        storage.jobs.persistCommitSuccessWithContinuation({
+          jobId: commitId,
+          update: { status: 'success', exitCode: 0, commitHash: 'c0ffee', failureMetadata } as Parameters<IStorage['jobs']['update']>[1],
+        })
+
+        // 行は終端化しない（clean の証拠が無い）。所有の判断は Worker の worktree 観測と
+        // 次の initial implement の baseline admission（dirty なら fail-closed）が行う。
+        expect(storage.jobs.findById(blockedId)?.status).toBe('blocked')
+        expect(buildSystemState(storage, { now: () => NOW }).attention
+          .some((item) => item.kind === 'workspace_held_by_stalled_owner')).toBe(false)
+        expect(storage.jobs.update(queuedId, { status: 'running' })?.status).toBe('running')
+      })
+    })
+
+    it("a paused-Project owner + a running-Project non-initial queued owner: exactly one attention, cause=multiple_live_owners", () => {
+      const { storage } = seedHeldWorkspace('blocked')
+      const runningProject = storage.projects.findAll().find((project) => project.status === 'running')!
+      const [runningTask] = storage.tasks.findByProjectId(runningProject.id)
+      for (const job of storage.jobs.findByTaskId(runningTask!.id)) storage.jobs.update(job.id, { status: 'success' })
+      storage.jobs.create({
+        taskId: runningTask!.id,
+        projectId: runningProject.id,
+        agentRole: 'developer_ai',
+        status: 'queued',
+        workflowStepKey: `resume:prior-${runningTask!.id}:1`,
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+        dryRun: false,
+      } as Parameters<IStorage['jobs']['create']>[0])
+
+      const held = buildSystemState(storage, { now: () => NOW }).attention
+        .filter((item) => item.kind === 'workspace_held_by_stalled_owner')
+
+      expect(held).toHaveLength(1)
+      expect(held[0]!.detail).toMatch(/^cause=multiple_live_owners: /)
+      expect(held[0]!.detail).not.toContain('cause=inactive_project')
+    })
+
+    it.each(['paused', 'draft'] as const)(
+      'a sole legacy done-Task blocked row in a %s Project is not an owner: no stalled-owner attention (no inactive_project either)',
+      (status) => {
+        const { storage, projectId, taskId } = seed()
+        storage.jobs.create({
+          taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+          workflowStepKey: `task:${taskId}:initial-implement`,
+          safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+        } as Parameters<IStorage['jobs']['create']>[0])
+        const stopped = storage.projects.create({ name: 'Stopped', goal: 'g', designPhilosophy: [], status })
+        const doneTask = storage.tasks.create({
+          projectId: stopped.id, title: 'Done', description: '', status: 'done', assignee: 'developer_ai', dependencies: [],
+        } as Parameters<IStorage['tasks']['create']>[0])
+        storage.jobs.create({
+          taskId: doneTask.id, projectId: stopped.id, agentRole: 'developer_ai', status: 'blocked',
+          safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+        } as Parameters<IStorage['jobs']['create']>[0])
+
+        expect(buildSystemState(storage, { now: () => NOW }).attention
+          .some((item) => item.kind === 'workspace_held_by_stalled_owner')).toBe(false)
+      },
+    )
+
+    it('runPlTick escalates it to the CEO exactly once, without diagnosis', async () => {
+      const { storage, ownerJobId } = seedHeldWorkspace('queued')
+      let diagnosed = 0
+      const escalations: string[] = []
+      const d = deps({
+        diagnose: async () => { diagnosed += 1; return '{}' },
+        escalate: async (p) => { escalations.push(p.title); return DELIVERED },
+      })
+
+      const first = await runPlTick(storage, d)
+      resetPlLoopInFlightForTest()
+      const second = await runPlTick(storage, d)
+      resetPlLoopInFlightForTest()
+      await runPlTick(storage, d)
+
+      expect(first).toMatchObject({
+        status: 'escalated',
+        target: { kind: 'workspace_held_by_stalled_owner', jobId: ownerJobId },
+      })
+      expect(second.status).not.toBe('escalated')
+      expect(escalations).toHaveLength(1)
+      expect(diagnosed).toBe(0)
+    })
+  })
+
+  // lifecycle repair C2 / RC5: claim されない queued Job が他のどの attention にも表れず黙って止まらない。
+  describe('job_queued_long', () => {
+    const T0 = Date.parse('2026-10-16T00:00:00.000Z')
+    const at = (offsetMs: number): string => new Date(T0 + offsetMs).toISOString()
+    const PAST = DEFAULT_STALL_HINT_MS + 60_000
+
+    // Job / approval の時刻は storage が実時刻で付けるので、作成時刻を固定する。
+    beforeEach(() => {
+      vi.useFakeTimers({ toFake: ['Date'] })
+      vi.setSystemTime(T0)
+    })
+    afterEach(() => {
+      vi.useRealTimers()
+    })
+
+    function queue(storage: IStorage, projectId: string, taskId: string, over: Record<string, unknown> = {}) {
+      return storage.jobs.create({
+        taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+        workflowStepKey: `task:${taskId}:initial-implement`,
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+        ...over,
+      } as Parameters<IStorage['jobs']['create']>[0])
+    }
+
+    function queuedLong(storage: IStorage, now: string) {
+      return buildSystemState(storage, { now: () => now }).attention.filter((item) => item.kind === 'job_queued_long')
+    }
+
+    it('the head-of-line queued Job past the threshold with nothing else explaining it: one attention, escalated once without diagnosis', async () => {
+      const { storage, projectId, taskId } = seed()
+      const job = queue(storage, projectId, taskId)
+      const now = at(PAST)
+
+      const items = queuedLong(storage, now)
+      expect(items).toHaveLength(1)
+      expect(items[0]).toMatchObject({ jobId: job.id, referenceId: job.id })
+      expect(items[0]!.stuckForMs).toBeGreaterThanOrEqual(DEFAULT_STALL_HINT_MS)
+
+      let diagnosed = 0
+      const escalations: string[] = []
+      const d = deps({
+        now: () => now,
+        diagnose: async () => { diagnosed += 1; return '{}' },
+        escalate: async (p) => { escalations.push(p.title); return DELIVERED },
+      })
+      const first = await runPlTick(storage, d)
+      for (let i = 0; i < 2; i += 1) {
+        resetPlLoopInFlightForTest()
+        await runPlTick(storage, d)
+      }
+
+      expect(first).toMatchObject({ status: 'escalated', target: { kind: 'job_queued_long', jobId: job.id } })
+      expect(escalations).toHaveLength(1)
+      expect(diagnosed).toBe(0)
+    })
+
+    it('is not emitted before the threshold', () => {
+      const { storage, projectId, taskId } = seed()
+      queue(storage, projectId, taskId)
+      expect(queuedLong(storage, at(DEFAULT_STALL_HINT_MS - 1_000))).toHaveLength(0)
+    })
+
+    it('a queued Job waiting behind a running Job is a normal serialized wait: no attention however long', () => {
+      const { storage, projectId, taskId } = seed()
+      queue(storage, projectId, taskId)
+      const otherTask = storage.tasks.create({
+        projectId, title: 'Running', description: '', status: 'in_progress', assignee: 'developer_ai', dependencies: [],
+      } as Parameters<IStorage['tasks']['create']>[0])
+      storage.jobs.create({
+        taskId: otherTask.id, projectId, agentRole: 'developer_ai', status: 'running',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+      } as Parameters<IStorage['jobs']['create']>[0])
+
+      expect(queuedLong(storage, at(PAST * 10))).toHaveLength(0)
+    })
+
+    it('two queued Jobs: only the head-of-line (the one the Worker would claim next) pages', () => {
+      const { storage, projectId, taskId } = seed()
+      const otherTask = storage.tasks.create({
+        projectId, title: 'Second', description: '', status: 'pending', assignee: 'developer_ai', dependencies: [],
+      } as Parameters<IStorage['tasks']['create']>[0])
+      queue(storage, projectId, taskId)
+      queue(storage, projectId, otherTask.id)
+      // Worker の順序: findAll → findByProjectId → findByTaskId で最初の queued。
+      const expectedHead = storage.tasks.findByProjectId(projectId)
+        .map((task) => storage.jobs.findByTaskId(task.id).find((job) => job.status === 'queued'))
+        .find((job) => job !== undefined)!
+
+      const items = queuedLong(storage, at(PAST))
+      expect(items).toHaveLength(1)
+      expect(items[0]!.jobId).toBe(expectedHead.id)
+    })
+
+    it('an approval requeue does not page immediately; it pages only after the threshold measured from the decision', () => {
+      const { storage, projectId, taskId } = seed()
+      const job = storage.jobs.create({
+        taskId, projectId, agentRole: 'developer_ai', status: 'blocked',
+        safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, dryRun: false,
+      } as Parameters<IStorage['jobs']['create']>[0])
+      storage.jobs.update(job.id, { startedAt: at(1_000), completedAt: at(2_000) })
+      const created = storage.approvalRequests.createForJob({
+        taskId,
+        targetBranch: 'candidate/self-dev',
+        targetCommit: 'abc1234',
+        targetDiffHash: 'hash',
+        riskLevel: 'LOW',
+        requestedAction: 'git_commit',
+        status: 'WAITING_FOR_USER',
+        expiresAt: at(24 * 60 * 60 * 1000),
+        invalidIf: [],
+        changedFiles: ['docs/notes.md'],
+        triggeredRules: ['git_commit requires CEO approval (policy)'],
+      } as Parameters<IStorage['approvalRequests']['create']>[0], job.id)
+      expect(created.ok).toBe(true)
+      const approvalId = storage.jobs.findById(job.id)!.approvalId!
+
+      // CEO が Job 作成から閾値を大きく過ぎてから承認する。
+      const decidedAt = 3 * PAST
+      vi.setSystemTime(T0 + decidedAt)
+      const resumed = storage.approvalRequests.approveAndResumeJob(approvalId, undefined, { credentialClass: 'admin' })
+      expect(resumed.ok).toBe(true)
+      expect(storage.jobs.findById(job.id)).toMatchObject({ status: 'queued' })
+
+      expect(queuedLong(storage, at(decidedAt + 1_000))).toHaveLength(0)
+      const items = queuedLong(storage, at(decidedAt + PAST))
+      expect(items).toHaveLength(1)
+      expect(items[0]!.jobId).toBe(job.id)
+      expect(items[0]!.stuckForMs).toBeLessThan(decidedAt)
+    })
+
+    it('a requeue that leaves no durable timestamp (generic PATCH keeps started/completed) is not paged', () => {
+      const { storage, projectId, taskId } = seed()
+      const job = queue(storage, projectId, taskId, { workflowStepKey: `resume:prior-${taskId}:1` })
+      storage.jobs.update(job.id, { startedAt: at(1_000), completedAt: at(2_000) })
+
+      expect(queuedLong(storage, at(PAST * 10))).toHaveLength(0)
+    })
+
+    it('is suppressed while workspace_held_by_stalled_owner explains the refused claim', () => {
+      const { storage, projectId, taskId } = seed()
+      queue(storage, projectId, taskId)
+      const paused = storage.projects.create({ name: 'Paused', goal: 'g', designPhilosophy: [], status: 'paused' })
+      const pausedTask = storage.tasks.create({
+        projectId: paused.id, title: 'P', description: '', status: 'pending', assignee: 'developer_ai', dependencies: [],
+      } as Parameters<IStorage['tasks']['create']>[0])
+      storage.jobs.create({
+        taskId: pausedTask.id, projectId: paused.id, agentRole: 'developer_ai', status: 'blocked',
+        workflowStepKey: `resume:prior-${pausedTask.id}:1`,
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+      } as Parameters<IStorage['jobs']['create']>[0])
+
+      const kinds = buildSystemState(storage, { now: () => at(PAST) }).attention.map((item) => item.kind)
+      expect(kinds).toContain('workspace_held_by_stalled_owner')
+      expect(kinds).not.toContain('job_queued_long')
+    })
+
+    it('is not emitted in a paused Project (claims are intentionally stopped)', () => {
+      const { storage, projectId, taskId } = seed()
+      queue(storage, projectId, taskId)
+      storage.projects.update(projectId, { status: 'paused' })
+
+      expect(queuedLong(storage, at(PAST))).toHaveLength(0)
+    })
+
+    it('is not emitted for a parked Task', () => {
+      const { storage, projectId, taskId } = seed()
+      queue(storage, projectId, taskId)
+      storage.tasks.update(taskId, { roadmapActive: false })
+      storage.auditLog.record({ actor: 'api', operation: 'task_aborted', entityType: 'task', entityId: taskId, result: 'success' })
+
+      expect(queuedLong(storage, at(PAST))).toHaveLength(0)
+    })
+  })
+
+  it('workspace_quarantined は診断も Gate も経ずに1回だけ escalate し、解除はしない（W5）', async () => {
+    const { storage, projectId, taskId } = seed()
+    const job = storage.jobs.create({
+      taskId,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'failed',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, {
+      failureMetadata: { quarantined: true, quarantineReason: 'workspace could not be proven quiescent' },
+    })
+    let diagnosed = 0
+    const escalations: string[] = []
+    const d = deps({
+      diagnose: async () => { diagnosed += 1; return '{}' },
+      escalate: async (p) => { escalations.push(p.body); return DELIVERED },
+    })
+
+    const first = await runPlTick(storage, d)
+    resetPlLoopInFlightForTest()
+    const second = await runPlTick(storage, d)
+
+    expect(first).toMatchObject({ status: 'escalated', target: { kind: 'workspace_quarantined' } })
+    expect(second.status).toBe('idle')
+    expect(diagnosed).toBe(0)
+    expect(escalations).toHaveLength(1)
+    // 解除条件（観測 + known-good）には触れない。quarantine は残ったまま。
+    expect(storage.jobs.findById(job.id)?.failureMetadata?.quarantined).toBe(true)
+    expect(buildSystemState(storage, { now: () => NOW }).attention.map((a) => a.kind))
+      .toContain('workspace_quarantined')
+  })
+
+  it('PL に提示する候補は executor が配線された action だけ（W5）', () => {
+    for (const kind of ['job_blocked', 'job_failed', 'design_review_idle', 'design_review_failed', 'workspace_quarantined'] as const) {
+      for (const action of allowedActionsFor(kind)) {
+        expect(hasWiredPlExecutor(action), `${kind} offers ${action}`).toBe(true)
+      }
+    }
+    expect(allowedActionsFor('job_blocked')).toEqual(['resume_task', 'observe_state', 'escalate_to_ceo'])
+    expect(allowedActionsFor('job_failed')).toEqual(['resume_task', 'observe_state', 'escalate_to_ceo'])
+    expect(hasWiredPlExecutor('retry_job')).toBe(false)
+    expect(hasWiredPlExecutor('clear_workspace_quarantine')).toBe(false)
   })
 
   it('Escalation 後も、原因が直れば採用を再開できる（永久に止まらない）', async () => {
@@ -2040,6 +2628,286 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     expect(readResumeActorClasses(storage, storage.jobs.findByTaskId(taskId)).get(resumeJob!.id)).toBe('pl')
   })
 
+  // C-03 の残り + Codex round 2: 生きた人の判断（APPROVED abort_task）がある Task を PL は resume しない。
+  // job_blocked ではなく approval_waiting（notify-only）として1回だけ人へ届け、診断も試行もしない。
+  it('a live APPROVED abort_task is a human wait: notified once as approval_waiting, no resume, no attempt', async () => {
+    const { storage, taskId, projectId } = seed()
+    const sourceJobId = blockedAiCliJob(storage, taskId, projectId)
+    const abortApproval = storage.approvalRequests.create({
+      taskId, requestedAction: 'abort_task', riskLevel: 'HIGH', targetBranch: 'b', targetCommit: 'c',
+      targetDiffHash: 'd', changedFiles: [], triggeredRules: [], invalidIf: [], status: 'APPROVED',
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    } as Parameters<IStorage['approvalRequests']['create']>[0])
+    // 人（ADMIN）が決めた APPROVED だけが人の判断待ち（lifecycle repair C3）。
+    recordApprovalActor(storage, abortApproval.id, 'admin')
+    const escalations: string[] = []
+
+    const result = await runPlTick(storage, deps({
+      diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: 'technical recovery', riskLevel: 'LOW' }),
+      escalate: async (p) => { escalations.push(p.title); return DELIVERED },
+      coordinatorDeps: alignedCoordinatorDeps,
+    }))
+
+    expect(result.status).toBe('escalated')
+    expect(result.target?.kind).toBe('approval_waiting')
+    expect(escalations).toHaveLength(1)
+    expect(countPriorAttempts(storage, `job_blocked:${sourceJobId}`)).toBe(0)
+    expect(storage.approvalRequests.findById(abortApproval.id)?.status).toBe('APPROVED')
+    expect(storage.jobs.findByTaskId(taskId).some((j) => j.workflowStepKey === `resume:${sourceJobId}:1`)).toBe(false)
+  })
+
+  // Codex round 2: RESUME_COMMIT_FAILED は技術的失敗の試行として数え、technical budget で止める。
+  it('a persistent resume_actor write failure burns attempts and stops instead of retrying silently', async () => {
+    const { storage, taskId, projectId } = seed()
+    const sourceJobId = blockedAiCliJob(storage, taskId, projectId)
+    const original = storage.auditLog.record.bind(storage.auditLog)
+    vi.spyOn(storage.auditLog, 'record').mockImplementation((entry) => {
+      if (entry.operation === 'resume_actor') throw new Error('disk is full')
+      return original(entry)
+    })
+    const escalations: string[] = []
+    let diagnoses = 0
+    const tickDeps = deps({
+      diagnose: async () => {
+        diagnoses += 1
+        return JSON.stringify({ actionKind: 'resume_task', rationale: 'technical recovery', riskLevel: 'LOW' })
+      },
+      escalate: async (payload) => { escalations.push(payload.title); return DELIVERED },
+      coordinatorDeps: alignedCoordinatorDeps,
+    })
+    const results: string[] = []
+    for (let tick = 0; tick < PL_MAX_ATTEMPTS_PER_TARGET + 4; tick += 1) {
+      resetPlLoopInFlightForTest()
+      results.push((await runPlTick(storage, tickDeps)).status)
+    }
+    vi.restoreAllMocks()
+
+    const key = `job_blocked:${sourceJobId}`
+    expect(countPriorAttempts(storage, key)).toBeGreaterThan(0)
+    expect(countPriorAttempts(storage, key)).toBeLessThanOrEqual(PL_MAX_ATTEMPTS_PER_TARGET)
+    expect(diagnoses).toBeLessThanOrEqual(PL_MAX_ATTEMPTS_PER_TARGET)
+    expect(storage.jobs.findByTaskId(taskId).some((j) => j.workflowStepKey === `resume:${sourceJobId}:1`)).toBe(false)
+    // 予算が尽きた後は試行しない（後半の tick は idle）。尽きた事実は既存の technical_exhausted として残り、
+    // attention の detail にも投影されて人に見える（試行回数だけで CEO decision にはしない既存方針）。
+    expect(results.slice(-3)).toEqual(['idle', 'idle', 'idle'])
+    expect(storage.auditLog.findByEntity('pl_loop_target', key)
+      .filter((entry) => entry.result === 'technical_exhausted')).toHaveLength(1)
+    const visible = buildSystemState(storage, { now: () => NOW }).attention.find((a) => a.jobId === sourceJobId)
+    expect(visible?.detail).toContain('technical recovery budget is exhausted')
+  })
+
+  // Codex round 3: audit の書き込み自体が全部失敗する（DB 書き込み障害）と、試行回数も technical_exhausted も
+  // 残せない。プロセス内の対象別カウンタで同じ上限まで数え、それ以上その対象を試さない。
+  it('when every audit write fails, the PL still stops retrying the target after the attempt bound', async () => {
+    const { storage, taskId, projectId } = seed()
+    const sourceJobId = blockedAiCliJob(storage, taskId, projectId)
+    vi.spyOn(storage.auditLog, 'record').mockImplementation(() => { throw new Error('SQLITE_IOERR: disk I/O error') })
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => {})
+    let diagnoses = 0
+    const tickDeps = deps({
+      diagnose: async () => {
+        diagnoses += 1
+        return JSON.stringify({ actionKind: 'resume_task', rationale: 'technical recovery', riskLevel: 'LOW' })
+      },
+      escalate: async () => DELIVERED,
+      coordinatorDeps: alignedCoordinatorDeps,
+    })
+    const results: string[] = []
+    for (let tick = 0; tick < PL_MAX_ATTEMPTS_PER_TARGET + 5; tick += 1) {
+      resetPlLoopInFlightForTest()
+      try {
+        results.push((await runPlTick(storage, tickDeps)).status)
+      } catch (error: unknown) {
+        results.push(`threw:${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    const fallbackErrors = errors.mock.calls.filter((call) => String(call[0]).includes('in-process attempt counter'))
+    vi.restoreAllMocks()
+
+    expect(diagnoses).toBeLessThanOrEqual(PL_MAX_ATTEMPTS_PER_TARGET)
+    expect(results.slice(-3).every((r) => r === 'idle')).toBe(true)
+    expect(storage.jobs.findByTaskId(taskId).some((j) => j.workflowStepKey === `resume:${sourceJobId}:1`)).toBe(false)
+    // 対象ごとに1回だけ記録する（毎 tick ログを流さない）。
+    expect(fallbackErrors).toHaveLength(1)
+  })
+
+  // **判定が出ていない resume の Design Review は否定ではない**（独立レビュー round 5・2026-10-16）。
+  // 試行を消費せず attention を残し、次の tick で同じ instruction を再送すると active-run dedup で
+  // **同じ run** が再開され、ALIGNED なら resume Job が1回だけ作られる。
+  it('a resume re-review with no judgment yet is pending: no attempt, no escalation, same run resumes later', async () => {
+    const { storage, taskId, projectId } = seed()
+    const sourceJobId = blockedAiCliJob(storage, taskId, projectId)
+    const escalations: string[] = []
+    const noJudgment = { ...alignedCoordinatorDeps, execute: async () => ({ ok: true as const, timedOut: false, stdout: 'null' }) }
+
+    const pending = await runPlTick(storage, deps({
+      diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: 'technical recovery', riskLevel: 'LOW' }),
+      escalate: async (p) => { escalations.push(p.title); return DELIVERED },
+      coordinatorDeps: noJudgment,
+    }))
+
+    expect(pending.status).toBe('idle')
+    expect(pending.reason).toContain('resume pending')
+    expect(escalations).toEqual([])
+    expect(countPriorAttempts(storage, `job_blocked:${sourceJobId}`)).toBe(0)
+    const queuedRun = storage.designReviewRuns.findActiveByTaskId(taskId)
+    expect(queuedRun?.status).toBe('queued')
+    expect(storage.jobs.findByTaskId(taskId).some((j) => j.workflowStepKey === `resume:${sourceJobId}:1`)).toBe(false)
+
+    // 判定の出なかった attempt の後の retry cooldown（retryCooldown.ts）中は、PL はその Task の
+    // job_blocked を選ばない: 何 tick 回しても provider 診断は 0 回、run も動かず attempt も増えない。
+    let coolingDiagnoses = 0
+    for (let i = 0; i < 5; i += 1) {
+      resetPlLoopInFlightForTest()
+      const cooling = await runPlTick(storage, deps({
+        diagnose: async () => {
+          coolingDiagnoses += 1
+          return JSON.stringify({ actionKind: 'resume_task', rationale: 'technical recovery', riskLevel: 'LOW' })
+        },
+        escalate: async (p) => { escalations.push(p.title); return DELIVERED },
+        coordinatorDeps: alignedCoordinatorDeps,
+      }))
+      expect(cooling.status).toBe('idle')
+    }
+    expect(coolingDiagnoses).toBe(0)
+    expect(escalations).toEqual([])
+    expect(countPriorAttempts(storage, `job_blocked:${sourceJobId}`)).toBe(0)
+    expect(storage.designReviewRuns.findById(queuedRun!.id)).toMatchObject({ status: 'queued', attemptCount: 1 })
+
+    passDesignReviewRetryCooldown()
+    resetPlLoopInFlightForTest()
+    const resumed = await runPlTick(storage, deps({
+      diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: 'technical recovery', riskLevel: 'LOW' }),
+      coordinatorDeps: alignedCoordinatorDeps,
+    }))
+
+    expect(resumed.status).toBe('acted')
+    // 新しい run を引き直さず、同じ queued run が判定まで進んだ。
+    expect(storage.designReviewRuns.findById(queuedRun!.id)?.status).toBe('succeeded')
+    expect(storage.jobs.findByTaskId(taskId).filter((j) => j.workflowStepKey === `resume:${sourceJobId}:1`)).toHaveLength(1)
+  })
+
+  // C3-c independent review: the cooldown wait applies only to a Job whose recovery is proven to depend
+  // on the cooling run. Other stops on the same Task must stay actionable during the cooldown.
+  async function coolingPlResumeReview(storage: IStorage, taskId: string): Promise<string> {
+    const noJudgment = { ...alignedCoordinatorDeps, execute: async () => ({ ok: true as const, timedOut: false, stdout: 'null' }) }
+    const pending = await runPlTick(storage, deps({
+      diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: 'technical recovery', riskLevel: 'LOW' }),
+      coordinatorDeps: noJudgment,
+    }))
+    expect(pending.reason).toContain('resume pending')
+    const run = storage.designReviewRuns.findActiveByTaskId(taskId)!
+    expect(run).toMatchObject({ status: 'queued', attemptCount: 1 })
+    return run.id
+  }
+
+  function diagnoseCounter(): { count: () => number; diagnose: () => Promise<string> } {
+    let calls = 0
+    return {
+      count: () => calls,
+      diagnose: async () => {
+        calls += 1
+        return JSON.stringify({ actionKind: 'observe_state', rationale: 'look at it', riskLevel: 'LOW' })
+      },
+    }
+  }
+
+  function manualBlockedJob(storage: IStorage, taskId: string, projectId: string): string {
+    // A manual, non-implement Job (POST /api/jobs) on the same Task. It is not what the resume review is for.
+    return storage.jobs.create({
+      taskId,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'blocked',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0]).id
+  }
+
+  it('cooldown wait does not hide an unrelated blocked Job created on the same Task after the review', async () => {
+    const { storage, taskId, projectId } = seed()
+    const source = blockedAiCliJob(storage, taskId, projectId)
+    const runId = await coolingPlResumeReview(storage, taskId)
+    // The resume review records the Job it was requested for (identity, not timestamps).
+    expect(storage.designReviewRuns.findById(runId)?.resumeSourceJobId).toBe(source)
+    advanceWallClock(1_000)
+    const manual = manualBlockedJob(storage, taskId, projectId)
+
+    const counter = diagnoseCounter()
+    resetPlLoopInFlightForTest()
+    const tick = await runPlTick(storage, deps({ diagnose: counter.diagnose, coordinatorDeps: alignedCoordinatorDeps }))
+
+    // The source Job waits on the cooling run; the manual Job is acted on.
+    expect(tick.target?.key).toBe(`job_blocked:${manual}`)
+    expect(counter.count()).toBe(1)
+    expect(storage.designReviewRuns.findById(runId)).toMatchObject({ status: 'queued', attemptCount: 1 })
+  })
+
+  it('cooldown wait does not hide an unrelated Job inserted in the same millisecond as the review', async () => {
+    // Same createdAt and latest by rowid: timestamps and "latest Job" cannot tell it apart; identity can.
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-17T03:00:00.000Z'))
+    const { storage, taskId, projectId } = seed()
+    const source = blockedAiCliJob(storage, taskId, projectId)
+    const runId = await coolingPlResumeReview(storage, taskId)
+    const manual = manualBlockedJob(storage, taskId, projectId)
+    const run = storage.designReviewRuns.findById(runId)!
+    expect(storage.jobs.findById(manual)?.createdAt).toBe(run.createdAt)
+    expect(storage.jobs.findByTaskId(taskId)[0]?.id).toBe(manual)
+    expect(run.resumeSourceJobId).toBe(source)
+
+    const counter = diagnoseCounter()
+    resetPlLoopInFlightForTest()
+    const tick = await runPlTick(storage, deps({ diagnose: counter.diagnose, coordinatorDeps: alignedCoordinatorDeps }))
+
+    expect(tick.target?.key).toBe(`job_blocked:${manual}`)
+    expect(counter.count()).toBe(1)
+  })
+
+  it('cooldown wait does not hide the same Job when the PL would resume it with a different instruction', async () => {
+    const { storage, taskId, projectId } = seed()
+    const source = blockedAiCliJob(storage, taskId, projectId)
+    const noJudgment = { ...alignedCoordinatorDeps, execute: async () => ({ ok: true as const, timedOut: false, stdout: 'null' }) }
+    // The cooling review was requested for this Job with instruction A (e.g. another resume actor).
+    await runPlTick(storage, deps({
+      diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: 'technical recovery', riskLevel: 'LOW' }),
+      coordinatorDeps: noJudgment,
+      resumeInstruction: 'instruction A',
+    }))
+    const run = storage.designReviewRuns.findActiveByTaskId(taskId)!
+    expect(run).toMatchObject({ status: 'queued', attemptCount: 1, resumeSourceJobId: source })
+
+    // Same instruction: proven to wait on this run, so there is no diagnosis.
+    const same = diagnoseCounter()
+    resetPlLoopInFlightForTest()
+    await runPlTick(storage, deps({ diagnose: same.diagnose, coordinatorDeps: alignedCoordinatorDeps, resumeInstruction: 'instruction A' }))
+    expect(same.count()).toBe(0)
+
+    // Different instruction B: the PL's resume would not use this run, so the Job stays actionable.
+    const other = diagnoseCounter()
+    resetPlLoopInFlightForTest()
+    const tick = await runPlTick(storage, deps({ diagnose: other.diagnose, coordinatorDeps: alignedCoordinatorDeps, resumeInstruction: 'instruction B' }))
+    expect(tick.target?.key).toBe(`job_blocked:${source}`)
+    expect(other.count()).toBe(1)
+  })
+
+  it('cooldown wait does not hide an older blocked Job that the resume would not target', async () => {
+    const { storage, taskId, projectId } = seed()
+    const older = blockedAiCliJob(storage, taskId, projectId)
+    advanceWallClock(1_000)
+    const newer = blockedAiCliJob(storage, taskId, projectId)
+    await coolingPlResumeReview(storage, taskId)
+
+    const counter = diagnoseCounter()
+    resetPlLoopInFlightForTest()
+    const tick = await runPlTick(storage, deps({ diagnose: counter.diagnose, coordinatorDeps: alignedCoordinatorDeps }))
+
+    // The newer (latest) blocked Job is what the resume targets, so it waits; the older one does not.
+    expect(counter.count()).toBe(1)
+    expect(tick.target?.key).toBe(`job_blocked:${older}`)
+    expect(tick.target?.key).not.toBe(`job_blocked:${newer}`)
+  })
+
   it('a CONFLICT re-review creates no resume Job and leaves the source blocked', async () => {
     const { storage, taskId, projectId } = seed()
     const sourceJobId = blockedAiCliJob(storage, taskId, projectId)
@@ -2223,7 +3091,8 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
     expect(exhausted.status).toBe('acted')
     expect(exhausted.proposedKind).toBe('observe_state')
     expect(lastAllowedActions).not.toContain('resume_task')
-    expect(lastAllowedActions).toContain('retry_job')
+    // retry_job は executor が無いので候補に出さない（W5）。残るのは配線済みの observe_state。
+    expect(lastAllowedActions).not.toContain('retry_job')
     expect(lastAllowedActions).toContain('observe_state')
     expect(storage.jobs.findByTaskId(taskId)
       .some((job) => job.workflowStepKey === `resume:${finalFailedReviewId}:1`)).toBe(false)
@@ -2280,9 +3149,12 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
       },
     }))
 
-    expect(seen?.allowedActionKinds).toContain('retry_job')
-    // retry は候補から失われず Gate まで届く。承認根拠が無いので既存 Gate が blocked にする。
+    // routine resume は Rule 5.5 の cap を消費しないので、resume_task は候補に残る。
+    // retry_job は executor が無いので候補に出さず、提案されても Gate の手前で止める（W5）。
+    expect(seen?.allowedActionKinds).toContain('resume_task')
+    expect(seen?.allowedActionKinds).not.toContain('retry_job')
     expect(retried).toMatchObject({ status: 'blocked', proposedKind: 'retry_job' })
+    expect(retried.reason ?? '').toContain('outside the actions this triage allows')
     expect(retried.reason ?? '').not.toContain('technical recovery budget exhausted')
   })
 
@@ -2350,12 +3222,48 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
       diagnose: async () => JSON.stringify({ actionKind: 'retry_job', rationale: 'transient', riskLevel: 'LOW' }),
     }))
 
-    // Gate の根拠照合まで到達している。approval_gate の根拠が無いので止まるが、
-    // 理由は「対象種別のズレ」ではなく「根拠が足りない」でなければならない。
+    // 対象種別のズレでは落ちない。retry_job は executor が無く候補に出ないため（W5）、
+    // 理由は「候補の外」になる（以前は Gate の approval_gate 不足で止まり、attempt を焼いていた）。
     expect(result.status).toBe('blocked')
     expect(result.reason).not.toContain('requires a job target')
     expect(result.reason).not.toContain('cannot be addressed')
-    expect(result.reason).toContain('approval_gate')
+    expect(result.reason).toContain('outside the actions this triage allows')
+  })
+
+  // 2026-10-16 監査 RC6: 根拠に積む approval は「今実行する action 向け」のものだけ。
+  // Task の最新行（別 action）を積むと、別 action の承認で PL 操作が通り、逆に自 action の承認を見落とす。
+  function seedApprovedRequest(storage: IStorage, taskId: string, requestedAction: string): string {
+    const created = storage.approvalRequests.create({
+      taskId, targetBranch: 'master', targetCommit: 'c', targetDiffHash: 'd', riskLevel: 'HIGH',
+      requestedAction, status: 'WAITING_FOR_USER',
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(), invalidIf: [],
+    } as Parameters<IStorage['approvalRequests']['create']>[0])
+    storage.approvalRequests.recordDecision(created.id, 'APPROVED', 'seeded', { credentialClass: 'admin' })
+    return created.id
+  }
+
+  function authorizeAudits(storage: IStorage): string[] {
+    return storage.auditLog.findAll()
+      .filter((entry) => entry.operation === 'pl_action_authorize')
+      .map((entry) => `${entry.result} ${entry.detail ?? ''}`)
+  }
+
+  // approval_gate を要する PL 操作（retry_job 等）は、いまこのループに executor が無いため候補に出ない
+  // （lifecycle repair W5）。よって「別 action の APPROVED を根拠にしない」binding はループからは到達できず、
+  // `actionGate.test.ts` の requiredApprovalRequestAction / checkApprovalGate の単体テストで固定している。
+  // ここでは、承認がどう積まれていても未配線の操作は Gate より前に候補外として止まることを固定する。
+  it('approval_gate 対象の未配線操作は、承認の有無に関わらず候補外として Gate 前に止まる', async () => {
+    const { storage, taskId, projectId } = seed()
+    blockedCommitJob(storage, taskId, projectId)
+    seedApprovedRequest(storage, taskId, 'retry_job')
+    seedApprovedRequest(storage, taskId, 'git_commit')
+
+    const result = await runPlTick(storage, deps({
+      diagnose: async () => JSON.stringify({ actionKind: 'retry_job', rationale: 'transient', riskLevel: 'LOW' }),
+    }))
+
+    expect(result.reason).toContain('outside the actions')
+    expect(authorizeAudits(storage).some((entry) => entry.startsWith('authorized'))).toBe(false)
   })
 
   it('要求される対象を組み立てられない提案は、Gate を呼ばずに fail-closed で止める', async () => {
@@ -2392,5 +3300,541 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
 
     expect(exhausted.status).toBe('idle')
     expect(escalations).toEqual([])
+  })
+})
+
+/**
+ * design_review_failed / idle のキーを `<kind>:<taskId>` から `<kind>:<runId>` へ移した後も、
+ * 移行前の履歴（escalation・試行）はその時点で既に在った run のものとして数える。
+ * 新しい run（同じ Task の次の episode）は新しい同一性から始める。
+ */
+describe('Design Review attention の legacy Task 単位履歴', () => {
+  afterAll(() => {
+    vi.useRealTimers()
+  })
+
+  function recordLegacy(storage: IStorage, key: string, result: string): void {
+    storage.auditLog.record({
+      actor: 'api', operation: 'pl_loop', entityType: 'pl_loop_target', entityId: key, result, detail: 'legacy',
+    })
+  }
+
+  it('既存 run は legacy の escalation・試行を引き継ぎ、後から作られた run は新しく始まる', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-09-14T09:00:00.000Z'))
+    const { storage, taskId, runId } = seedIdleDesignReview()
+    vi.setSystemTime(new Date('2026-09-14T09:10:00.000Z'))
+    recordTargetAttempts(storage, `design_review_idle:${taskId}`, 2)
+    recordLegacy(storage, `design_review_idle:${taskId}`, 'escalated')
+
+    expect(countPriorAttempts(storage, `design_review_idle:${runId}`)).toBe(2)
+    let diagnosed = 0
+    const d = deps({ diagnose: async () => { diagnosed += 1; return JSON.stringify({ actionKind: 'rekick_design_review', rationale: 'r', riskLevel: 'LOW' }) } })
+    expect((await runPlTick(storage, d)).status).not.toBe('acted')
+    expect(diagnosed).toBe(0)
+
+    // 同じ Task の新しい episode。legacy 行より後に作られたので履歴を引き継がない。
+    vi.setSystemTime(new Date('2026-09-14T09:20:00.000Z'))
+    const first = storage.designReviewRuns.claim(runId, 3)
+    storage.designReviewRuns.complete(runId, first.claimToken!, 'failed', undefined, 'boom')
+    const newer = storage.designReviewRuns.create({
+      taskId, taskTitle: 'design', designText: 'design text 2', designTextHash: 'hash-2', changedFiles: ['docs/notes.md'],
+    })
+    vi.useRealTimers()
+    expect(countPriorAttempts(storage, `design_review_idle:${newer.id}`)).toBe(0)
+    resetPlLoopInFlightForTest()
+    expect((await runPlTick(storage, d)).status).toBe('acted')
+    expect(diagnosed).toBe(1)
+  })
+})
+
+describe('rekick_design_review は attention が名指した run だけを動かす', () => {
+  it('診断中に run が差し替わったら何もせず、試行も消費しない', async () => {
+    const { storage, taskId, runId } = seedIdleDesignReview()
+    const rekicked: string[] = []
+    let replacementId = ''
+    const d = deps({
+      diagnose: async () => {
+        // 診断の間に名指しの run が終端し（idle でなくなり）、同じ Task の新しい run が作られる。
+        const claimed = storage.designReviewRuns.claim(runId, 3)
+        storage.designReviewRuns.complete(runId, claimed.claimToken!, 'failed', undefined, 'boom')
+        replacementId = storage.designReviewRuns.create({
+          taskId, taskTitle: 'design', designText: 'design text 2', designTextHash: 'hash-2', changedFiles: ['docs/notes.md'],
+        }).id
+        return JSON.stringify({ actionKind: 'rekick_design_review', rationale: 'queued run is idle', riskLevel: 'LOW' })
+      },
+      rekickDesignReview: async (_s, id) => { rekicked.push(id); return { status: 'evidence_registered' } },
+    })
+
+    const result = await runPlTick(storage, d)
+
+    expect(result.status).toBe('idle')
+    expect(result.reason).toContain('stale target')
+    expect(rekicked).toEqual([])
+    expect(countPriorAttempts(storage, `design_review_idle:${runId}`)).toBe(0)
+    expect(storage.designReviewRuns.findById(replacementId)?.status).toBe('queued')
+  })
+})
+
+// integrated E2E・P1: ADMIN が HIGH の git_commit を承認 → gate/check は ALLOW + call_consume →
+// Worker の gate policy（AI 編集禁止）が continue_safe_work_only へ倒して blocked を報告する。
+// 以前は API がこの blocked を「承認と競合した古い結果」として捨て、Job は running のまま無音停止した。
+describe('approved git_commit blocked by the Worker gate policy', () => {
+  function approvedThenWorkerBlocked(): { storage: IStorage; taskId: string; jobId: string; approvalId: string } {
+    const { storage, taskId, projectId } = seed()
+    storage.tasks.update(taskId, { status: 'in_progress' })
+    const job = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, dryRun: false,
+      workflowStepKey: 'review:some-review-job:git-commit',
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, { status: 'running', startedAt: new Date().toISOString() })
+    const linked = storage.approvalRequests.createForJob({
+      taskId, requestedAction: 'git_commit', riskLevel: 'HIGH', targetBranch: 'main', targetCommit: 'c0ffee',
+      targetDiffHash: 'd1ff', changedFiles: ['src/a.ts'], triggeredRules: [], invalidIf: [],
+      status: 'WAITING_FOR_USER', expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    } as Parameters<IStorage['approvalRequests']['create']>[0], job.id)
+    if (!linked.ok) throw new Error(linked.reason)
+    // 最初の実行は承認待ちで blocked。
+    storage.jobs.update(job.id, { status: 'blocked' })
+    const approved = storage.approvalRequests.approveAndResumeJob(
+      linked.approvalRequest.id, undefined, { credentialClass: 'admin' },
+    )
+    if (!approved.ok) throw new Error(approved.reason)
+    // 承認後の実行: claim → Worker が safe_work_only で blocked を報告（stderr 無し）。
+    const claimed = storage.jobs.update(job.id, { status: 'running', startedAt: new Date().toISOString() })
+    expect(claimed?.status).toBe('running')
+    storage.jobs.update(job.id, {
+      status: 'blocked',
+      completedAt: new Date().toISOString(),
+      guardResult: { permissionAllowed: true, fileChangeAllowed: true, fileViolations: [] },
+    })
+    return { storage, taskId, jobId: job.id, approvalId: linked.approvalRequest.id }
+  }
+
+  it('persists the blocked result, keeps the approval APPROVED, and surfaces job_blocked with the cause', () => {
+    const fx = approvedThenWorkerBlocked()
+
+    expect(fx.storage.jobs.findById(fx.jobId)?.status).toBe('blocked')
+    expect(fx.storage.approvalRequests.findById(fx.approvalId)?.status).toBe('APPROVED')
+    const attention = buildSystemState(fx.storage, { now: () => NOW }).attention
+      .filter((item) => item.taskId === fx.taskId && item.kind === 'job_blocked')
+    expect(attention).toHaveLength(1)
+    expect(attention[0].detail).toContain('approved_but_worker_blocked')
+    expect(attention[0].detail).toContain(fx.approvalId)
+    expect(attention[0].detail).toContain('guards passed but the Worker gate step blocked git_commit')
+  })
+
+  it('a stale blocked result for a requeued (queued) Job is still ignored', () => {
+    const { storage, taskId, projectId } = seed()
+    const job = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, dryRun: false,
+      workflowStepKey: 'review:other-review-job:git-commit',
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, { status: 'running', startedAt: new Date().toISOString() })
+    const linked = storage.approvalRequests.createForJob({
+      taskId, requestedAction: 'git_commit', riskLevel: 'HIGH', targetBranch: 'main', targetCommit: 'c',
+      targetDiffHash: 'd', changedFiles: [], triggeredRules: [], invalidIf: [],
+      status: 'WAITING_FOR_USER', expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    } as Parameters<IStorage['approvalRequests']['create']>[0], job.id)
+    if (!linked.ok) throw new Error(linked.reason)
+    const approved = storage.approvalRequests.approveAndResumeJob(linked.approvalRequest.id, undefined, { credentialClass: 'admin' })
+    if (!approved.ok) throw new Error(approved.reason)
+
+    storage.jobs.update(job.id, { status: 'blocked' })
+    expect(storage.jobs.findById(job.id)?.status).toBe('queued')
+  })
+
+  it('the PL neither auto-resumes nor escalates it: one technical_exhausted (technical stop), visible, no churn', async () => {
+    const fx = approvedThenWorkerBlocked()
+    const escalations: string[] = []
+    const tickDeps = deps({
+      diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: 'retry', riskLevel: 'LOW' }),
+      escalate: async (payload) => { escalations.push(payload.title); return DELIVERED },
+    })
+
+    const first = await runPlTick(fx.storage, tickDeps)
+    expect(first.status).toBe('idle')
+    expect(escalations).toHaveLength(0)
+
+    for (let tick = 0; tick < 3; tick += 1) {
+      resetPlLoopInFlightForTest()
+      await runPlTick(fx.storage, tickDeps)
+    }
+    expect(escalations).toHaveLength(0)
+    const rows = fx.storage.auditLog.findByEntity('pl_loop_target', `job_blocked:${fx.jobId}`)
+    expect(rows.some((entry) => entry.result === 'escalated')).toBe(false)
+    const exhausted = rows.filter((entry) => entry.result === 'technical_exhausted')
+    expect(exhausted).toHaveLength(1)
+    expect(exhausted[0]?.detail).toContain('stop=approved_commit_gate_refusal')
+    // 見える停止: job_blocked は attention に残る。
+    const item = buildSystemState(fx.storage, { now: () => NOW }).attention.find((a) => a.jobId === fx.jobId)
+    expect(item?.kind).toBe('job_blocked')
+    expect(item?.detail).toContain('no CEO decision was requested')
+    // 自動 resume していない: 後継 Job も新しい承認も作られず、承認は APPROVED のまま。
+    expect(fx.storage.jobs.findByTaskId(fx.taskId)).toHaveLength(1)
+    expect(fx.storage.approvalRequests.findById(fx.approvalId)?.status).toBe('APPROVED')
+  })
+
+  it('a Human Resume starts a new generation and supersedes the unused approval', () => {
+    const fx = approvedThenWorkerBlocked()
+    fx.storage.tasks.update(fx.taskId, { status: 'blocked' })
+
+    const resumed = fx.storage.jobs.resumeBlockedTask({
+      taskId: fx.taskId,
+      instructionPrompt: 'resume',
+      resumedBy: { actorClass: 'human', evidence: 'admin_credential' },
+    })
+
+    expect(resumed.ok).toBe(true)
+    if (!resumed.ok) return
+    expect(resumed.job.approvalId).toBeUndefined()
+    expect(fx.storage.jobs.findById(fx.jobId)?.status).toBe('failed')
+    expect(fx.storage.approvalRequests.findById(fx.approvalId)?.status).toBe('SUPERSEDED')
+  })
+})
+
+// Codex round 2 (34fb1d8)
+describe('approved-run blocked cause comes from the evidence the Worker sent', () => {
+  function approvedRunBlocked(guardResult: Record<string, unknown>): { storage: IStorage; jobId: string } {
+    const { storage, taskId, projectId } = seed()
+    storage.tasks.update(taskId, { status: 'in_progress' })
+    const job = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, dryRun: false,
+      workflowStepKey: 'review:perm-review-job:git-commit',
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, { status: 'running', startedAt: new Date().toISOString() })
+    const linked = storage.approvalRequests.createForJob({
+      taskId, requestedAction: 'git_commit', riskLevel: 'HIGH', targetBranch: 'main', targetCommit: 'c',
+      targetDiffHash: 'd', changedFiles: [], triggeredRules: [], invalidIf: [],
+      status: 'WAITING_FOR_USER', expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    } as Parameters<IStorage['approvalRequests']['create']>[0], job.id)
+    if (!linked.ok) throw new Error(linked.reason)
+    storage.jobs.update(job.id, { status: 'blocked' })
+    const approved = storage.approvalRequests.approveAndResumeJob(linked.approvalRequest.id, undefined, { credentialClass: 'admin' })
+    if (!approved.ok) throw new Error(approved.reason)
+    storage.jobs.update(job.id, { status: 'running', startedAt: new Date().toISOString() })
+    storage.jobs.update(job.id, { status: 'blocked', completedAt: new Date().toISOString(), guardResult } as never)
+    return { storage, jobId: job.id }
+  }
+
+  it('a permission denial on the approved rerun is persisted with the real guard reason, not a gate-policy story', () => {
+    const fx = approvedRunBlocked({
+      permissionAllowed: false, permissionReason: 'once grant already used', fileChangeAllowed: true, fileViolations: [],
+    })
+    const job = fx.storage.jobs.findById(fx.jobId)!
+    expect(job.status).toBe('blocked')
+    expect(job.stderr).toContain('approved_run_permission_denied: once grant already used')
+    expect(job.stderr).not.toContain('gate step')
+    const item = buildSystemState(fx.storage, { now: () => NOW }).attention.find((a) => a.jobId === fx.jobId)!
+    expect(triageBlocked(fx.storage, item).rootCauseClass).not.toBe('safety_or_authority_boundary')
+  })
+
+  it('guards passed (gate-step refusal) is the only evidence for the triage rule 6.9 technical stop', () => {
+    const fx = approvedRunBlocked({ permissionAllowed: true, fileChangeAllowed: true, fileViolations: [] })
+    const item = buildSystemState(fx.storage, { now: () => NOW }).attention.find((a) => a.jobId === fx.jobId)!
+    // D2: after the fix this is worker/api skew or an unexpected consume refusal, not an authority boundary.
+    // A visible technical stop (no CEO lane, no auto-resume); no authority change; the existing resume is the exit.
+    expect(triageBlocked(fx.storage, item)).toMatchObject({
+      rootCauseClass: 'unknown', recommendedLane: 'auto_recovery', technicalStop: 'approved_commit_gate_refusal',
+      recoverable: false, requiresAuthorityChange: false, existingRecoveryAvailable: true,
+    })
+  })
+})
+
+describe('a live task-scoped human decision is a human wait, not a blocked-job recovery target', () => {
+  it('a human-decided APPROVED abort_task also suppresses job_failed; an actorless one does not (lifecycle repair C3)', () => {
+    for (const decidedByHuman of [true, false]) {
+      const { storage, taskId, projectId } = seed()
+      storage.tasks.update(taskId, { status: 'blocked' })
+      storage.jobs.create({
+        taskId, projectId, agentRole: 'developer_ai', status: 'failed',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+        aiCliMode: 'implement', aiCliProvider: 'codex',
+      } as Parameters<IStorage['jobs']['create']>[0])
+      const abort = storage.approvalRequests.create({
+        taskId, requestedAction: 'abort_task', riskLevel: 'HIGH', targetBranch: 'b', targetCommit: 'c',
+        targetDiffHash: 'd', changedFiles: [], triggeredRules: [], invalidIf: [], status: 'APPROVED',
+        expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+      } as Parameters<IStorage['approvalRequests']['create']>[0])
+      if (decidedByHuman) recordApprovalActor(storage, abort.id, 'admin')
+
+      const kinds = buildSystemState(storage, { now: () => NOW }).attention
+        .filter((a) => a.taskId === taskId).map((a) => a.kind)
+      expect(kinds).toEqual(decidedByHuman ? ['approval_waiting'] : ['job_failed'])
+    }
+  })
+
+  it('an APPROVED abort_task without a human approval_actor record does not hide job_blocked (lifecycle repair C3)', () => {
+    // 実行側（verifyAndConsumeTaskApproval）が authority として使わない行は、人の判断待ちではない。
+    const { storage, taskId, projectId } = seed()
+    storage.tasks.update(taskId, { status: 'blocked' })
+    const job = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+      aiCliMode: 'implement', aiCliProvider: 'codex',
+    } as Parameters<IStorage['jobs']['create']>[0])
+    const actorless = storage.approvalRequests.create({
+      taskId, requestedAction: 'abort_task', riskLevel: 'HIGH', targetBranch: 'b', targetCommit: 'c',
+      targetDiffHash: 'd', changedFiles: [], triggeredRules: [], invalidIf: [], status: 'APPROVED',
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    } as Parameters<IStorage['approvalRequests']['create']>[0])
+
+    const attention = buildSystemState(storage, { now: () => NOW }).attention.filter((a) => a.taskId === taskId)
+    expect(attention.map((a) => a.kind)).toEqual(['job_blocked'])
+    expect(attention[0].jobId).toBe(job.id)
+    // read-only な観測は行を書き換えない。
+    expect(storage.approvalRequests.findById(actorless.id)?.status).toBe('APPROVED')
+    // 人でない resume は HUMAN_DECISION_PENDING にならず、主体の無い APPROVED は approval_actor_not_human で置き換わる。
+    const resumed = storage.jobs.resumeBlockedTask({
+      taskId, instructionPrompt: 'resume', resumedBy: { actorClass: 'pl', evidence: 'in_process_pl' },
+    })
+    // （この fixture は Design Review evidence を持たないので resume 自体は後段で断られ得る。ここで確かめるのは
+    //   主体の無い APPROVED が人の判断待ちとして扱われないことだけ。）
+    expect(resumed.ok ? undefined : resumed.code).not.toBe('HUMAN_DECISION_PENDING')
+    expect(storage.approvalRequests.findById(actorless.id)?.status).toBe('SUPERSEDED')
+  })
+
+  it('APPROVED abort_task + blocked Job: no job_blocked, one approval_waiting notification, no per-tick diagnosis', async () => {
+    const { storage, taskId, projectId } = seed()
+    storage.tasks.update(taskId, { status: 'blocked' })
+    storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'blocked',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+      aiCliMode: 'implement', aiCliProvider: 'codex',
+    } as Parameters<IStorage['jobs']['create']>[0])
+    const abort = storage.approvalRequests.create({
+      taskId, requestedAction: 'abort_task', riskLevel: 'HIGH', targetBranch: 'b', targetCommit: 'c',
+      targetDiffHash: 'd', changedFiles: [], triggeredRules: [], invalidIf: [], status: 'WAITING_FOR_USER',
+      expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    } as Parameters<IStorage['approvalRequests']['create']>[0])
+    storage.approvalRequests.recordDecision(abort.id, 'APPROVED', undefined, { credentialClass: 'admin' })
+
+    const attention = buildSystemState(storage, { now: () => NOW }).attention.filter((a) => a.taskId === taskId)
+    expect(attention.map((a) => a.kind)).toEqual(['approval_waiting'])
+    expect(attention[0].referenceId).toBe(abort.id)
+    expect(attention[0].detail).toContain('APPROVED but not yet executed')
+
+    let diagnoses = 0
+    const escalations: string[] = []
+    const tickDeps = deps({
+      diagnose: async () => { diagnoses += 1; return JSON.stringify({ actionKind: 'resume_task', rationale: 'r', riskLevel: 'LOW' }) },
+      escalate: async (payload) => { escalations.push(payload.title); return DELIVERED },
+    })
+    for (let tick = 0; tick < 4; tick += 1) {
+      resetPlLoopInFlightForTest()
+      await runPlTick(storage, tickDeps)
+    }
+    expect(diagnoses).toBe(0)
+    expect(escalations).toHaveLength(1)
+    expect(storage.approvalRequests.findById(abort.id)?.status).toBe('APPROVED')
+    expect(storage.jobs.findByTaskId(taskId)).toHaveLength(1)
+  })
+})
+
+
+// D2 v4: a technical Gate stop (risk_rule_skew / approval_contract_violation in job.stderr) is a visible,
+// non-auto stop for ANY command kind — it is recognized before rule 7, so the PL never auto-resumes it.
+// It is a technical stop, not a CEO decision: the technical lane with `technicalStop` set (technical_exhausted).
+describe('triage rule 6.8: technical Gate stop recognized from the persisted reason, for any command kind', () => {
+  const SKEW = 'risk_rule_skew: local CRITICAL > API HIGH (worker/api rule skew); technical Gate inconsistency, not an approval decision'
+  const CONTRACT = 'approval_contract_violation: decision=BLOCKED continuationPolicy=continue nextAction=wait_for_approval; technical Gate inconsistency, not an approval decision'
+
+  function blockedWith(kind: string, stderr: string): { storage: IStorage; jobId: string } {
+    const { storage, taskId, projectId } = seed()
+    storage.tasks.update(taskId, { status: 'in_progress' })
+    const job = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+      safeCommand: { kind, workingDir: '/workspace/target' }, dryRun: false,
+      ...(kind === 'git_status' ? { aiCliMode: 'review', aiCliProvider: 'claude', workflowStepKey: 'implement:src-job:review' } : {}),
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, { status: 'running', startedAt: new Date().toISOString() })
+    storage.jobs.update(job.id, {
+      status: 'blocked', completedAt: new Date().toISOString(), stderr,
+      guardResult: { permissionAllowed: true, fileChangeAllowed: true, fileViolations: [] },
+    } as never)
+    return { storage, jobId: job.id }
+  }
+
+  it.each([
+    ['git_status (safe-work kind)', 'git_status', SKEW, 'risk_rule_skew'],
+    ['test (safe-work kind)', 'test', CONTRACT, 'approval_contract_violation'],
+    ['git_commit without a linked approval', 'git_commit', SKEW, 'risk_rule_skew'],
+  ])('%s → technical stop (no auto-recovery, no CEO lane), unknown, no authority change, visible', (_label, kind, stderr, code) => {
+    const fx = blockedWith(kind, stderr)
+    const item = buildSystemState(fx.storage, { now: () => NOW }).attention.find((a) => a.jobId === fx.jobId)!
+    expect(item).toBeDefined()
+    const triage = triageBlocked(fx.storage, item)
+    expect(triage).toMatchObject({
+      rootCauseClass: 'unknown', recommendedLane: 'auto_recovery', technicalStop: code, recoverable: false,
+      requiresAuthorityChange: false, existingRecoveryAvailable: true, confidence: 'high',
+    })
+    expect(triage.evidence.find((e) => e.fact.startsWith('gate technical stop code'))?.value).toBe(code)
+  })
+
+  it('an ordinary blocked Job without a technical stop code still reaches rule 7 (unchanged)', () => {
+    const fx = blockedWith('git_status', 'some other block')
+    const item = buildSystemState(fx.storage, { now: () => NOW }).attention.find((a) => a.jobId === fx.jobId)!
+    expect(triageBlocked(fx.storage, item).rootCauseClass).not.toBe('unknown')
+  })
+})
+
+describe('triage rule 6.8: only an unspoofable, pre-execution technical stop; a CEO rejection keeps rule 7', () => {
+  const SKEW = 'risk_rule_skew: local CRITICAL > API HIGH (worker/api rule skew); technical Gate inconsistency, not an approval decision'
+
+  function blocked(kind: string, update: Record<string, unknown>): { storage: IStorage; jobId: string; taskId: string } {
+    const { storage, taskId, projectId } = seed()
+    storage.tasks.update(taskId, { status: 'in_progress' })
+    const job = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+      safeCommand: { kind, workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, { status: 'running', startedAt: new Date().toISOString() })
+    storage.jobs.update(job.id, {
+      status: 'blocked', completedAt: new Date().toISOString(),
+      guardResult: { permissionAllowed: true, fileChangeAllowed: true, fileViolations: [] },
+      ...update,
+    } as never)
+    return { storage, jobId: job.id, taskId }
+  }
+
+  function triageOf(fx: { storage: IStorage; jobId: string }) {
+    const item = buildSystemState(fx.storage, { now: () => NOW }).attention.find((a) => a.jobId === fx.jobId)!
+    return triageBlocked(fx.storage, item)
+  }
+
+  it('a code on a later stderr line (command output) is not a technical stop', () => {
+    const triage = triageOf(blocked('test', { stderr: `some output\n${SKEW}` }))
+    expect(triage.evidence.some((e) => e.fact.startsWith('gate technical stop code'))).toBe(false)
+    expect(triage.technicalStop).toBeUndefined()
+  })
+
+  it('a Job that executed (exitCode recorded) is not a technical Gate stop even if stderr starts with the code', () => {
+    const triage = triageOf(blocked('test', { stderr: SKEW, exitCode: 0 }))
+    expect(triage.evidence.some((e) => e.fact.startsWith('gate technical stop code'))).toBe(false)
+  })
+
+  it('a CEO-REJECTED git_commit with a technical stop reason keeps the rule-7 rejection handling (no "new approval" wording)', () => {
+    const { storage, taskId, projectId } = seed()
+    storage.tasks.update(taskId, { status: 'in_progress' })
+    const job = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, dryRun: false,
+      workflowStepKey: 'review:rej-review-job:git-commit',
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, { status: 'running', startedAt: new Date().toISOString() })
+    const linked = storage.approvalRequests.createForJob({
+      taskId, requestedAction: 'git_commit', riskLevel: 'HIGH', targetBranch: 'main', targetCommit: 'c',
+      targetDiffHash: 'd', changedFiles: [], triggeredRules: [], invalidIf: [],
+      status: 'WAITING_FOR_USER', expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+    } as Parameters<IStorage['approvalRequests']['create']>[0], job.id)
+    if (!linked.ok) throw new Error(linked.reason)
+    const rejected = storage.approvalRequests.recordDecision(linked.approvalRequest.id, 'REJECTED', 'no', { credentialClass: 'admin' })
+    if (!rejected.ok) throw new Error(rejected.reason)
+    storage.jobs.update(job.id, {
+      status: 'blocked', completedAt: new Date().toISOString(), stderr: SKEW,
+      guardResult: { permissionAllowed: true, fileChangeAllowed: true, fileViolations: [] },
+    } as never)
+    const triage = triageOf({ storage, jobId: job.id })
+    expect(triage.evidence.some((e) => e.fact.startsWith('gate technical stop code'))).toBe(false)
+    expect(triage.rootCauseClass).toBe('approval_not_actionable')
+    expect(triage.summary).not.toContain('新しい承認が求められる')
+  })
+})
+
+describe('triage rule 6.8: the exit it names matches what is actually admitted', () => {
+  const SKEW = 'risk_rule_skew: local CRITICAL > API HIGH (worker/api rule skew); technical Gate inconsistency, not an approval decision'
+
+  function commitJobStoppedBySkew(approvalStatus: 'WAITING_FOR_USER' | 'none', expiresInMs = 60 * 60 * 1000) {
+    const { storage, taskId, projectId } = seed()
+    storage.tasks.update(taskId, { status: 'in_progress' })
+    const job = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+      safeCommand: { kind: 'git_commit', workingDir: '/workspace/target' }, dryRun: false,
+      workflowStepKey: 'review:skew-review-job:git-commit',
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, { status: 'running', startedAt: new Date().toISOString() })
+    let approvalId: string | undefined
+    if (approvalStatus === 'WAITING_FOR_USER') {
+      const linked = storage.approvalRequests.createForJob({
+        taskId, requestedAction: 'git_commit', riskLevel: 'HIGH', targetBranch: 'main', targetCommit: 'c',
+        targetDiffHash: 'd', changedFiles: [], triggeredRules: [], invalidIf: [],
+        status: 'WAITING_FOR_USER', expiresAt: new Date(Date.now() + expiresInMs).toISOString(),
+      } as Parameters<IStorage['approvalRequests']['create']>[0], job.id)
+      if (!linked.ok) throw new Error(linked.reason)
+      approvalId = linked.approvalRequest.id
+    }
+    storage.jobs.update(job.id, {
+      status: 'blocked', completedAt: new Date().toISOString(), stderr: SKEW,
+      guardResult: { permissionAllowed: true, fileChangeAllowed: true, fileViolations: [] },
+    } as never)
+    const item = buildSystemState(storage, { now: () => new Date().toISOString() }).attention.find((a) => a.jobId === job.id)!
+    return { triage: triageBlocked(storage, item), approvalId }
+  }
+
+  it('a live WAITING linked approval → the summary names approving that approval (resume is not admitted while it waits)', () => {
+    const { triage, approvalId } = commitJobStoppedBySkew('WAITING_FOR_USER')
+    expect(triage.technicalStop).toBe('risk_rule_skew')
+    expect(triage.summary).toContain(`承認 ${approvalId} を承認する`)
+    expect(triage.summary).toContain('承認待ちの間は resume できない')
+    expect(triage.summary).not.toContain('新しい承認が求められる')
+  })
+
+  it('no linked waiting approval → the summary names resume (a new approval will be requested)', () => {
+    const { triage } = commitJobStoppedBySkew('none')
+    expect(triage.summary).toContain('resume すれば再開でき')
+    expect(triage.summary).toContain('新しい承認が求められる')
+  })
+
+  it('an expired WAITING linked approval is not live → the summary names resume', () => {
+    const { triage } = commitJobStoppedBySkew('WAITING_FOR_USER', -60 * 1000)
+    expect(triage.summary).toContain('resume すれば再開でき')
+  })
+})
+
+describe('runPlTick — a technical Gate stop (rule 6.8) is a deduplicated technical_exhausted, never a CEO escalation', () => {
+  const SKEW = 'risk_rule_skew: local CRITICAL > API HIGH (worker/api rule skew); technical Gate inconsistency, not an approval decision'
+
+  it('no diagnosis, no resume, no escalation; one technical_exhausted with the reason code; the stop stays visible', async () => {
+    const { storage, taskId, projectId } = seed()
+    storage.tasks.update(taskId, { status: 'in_progress' })
+    const job = storage.jobs.create({
+      taskId, projectId, agentRole: 'developer_ai', status: 'queued',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' }, dryRun: false,
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.jobs.update(job.id, { status: 'running', startedAt: new Date().toISOString() })
+    storage.jobs.update(job.id, {
+      status: 'blocked', completedAt: new Date().toISOString(), stderr: SKEW,
+      guardResult: { permissionAllowed: true, fileChangeAllowed: true, fileViolations: [] },
+    } as never)
+
+    const escalations: string[] = []
+    let diagnoses = 0
+    const d = deps({
+      diagnose: async () => { diagnoses += 1; return '{"actionKind":"resume_task"}' },
+      escalate: async (p) => { escalations.push(p.title); return DELIVERED },
+    })
+    const jobsBefore = storage.jobs.findByTaskId(taskId).length
+    for (let i = 0; i < PL_MAX_ATTEMPTS_PER_TARGET + 2; i += 1) {
+      resetPlLoopInFlightForTest()
+      expect((await runPlTick(storage, d)).status).toBe('idle')
+    }
+
+    expect(escalations).toEqual([])
+    expect(diagnoses).toBe(0)
+    expect(storage.jobs.findByTaskId(taskId).length).toBe(jobsBefore)
+    const rows = storage.auditLog.findByEntity('pl_loop_target', `job_blocked:${job.id}`)
+    expect(rows.some((entry) => entry.result === 'escalated')).toBe(false)
+    const exhausted = rows.filter((entry) => entry.result === 'technical_exhausted')
+    expect(exhausted).toHaveLength(1)
+    expect(exhausted[0]?.detail).toContain('stop=risk_rule_skew')
+    expect(exhausted[0]?.detail).toContain('lane=auto_recovery')
+
+    // Visible: job_blocked stays in attention, marked as a technical stop that requested no CEO decision.
+    const item = buildSystemState(storage, { now: () => NOW }).attention.find((a) => a.jobId === job.id)
+    expect(item?.kind).toBe('job_blocked')
+    expect(item?.detail).toContain('no CEO decision was requested')
   })
 })

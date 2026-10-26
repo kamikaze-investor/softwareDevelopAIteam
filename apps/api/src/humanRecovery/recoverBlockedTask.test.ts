@@ -44,7 +44,7 @@ interface Seeded {
 
 function seed(options: {
   taskStatus?: 'pending' | 'blocked' | 'done'
-  projectStatus?: 'running' | 'archived' | 'paused'
+  projectStatus?: 'running' | 'archived' | 'paused' | 'draft'
   roadmapTaskKey?: string
   withJob?: boolean
   /** 診断まで進む `job_blocked` attention を作る（Job があるので recover 自体は対象外）。 */
@@ -357,26 +357,24 @@ describe('recoverBlockedTask — nextDriver は再投入後に何が動くかを
     expect(result).toMatchObject({ ok: true, nextDriver: 'attention_only' })
   })
 
-  it('**running でない Project では、通知が出るとすら言わない**', () => {
-    // paused では PL tick も attention 導出も動かない。`pl_independent_remediation` は
-    // もちろん嘘だが、`attention_only` も嘘である —— attention 導出は
-    // `project.status === 'running'` を要求するので、通知は1件も出ない
-    // （独立レビュー round 4 指摘）。
+  it('**running でない Project では再投入しない（PROJECT_NOT_RUNNING）**', () => {
+    // paused では PL tick も attention 導出も Worker の claim も動かない。以前は pending へ戻して
+    // `nextDriver: project_not_running` を返していたが、それでは blocked という「人が見るべき停止」が
+    // 消えるだけで何も進まない（b8d0fc5d 監査）。Task は blocked のまま残し、audit も書かない。
     const { storage, taskId } = seed({ projectStatus: 'paused', roadmapTaskKey: 'some-item' })
     completeReviewAsConflict(storage, taskId)
 
     const result = recoverBlockedTask(storage, { taskId, reason: 'r' })
 
-    expect(result).toMatchObject({ ok: true, nextDriver: 'project_not_running' })
-    // 実測で裏を取る: 再投入後も attention は1件も立たない。
-    expect(buildSystemState(storage).attention).toHaveLength(0)
+    expect(result).toMatchObject({ ok: false, code: 'PROJECT_NOT_RUNNING' })
+    expect(storage.tasks.findById(taskId)?.status).toBe('blocked')
   })
 
-  it('**Remediation 予算を使い切っていたら remediation を約束しない**', () => {
+  it('**Remediation の判定予算を使い切っていたら remediation を約束しない**（判定 = parse 済みの提案。技術的失敗は数えない）', () => {
     const { storage, taskId } = seed({ roadmapTaskKey: 'some-item' })
     completeReviewAsConflict(storage, taskId)
     for (let i = 0; i < PL_MAX_REMEDIATION_ATTEMPTS; i += 1) {
-      recordRemediationFailure(storage, taskId, `attempt ${i}`)
+      recordRemediationFailure(storage, taskId, `stage=remediation attempt=${i} outcome=abandon`)
     }
 
     const result = recoverBlockedTask(storage, { taskId, reason: 'r' })
@@ -385,23 +383,45 @@ describe('recoverBlockedTask — nextDriver は再投入後に何が動くかを
     expect(countRemediationAttempts(storage, taskId)).toBe(PL_MAX_REMEDIATION_ATTEMPTS)
   })
 
-  it('**paused かつ到達不能なら、Project 再開を勧めない**', () => {
-    // `project_not_running` は「再開すれば動く」ことまで含意する。到達不能な Task に
-    // それを返すと、docs どおり再開した CEO は**何も起きない**のを見る
-    // （独立レビュー round 6 指摘）。解けない方の阻害要因を先に返すのが正しい。
-    const { storage, taskId } = seed({ projectStatus: 'paused', unreachable: true })
+  it.each(['paused', 'draft'] as const)('**%s の Project では到達可能でも不能でも再投入しない**', (projectStatus) => {
+    for (const unreachable of [false, true]) {
+      const { storage, taskId } = seed({ projectStatus, unreachable })
 
-    const result = recoverBlockedTask(storage, { taskId, reason: 'r' })
+      const result = recoverBlockedTask(storage, { taskId, reason: 'r' })
 
-    expect(result).toMatchObject({ ok: true, nextDriver: 'none' })
+      expect(result).toMatchObject({ ok: false, code: 'PROJECT_NOT_RUNNING' })
+      expect(storage.tasks.findById(taskId)?.status).toBe('blocked')
+    }
   })
 
-  it('**paused でも到達可能なら、Project 再開が出口だと返す**', () => {
-    const { storage, taskId } = seed({ projectStatus: 'paused' })
+  it('**precheck の後に Project が pause されても、transaction 内で読み直して断る**', () => {
+    const { storage, taskId } = seed({})
+    const task = storage.tasks.findById(taskId)!
+    storage.projects.update(task.projectId, { status: 'paused' })
 
-    const result = recoverBlockedTask(storage, { taskId, reason: 'r' })
+    const committed = storage.tasks.recoverFromBlocked({ taskId, detail: 'race' })
 
-    expect(result).toMatchObject({ ok: true, nextDriver: 'project_not_running' })
+    expect(committed).toMatchObject({ ok: false, code: 'PROJECT_NOT_RUNNING' })
+    expect(storage.tasks.findById(taskId)?.status).toBe('blocked')
+  })
+
+  it('**transaction 内の再確認も precheck と同じ共有述語の code を返す（archived / park）**', () => {
+    const archived = seed({})
+    const archivedTask = archived.storage.tasks.findById(archived.taskId)!
+    archived.storage.projects.update(archivedTask.projectId, { status: 'archived' })
+    expect(archived.storage.tasks.recoverFromBlocked({ taskId: archived.taskId, detail: 'race' }))
+      .toMatchObject({ ok: false, code: 'PROJECT_UNAVAILABLE' })
+    expect(recoverBlockedTask(archived.storage, { taskId: archived.taskId, reason: 'r' }))
+      .toMatchObject({ ok: false, code: 'PROJECT_UNAVAILABLE' })
+
+    const parked = seed({})
+    parked.storage.auditLog.record({
+      actor: 'api', operation: 'task_aborted', entityType: 'task', entityId: parked.taskId,
+      result: 'success', detail: 'parked mid-flight',
+    })
+    expect(parked.storage.tasks.recoverFromBlocked({ taskId: parked.taskId, detail: 'race' }))
+      .toMatchObject({ ok: false, code: 'TASK_PARKED' })
+    expect(parked.storage.tasks.findById(parked.taskId)?.status).toBe('blocked')
   })
 
   it('**attention_only は「通知が必ず飛ぶ」ことまでは意味しない**', () => {

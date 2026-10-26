@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
+import { recordApprovalActor } from '../designReview/resumeActor'
 import {
   authorizePlAction,
   previewPlActionPolicy,
@@ -79,7 +80,7 @@ function addDesignReviewEvidence(
 }
 
 function addApprovalRequest(storage: IStorage, taskId: string, over: Record<string, unknown> = {}): string {
-  return storage.approvalRequests.create({
+  const id = storage.approvalRequests.create({
     taskId,
     requestedAction: 'git_commit',
     riskLevel: 'LOW',
@@ -92,6 +93,9 @@ function addApprovalRequest(storage: IStorage, taskId: string, over: Record<stri
     expiresAt: FUTURE,
     ...over,
   } as Parameters<IStorage['approvalRequests']['create']>[0]).id
+  // 人（ADMIN）が決めた承認として作る（approval_gate は approval_actor = human を要求する）。
+  recordApprovalActor(storage, id, 'admin')
+  return id
 }
 
 function addCeoApproval(
@@ -135,7 +139,7 @@ describe('previewPlActionPolicy — 見るだけで、許可ではない', () =>
 describe('authorizePlAction — 判定を必ず監査記録へ残す', () => {
   it('許可されたときも記録する（境界が効いているかを後から検証できるように）', () => {
     const { storage, taskId, jobId } = seed()
-    const approvalRequestId = addApprovalRequest(storage, taskId)
+    const approvalRequestId = addApprovalRequest(storage, taskId, { requestedAction: 'retry_job' })
 
     const { actionId } = authorizePlAction(storage, {
       proposal: { kind: 'retry_job' },
@@ -348,7 +352,7 @@ describe('authorizePlAction — レコードの状態を実際に読む', () => 
 
   it('期限切れの Approval Request は充足にならない', () => {
     const { storage, jobId, taskId } = seed()
-    const approvalRequestId = addApprovalRequest(storage, taskId, { expiresAt: PAST })
+    const approvalRequestId = addApprovalRequest(storage, taskId, { expiresAt: PAST, requestedAction: 'retry_job' })
 
     const blocked = expectBlocked(storage, {
       proposal: { kind: 'retry_job' },
@@ -361,7 +365,7 @@ describe('authorizePlAction — レコードの状態を実際に読む', () => 
 
   it('読めない期限値は「未失効」として通さない', () => {
     const { storage, jobId, taskId } = seed()
-    const approvalRequestId = addApprovalRequest(storage, taskId, { expiresAt: 'not-a-date' })
+    const approvalRequestId = addApprovalRequest(storage, taskId, { expiresAt: 'not-a-date', requestedAction: 'retry_job' })
 
     const blocked = expectBlocked(storage, {
       proposal: { kind: 'retry_job' },
@@ -404,20 +408,15 @@ describe('authorizePlAction — レコードの状態を実際に読む', () => 
     expect(blocked.missingGates).toContain('independent_review')
   })
 
-  it('pending な CEO Approval は充足にならない', () => {
+  // 2026-10-17 監査 P2: legacy CEO Approval は actor・action・target・一回性を束縛できないので、
+  // 状態や type に関係なく ceo_approval の根拠にならない（人の承認は approval_gate で積む）。
+  it.each([
+    { label: 'pending', over: { status: 'pending' } },
+    { label: '用途の違う（billing）承認済み', over: { type: 'billing' } },
+    { label: '用途の合う（deployment）承認済み', over: { type: 'deployment' } },
+  ])('$label の legacy CEO Approval では restart_service は通らない', ({ over }) => {
     const { storage, projectId } = seed()
-    const approvalId = addCeoApproval(storage, projectId, { status: 'pending' })
-
-    expectBlocked(storage, {
-      proposal: { kind: 'restart_service' },
-      target: { kind: 'system' },
-      evidence: [{ gate: 'ceo_approval', approvalId }],
-    })
-  })
-
-  it('用途の違う CEO Approval は流用できない', () => {
-    const { storage, projectId } = seed()
-    const approvalId = addCeoApproval(storage, projectId, { type: 'billing' })
+    const approvalId = addCeoApproval(storage, projectId, over)
 
     const blocked = expectBlocked(storage, {
       proposal: { kind: 'restart_service' },
@@ -425,20 +424,23 @@ describe('authorizePlAction — レコードの状態を実際に読む', () => 
       evidence: [{ gate: 'ceo_approval', approvalId }],
     })
 
-    expect(blocked.rejectedEvidence.join(' ')).toContain("not 'deployment'")
+    expect(blocked.missingGates).toContain('ceo_approval')
+    expect(blocked.rejectedEvidence.join(' ')).toContain('LEGACY_CEO_APPROVAL_NOT_ACCEPTED')
   })
 
-  it('用途の合う承認済み CEO Approval なら restart_service は通る', () => {
-    const { storage, projectId } = seed()
+  it('同じ deployment 承認を別の操作（deploy_production / rollback_commit）へ流用できない', () => {
+    const { storage, projectId, taskId, jobId } = seed()
     const approvalId = addCeoApproval(storage, projectId, { type: 'deployment' })
 
-    const { decision } = authorizePlAction(storage, {
-      proposal: { kind: 'restart_service' },
-      target: { kind: 'system' },
-      evidence: [{ gate: 'ceo_approval', approvalId }],
-    })
-
-    expect(decision.kind).toBe('restart_service')
+    for (const request of [
+      { proposal: { kind: 'deploy_production' as const }, target: { kind: 'system' as const } },
+      { proposal: { kind: 'rollback_commit' as const }, target: { kind: 'job' as const, jobId, taskId } },
+    ]) {
+      const blocked = expectBlocked(storage, { ...request, evidence: [{ gate: 'ceo_approval', approvalId }] })
+      expect(blocked.missingGates).toContain('ceo_approval')
+    }
+    // 拒否は承認行を書き換えない（存在しない consume を装わない）。
+    expect(storage.approvals.findById(approvalId)?.status).toBe('approved')
   })
 })
 
@@ -538,10 +540,48 @@ describe('authorizePlAction — 対象スコープと Review 根拠の対応', (
   })
 })
 
+describe('authorizePlAction — approval_gate は PL action と同じ requestedAction の承認だけ (2026-10-16 RC6)', () => {
+  it.each(['retry_job', 'fail_stuck_job'] as const)(
+    '%s: 別 action（git_commit / git_status）の APPROVED は根拠にならず、同じ action の APPROVED は通る',
+    (kind) => {
+      const { storage, jobId, taskId } = seed()
+      for (const otherAction of ['git_commit', 'git_status']) {
+        const other = addApprovalRequest(storage, taskId, { requestedAction: otherAction })
+        const blocked = expectBlocked(storage, {
+          proposal: { kind },
+          target: { kind: 'job', jobId, taskId },
+          evidence: [{ gate: 'approval_gate', approvalRequestId: other }],
+        })
+        expect(blocked.missingGates).toEqual(['approval_gate'])
+        expect(blocked.rejectedEvidence.join(' ')).toContain(`approved "${otherAction}", not "${kind}"`)
+      }
+
+      const matching = addApprovalRequest(storage, taskId, { requestedAction: kind })
+      const authorization = authorizePlAction(storage, {
+        proposal: { kind },
+        target: { kind: 'job', jobId, taskId },
+        evidence: [{ gate: 'approval_gate', approvalRequestId: matching }],
+      })
+      expect(authorization.decision.requiredGates).toContain('approval_gate')
+    },
+  )
+
+  it('reconcile_external_completion も git_commit の承認では通らない', () => {
+    const { storage, taskId } = seed()
+    const gitCommitApproval = addApprovalRequest(storage, taskId, { requestedAction: 'git_commit' })
+
+    expect(() => authorizePlAction(storage, {
+      proposal: { kind: 'reconcile_external_completion' },
+      target: { kind: 'task', taskId },
+      evidence: [{ gate: 'approval_gate', approvalRequestId: gitCommitApproval }],
+    })).toThrow(PlActionBlockedError)
+  })
+})
+
 describe('authorizePlAction — 検証手段の無い Gate は充足できない', () => {
   it('safety_review を要求する操作は、根拠を積んでも通らない（fail-closed）', () => {
     const { storage, jobId, taskId } = seed()
-    const approvalRequestId = addApprovalRequest(storage, taskId)
+    const approvalRequestId = addApprovalRequest(storage, taskId, { requestedAction: 'clear_workspace_quarantine' })
 
     const blocked = expectBlocked(storage, {
       proposal: { kind: 'clear_workspace_quarantine' },
@@ -599,7 +639,7 @@ describe('reconcile_external_completion — 外部完了は Gate を通ってし
 
   it('APPROVED な承認があれば通る', () => {
     const { storage, taskId } = seed()
-    const approvalId = addApprovalRequest(storage, taskId)
+    const approvalId = addApprovalRequest(storage, taskId, { requestedAction: 'reconcile_external_completion' })
 
     const authorization = authorizePlAction(storage, {
       proposal: { kind: 'reconcile_external_completion' },

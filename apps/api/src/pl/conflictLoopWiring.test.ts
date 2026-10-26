@@ -321,3 +321,32 @@ describe('PL tick — CONFLICT 解決の配線', () => {
     expect(PL_MAX_REMEDIATION_ATTEMPTS).toBe(2)
   })
 })
+describe('PL tick — fresh Review が判定を出さなかった（review_pending）', () => {
+  it('escalation せず、試行も数えず、attention を残す（stage を問わない）', async () => {
+    for (const stage of ['challenge', 'pl_revision', 'remediation'] as const) {
+      resetPlLoopInFlightForTest()
+      const { storage, taskId } = seedConflicted()
+      const escalations: string[] = []
+
+      const result = await runPlTick(storage, deps({
+        escalate: async (payload) => { escalations.push(payload.title) },
+        resolveConflict: async (_s, id) => ({
+          stage,
+          taskId: id,
+          // remediation は中身（Remediation の結果）の status で判定される。
+          ...(stage === 'remediation'
+            ? { status: 'remediation' as const, remediation: { status: 'review_pending' as const, taskId: id } }
+            : { status: 'review_pending' as const }),
+          reason: 'run is queued',
+        }),
+      }))
+
+      expect(result.status).toBe('idle')
+      expect(escalations).toEqual([])
+      const attempts = storage.auditLog
+        .findByEntity('pl_loop_target', `task_ready_without_job:${taskId}`)
+        .filter((entry) => ['acted', 'blocked', 'diagnosis_unusable', 'diagnosis_failed', 'escalated'].includes(entry.result))
+      expect(attempts).toEqual([])
+    }
+  })
+})

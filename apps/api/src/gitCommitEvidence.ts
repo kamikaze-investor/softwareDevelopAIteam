@@ -43,8 +43,15 @@ import {
 } from '@ai-team/worker/src/guards/fileChangeGuard.js'
 import type { ChangeManifest, EntryType, FileChange } from '@ai-team/worker/src/guards/changeManifest.js'
 import type { ChangeManifestEntry } from './approvalExplain/changeManifestIdentity'
+import { classifyStoredRunJudgment } from './designReview/designReviewCoordinator'
 import { checkImplementJobDesignReviewEvidence } from './designReviewEvidencePolicy'
 import { resolveReviewedImplementation } from './designReview/repairFlow'
+import { parseResumeSource, resolveGitCommitResumeOrigin } from './designReview/repairPolicy'
+import {
+  classifyGitCommitResumeLineage,
+  isCanonicalGitCommitAnchor,
+  parseGitCommitResumeStepKey,
+} from './gitCommitResumeLineage'
 import type { IStorage } from './storage/interface'
 
 export type GitCommitHumanGateReason = 'human_decision_authority' | 'insufficient_safety_evidence'
@@ -74,6 +81,7 @@ export type GitCommitEvidenceFailure =
   | 'implementation_unresolved'
   | 'implementation_not_successful'
   | 'design_review_not_aligned'
+  | 'design_review_reversed'
 
 export type GitCommitEvidenceResult =
   | { passed: true }
@@ -180,6 +188,16 @@ export function evaluateGitCommitEvidence(
     failures.length === 0
       ? { passed: true }
       : { passed: false, reason: 'insufficient_safety_evidence', failures }
+  // lineage を辿れずに打ち切る経路（`resume:<anchor>:N` の git_commit 等）でも、同じ設計での Design Review
+  // 判定反転は DA trigger (7) として開示する。既に fail closed している経路にだけ失敗を足す（通す方向には働かない）。
+  // implement Job を特定できないので、Task の最新 evidence（ALIGNED のときだけ）で判定する。
+  const earlyResult = (): GitCommitEvidenceResult => {
+    const latest = storage.designReviewEvidence.findLatestByTaskId(input.task.id)
+    if (latest?.decision === 'ALIGNED' && hasEarlierNegativeDesignReviewRun(storage, latest)) {
+      fail('design_review_reversed')
+    }
+    return result()
+  }
 
   const { gitCommitJob, task, targetCommit, targetDiffHash } = input
 
@@ -223,7 +241,7 @@ export function evaluateGitCommitEvidence(
   const stepMatch = GIT_COMMIT_STEP_KEY.exec(gitCommitJob.workflowStepKey ?? '')
   if (!stepMatch) {
     fail('review_lineage_unresolved')
-    return result()
+    return earlyResult()
   }
   const reviewJob = storage.jobs.findById(stepMatch[1] as string)
   if (
@@ -233,7 +251,7 @@ export function evaluateGitCommitEvidence(
     || reviewJob.aiCliMode !== 'review'
   ) {
     fail('review_job_invalid')
-    return result()
+    return earlyResult()
   }
 
   // review result は、その review Job 自身のものが 1 件だけ
@@ -268,7 +286,7 @@ export function evaluateGitCommitEvidence(
   const reviewed = resolveReviewedImplementation(storage, reviewJob.id)
   if (!reviewed.ok) {
     fail('implementation_unresolved')
-    return result()
+    return earlyResult()
   }
   // resume を挟んだ review は、implement 終了から review 開始までの間に worktree が変わり得る。
   // Stage 1 では対象外とする（範囲を狭める方向の制限）。
@@ -280,7 +298,103 @@ export function evaluateGitCommitEvidence(
     { taskId: task.id, aiCliMode: implementJob.aiCliMode, aiCliPrompt: implementJob.aiCliPrompt },
     storage.designReviewEvidence,
   )
-  if (!designReview.ok || designReview.evidence === undefined) fail('design_review_not_aligned')
+  if (!designReview.ok || designReview.evidence === undefined) {
+    fail('design_review_not_aligned')
+  } else if (hasEarlierNegativeDesignReviewRun(storage, designReview.evidence)) {
+    // 同じ設計（同じ designTextHash）への CONFLICT / UNCERTAIN が、後の ALIGNED で覆っただけ
+    // （例: Challenge の再評価）。spec 22 §14-3 DA trigger (7)「review 判定不一致が未解決」として、
+    // `review_resumed` と同じく人間承認へ fail closed する（Evidence を通す方向には働かない）。
+    fail('design_review_reversed')
+  }
 
   return result()
+}
+
+/**
+ * **使った ALIGNED evidence より前に、同じ subject・同じ designTextHash の run が否定判定で終わっていたか**
+ * （spec 22 §14-3 DA trigger (7)）。
+ *
+ * evidence policy は「最新の判定が正」なので、古い CONFLICT は新しい ALIGNED を無効にしない
+ * （`designReviewEvidencePolicy.findSupersedingRun()`）。それ自体は Job 作成の規則として正しいが、
+ * commit 時点では「同一設計への判定が割れた」事実が消える。ここではそれを commit の Evidence 不成立として拾う。
+ *
+ * - 判定の分類は既存の `classifyStoredRunJudgment()`（failed / REVIEW_UNAVAILABLE / 結果なしは `none` =
+ *   否定に数えない）。
+ * - hash が違う run（設計を改訂する前の CONFLICT）は数えない —— 改訂された設計は不一致ではない。
+ * - 「前」の順序は `findSupersedingRun()` と同じ規約: evidence を生んだ run が分かればその run より前に
+ *   挿入された run（`findByTaskId()` は新しい順）、分からなければ evidence より厳密に前に作られた run。
+ */
+function hasEarlierNegativeDesignReviewRun(
+  storage: IStorage,
+  evidence: { taskId?: string; reviewKind: string; subjectId: string; designTextHash: string; createdAt: string; runId?: string },
+): boolean {
+  if (evidence.taskId === undefined) return false
+  const runs = storage.designReviewRuns.findByTaskId(evidence.taskId)
+  const originIndex = evidence.runId !== undefined ? runs.findIndex((run) => run.id === evidence.runId) : -1
+  return runs.some((run, index) => {
+    if (run.reviewKind !== evidence.reviewKind || run.subjectId !== evidence.subjectId) return false
+    if (run.designTextHash !== evidence.designTextHash) return false
+    const earlier = originIndex >= 0 ? index > originIndex : run.createdAt < evidence.createdAt
+    return earlier && classifyStoredRunJudgment(run) === 'negative'
+  })
+}
+
+/**
+ * resume 済みを含む git_commit Job を、`review:<id>:git-commit` を持つ canonical anchor へ正規化する。
+ * 新方式は fixed anchor を exact id で1回だけ、旧形式（#348 以前の入れ子）は既存の
+ * `resolveGitCommitResumeOrigin()` で辿る（`storage/sqlite.ts` の REJECT 後 provenance と同じ規約）。
+ * 解けなければ undefined（呼び出し側は「不一致なし」とせず、開示を付けないだけ。判定自体は別途 fail closed 済み）。
+ */
+function canonicalGitCommitAnchorOf(storage: IStorage, gitCommitJob: Job): Job | undefined {
+  if (isCanonicalGitCommitAnchor(gitCommitJob)) return gitCommitJob
+  const parsed = parseGitCommitResumeStepKey(gitCommitJob.workflowStepKey)
+  const lineage = classifyGitCommitResumeLineage({
+    currentJob: gitCommitJob,
+    referencedJob: parsed !== undefined ? storage.jobs.findById(parsed.anchorJobId) : undefined,
+    taskJobs: storage.jobs.findByTaskId(gitCommitJob.taskId),
+    requireCurrentIsLatestGeneration: false,
+  })
+  if (lineage.kind === 'new_scheme') return lineage.lineage.anchorJob
+  if (lineage.kind !== 'legacy') return undefined
+  const origin = resolveGitCommitResumeOrigin(storage.jobs, gitCommitJob)
+  return origin.ok && isCanonicalGitCommitAnchor(origin.origin) ? origin.origin : undefined
+}
+
+/**
+ * **同じ実装に対する review の判定が割れたまま commit へ進んだか**（spec 22 §14-3 DA trigger (7)）。
+ *
+ * git_commit → canonical anchor → `review:<reviewJobId>:git-commit` → review の resume lineage を、
+ * 既存の walker（`resolveReviewedImplementation()`）で辿る。lineage 上の review はすべて同じ implement Job を
+ * レビューしているので「同一実装」である。その上で
+ * - commit の根拠になった最後の review が approved で、
+ * - それより前の review（resume で置き換えられた側）に changes_requested / rejected がある
+ * ときだけ true を返す（2026-10-09 b6d4097a: 517d0af7 の changes_requested が、同一 diff の resume 再実行
+ * 9dfffc41 で approved に変わり、そのまま git_commit の承認依頼になった）。
+ *
+ * 読み取りだけで、Evidence の合否は変えない（その経路は `review_resumed` / `review_lineage_unresolved` で
+ * 既に fail closed している）。用途は人間承認の依頼に「判定不一致」を開示することだけ。
+ */
+export function hasReviewVerdictDisagreement(storage: IStorage, gitCommitJob: Job): boolean {
+  if (gitCommitJob.safeCommand.kind !== 'git_commit') return false
+  const anchor = canonicalGitCommitAnchorOf(storage, gitCommitJob)
+  if (anchor === undefined) return false
+  const reviewRef = GIT_COMMIT_STEP_KEY.exec(anchor.workflowStepKey ?? '')
+  if (!reviewRef) return false
+  const reviewed = resolveReviewedImplementation(storage, reviewRef[1] as string)
+  if (!reviewed.ok || reviewed.resumeHops.length === 0) return false
+
+  // resumeHops は resume key を持つ review Job（最後の review 側から近い順）。各段の source が
+  // 置き換えられた側の review である。
+  const supersededReviewIds = new Set<string>()
+  for (const hop of reviewed.resumeHops) {
+    const sourceId = parseResumeSource(hop.workflowStepKey ?? '')
+    if (sourceId !== undefined) supersededReviewIds.add(sourceId)
+  }
+
+  const results = storage.reviewResults.findByTaskId(gitCommitJob.taskId)
+  const finalApproved = results.some((r) => r.jobId === reviewed.reviewJob.id && r.status === 'approved')
+  const earlierNegative = results.some((r) =>
+    supersededReviewIds.has(r.jobId)
+    && (r.status === 'changes_requested' || r.status === 'rejected'))
+  return finalApproved && earlierNegative
 }

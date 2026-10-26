@@ -85,7 +85,7 @@ function approveAbort(storage: IStorage, taskId: string): string {
     status: 'WAITING_FOR_USER',
     expiresAt: new Date(Date.now() + 60_000).toISOString(),
   } as Parameters<IStorage['approvalRequests']['create']>[0])
-  storage.approvalRequests.updateStatus(approval.id, 'APPROVED')
+  storage.approvalRequests.recordDecision(approval.id, 'APPROVED', undefined, { credentialClass: 'admin' })
   return approval.id
 }
 
@@ -267,7 +267,7 @@ describe('startup reconciliation — rows it must leave alone', () => {
     expect(storage.jobs.findById('source-waiting')?.status).toBe('blocked')
     expect(storage.auditLog.findByEntity('job', 'source-waiting')).toHaveLength(0)
   })
-  it('skips a source whose approval_id points to a missing approval row, and one bound to an expired WAITING row', () => {
+  it('skips a source whose approval_id points to a missing approval row, but no longer pins one bound to an expired WAITING row', () => {
     const dbPath = databasePath()
     seedDatabase(dbPath, (db) => {
       for (const taskId of ['dangling', 'expired', 'rejected']) insertTask(db, taskId, 'done')
@@ -294,7 +294,9 @@ describe('startup reconciliation — rows it must leave alone', () => {
 
     const storage = createSQLiteStorage(dbPath)
     expect(storage.jobs.findById('source-dangling')?.status).toBe('blocked')
-    expect(storage.jobs.findById('source-expired')?.status).toBe('blocked')
+    // 期限切れ WAITING は approveAndResumeJob() が EXPIRED で拒否するので、もう誰も source を動かさない。
+    // shared isLiveWaitingApproval に揃え、lineage どおり終端化する（2026-10-16 監査 A2）。
+    expect(storage.jobs.findById('source-expired')?.status).toBe('failed')
     // 終わった承認（REJECTED）が結び付いているだけなら、lineage どおり終端化する。
     expect(storage.jobs.findById('source-rejected')?.status).toBe('failed')
   })

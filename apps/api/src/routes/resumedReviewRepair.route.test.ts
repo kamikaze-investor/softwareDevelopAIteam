@@ -1,5 +1,6 @@
 import Fastify, { type FastifyInstance } from 'fastify'
-import { createHash } from 'node:crypto'
+import { setCredentialClass } from '../auth/credentialClass'
+import { createHash, randomUUID } from 'node:crypto'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { canonicalizeJobUpdate, type Job } from '@ai-team/shared'
 
@@ -33,6 +34,11 @@ async function buildApp(): Promise<FastifyInstance> {
   ])
   resetStorage()
   const app = Fastify()
+  // C-1: the Worker's result delivery is authenticated as the Worker (apiTokenAuth sets the class in
+  // production). These route tests have no auth plugin, so stand in for it on the Worker's PATCH /api/jobs/:id.
+  app.addHook('onRequest', async (req) => {
+    if (req.method === 'PATCH' && /^\/api\/jobs\/[^/?]+(\?|$)/.test(req.url)) setCredentialClass(req, 'worker')
+  })
   app.register(taskRoutes, { prefix: '/api/tasks' })
   app.register(jobRoutes, { prefix: '/api/jobs' })
   await app.ready()
@@ -255,7 +261,7 @@ describe('PATCH の review 分岐: Human Resume で再実行された review', (
       expect(resumed.workflowStepKey).toBe(`resume:${shape.r0.id}:1`)
       expect(resumed.aiCliMode).toBe('review')
 
-      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${resumed.id}`, payload: reviewPatch('changes_requested') })
+      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${resumed.id}`, payload: withOutbox(reviewPatch('changes_requested'), randomUUID()) })
 
       expect(res.statusCode).toBe(200)
       const runs = await repairRuns(shape.taskId)
@@ -273,7 +279,7 @@ describe('PATCH の review 分岐: Human Resume で再実行された review', (
       const shape = await blockedAfterFailedReview()
       const resumed = await resume(app, shape.taskId)
 
-      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${resumed.id}`, payload: reviewPatch('approved') })
+      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${resumed.id}`, payload: withOutbox(reviewPatch('approved'), randomUUID()) })
 
       expect(res.statusCode).toBe(200)
       expect(await repairRuns(shape.taskId)).toHaveLength(0)
@@ -313,7 +319,7 @@ describe('PATCH の review 分岐: Human Resume で再実行された review', (
       const resumed = await resume(app, shape.taskId)
       expect(resumed.workflowStepKey).toBe(`resume:${manual.id}:1`)
 
-      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${resumed.id}`, payload: reviewPatch('changes_requested') })
+      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${resumed.id}`, payload: withOutbox(reviewPatch('changes_requested'), randomUUID()) })
 
       expect(res.statusCode).toBe(200)
       expect(await repairRuns(shape.taskId)).toHaveLength(0)
@@ -331,7 +337,7 @@ describe('PATCH の review 分岐: 既存の implement:<id>:review（regression�
     await withApp(async (app) => {
       const shape = await blockedAfterFailedReview({ firstReviewTerminal: false })
 
-      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${shape.r0.id}`, payload: reviewPatch('changes_requested', 'first review') })
+      const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${shape.r0.id}`, payload: withOutbox(reviewPatch('changes_requested', 'first review'), randomUUID()) })
 
       expect(res.statusCode).toBe(200)
       const runs = await repairRuns(shape.taskId)
@@ -349,7 +355,7 @@ describe('PATCH の review 分岐: 既存の implement:<id>:review（regression�
       const res = await app.inject({
         method: 'PATCH',
         url: `/api/jobs/${shape.repairReview.id}`,
-        payload: reviewPatch('changes_requested', '517d0af7-like review'),
+        payload: withOutbox(reviewPatch('changes_requested', '517d0af7-like review'), randomUUID()),
       })
 
       expect(res.statusCode).toBe(200)
@@ -361,6 +367,91 @@ describe('PATCH の review 分岐: 既存の implement:<id>:review（regression�
       expect(kick).toHaveBeenCalledTimes(1)
       expect(kick.mock.calls[0]![2]).toBe(`repair:${shape.repair.id}:1`)
       expect((await storage()).tasks.findById(shape.taskId)?.status).toBe('blocked')
+    })
+  })
+})
+
+/**
+ * **review 結果の永続化後・Stage 2 前に落ちても、再送で Stage 2 が1回だけ起きる**（lifecycle repair C2 / H-02）。
+ *
+ * persistReviewWorkflowResult（Outbox 記録を含む）と Stage 2 は別 transaction。以前は再送が
+ * deduplicated になると Stage 2 を飛ばし、Task は pending・最新 review failed・live Job / run 無しで止まった。
+ */
+describe('PATCH の review 分岐: 永続化後に落ちた changes_requested の再送', () => {
+  beforeEach(() => {
+    kick.mockClear()
+  })
+
+  async function pendingReviewedImplementation() {
+    const s = await storage()
+    const project = s.projects.create({ name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running' })
+    const task = s.tasks.create({
+      projectId: project.id, title: 'VPS docs', description: 'd', status: 'pending',
+      assignee: 'developer_ai', dependencies: [], allowedPaths: [DOC], roadmapActive: true,
+    } as never)
+    const base = {
+      taskId: task.id, projectId: project.id, status: 'queued',
+      safeCommand: { kind: 'git_status', workingDir: '/workspace/target' }, aiCliProvider: 'claude_code', aiCliPrompt: 'p',
+    }
+    const impl = s.jobs.create({ ...base, agentRole: 'developer_ai', aiCliMode: 'implement', workflowStepKey: `task:${task.id}:initial-implement` } as never)
+    s.jobs.update(impl.id, { status: 'success', exitCode: 0, changedFiles: [DOC] } as never)
+    await tick()
+    const review = s.jobs.create({ ...base, agentRole: 'qa_ai', aiCliMode: 'review', workflowStepKey: `implement:${impl.id}:review` } as never)
+    s.jobs.update(review.id, { status: 'running' } as never)
+    await tick()
+    return { taskId: task.id, impl, review }
+  }
+
+  it('永続化だけ済んだ event の再送で Stage 2 が起き、さらに再送しても run は1件のまま', async () => {
+    await withApp(async (app) => {
+      const shape = await pendingReviewedImplementation()
+      const payload = withOutbox(reviewPatch('changes_requested', 'lost before stage 2'), 'evt-review-crash')
+      const { eventId, payloadHash, reviewResult, ...update } = payload
+
+      // crash の再現: route と同じ永続化（status は failed へ正規化）だけを行い、Stage 2 は走らせない。
+      const persisted = (await storage()).jobs.persistReviewWorkflowResult({
+        jobId: shape.review.id,
+        update: { ...update, status: 'failed' } as never,
+        reviewResult: reviewResult as never,
+        outboxEvent: { eventId, payloadHash },
+      })
+      expect(persisted.ok).toBe(true)
+      expect(await repairRuns(shape.taskId)).toHaveLength(0)
+
+      const replay = await app.inject({ method: 'PATCH', url: `/api/jobs/${shape.review.id}`, payload })
+
+      expect(replay.statusCode).toBe(200)
+      expect(JSON.parse(replay.body).outbox).toEqual({ eventId, deduplicated: true })
+      const runs = await repairRuns(shape.taskId)
+      expect(runs).toHaveLength(1)
+      expect(runs[0]!.repairSourceJobId).toBe(shape.impl.id)
+      expect(runs[0]!.designText).toContain('lost before stage 2')
+      expect(kick).toHaveBeenCalledTimes(1)
+
+      // もう一度再送しても、Stage 2 は二重に起きない（active run / identity 照合）。
+      const again = await app.inject({ method: 'PATCH', url: `/api/jobs/${shape.review.id}`, payload })
+      expect(again.statusCode).toBe(200)
+      expect(await repairRuns(shape.taskId)).toHaveLength(1)
+      expect(kick).toHaveBeenCalledTimes(1)
+    })
+  })
+
+  it('Stage 2 の run が終端した後の再送でも、同じ repair 計画の run を作り直さない', async () => {
+    await withApp(async (app) => {
+      const shape = await pendingReviewedImplementation()
+      const payload = withOutbox(reviewPatch('changes_requested', 'terminal before replay'), 'evt-review-terminal')
+
+      expect((await app.inject({ method: 'PATCH', url: `/api/jobs/${shape.review.id}`, payload })).statusCode).toBe(200)
+      const s = await storage()
+      const [run] = s.designReviewRuns.findByTaskId(shape.taskId)
+      expect(run).toBeDefined()
+      const claimed = s.designReviewRuns.claim(run!.id, 3)
+      s.designReviewRuns.complete(run!.id, claimed.claimToken!, 'succeeded', JSON.stringify({
+        focusedReviewResults: [], integrationReviewResult: { decision: 'CONFLICT' }, finalDecision: 'CONFLICT',
+      }))
+
+      expect((await app.inject({ method: 'PATCH', url: `/api/jobs/${shape.review.id}`, payload })).statusCode).toBe(200)
+      expect(s.designReviewRuns.findByTaskId(shape.taskId)).toHaveLength(1)
     })
   })
 })

@@ -238,6 +238,14 @@ describe('resolveMetaReviewOutcome — 技術的 blocked と Human Decision の�
     expect(outcome.exitCode).toBe(1)
     expect(outcome.result.status).toBe('blocked')
     expect(outcome.result.findings.at(-1)).toMatchObject({ severity: 'critical', category: 'authority_change' })
+    // 実装ファイルを CODEOWNERS へ足すのではなく、rule 変更と実装を同じ PR に載せる方向へ誘導する
+    const suggestion = outcome.result.findings.at(-1)?.suggestion ?? ''
+    expect(suggestion).toContain('base の canonical rule（approval_rules.md / specs/22）が定めていない Approval Tuple (a)〜(d) の変更なら、対応する canonical rule の変更を同じ PR に含め、CODEOWNERS review に委ねる')
+    expect(suggestion).toContain('base の canonical rule が定める Tuple をそのとおりに実装する変更（Tuple 不変の enforcement-only 修正を含む）は B なので、DA (2) 判定を見直す')
+    // base で定義済みの Tuple の exact implementation を CODEOWNERS review へ回す旧誘導に戻っていない
+    expect(suggestion).not.toContain('exact implementation')
+    expect(suggestion).toContain('Human Gate を得る目的だけで実装ファイルを CODEOWNERS へ追加しない')
+    expect(suggestion).not.toContain('CODEOWNERS へ追加する。')
   })
 
   it('CODEOWNERS を確認できなければ（undefined）requiresCeoApproval=true は fail closed', () => {

@@ -13,6 +13,7 @@ import type {
   ReviewResult,
   RiskLevel,
   Task,
+  TaskDetail,
   TaskFailureClassification,
   TaskFailureExplanationResponse,
   TaskFailureFacts,
@@ -42,6 +43,7 @@ import {
   canRunReview,
   allowsProgressActions,
   visibleTaskActions,
+  canShowRecoverUI,
   canShowResumeUI,
   invalidateQaEvidence,
   deriveJobDisplayState,
@@ -58,7 +60,20 @@ import {
   storedReviewRecoveryView,
 } from '../../lib/taskWorkflow'
 import { formatResumeErrorMessage, RESUME_ERROR_MESSAGE_FALLBACK } from '../../lib/resumeErrorMessage'
+import { readApiRejection, submitTaskRecovery } from '../../lib/taskRecovery'
+import {
+  ONE_TAP_ABORT_BUTTON_LABEL,
+  ONE_TAP_ABORT_CONFIRM_TITLE,
+  ONE_TAP_ABORT_DEFAULT_DEPS,
+  ONE_TAP_ABORT_PROGRESS_TEXT,
+  canShowAbortUI,
+  createOneTapAbortRunner,
+  oneTapAbortConfirmMessage,
+  oneTapAbortView,
+} from '../../lib/taskAbort'
+import type { OneTapAbortStage } from '../../lib/taskAbort'
 import { POLLING_INTERVAL_MS, usePolling } from '../../lib/usePolling'
+import { TASK_NUMBER_TEXT_STYLE, taskNumberLabel } from '../../lib/taskNumber'
 
 const RESUME_INSTRUCTION_MAX_LENGTH = 2000
 // MOB-001: 自由入力を「停止時の既定の対処」に見せない。
@@ -187,7 +202,8 @@ const TASK_FAILURE_CLASSIFICATION_LABEL: Record<
 }
 
 interface TaskDetailData {
-  task: Task
+  /** `GET /api/tasks/:id` は Resume / Recover の前提判定用に parked・projectStatus を足して返す */
+  task: TaskDetail
   jobs: Job[]
   approvalRequests: ApprovalRequest[]
   /** MOB-001: stall を「検出しただけ」と「確認済み」に分けて表示するため */
@@ -198,7 +214,7 @@ interface TaskDetailData {
   qaResults: QAResult[] | null
 }
 
-async function fetchTask(taskId: string): Promise<Task | null> {
+async function fetchTask(taskId: string): Promise<TaskDetail | null> {
   const response = await apiFetch(
     `/api/tasks/${encodeURIComponent(taskId)}`,
   )
@@ -211,7 +227,7 @@ async function fetchTask(taskId: string): Promise<Task | null> {
     throw new Error(`Failed to fetch task: ${response.status}`)
   }
 
-  return (await response.json()) as Task
+  return (await response.json()) as TaskDetail
 }
 
 async function fetchJobs(taskId: string): Promise<Job[]> {
@@ -429,15 +445,6 @@ async function createTaskJob(
   }
 }
 
-async function readResumeApiError(response: Response): Promise<string | null> {
-  try {
-    const body = (await response.json()) as { error?: unknown }
-    return typeof body.error === 'string' ? body.error : null
-  } catch {
-    return null
-  }
-}
-
 async function postResumeInstruction(
   taskId: string,
   instruction: string,
@@ -456,8 +463,8 @@ async function postResumeInstruction(
       return { ok: true }
     }
 
-    const errorMessage = await readResumeApiError(response)
-    return { message: formatResumeErrorMessage(errorMessage), ok: false }
+    const { code, error } = await readApiRejection(response)
+    return { message: formatResumeErrorMessage(error, code), ok: false }
   } catch {
     return { message: RESUME_ERROR_MESSAGE_FALLBACK, ok: false }
   }
@@ -903,14 +910,14 @@ function TaskFailureExplanationSection({
 }
 
 interface StoredReviewRecoverySectionProps {
-  approvalRequests: ApprovalRequest[]
   isSubmitting: boolean
   jobs: Job[]
   onSubmit: (reviewJobId: string, evidence: DerivedQaEvidence[]) => void
   /** null = 取得できなかった。重複登録を避けられないので操作を出さない */
   qaResults: QAResult[] | null
   reviews: ReviewResult[]
-  task: Task
+  /** 承認状態は `TaskDetail.humanTaskDecisions`（API が authority を確定した事実）から出す。 */
+  task: TaskDetail
 }
 
 /**
@@ -921,7 +928,6 @@ interface StoredReviewRecoverySectionProps {
  * 通してよいかの最終判断は backend の admission が正本で、ここは表示制御だけである。
  */
 function StoredReviewRecoverySection({
-  approvalRequests,
   isSubmitting,
   jobs,
   onSubmit,
@@ -929,7 +935,7 @@ function StoredReviewRecoverySection({
   reviews,
   task,
 }: StoredReviewRecoverySectionProps): ReactElement | null {
-  const view = storedReviewRecoveryView(task, jobs, reviews, qaResults, approvalRequests)
+  const view = storedReviewRecoveryView(task, jobs, reviews, qaResults)
   if (view.kind === 'hidden') return null
 
   // 登録済み QA が分からないまま送ると、同じ事実を二重に登録する。操作は出さない。
@@ -988,6 +994,64 @@ function StoredReviewRecoverySection({
   )
 }
 
+interface AbortSectionProps {
+  isSubmitting: boolean
+  jobs: Job[]
+  /** 直前の操作結果（実行結果・止まった段階の文言）。画面を離れるまで表示する */
+  lastResult: string | null
+  /** ワンタップ中止（起票 → 人の承認 → 実行を 1 回の確認で） */
+  onAbort: () => void
+  /** ワンタップ中止の実行中の段階（進行状況の文言を出す）。実行中でなければ null */
+  progress: OneTapAbortStage | null
+  task: TaskDetail
+}
+
+/**
+ * 既存の manual abort（park）経路を 1 ボタンで辿る。表示条件は `canShowAbortUI()`、
+ * 何を順に呼ぶかは `oneTapAbortView()`、連鎖は `runOneTapAbort()`（承認は承認一覧と同じ human-only PATCH）。
+ */
+function AbortSection({
+  isSubmitting,
+  jobs,
+  lastResult,
+  onAbort,
+  progress,
+  task,
+}: AbortSectionProps): ReactElement | null {
+  if (!canShowAbortUI(task, jobs)) return null
+  const oneTap = oneTapAbortView(task.humanTaskDecisions)
+
+  return (
+    <View style={styles.section}>
+      <Text style={styles.sectionTitle}>タスクを中止</Text>
+      <View style={styles.resumeBox}>
+        <Text style={styles.resumeHelpText}>{oneTap.note}</Text>
+        <TouchableOpacity
+          disabled={isSubmitting}
+          onPress={onAbort}
+          style={[
+            styles.resumeSubmitButton,
+            styles.recoverButton,
+            styles.abortExecuteButton,
+            isSubmitting && styles.resumeSubmitButtonDisabled,
+          ]}
+        >
+          {isSubmitting && (
+            <ActivityIndicator color="#fff" size="small" />
+          )}
+          <Text style={styles.resumeSubmitButtonText}>{ONE_TAP_ABORT_BUTTON_LABEL}</Text>
+        </TouchableOpacity>
+        {progress !== null && (
+          <Text style={[styles.resumeHelpText, styles.abortResultText]}>{ONE_TAP_ABORT_PROGRESS_TEXT[progress]}</Text>
+        )}
+        {lastResult !== null && (
+          <Text style={[styles.resumeHelpText, styles.abortResultText]}>{lastResult}</Text>
+        )}
+      </View>
+    </View>
+  )
+}
+
 interface ResumeInstructionSectionProps {
   approvalRequests: ApprovalRequest[]
   instruction: string
@@ -997,7 +1061,55 @@ interface ResumeInstructionSectionProps {
   onChangeInstruction: (instruction: string) => void
   onOpen: () => void
   onSubmit: () => void
-  task: Task
+  task: TaskDetail
+}
+
+const RECOVER_HELP_TEXT =
+  'このTaskは作業が1件も作られないまま停止しています（設計レビューで止まった場合など）。'
+  + '復旧すると「再開待ち」に戻り、AI開発チームが設計レビューからやり直します。'
+  + '承認や安全確認は省略されません。'
+
+interface RecoverSectionProps {
+  approvalRequests: ApprovalRequest[]
+  isSubmitting: boolean
+  jobs: Job[]
+  onSubmit: () => void
+  task: TaskDetail
+}
+
+/** Job 0 件の blocked Task だけに出る「復旧（再開待ちに戻す）」。表示条件は `canShowRecoverUI()`。 */
+function RecoverSection({
+  approvalRequests,
+  isSubmitting,
+  jobs,
+  onSubmit,
+  task,
+}: RecoverSectionProps): ReactElement | null {
+  if (!canShowRecoverUI(task, jobs, approvalRequests)) {
+    return null
+  }
+
+  return (
+    <View style={styles.section}>
+      <View style={styles.resumeBox}>
+        <Text style={styles.resumeHelpText}>{RECOVER_HELP_TEXT}</Text>
+        <TouchableOpacity
+          disabled={isSubmitting}
+          onPress={onSubmit}
+          style={[
+            styles.resumeSubmitButton,
+            styles.recoverButton,
+            isSubmitting && styles.resumeSubmitButtonDisabled,
+          ]}
+        >
+          {isSubmitting && (
+            <ActivityIndicator color="#fff" size="small" />
+          )}
+          <Text style={styles.resumeSubmitButtonText}>復旧（再開待ちに戻す）</Text>
+        </TouchableOpacity>
+      </View>
+    </View>
+  )
 }
 
 function ResumeInstructionSection({
@@ -1392,6 +1504,10 @@ export default function TaskDetailScreen(): ReactElement {
   const [isResumeEditorOpen, setIsResumeEditorOpen] = useState(false)
   const [isSubmittingResumeInstruction, setIsSubmittingResumeInstruction] =
     useState(false)
+  const [isSubmittingRecovery, setIsSubmittingRecovery] = useState(false)
+  const [isSubmittingAbort, setIsSubmittingAbort] = useState(false)
+  const [lastAbortResult, setLastAbortResult] = useState<string | null>(null)
+  const [abortProgress, setAbortProgress] = useState<OneTapAbortStage | null>(null)
 
   const loadTaskDetail = useCallback(async (): Promise<void> => {
     if (taskId === null || taskId.length === 0) {
@@ -1535,6 +1651,69 @@ export default function TaskDetailScreen(): ReactElement {
     [isSubmittingStoredReviewRecovery, submitStoredReviewRecoveryAction],
   )
 
+  const submitRecovery = useCallback(async (): Promise<void> => {
+    if (taskId === null || taskId.length === 0) return
+    setIsSubmittingRecovery(true)
+    try {
+      const result = await submitTaskRecovery(taskId)
+      if (!result.ok) {
+        Alert.alert('復旧失敗', result.message)
+        return
+      }
+      Alert.alert(
+        '復旧（再開待ちに戻す）',
+        'Taskを再開待ちに戻しました。AI開発チームが設計レビューからやり直します。',
+      )
+      await loadTaskDetail()
+    } finally {
+      setIsSubmittingRecovery(false)
+    }
+  }, [loadTaskDetail, taskId])
+
+  const handleRecover = useCallback((): void => {
+    if (isSubmittingRecovery) return
+    Alert.alert(
+      '復旧（再開待ちに戻す）',
+      'このTaskを再開待ちに戻しますか？',
+      [
+        { style: 'cancel', text: 'キャンセル' },
+        { onPress: () => { void submitRecovery() }, text: '復旧' },
+      ],
+    )
+  }, [isSubmittingRecovery, submitRecovery])
+
+  // ワンタップ中止: CEO が自分で始めた中止なので、1 回の確認の後ろで起票 → 人の承認 → 実行を順に呼ぶ（lib の runOneTapAbort）。
+  // runner は二重送信を API の手前で止める（描画の反映前の 2 回押し対策）。
+  const oneTapAbortRunner = useMemo(
+    () => createOneTapAbortRunner({ ...ONE_TAP_ABORT_DEFAULT_DEPS, onProgress: setAbortProgress }),
+    [],
+  )
+
+  const submitOneTapAbort = useCallback(async (): Promise<void> => {
+    if (taskId === null || taskId.length === 0 || data === null) return
+    const view = oneTapAbortView(data.task.humanTaskDecisions)
+    setIsSubmittingAbort(true)
+    try {
+      const result = await oneTapAbortRunner.run(taskId, view.approval)
+      if (result === null) return
+      setLastAbortResult(result.message)
+      Alert.alert(result.ok ? 'タスクを中止' : '中止失敗', result.message)
+    } finally {
+      setAbortProgress(null)
+      await loadTaskDetail()
+      setIsSubmittingAbort(false)
+    }
+  }, [data, loadTaskDetail, oneTapAbortRunner, taskId])
+
+  const handleOneTapAbort = useCallback((): void => {
+    if (isSubmittingAbort || oneTapAbortRunner.isRunning() || data === null) return
+    const view = oneTapAbortView(data.task.humanTaskDecisions)
+    Alert.alert(ONE_TAP_ABORT_CONFIRM_TITLE, oneTapAbortConfirmMessage(data.task, view), [
+      { style: 'cancel', text: 'キャンセル' },
+      { onPress: () => { void submitOneTapAbort() }, style: 'destructive', text: 'タスクを中止' },
+    ])
+  }, [data, isSubmittingAbort, oneTapAbortRunner, submitOneTapAbort])
+
   const handleSubmitResumeInstruction = useCallback((): void => {
     const trimmedInstruction = resumeInstruction.trim()
 
@@ -1578,6 +1757,9 @@ export default function TaskDetailScreen(): ReactElement {
         <Text style={styles.title} numberOfLines={2}>
           {data?.task.title ?? 'Task詳細'}
         </Text>
+        {taskNumberLabel(data?.task.id ?? taskId) !== null && (
+          <Text style={TASK_NUMBER_TEXT_STYLE} selectable>{taskNumberLabel(data?.task.id ?? taskId)}</Text>
+        )}
       </View>
 
       {error !== null && (
@@ -1623,13 +1805,27 @@ export default function TaskDetailScreen(): ReactElement {
             onSubmit={handleSubmitResumeInstruction}
             task={data.task}
           />
-          <StoredReviewRecoverySection
+          <RecoverSection
             approvalRequests={data.approvalRequests}
+            isSubmitting={isSubmittingRecovery}
+            jobs={data.jobs}
+            onSubmit={handleRecover}
+            task={data.task}
+          />
+          <StoredReviewRecoverySection
             isSubmitting={isSubmittingStoredReviewRecovery}
             jobs={data.jobs}
             onSubmit={handleStoredReviewRecovery}
             qaResults={data.qaResults}
             reviews={data.reviews}
+            task={data.task}
+          />
+          <AbortSection
+            isSubmitting={isSubmittingAbort}
+            jobs={data.jobs}
+            lastResult={lastAbortResult}
+            onAbort={handleOneTapAbort}
+            progress={abortProgress}
             task={data.task}
           />
           <JobHistorySection jobs={data.jobs} />
@@ -1998,6 +2194,17 @@ const styles = StyleSheet.create({
     fontSize: 12,
     lineHeight: 18,
     marginTop: 8,
+  },
+  recoverButton: {
+    justifyContent: 'center',
+    marginTop: 12,
+  },
+  abortExecuteButton: {
+    backgroundColor: '#b91c1c',
+  },
+  abortResultText: {
+    marginBottom: 0,
+    marginTop: 12,
   },
   resumeBox: {
     backgroundColor: '#141414',

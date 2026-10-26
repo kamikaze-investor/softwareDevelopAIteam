@@ -51,6 +51,7 @@ import {
 } from '../designReview/designReviewCoordinator'
 import { validateRoadmapTasks, validateRoadmapPhases } from '../storage/roadmapTaskValidation'
 import { ensureInitialWorkflowsForActiveTasks } from './projectInitialization'
+import { isUsableAlignedEvidence } from '../designReviewEvidencePolicy'
 
 /**
  * 採用した Task が属する Phase。
@@ -153,8 +154,19 @@ export function awaitingPromotionAuditKey(
  * Safety Evidence path で Candidate commit を証明できる Gate 判定の policy version。
  * #340（Stage 1）より前の Gate 評価は approval 無しの git_commit を ALLOW しないので対象外。
  * policy を上げるときは、その policy でこの証明が同じ意味を持つかを確認して更新する。
+ *
+ * v3（2026-10-16 監査 RC4/RC6）は RISK_RULES の HIGH 対象を広げ、承認の action 束縛を締めただけで、
+ * git_commit の ALLOW はより厳しくなる方向にしか変わっていない。よって v3 の ALLOW も同じ証明になる。
+ * Production の既存 evidence は v2 なので両方を受け付ける。
+ *
+ * v4（2026-10-23）は Design Review の同一設計での判定反転（`design_review_reversed`）を fail closed に
+ * 加えただけで、git_commit の ALLOW はより厳しくなる方向にしか変わっていない。よって v4 の ALLOW も同じ証明になる。
  */
-const CANDIDATE_COMMIT_EVIDENCE_POLICY_VERSION = 'gate-policy-v2'
+export const CANDIDATE_COMMIT_EVIDENCE_POLICY_VERSIONS: ReadonlySet<string> = new Set([
+  'gate-policy-v2',
+  'gate-policy-v3',
+  'gate-policy-v4',
+])
 
 /** Human Approval path: source Job の linked approval が Candidate への CONSUMED な git_commit。 */
 function hasConsumedCandidateApproval(storage: IStorage, taskId: string, sourceJob: Job): boolean {
@@ -182,7 +194,7 @@ function hasBoundCandidateGateEvidence(storage: IStorage, taskId: string, source
     && evidence.taskId === taskId
     && evidence.decision === 'ALLOW'
     && evidence.bindingVerification === 'authoritative'
-    && evidence.policyVersion === CANDIDATE_COMMIT_EVIDENCE_POLICY_VERSION
+    && CANDIDATE_COMMIT_EVIDENCE_POLICY_VERSIONS.has(evidence.policyVersion)
     && evidence.targetBranch === TIER_A_CANDIDATE_BRANCH
     && evidence.resultingCommit !== undefined
     && evidence.resultingCommit === sourceJob.commitHash)
@@ -641,7 +653,10 @@ export async function adoptRoadmapItem(
       recoveryTask.status !== 'pending'
       || run?.reviewKind !== 'task'
       || run.status !== 'succeeded'
-      || evidence?.designTextHash === run.designTextHash
+      // 同じ設計の ALIGNED evidence があっても、それより新しいこの run の CONFLICT が正である
+      // （覆されていない evidence のときだけ「CONFLICT で止まっていない」とみなす）。
+      || (evidence?.designTextHash === run.designTextHash
+        && isUsableAlignedEvidence(evidence, storage.designReviewEvidence))
       || recoveryDecision !== 'CONFLICT'
     ) {
       return {

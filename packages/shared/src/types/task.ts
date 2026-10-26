@@ -2,8 +2,10 @@
 
 import type { AgentRole } from './agent'
 import type { AiCliProvider } from './ai_cli'
-import type { ApprovalGateStatus } from './approval_gate'
+import type { ApprovalGateStatus, ApprovalRequest } from './approval_gate'
+import { isLiveWaitingApproval } from '../approvalLiveness'
 import type { JobStatus } from './job'
+import type { ProjectStatus } from './project'
 import type { RiskLevel } from './safety_guard'
 
 export type TaskStatus = 'pending' | 'in_progress' | 'review' | 'done' | 'blocked'
@@ -69,6 +71,37 @@ export interface Task {
   updatedAt: string
 }
 
+/**
+ * `GET /api/tasks/:id` の応答。Task に、Resume / Recover の前提判定
+ * （`evaluateResumeAdmission()` / `evaluateRecoverAdmission()`）が要る保存済みの事実を足したもの。
+ * Mobile がこの 2 つを API と同じ入力で判定するために返す。新しい状態ではない
+ * （`parked` は `ITaskStorage.isParked()`、`projectStatus` は所属 Project の status）。
+ */
+export interface TaskDetail extends Task {
+  parked: boolean
+  /** 所属 Project が見つからなければ null。 */
+  projectStatus: ProjectStatus | null
+  /**
+   * この Task の**生きた Task 単位の人の判断**（API が shared `liveTaskDecisionState()` に
+   * `approval_actor` の事実を渡して計算したもの。lifecycle repair C3）。
+   * Mobile は ApprovalRequest の生の status から authority を組み立て直さず、これを使う
+   * （主体の記録の無い APPROVED は authority ではないので、ここには載らない）。
+   */
+  humanTaskDecisions: TaskHumanDecisionFact[]
+  /**
+   * queued / running の repair Design Review run があるか（`evaluateResumeAdmission()` の
+   * `repairDesignReviewInFlight`。lifecycle repair C3 / D3-1）。
+   */
+  repairDesignReviewInFlight: boolean
+}
+
+export interface TaskHumanDecisionFact {
+  approvalRequestId: string
+  requestedAction: string
+  /** waiting = 人の判断を待っている / approved = 人（ADMIN）が承認し、人の実行を待っている。 */
+  state: 'waiting' | 'approved'
+}
+
 export type TaskDisplayStatus =
   | 'waiting_approval'
   | 'rejected_waiting_instruction'
@@ -114,15 +147,21 @@ export interface TaskSummary {
 export interface TaskDisplayStatusInput {
   taskStatus: TaskStatus
   latestJobStatus?: JobStatus
-  /** Approval referenced by the latest Job's approvalId, if that link resolves. */
-  linkedApprovalStatus?: ApprovalGateStatus
+  /**
+   * Approval referenced by the latest Job's approvalId, if that link resolves.
+   * status だけでなく期限も渡す: 期限切れ WAITING は誰も待っていない（`isLiveWaitingApproval`）。
+   * status だけで「承認待ち」と出すと、API が Resume を許す Task を画面が承認待ちと表示する（監査 A-02）。
+   */
+  linkedApproval?: Pick<ApprovalRequest, 'status' | 'expiresAt'>
+  /** 期限判定の基準時刻（既定は現在時刻）。 */
+  nowMs?: number
 }
 
 export function computeTaskDisplayStatus(input: TaskDisplayStatusInput): TaskDisplayStatus {
-  if (input.latestJobStatus === 'blocked' && input.linkedApprovalStatus === 'WAITING_FOR_USER') {
+  if (input.latestJobStatus === 'blocked' && isLiveWaitingApproval(input.linkedApproval, input.nowMs)) {
     return 'waiting_approval'
   }
-  if (input.latestJobStatus === 'blocked' && input.linkedApprovalStatus === 'REJECTED') {
+  if (input.latestJobStatus === 'blocked' && input.linkedApproval?.status === 'REJECTED') {
     return 'rejected_waiting_instruction'
   }
   if (input.latestJobStatus === 'blocked') return 'blocked'

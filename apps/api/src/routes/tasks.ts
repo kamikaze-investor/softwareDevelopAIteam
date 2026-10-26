@@ -11,12 +11,19 @@ import {
   type Job,
   type PersistedTaskFailureExplanationV1,
   type Task,
+  type TaskDetail,
   type TaskFailureQuestionTurn,
 } from '@ai-team/shared'
 import { buildResumeAiCliPrompt } from '../implementPrompt'
 import { authorizePlAction, PlActionBlockedError } from '../pl/actionGate'
-import { verifyExternalCompletion } from '../reconcile/externalCompletion'
+import {
+  blockedJobsReconcileRefusalReason,
+  findBlockedJobsPreventingReconcile,
+  TASK_HAS_BLOCKED_JOBS,
+  verifyExternalCompletion,
+} from '../reconcile/externalCompletion'
 import { repairFromStoredReview } from '../designReview/repairFromStoredReview'
+import { strandedLifecycleRefusal } from '../state/strandedTask'
 import { getStorage } from '../storage'
 import {
   answerTaskFailureQuestion,
@@ -27,9 +34,10 @@ import {
   type TaskFailureJob,
 } from '../taskFailureExplain/taskFailureAi'
 import type { CoordinatorDeps } from '../designReview/designReviewCoordinator'
-import { classifyResumeActorFromRequest, recordResumeActor } from '../designReview/resumeActor'
+import { classifyResumeActorFromRequest, humanTaskDecisionFacts } from '../designReview/resumeActor'
 import {
   RESUME_DESIGN_REVIEW_FAILED,
+  RESUME_DESIGN_REVIEW_PENDING,
   resumeBlockedTaskWithDesignReview,
 } from '../designReview/resumeBlockedTask'
 
@@ -129,6 +137,49 @@ const UpdateTaskBody = z.object({
   branchName: z.string().optional(),
   commitHash: z.string().optional(),
 }).strict()
+
+/**
+ * 汎用の作成・更新経路で `done` を拒否するときの応答（lifecycle repair W5）。
+ * 完了は git_commit Job の完了経路か reconcile-external-completion だけが commit / audit と一緒に書く。
+ */
+const TASK_DONE_REFUSAL = {
+  error:
+    'A task cannot be marked done through this generic route. '
+    + 'Completion is recorded by the git_commit job completion path, or by '
+    + 'POST /api/tasks/:id/reconcile-external-completion for work completed outside the loop '
+    + '(a task that still has blocked jobs must first be parked with abort_task, which observes the '
+    + 'worktree and releases them, or be resumed)',
+  code: 'TASK_DONE_USE_COMPLETION_ROUTE',
+} as const
+
+/**
+ * lifecycle が所有する status（lifecycle repair C3）。
+ *
+ * `in_progress` / `review` / `blocked` は「Job・Design Review・失敗処理がこの Task を動かしている」ことを
+ * 表す状態で、書き手は採用・review・失敗・resume・recovery の各 transaction だけである。
+ * 汎用 CRUD がそれを書けると、Job も Design Review も無いのに Project を占有し（currentTask）、
+ * attention も出口も無い Task を作れてしまう。汎用経路から**入る**遷移は拒否する。
+ * 出る方向（`in_progress` / `review` → `pending`）は従来どおり汎用 PATCH が出口である
+ * （`blocked` から出るのは recover / resume の担当。下の TASK_BLOCKED_USE_RECOVERY_ROUTE）。
+ */
+export const LIFECYCLE_OWNED_TASK_STATUSES: ReadonlySet<string> = new Set(['in_progress', 'review', 'blocked'])
+
+const TASK_LIFECYCLE_STATE_OWNED_REFUSAL = {
+  error:
+    'in_progress / review / blocked are owned by the task lifecycle (adoption, design review, job failure, '
+    + 'resume and recovery) and cannot be set through this generic route. Create tasks as pending; '
+    + 'a task that is stuck in in_progress / review without a live job can be moved back to pending here.',
+  code: 'TASK_LIFECYCLE_STATE_OWNED',
+} as const
+
+/** blocked からの汎用経路での復帰を断る応答（code・文言は従来のまま）。 */
+const TASK_BLOCKED_USE_RECOVERY_ROUTE_REFUSAL = {
+  error:
+    'A blocked task cannot be moved out of blocked through this generic route. '
+    + 'Use POST /api/tasks/:id/recover (no job) or POST /api/tasks/:id/resume (has jobs), '
+    + 'which audit the human reason and report what will drive the task next',
+  code: 'TASK_BLOCKED_USE_RECOVERY_ROUTE',
+} as const
 
 const ListQuerySchema = z.object({
   projectId: z.string().min(1),
@@ -249,7 +300,11 @@ export async function taskRoutes(
       return reply.status(404).send({ error: 'Project not found' })
     }
 
-    return reply.send(storage.tasks.findByProjectId(query.data.projectId))
+    // **各 Task に `parked` を載せる**（additive）。Worker は workspace 所有権の判定で shared の
+    // `isStaleBlockedJobCandidate()` にこれを渡し、API の claim guard と同じ意味で
+    // park された Task の stale blocked 行を扱う（lifecycle repair C2）。park 判定はここで再定義しない。
+    return reply.send(storage.tasks.findByProjectId(query.data.projectId)
+      .map((task) => ({ ...task, parked: storage.tasks.isParked(task.id) })))
   })
 
   app.get<{ Params: { id: string } }>('/:id', async (req, reply) => {
@@ -257,7 +312,19 @@ export async function taskRoutes(
     if (!task) {
       return reply.status(404).send({ error: 'Task not found' })
     }
-    return reply.send(task)
+    // **Resume / Recover の前提判定に要る保存済みの事実を足す**（`TaskDetail`）。
+    // Mobile はこれを共有の `evaluateResumeAdmission()` / `evaluateRecoverAdmission()` へ渡し、
+    // API と同じ入力でボタンの表示を決める。park 判定・Project 状態をここで再定義しない。
+    const detail: TaskDetail = {
+      ...task,
+      parked: storage.tasks.isParked(task.id),
+      projectStatus: storage.projects.findById(task.projectId)?.status ?? null,
+      // 生きた Task 単位の人の判断（approval_actor を付けて shared `liveTaskDecisionState()` が決める）。
+      // Mobile は ApprovalRequest の生の status から authority を組み立て直さない（lifecycle repair C3）。
+      humanTaskDecisions: humanTaskDecisionFacts(storage, task.id),
+      repairDesignReviewInFlight: storage.tasks.hasRepairDesignReviewInFlight(task.id),
+    }
+    return reply.send(detail)
   })
 
   app.post<{ Params: { id: string } }>('/:id/failure-explanation', async (req, reply) => {
@@ -414,6 +481,15 @@ export async function taskRoutes(
       return reply.status(400).send({ error: 'Validation failed', details: result.error.format() })
     }
 
+    // PATCH と同じ理由で、完了済みとして**作る**ことも許さない（根拠の無い done を作れる裏口になる）。
+    if (result.data.status === 'done') {
+      return reply.status(409).send(TASK_DONE_REFUSAL)
+    }
+    // 作成は `pending` だけ。lifecycle が所有する status で**作る**と、Job も Design Review も無い占有 Task になる。
+    if (LIFECYCLE_OWNED_TASK_STATUSES.has(result.data.status)) {
+      return reply.status(409).send(TASK_LIFECYCLE_STATE_OWNED_REFUSAL)
+    }
+
     const project = storage.projects.findById(result.data.projectId)
     if (!project) {
       return reply.status(404).send({ error: 'Project not found' })
@@ -536,24 +612,54 @@ export async function taskRoutes(
     }
 
     const instructionPrompt = buildResumeAiCliPrompt(task, result.data.instruction)
+    // **誰が再開したかを、この request の credential だけから決める。**
+    //
+    // body は見ない。`{"human": true}` や `{"resetRepairBudget": true}` を送られても
+    // `ResumeTaskBody` が落とすうえ、ここは request の認証結果しか読まない。
+    // repair budget の generation 境界はこの記録だけを根拠にする（`../designReview/resumeActor`）。
+    // 記録は storage が resume Job の作成と同じ transaction で書く（G-01）。
+    const actor = classifyResumeActorFromRequest(req)
     const resumed = await resumeBlockedTaskWithDesignReview(storage, {
       task,
       instructionPrompt,
+      resumedBy: { actorClass: actor.actorClass, evidence: actor.evidence },
       ...(options.resumeDesignReviewDeps !== undefined
         ? { coordinatorDeps: options.resumeDesignReviewDeps }
         : {}),
     })
 
+    // 判定がまだ出ていないだけ。否定ではないので 409 にせず、同じ instruction の再送で
+    // 同じ queued run が再開されることを示す（503 + retryable）。
+    if (!resumed.ok && resumed.code === RESUME_DESIGN_REVIEW_PENDING) {
+      return reply.status(503).send({ error: resumed.reason, code: resumed.code, retryable: true })
+    }
+
+    // authority evidence が書けず resume ごと rollback された（何も変わっていない）。再送してよい。
+    if (!resumed.ok && resumed.code === 'RESUME_COMMIT_FAILED') {
+      return reply.status(503).send({ error: resumed.reason, code: resumed.code, retryable: true })
+    }
+
     if (!resumed.ok && resumed.code === RESUME_DESIGN_REVIEW_FAILED) {
       return reply.status(409).send({
         error: 'Resume instruction did not pass the pre-implementation Design Review',
+        code: resumed.code,
         reason: resumed.reviewError,
       })
     }
 
     if (!resumed.ok) {
-      if (resumed.code === 'WORKSPACE_QUARANTINED') {
-        return reply.status(409).send({ error: resumed.reason })
+      // **409 は必ず stable な code を添える。** Mobile と PL が reason 文字列で分岐しないため。
+      // done の Task と running でない Project は request の不備ではなく状態の衝突なので 409
+      // （b8d0fc5d 監査）。他の既存の拒否は status を変えず、code だけを足す。
+      if (
+        resumed.code === 'WORKSPACE_QUARANTINED'
+        || resumed.code === 'TASK_DONE'
+        || resumed.code === 'PROJECT_NOT_RUNNING'
+        || resumed.code === 'HUMAN_DECISION_PENDING'
+        || resumed.code === 'REPAIR_REVIEW_IN_FLIGHT'
+        || resumed.code === 'RESUME_TARGET_CHANGED'
+      ) {
+        return reply.status(409).send({ error: resumed.reason, code: resumed.code })
       }
       // **却下済み commit の出所を特定できなかったのは request の不備ではなく状態の問題**なので
       // 400 ではなく 409 を返す。code を添えるのは、呼び出し側が
@@ -565,21 +671,11 @@ export async function taskRoutes(
       ) {
         return reply.status(409).send({ error: resumed.reason, code: resumed.code })
       }
-      return reply.status(400).send({ error: resumed.reason })
+      return reply.status(400).send({
+        error: resumed.reason,
+        ...(resumed.code === undefined ? {} : { code: resumed.code }),
+      })
     }
-
-    // **誰が再開したかを、この request の credential だけから決めて残す。**
-    //
-    // body は見ない。`{"human": true}` や `{"resetRepairBudget": true}` を送られても
-    // `ResumeTaskBody` が落とすうえ、ここは request の認証結果しか読まない。
-    // repair budget の generation 境界はこの記録だけを根拠にする（`../designReview/resumeActor`）。
-    const actor = classifyResumeActorFromRequest(req)
-    recordResumeActor(storage, {
-      jobId: resumed.job.id,
-      taskId: task.id,
-      actorClass: actor.actorClass,
-      evidence: actor.evidence,
-    })
 
     return reply.status(201).send(resumed.job)
   })
@@ -613,6 +709,16 @@ export async function taskRoutes(
       return reply.status(422).send({ error: verification.reason })
     }
 
+    // blocked Job が残る Task は取り込まない（storage の transaction でも同じ関数で再確認する）。
+    // Gate より前に断るのは、断られる操作のために承認を評価・消費させないため。
+    const blockedJobs = findBlockedJobsPreventingReconcile(storage, task.id)
+    if (blockedJobs.length > 0) {
+      return reply.status(409).send({
+        code: TASK_HAS_BLOCKED_JOBS,
+        error: blockedJobsReconcileRefusalReason(blockedJobs),
+      })
+    }
+
     // 2) Mandatory Gate。**Task completion を起こす正式操作なので必ず通す。**
     //    充足の根拠は seam が DB の実レコードで検証する（Gate 名の文字列では通らない）。
     try {
@@ -634,6 +740,9 @@ export async function taskRoutes(
       sourceJobId: parsed.data.sourceJobId,
     })
     if (!reconciled.ok) {
+      if (reconciled.code === 'TASK_HAS_BLOCKED_JOBS') {
+        return reply.status(409).send({ code: reconciled.code, error: reconciled.reason })
+      }
       return reply.status(reconciled.code === 'ALREADY_DONE' ? 409 : 400).send({ error: reconciled.reason })
     }
 
@@ -662,6 +771,16 @@ export async function taskRoutes(
       return reply.status(400).send({ error: 'Validation failed', details: result.error.format() })
     }
 
+    // **完了をこの汎用経路で付けさせない。**
+    //
+    // `tasks.update()` は commit も continuation も audit も伴わずに `done` を書けてしまい、
+    // done は blocked Job の attention 抑止や workspace 所有の判断にも使われるため、
+    // 根拠の無い完了が後続の停止を見えなくする（lifecycle repair W5）。完了は
+    // git_commit Job の完了経路か `POST /api/tasks/:id/reconcile-external-completion` に限る。
+    if (result.data.status === 'done') {
+      return reply.status(409).send(TASK_DONE_REFUSAL)
+    }
+
     // **park された Task を、この汎用経路から占有状態へ戻さない。**
     //
     // `in_progress` と `blocked` は `occupiesProject()` が `roadmapActive` に関係なく
@@ -676,6 +795,18 @@ export async function taskRoutes(
         error: 'Task was parked by abort_task; it cannot be moved back into an occupying status',
         code: 'TASK_PARKED',
       })
+    }
+
+    // **lifecycle が所有する status へ、この汎用経路から入らせない**（lifecycle repair C3）。
+    // 同じ status のままの PATCH（title 等の編集に status を添えたもの）は遷移ではないので通す。
+    if (result.data.status !== undefined && LIFECYCLE_OWNED_TASK_STATUSES.has(result.data.status)) {
+      const current = storage.tasks.findById(req.params.id)
+      if (!current) {
+        return reply.status(404).send({ error: 'Task not found' })
+      }
+      if (current.status !== result.data.status) {
+        return reply.status(409).send(TASK_LIFECYCLE_STATE_OWNED_REFUSAL)
+      }
     }
 
     // **blocked からの復帰をこの汎用経路で行わせない。**
@@ -694,17 +825,53 @@ export async function taskRoutes(
     // 既存 audit 行の id を使う）。Job を持つ Task は従来どおり `/resume` の担当である。
     //
     // 制限するのは blocked から**出る**方向だけで、他の status 遷移は従来どおりである。
-    if (result.data.status !== undefined && result.data.status !== 'blocked') {
+    // `pending` への PATCH はこの事前読みを使わず、下の transaction が最新の status で同じ code を返す
+    // （/recover が直前に pending へ戻した Task に古い 409 を返して編集を落とさない。Codex review 348c22a）。
+    if (result.data.status !== undefined && result.data.status !== 'blocked' && result.data.status !== 'pending') {
       const current = storage.tasks.findById(req.params.id)
       if (current?.status === 'blocked') {
+        return reply.status(409).send(TASK_BLOCKED_USE_RECOVERY_ROUTE_REFUSAL)
+      }
+    }
+
+    // **lifecycle が所有する status（in_progress / review）から出る遷移は、stranded のときだけ通す**
+    // （lifecycle repair C3）。Job / Design Review / 人の判断がまだ Task を動かしているのに pending へ戻すと、
+    // driver が走っている間に Project の占有が外れる。判定は stranded attention と同じ唯一の述語
+    // （`strandedLifecycleRefusal`）を、書き込みと同じ storage transaction の中で呼び直す。
+    //
+    // **明示的な `status: 'pending'` はすべてこの 1 transaction を通す**（Codex review 2d8f060）。transaction の外で
+    // 読んだ status で経路を選ぶと、その後に driver 付きの in_progress になった Task や done になった Task へ
+    // pending を直接書けてしまう。判定は transaction 内で読み直した最新の status だけで行う:
+    //   - pending → 遷移ではないので通す（他の欄の編集は従来どおり）
+    //   - blocked → 409 TASK_BLOCKED_USE_RECOVERY_ROUTE（/recover・/resume の担当。上の事前読みと同じ code）
+    //   - in_progress / review → stranded のときだけ通す。**park 済みでも通す**: park 状態は task_aborted
+    //     audit から推定され status に DB 制約は無いので、park された in_progress / review の legacy 行があり得る。
+    //     abort / resume / recover はどれも park された Task を断るので、ここも断ると Project を占有したまま
+    //     出口が無い。park の audit と roadmapActive=false はそのまま残す（Codex review 348c22a）。
+    //   - それ以外（done 等）→ 断る（完了の取り消しはこの経路の担当ではない）
+    if (result.data.status === 'pending') {
+      let latestWasBlocked = false
+      const released = storage.tasks.updateIfAdmitted(req.params.id, result.data, (latest) => {
+        if (latest.status === 'pending') return undefined
+        if (latest.status === 'blocked') {
+          latestWasBlocked = true
+          return 'task is blocked'
+        }
+        if (latest.status === 'in_progress' || latest.status === 'review') {
+          return strandedLifecycleRefusal(storage, latest)
+        }
+        return `task is ${latest.status}; only a stranded in_progress / review task can be moved back to pending here`
+      })
+      if (!released.ok) {
+        if (released.code === 'TASK_NOT_FOUND') return reply.status(404).send({ error: 'Task not found' })
+        if (latestWasBlocked) return reply.status(409).send(TASK_BLOCKED_USE_RECOVERY_ROUTE_REFUSAL)
         return reply.status(409).send({
-          error:
-            'A blocked task cannot be moved out of blocked through this generic route. '
-            + 'Use POST /api/tasks/:id/recover (no job) or POST /api/tasks/:id/resume (has jobs), '
-            + 'which audit the human reason and report what will drive the task next',
-          code: 'TASK_BLOCKED_USE_RECOVERY_ROUTE',
+          ...TASK_LIFECYCLE_STATE_OWNED_REFUSAL,
+          error: `The task cannot be moved back to pending through this generic route: ${released.reason}`,
+          reason: released.reason,
         })
       }
+      return reply.send(released.task)
     }
 
     const updated = storage.tasks.update(req.params.id, result.data)

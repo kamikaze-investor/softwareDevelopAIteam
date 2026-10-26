@@ -1,6 +1,8 @@
 /**
- * `POST /api/tasks/:id/resume` の失敗を、CEO が次に何をすべきか分かる文言へ写す。
+ * `POST /api/tasks/:id/resume`（と `POST /api/tasks/:id/recover`）の失敗を、
+ * CEO が次に何をすべきか分かる文言へ写す。
  *
+ * code が無い・未知のときの fallback として:
  * API の `error` 文字列を部分一致で引く。**先に書いた方が優先される**ので、
  * 具体的な理由ほど上に置く。
  */
@@ -31,7 +33,52 @@ const RESUME_ERROR_MESSAGE_BY_REASON: ReadonlyArray<readonly [string, string]> =
   ['waiting for user review', '承認待ちの操作があるため、追加指示を送れませんでした。'],
 ]
 
-export function formatResumeErrorMessage(errorMessage: string | null): string {
+/**
+ * resume 拒否の `code` ごとの文言。code は共有 `ResumeAdmissionCode` と、API 固有の拒否 code
+ * （`apps/api/src/routes/tasks.ts` の `POST /:id/resume`）。
+ */
+const RESUME_ERROR_MESSAGE_BY_CODE: Readonly<Record<string, string>> = {
+  TASK_DONE: 'このTaskは完了しているため、再開できません。',
+  PROJECT_NOT_RUNNING: 'Projectが実行中ではないため、再開できませんでした。先にProjectを再開してください。',
+  NO_JOBS: 'このTaskには作業履歴が無いため、追加指示では再開できません。「復旧（再開待ちに戻す）」を使ってください。',
+  LATEST_JOB_NOT_BLOCKED: '現在は停止状態ではないため、追加指示を送れませんでした。',
+  TASK_PARKED: 'このTaskは中止（保留）されているため、再開できません。',
+  WORKSPACE_QUARANTINED: '安全のため停止しているため、追加指示では再開できません。AI開発チーム側で作業領域の復旧が必要です。',
+  LIVE_JOB_EXISTS: '既に実行中または待機中の作業があるため、追加指示を送れませんでした。',
+  REPAIR_REVIEW_IN_FLIGHT: '修正の設計レビューが進行中のため、追加指示を送れませんでした。レビューの結果を待ってください。',
+  APPROVAL_WAITING: '承認待ちの操作があるため、追加指示を送れませんでした。',
+  HUMAN_DECISION_PENDING: '承認画面で判断待ち・判断済みの操作（中止など）があるため、この操作では再開できませんでした。CEOの操作として再開してください。',
+  AI_CLI_MODE_MISSING: 'AI実行設定が不足しているため、再開できませんでした。',
+  AI_CLI_PROVIDER_MISSING: 'AI実行設定（使用するAI）が記録されていないため、再開できませんでした。AI開発チームに確認を依頼してください。',
+  RESUME_DESIGN_REVIEW_FAILED: RESUME_DESIGN_REVIEW_FAILED_MESSAGE,
+  REJECTED_COMMIT_SOURCE_UNRESOLVED:
+    '却下されたコミットの元の作業を特定できないため、再開できませんでした。AI開発チームに確認を依頼してください。',
+  GIT_COMMIT_RESUME_LINEAGE_INVALID:
+    '却下されたコミットの元の作業を特定できないため、再開できませんでした。AI開発チームに確認を依頼してください。',
+  // 409: 事前 Design Review を待つ間に、再開しようとした停止中の作業が別のものに変わった。
+  RESUME_TARGET_CHANGED:
+    '設計レビューを待つ間に対象の作業が変わったため、再開しませんでした。画面を更新して状態を確認してから、もう一度送信してください。',
+  // 503（retryable）: 事前 Design Review の判定がまだ出ていない。否定ではない。
+  RESUME_DESIGN_REVIEW_PENDING:
+    '追加指示の事前の設計レビューがまだ終わっていません。しばらく待ってから同じ指示をもう一度送信してください。',
+  // 503（retryable）: 再開の記録が書けず、何も変更されなかった。
+  RESUME_COMMIT_FAILED:
+    '再開の記録に失敗したため、何も変更されませんでした。時間をおいてもう一度送信してください。',
+}
+
+function messageForCode(table: Readonly<Record<string, string>>, code: string | null): string | undefined {
+  if (code === null || !Object.prototype.hasOwnProperty.call(table, code)) return undefined
+  return table[code]
+}
+
+/**
+ * **stable な `code` を先に引く**（resume の 409 は必ず `{ error, code }` を返す）。
+ * code が無い・未知のときだけ、従来どおり `error` 文字列を部分一致で引く。
+ */
+export function formatResumeErrorMessage(errorMessage: string | null, code: string | null = null): string {
+  const byCode = messageForCode(RESUME_ERROR_MESSAGE_BY_CODE, code)
+  if (byCode !== undefined) return byCode
+
   if (errorMessage === null || errorMessage.length === 0) {
     return RESUME_ERROR_MESSAGE_FALLBACK
   }
@@ -42,4 +89,80 @@ export function formatResumeErrorMessage(errorMessage: string | null): string {
   )
 
   return matchingMessage?.[1] ?? RESUME_ERROR_MESSAGE_FALLBACK
+}
+
+export const RECOVER_ERROR_MESSAGE_FALLBACK =
+  '復旧に失敗しました。時間をおいて再度お試しください。'
+
+/** `POST /api/tasks/:id/recover` の拒否 `code`（`RecoverBlockedTaskResult`）ごとの文言。 */
+const RECOVER_ERROR_MESSAGE_BY_CODE: Readonly<Record<string, string>> = {
+  TASK_NOT_FOUND: '対象のTaskが見つかりませんでした。',
+  PROJECT_UNAVAILABLE: 'Projectが見つからないかアーカイブ済みのため、復旧できませんでした。',
+  PROJECT_NOT_RUNNING: 'Projectが実行中ではないため、復旧できませんでした。先にProjectを再開してください。',
+  TASK_NOT_BLOCKED: '現在は停止状態ではないため、復旧の必要はありません。',
+  TASK_HAS_JOBS: 'このTaskには作業履歴があるため、「追加指示を出す」から再開してください。',
+  TASK_PARKED: 'このTaskは中止（保留）されているため、復旧できません。',
+  APPROVAL_WAITING: '承認待ちの操作があるため、復旧できませんでした。先に承認画面で判断してください。',
+  // 403: 人（CEO）だけの操作で、API の認証構成が人と自動を区別できない（`HUMAN_ONLY_ROUTES`）。
+  HUMAN_ONLY_ROUTE_REQUIRES_SPLIT_CREDENTIALS:
+    'この操作はCEO専用です。現在のAPIの認証設定では実行できません。AI開発チームに確認を依頼してください。',
+}
+
+export function formatRecoverErrorMessage(code: string | null): string {
+  return messageForCode(RECOVER_ERROR_MESSAGE_BY_CODE, code) ?? RECOVER_ERROR_MESSAGE_FALLBACK
+}
+
+export const ABORT_ERROR_MESSAGE_FALLBACK =
+  '中止（park）に失敗しました。画面を更新して状態を確認し、時間をおいて再度お試しください。'
+
+export const ABORT_APPROVAL_REQUEST_ERROR_MESSAGE_FALLBACK =
+  '中止の承認依頼を作成できませんでした。時間をおいて再度お試しください。'
+
+/**
+ * `POST /api/tasks/:id/abort` の拒否 `code`（`apps/api/src/pl/abortTask.ts` の `AbortTaskResult`）ごとの文言。
+ * HTTP は TASK_NOT_FOUND=404 / NOT_AUTHORIZED=403 / それ以外=409。
+ */
+const ABORT_ERROR_MESSAGE_BY_CODE: Readonly<Record<string, string>> = {
+  TASK_NOT_FOUND: '対象のTaskが見つかりませんでした。',
+  TASK_ALREADY_DONE: 'このTaskは既に完了しているため、中止できません。',
+  TASK_NOT_PARKABLE:
+    'このTaskは今の状態では中止できません（実行中、未完了の作業が残っている、作業履歴の無い停止など）。'
+    + '作業が1件も無い停止中のTaskは、先に「復旧（再開待ちに戻す）」を使ってください。',
+  TASK_NOT_ACTIVE: 'このTaskは現在のRoadmapの対象ではないため、中止するものがありません。',
+  LIVE_JOB_PRESENT: 'Projectに実行中・待機中の作業があるため、中止できませんでした。作業が終わってから再度実行してください。',
+  FOREIGN_BLOCKED_JOB: '別のTaskの停止中の作業が作業場所を保持しているため、中止できませんでした。AI開発チームに確認を依頼してください。',
+  JOB_QUARANTINED: '安全のため隔離された作業があるため、中止できませんでした。AI開発チーム側で作業領域の復旧が必要です。',
+  OWNERSHIP_UNPROVEN: '作業場所の所有者を確認できなかったため、中止しませんでした。AI開発チームに確認を依頼してください。',
+  // T-2: 承認は consume されず、Task は Human Resume 用に blocked へ上がる。
+  UNATTRIBUTED_DIRTY_WORKSPACE:
+    '作業場所に誰の変更か分からない差分が残っているため、中止しませんでした（承認は使われていません）。'
+    + '「追加指示を出す」で再開するか、AI開発チームに確認を依頼してください。',
+  TASK_STATE_CHANGED: '確認の途中でTaskの状態が変わったため、中止しませんでした。画面を更新して状態を確認してください。',
+  TECHNICAL_EVIDENCE_INELIGIBLE: '中止の前提となる記録が条件を満たさないため、中止できませんでした。AI開発チームに確認を依頼してください。',
+  NOT_AUTHORIZED:
+    '有効な中止の承認が見つかりませんでした（期限切れ・別の依頼に置き換え済み・人の承認の記録が無いなど）。'
+    + '承認依頼を作り直し、承認一覧で承認してください。',
+  PARK_FAILED: '中止の記録に失敗しました。画面を更新して状態を確認し、必要なら再度実行してください。',
+}
+
+export function formatAbortErrorMessage(code: string | null): string {
+  return messageForCode(ABORT_ERROR_MESSAGE_BY_CODE, code) ?? ABORT_ERROR_MESSAGE_FALLBACK
+}
+
+export const APPROVAL_DECISION_ERROR_MESSAGE_FALLBACK = '操作に失敗しました'
+
+/**
+ * `PATCH /api/approval-requests/:id/status` と `PATCH /api/approvals/:id` の拒否 `code` ごとの文言。
+ * どちらも `HUMAN_ONLY_ROUTES`（C-02 / 2026-10-17）なので、API の認証構成が人と自動を区別できないと 403 になる。
+ */
+const APPROVAL_DECISION_ERROR_MESSAGE_BY_CODE: Readonly<Record<string, string>> = {
+  HUMAN_ONLY_ROUTE_REQUIRES_SPLIT_CREDENTIALS:
+    '承認・却下はCEO専用の操作です。現在のAPIの認証設定では実行できません。AI開発チームに確認を依頼してください。',
+  // 409: 判断の期限が切れていた（API は承認・却下のどちらも記録せず、依頼を期限切れにする）。
+  APPROVAL_EXPIRED:
+    'この承認依頼は期限が切れていたため、承認・却下は記録されませんでした。必要な場合はAI開発チームが改めて依頼します。',
+}
+
+export function formatApprovalDecisionErrorMessage(code: string | null): string {
+  return messageForCode(APPROVAL_DECISION_ERROR_MESSAGE_BY_CODE, code) ?? APPROVAL_DECISION_ERROR_MESSAGE_FALLBACK
 }

@@ -39,6 +39,16 @@ import { callGeminiForReview } from './geminiClient.js'
 // 不具合）。PATH 解決に一本化し、環境差分は AGY_CLI_PATH で上書き可能にする。
 const AGY_PATH = process.env.AGY_CLI_PATH ?? 'agy'
 
+/**
+ * agy へ argv で prompt を渡してよい上限（UTF-8 バイト）。これを超えたら CLI 段は使わない。
+ *
+ * Linux の `MAX_ARG_STRLEN`（1 引数あたり概ね 128KiB）を超えると spawn が `E2BIG` で失敗する
+ * （2026-10-16 実測: 193,755 文字の Design Review prompt）。同じ理由で
+ * `COPILOT_ARGV_PROMPT_BYTE_LIMIT` と同じ 64KiB に余裕を取る。根拠は OS 上限であり、
+ * 観測された分布ではない。変更するときは、どの実測を見てそう決めたかを併記すること。
+ */
+export const AGY_ARGV_PROMPT_BYTE_LIMIT = 64 * 1024
+
 // Gemini（API・CLI 双方）が quota 起因で失敗した場合だけ使う、Antigravity CLI 経由の
 // Claude フォールバックモデル。
 const ANTIGRAVITY_CLAUDE_FALLBACK_MODEL = 'claude-sonnet-4-6'
@@ -394,17 +404,35 @@ function callCliOnce(
     }
   }
 
+  // **agy は prompt を argv の 1 引数としてしか受け取らない**（text 入力に stdin・ファイル経路は無い。
+  // 2026-10-16 実測）。上限を超える prompt は spawn 自体が E2BIG で失敗し、`unknown` に分類されて
+  // 既存の Copilot fallback まで塞いでいた（b8d0fc5d の repair Design Review、193,755 文字）。
+  // 上限超えはバイナリ不在と同じく「この段は使えない」として spawn せずに返し、既存の合成
+  // （unavailable 段は他に実信号があれば除外）と fallback に委ねる。prompt は切り詰めない。
+  const effectivePrompt = jsonSchema !== undefined ? withToolFreeInstruction(prompt) : prompt
+  const promptBytes = Buffer.byteLength(effectivePrompt, 'utf-8')
+  if (promptBytes > AGY_ARGV_PROMPT_BYTE_LIMIT) {
+    return {
+      ok: false,
+      text: null,
+      unavailable: true,
+      diagnostics: {
+        provider, stage, failureClass: 'auth_or_config',
+        exitCode: null, timedOut: false,
+        message: `prompt is ${promptBytes} bytes, over the ${AGY_ARGV_PROMPT_BYTE_LIMIT}-byte limit for passing it to ${AGY_PATH} as one argv argument; skipping this stage without spawning`,
+      },
+    }
+  }
+
   let schemaDir: string | undefined
   const argv = ['--model', cliModel]
   if (cliEffort !== undefined) argv.push('--effort', cliEffort)
-  let effectivePrompt = prompt
 
   if (jsonSchema !== undefined) {
     schemaDir = mkdtempSync(path.join(tmpdir(), 'agy-schema-'))
     const schemaPath = path.join(schemaDir, 'schema.json')
     writeFileSync(schemaPath, JSON.stringify(jsonSchema))
     argv.push('--output-format', 'json', '--json-schema', schemaPath)
-    effectivePrompt = withToolFreeInstruction(prompt)
   }
   argv.push('--print', effectivePrompt)
 

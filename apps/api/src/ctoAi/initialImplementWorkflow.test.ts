@@ -85,7 +85,7 @@ describe('initial implement workflow', () => {
           changedFiles: [], triggeredRules: [], invalidIf: ['commit changes'],
           status: 'WAITING_FOR_USER', expiresAt: new Date(Date.now() + 3600_000).toISOString(),
         } as Parameters<IStorage['approvalRequests']['create']>[0])
-        storage.approvalRequests.updateStatus(request.id, 'APPROVED')
+        storage.approvalRequests.recordDecision(request.id, 'APPROVED', undefined, { credentialClass: 'admin' })
         const parked = abortTask(storage, {
           taskId, approvalRequestId: request.id, reason: 'CEO parked it while the review ran',
         })
@@ -99,6 +99,49 @@ describe('initial implement workflow', () => {
     expect(result).toMatchObject({ status: 'skipped' })
     expect(storage.jobs.findByTaskId(taskId)).toHaveLength(0)
     expect(storage.tasks.findById(taskId)?.roadmapActive).toBe(false)
+  })
+
+  // lifecycle repair C3: 待っている間の Project 状態変化は、Job INSERT と同じ transaction で確かめ直す。
+  it('archive is refused while the initial review runs; a pause during the review leaves no Job and a retryable skip', async () => {
+    const projectId = storage.tasks.findById(taskId)!.projectId
+    const racingDeps = {
+      ...alignedDeps(),
+      execute: async () => {
+        // initial Design Review run が running の間は放棄（archive）を断る。
+        expect(() => storage.projects.update(projectId, { status: 'archived' })).toThrow(/design_review_run/)
+        // pause（CEO の停止スイッチ）は常に通る。
+        storage.projects.update(projectId, { status: 'paused' })
+        return alignedDeps().execute()
+      },
+    }
+
+    const result = await createInitialImplementWorkflow(storage, taskId, racingDeps)
+
+    expect(result).toMatchObject({ status: 'skipped', retryable: true })
+    expect(storage.jobs.findByTaskId(taskId)).toHaveLength(0)
+    expect(storage.tasks.findById(taskId)?.status).toBe('pending')
+    expect(storage.projects.findById(projectId)?.status).toBe('paused')
+
+    // running へ戻せば、既存の ALIGNED evidence を再利用して Job が作られる。
+    storage.projects.update(projectId, { status: 'running' })
+    const retried = await createInitialImplementWorkflow(storage, taskId, conflictingDeps())
+    expect(retried).toMatchObject({ status: 'created' })
+  })
+
+  it('createInitialImplementJob refuses in-transaction when the Project is not running or the Task is done', () => {
+    const task = storage.tasks.findById(taskId)!
+    const input = {
+      taskId, projectId: task.projectId, workflowStepKey: `task:${taskId}:initial-implement`,
+      agentRole: 'developer_ai' as const, status: 'queued' as const,
+      safeCommand: { kind: 'test' as const, workingDir: '/workspace/target' },
+      aiCliProvider: 'codex' as const, aiCliPrompt: 'p', aiCliMode: 'implement' as const,
+    }
+    storage.projects.update(task.projectId, { status: 'paused' })
+    expect(storage.jobs.createInitialImplementJob(input)).toMatchObject({ ok: false, code: 'PROJECT_NOT_RUNNING' })
+    storage.projects.update(task.projectId, { status: 'running' })
+    storage.tasks.update(taskId, { status: 'done' })
+    expect(storage.jobs.createInitialImplementJob(input)).toMatchObject({ ok: false, code: 'TASK_NOT_INITIAL_TARGET' })
+    expect(storage.jobs.findByTaskId(taskId)).toHaveLength(0)
   })
 
   it('creates exactly one reviewed initial implement Job with a Design Contract prompt', async () => {

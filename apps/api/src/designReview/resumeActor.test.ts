@@ -13,6 +13,7 @@ import {
   resumeActorClassForCredential,
   resumeActorClassFromAudit,
   resumeEvidenceForCredential,
+  recordApprovalActor,
   recordRepairGeneration,
   recordResumeActor,
 } from './resumeActor'
@@ -143,8 +144,14 @@ describe('[4][21] human は「根拠の種別」まで揃って初めて成立�
   })
 })
 
-describe('記録の失敗が呼び出し側を失敗させない', () => {
-  it('auditLog.record が例外を投げても recordResumeActor は投げ返さない', () => {
+// G-01（review）: resume_actor / approval_actor は authority evidence。以前は「Job は既に作られている
+// ので記録の失敗で caller を失敗させない」として握り潰していたが、それでは本物の Human Resume が
+// resume_actor を欠いたまま commit され、後から human_resume authority を失う。今は route / PL が
+// storage の resume transaction に書かせ（失敗したら resume ごと rollback）、transaction の外で書く
+// recordResumeActor / recordApprovalActor も失敗を投げ返す。握り潰すのは判定に使われない
+// 検証用の記録（repair_generation）だけである。
+describe('authority evidence の記録失敗は握り潰さない', () => {
+  it('auditLog.record が例外を投げたら recordResumeActor は投げ返す', () => {
     const storage = {
       auditLog: {
         record: () => { throw new Error('disk is full') },
@@ -153,9 +160,21 @@ describe('記録の失敗が呼び出し側を失敗させない', () => {
 
     expect(() => recordResumeActor(storage, {
       jobId: 'job-1', taskId: 'task-1', actorClass: 'human', evidence: 'admin_credential',
-    })).not.toThrow()
+    })).toThrow('disk is full')
   })
 
+  it('auditLog.record が例外を投げたら recordApprovalActor は投げ返す', () => {
+    const storage = {
+      auditLog: {
+        record: () => { throw new Error('disk is full') },
+      },
+    } as unknown as Parameters<typeof recordApprovalActor>[0]
+
+    expect(() => recordApprovalActor(storage, 'approval-1', 'admin')).toThrow('disk is full')
+  })
+})
+
+describe('判定に使われない検証用の記録は呼び出し側を失敗させない', () => {
   it('auditLog.record が例外を投げても recordRepairGeneration は投げ返さない', () => {
     const storage = {
       auditLog: {

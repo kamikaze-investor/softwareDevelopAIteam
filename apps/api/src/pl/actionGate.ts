@@ -26,8 +26,10 @@
  *   言えない。executor を提案から構造的に dispatch するのは配線側の責務である。
  * - `changedFiles` / `providerChange` を実差分・実構成へ束縛すること。
  * - 対象 Job の risk / production 影響の継承、実行者の Role・Production 操作権限。
- * - CEO Approval の Project スコープ束縛。`approvals.findById()` が `projectId` を返さないため、
- *   現状は Approval の `type` による束縛までしかできない（`findById` の additive 拡張が要る）。
+ * - `ceo_approval` の充足。legacy の CEO Approval（`approvals`）は actor・action・target・一回性のどれも
+ *   束縛できないため、**この層では根拠として受け付けない**（`checkCeoApproval()`。2026-10-17 監査 P2）。
+ *   `ceo_approval` を要求する操作（rollback_commit / restart_service / deploy_production / switch_provider）は
+ *   PL から実行できない。人の承認を根拠にする操作は `approval_gate`（ApprovalRequest）を使う。
  * - `deploy_production` は `system` 対象なので Task/Project スコープの Review 根拠を
  *   結び付けられず、**この層では充足不能**である（`unbindableGates()` が明示する）。
  *   deploy スコープの Review 根拠を用意するのは配線側の責務。
@@ -53,8 +55,8 @@ import {
   type PlActionProposal,
   type RequiredGate,
 } from '@ai-team/shared'
-import type { ApprovalType } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
+import { readApprovalActorClass } from '../designReview/resumeActor'
 
 /** 監査記録で使う語彙。`audit_log` の既存スキーマをそのまま使う。 */
 const AUDIT_OPERATION = 'pl_action_authorize'
@@ -124,18 +126,6 @@ export function requiredTargetKindFor(kind: string): PlActionTarget['kind'] | 'a
   return Object.prototype.hasOwnProperty.call(REQUIRED_TARGET_KIND, kind)
     ? REQUIRED_TARGET_KIND[kind as PlActionKind]
     : undefined
-}
-
-/**
- * CEO Approval の scope 束縛。**その操作のために出された承認であることを型で照合する。**
- * Project スコープの照合は `approvals.findById()` が `projectId` を返さないため未実施
- * （モジュール冒頭の「保証しないこと」を参照）。
- */
-const REQUIRED_CEO_APPROVAL_TYPE: Partial<Record<PlActionKind, ApprovalType>> = {
-  rollback_commit: 'deployment',
-  restart_service: 'deployment',
-  deploy_production: 'deployment',
-  switch_provider: 'external_service',
 }
 
 /**
@@ -275,6 +265,15 @@ function checkDesignReview(
     return { satisfied: false, rejection: `${label} evidence ${evidenceId} is not the latest for the target` }
   }
 
+  // 最新の evidence でも、それより新しい同じ設計の run（active / ALIGNED 以外の判定）があれば覆されている。
+  const superseding = storage.designReviewEvidence.findSupersedingRun(evidence)
+  if (superseding !== undefined) {
+    return {
+      satisfied: false,
+      rejection: `${label} evidence ${evidenceId} is superseded by newer run ${superseding.id} (${superseding.status})`,
+    }
+  }
+
   if (requireIndependent) {
     if (!evidence.independentReviewRequired) {
       return { satisfied: false, rejection: `evidence ${evidenceId} did not run an independent review` }
@@ -302,11 +301,15 @@ function checkDesignReview(
  * 「この Task の何かを承認した」以上の意味を持たない**。別 action（git_commit 等）の
  * 承認で park を通さないよう、action 名まで一致を要求する。
  *
- * ここに載っていない action の検証は変えていない（既存経路の挙動は不変）。
- * 束縛材料は既存の `requestedAction` であり、新しい承認種別は追加していない。
+ * **全 action に適用する**（2026-10-16 監査 RC4/RC6）。以前は abort_task だけで、それ以外の
+ * approval_gate 対象（retry_job・reconcile_external_completion・fail_stuck_job 等）は
+ * Task のどの APPROVED でも通った —— git_status 向けに勝手に作られた行が承認されると、それが
+ * 無関係な PL 操作の根拠になり得た。承認は自 action にしか効かない、を Gate 側でも揃える。
+ * 束縛材料は既存の `requestedAction`（= PL action 名）であり、新しい承認種別は追加していない。
  */
-const REQUIRED_APPROVAL_REQUEST_ACTION: Partial<Record<PlActionKind, string>> = {
-  abort_task: 'abort_task',
+// `string` を受けるのは、PL 提案（未検証の文字列）から根拠を選ぶ executionLoop の selector も同じ規則を使うため。
+export function requiredApprovalRequestAction(kind: string): string {
+  return kind
 }
 
 function checkApprovalGate(
@@ -331,8 +334,8 @@ function checkApprovalGate(
     return { satisfied: false, rejection: `approval request ${approvalRequestId} is ${request.status}` }
   }
 
-  const requiredAction = REQUIRED_APPROVAL_REQUEST_ACTION[kind]
-  if (requiredAction !== undefined && request.requestedAction !== requiredAction) {
+  const requiredAction = requiredApprovalRequestAction(kind)
+  if (request.requestedAction !== requiredAction) {
     return {
       satisfied: false,
       rejection:
@@ -348,30 +351,46 @@ function checkApprovalGate(
   if (expiresAtMs <= Date.now()) {
     return { satisfied: false, rejection: `approval request ${approvalRequestId} has expired` }
   }
-  return { satisfied: true }
-}
-
-function checkCeoApproval(storage: IStorage, approvalId: string, kind: PlActionKind): EvidenceCheck {
-  const approval = storage.approvals.findById(approvalId)
-  if (!approval) {
-    return { satisfied: false, rejection: `approval ${approvalId} does not exist` }
-  }
-  if (approval.status !== 'approved') {
-    return { satisfied: false, rejection: `approval ${approvalId} is ${approval.status}` }
-  }
-
-  const requiredType = REQUIRED_CEO_APPROVAL_TYPE[kind]
-  if (requiredType === undefined) {
-    // scope を照合できない操作で CEO 承認を要求していたら、それは表の穴である。fail-closed。
-    return { satisfied: false, rejection: `no CEO approval scope is defined for ${kind}` }
-  }
-  if (approval.type !== requiredType) {
+  // **Task 単位の人の判断は、人が決めた記録（approval_actor = human）があって初めて authority になる**
+  // （Codex review 361c19a・stored-review recovery と同じ正本の規則）。APPROVED の行の状態だけでは
+  // legacy 単一 token / actor 記録導入前の決定と区別できない。証明できない承認は通さず、改めて人の承認を求める。
+  if (readApprovalActorClass(storage, approvalRequestId) !== 'human') {
     return {
       satisfied: false,
-      rejection: `approval ${approvalId} is a '${approval.type}' approval, not '${requiredType}'`,
+      rejection:
+        `approval request ${approvalRequestId} has no record that a human (ADMIN credential) decided it`
+        + ' (APPROVAL_ACTOR_NOT_HUMAN); a fresh human approval is required',
     }
   }
   return { satisfied: true }
+}
+
+/**
+ * `ceo_approval` 根拠。**legacy の CEO Approval（`approvals`）は authority として受け付けない**
+ * （2026-10-17 監査 P2）。
+ *
+ * 以前は `status === 'approved'` と broad な `type`（例: `deployment`）だけを照合していた。その結果:
+ *   - 決定した主体が記録されない（legacy 単一 token の Worker でも PATCH できた）
+ *   - 1件の `deployment` 承認が rollback_commit / restart_service / deploy_production のどれにも効く
+ *   - 消費されないので、同じ承認を何度でも使い回せる
+ *   - Project / target への束縛が無い
+ *
+ * これらを legacy テーブルに後付けする代わりに、ここで一律に拒否する。根拠:
+ *   - `ceo_approval` 根拠を組み立てる配線済み経路が無い（PL ループの `collectSystemEvidence()` は
+ *     design_review / approval_gate しか積まず、他の `authorizePlAction()` 呼び出しも approval_gate か
+ *     strategic_alignment_review だけ）。拒否しても動いている executor は1つも止まらない
+ *   - actor（approval_actor）・action 束縛（requestedAction）・期限・一回性（CONSUMED）はすでに
+ *     ApprovalRequest（`approval_gate`）が持っている。人の承認を根拠にするならそちらを使う
+ *
+ * `ceo_approval` を要求する操作はこの層で充足不能になる（fail-closed）。
+ */
+function checkCeoApproval(approvalId: string, kind: PlActionKind): EvidenceCheck {
+  return {
+    satisfied: false,
+    rejection:
+      `legacy CEO approval ${approvalId} cannot authorize ${kind} (LEGACY_CEO_APPROVAL_NOT_ACCEPTED): `
+      + 'it binds no deciding actor, action, target or single use; use an ApprovalRequest (approval_gate) instead',
+  }
 }
 
 /** 採用時に PL が宣言できる `allowedPaths` の最小セグメント数。 */
@@ -499,7 +518,7 @@ function verifyEvidence(
     case 'approval_gate':
       return checkApprovalGate(storage, ref.approvalRequestId, scope, kind)
     case 'ceo_approval':
-      return checkCeoApproval(storage, ref.approvalId, kind)
+      return checkCeoApproval(ref.approvalId, kind)
     case 'strategic_alignment_review':
       return checkRoadmapItemAlignment(ref.roadmapItemId, kind)
     default: {

@@ -1,6 +1,6 @@
-import { describe, expect, it, beforeAll, afterAll } from 'vitest'
+import { describe, expect, it, beforeAll, afterAll, afterEach, vi } from 'vitest'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import {
   CLAUDE_REVIEWER_MODEL,
@@ -10,9 +10,12 @@ import { FLAGSHIP_REMEDIATION_CANDIDATES, selectRemediationModel } from '@ai-tea
 import { CHEAP_AI_CONFIG } from '../aiExplain/cheapAiClient'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
-import { computeDesignTextHash } from '../designReviewEvidencePolicy'
+import { checkImplementJobDesignReviewEvidence, computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
-import { ensureInitialWorkflowsForActiveTasks } from '../ctoAi/projectInitialization'
+import { ensureInitialWorkflowsForActiveTasks, recoverReadyTasksWithoutJob } from '../ctoAi/projectInitialization'
+import { executeQueuedRun } from '../designReview/queuedRunDispatch'
+import { passDesignReviewRetryCooldown } from '../designReview/retryCooldownTestClock'
+import { buildSystemState } from '../state/systemState'
 import { adoptRoadmapItem, buildAdoptedDescription } from '../ctoAi/roadmapAdoption'
 import {
   buildRemediatedScope,
@@ -22,6 +25,8 @@ import {
   findRemediationSubject,
   stageEntries,
   PL_MAX_REMEDIATION_ATTEMPTS,
+  PL_MAX_TECHNICAL_FAILURES_PER_STAGE,
+  tallyConflictStage,
   REMEDIATION_SYSTEM_PROMPT,
   buildRemediationPrompt,
   runRemediationStep,
@@ -525,7 +530,7 @@ describe('著者の独立性 — 自分の却下案を自分で書き直させ�
     expect(used).toEqual(['codex', 'claude_code'])
   })
 
-  it('両 flagship を使い切ったら no_independent_model で止まる（弱い model へ落ちない）', async () => {
+  it('両 flagship が runner_failed しただけなら著者ではないので no_independent_model にならない', async () => {
     const { storage, taskId } = seedConflictedTask()
     // provenance だけを2件置き、両 provider が既に使われた状態を作る。
     for (const provider of ['codex', 'claude_code']) {
@@ -536,7 +541,88 @@ describe('著者の独立性 — 自分の却下案を自分で書き直させ�
       })
     }
 
-    // 予算も尽きているので、まず attempts_exhausted で止まることを確かめる。
+    // runner_failed は判定でも著者でもない（2026-10-23 `#2cae0d07`）。判定予算は残り、
+    // 両 provider とも提案を書いていないので著者として除外されず、flagship を選んで実行できる。
+    let selected: string | undefined
+    const result = await runRemediationStep(storage, taskId, deps({
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async (raw: string) => {
+          selected = (JSON.parse(raw) as { provider: string }).provider
+          return { ok: true, stdout: JSON.stringify({ ...PROPOSAL, abandon: true }), timedOut: false }
+        },
+      },
+    }))
+
+    expect(result.status).toBe('abandon_recommended')
+    expect(result.failureCode).not.toBe('no_independent_flagship')
+    expect(['codex', 'claude_code']).toContain(selected)
+  })
+
+  it('Production 形（remediation runner_failed: codex, claude_code）の3回目は flagship を選べる（runner 失敗は著者ではない）', async () => {
+    const { storage, taskId } = seedConflictedTask()
+    for (const provider of ['codex', 'claude_code']) {
+      storage.auditLog.record({
+        actor: 'api', operation: 'pl_independent_remediation', entityType: 'pl_remediation',
+        entityId: `remediate:${taskId}`, result: 'success',
+        detail: `provider=${provider} model=m vendor=v excluded=- unverified_separation=opencode-go`
+          + ' stage=remediation rejected_specs=1 outcome=runner_failed',
+      })
+    }
+    let executions = 0
+    const result = await runRemediationStep(storage, taskId, deps({
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async () => {
+          executions += 1
+          return { ok: false, stdout: '', error: 'boom', timedOut: false }
+        },
+      },
+    }))
+
+    expect(executions).toBe(1)
+    expect(result.status).toBe('remediation_failed')
+    expect(result.failureCode).toBe('runner_failed')
+  })
+
+  it('parse 済みの提案（abandon / fspec 行）を書いた provider は従来どおり著者として除外される', async () => {
+    for (const authored of [
+      'provider=codex model=m stage=remediation rejected_specs=1 outcome=abandon',
+      'provider=codex model=m stage=remediation proposed=h fspec=abc rejected_fspec=def outcome=not_different',
+    ]) {
+      const { storage, taskId } = seedConflictedTask()
+      storage.auditLog.record({
+        actor: 'api', operation: 'pl_independent_remediation', entityType: 'pl_remediation',
+        entityId: `remediate:${taskId}`, result: 'success', detail: authored,
+      })
+      const used: string[] = []
+      await runRemediationStep(storage, taskId, deps({
+        runnerDeps: {
+          runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+          execute: async (raw: string) => {
+            used.push((JSON.parse(raw) as { provider: string }).provider)
+            return { ok: false, stdout: '', error: 'boom', timedOut: false }
+          },
+        },
+      }))
+
+      expect(used).toEqual(['claude_code'])
+    }
+  })
+
+  it('両 flagship が提案を書いていたら、判定予算が尽きて attempts_exhausted で止まる', async () => {
+    const { storage, taskId } = seedConflictedTask()
+    storage.auditLog.record({
+      actor: 'api', operation: 'pl_independent_remediation', entityType: 'pl_remediation',
+      entityId: `remediate:${taskId}`, result: 'success',
+      detail: 'provider=codex model=m stage=remediation outcome=abandon',
+    })
+    storage.auditLog.record({
+      actor: 'api', operation: 'pl_independent_remediation', entityType: 'pl_remediation',
+      entityId: `remediate:${taskId}`, result: 'success',
+      detail: 'provider=claude_code model=m stage=remediation proposed=h fspec=abc rejected_fspec=- outcome=adopting',
+    })
+
     const result = await runRemediationStep(storage, taskId, deps())
 
     expect(result.status).toBe('attempts_exhausted')
@@ -686,10 +772,16 @@ describe('有界性と記録', () => {
     }))
 
     expect(result.status).toBe('remediation_failed')
-    expect(countRemediationAttempts(storage, taskId)).toBe(1)
+    // Round 開始行（outcome=starting）+ 失敗行。Round としては技術的失敗1回。
+    expect(countRemediationAttempts(storage, taskId)).toBe(2)
+    expect(tallyConflictStage(storage, taskId, 'remediation'))
+      .toEqual({ judgments: 0, technicalFailures: 1, lifetimeTechnicalFailures: 1 })
   })
 
-  it('上限に達したら実行せず attempts_exhausted を返す', async () => {
+  it('runner 失敗は判定予算ではなく技術的失敗上限で打ち切り、上限後は実行せず attempts_exhausted を返す', async () => {
+    // 以前は runner_failed ×PL_MAX_REMEDIATION_ATTEMPTS で判定予算が尽きていた（判定 0 件で terminal。
+    // 2026-10-23 `#2cae0d07`）。runner_failed は判定ではないので、別の上限
+    // PL_MAX_TECHNICAL_FAILURES_PER_STAGE で有界にする（無制限には再試行しない）。
     const { storage, taskId } = seedConflictedTask()
     let executions = 0
     const failing = deps({
@@ -702,13 +794,46 @@ describe('有界性と記録', () => {
       },
     })
 
-    for (let i = 0; i < PL_MAX_REMEDIATION_ATTEMPTS; i += 1) {
+    for (let i = 0; i < PL_MAX_TECHNICAL_FAILURES_PER_STAGE; i += 1) {
       await runRemediationStep(storage, taskId, failing)
     }
+    // runner 失敗は著者ではないので3回とも flagship を選んで実行し、3回とも技術的失敗として数える。
+    const tally = tallyConflictStage(storage, taskId, 'remediation')
+    expect(tally).toEqual({
+      judgments: 0,
+      technicalFailures: PL_MAX_TECHNICAL_FAILURES_PER_STAGE,
+      lifetimeTechnicalFailures: PL_MAX_TECHNICAL_FAILURES_PER_STAGE,
+    })
+    const executionsAtCap = executions
     const beyond = await runRemediationStep(storage, taskId, failing)
+
+    expect(executions).toBe(executionsAtCap)
+    expect(beyond.status).toBe('attempts_exhausted')
+    expect(beyond.reason).toContain('technical failures exhausted the stage')
+  })
+
+  it('parse 済みの提案（abandon）は判定予算を消費し、PL_MAX_REMEDIATION_ATTEMPTS 回で attempts_exhausted', async () => {
+    const { storage, taskId } = seedConflictedTask()
+    let executions = 0
+    const abandoning = deps({
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async () => {
+          executions += 1
+          return { ok: true, stdout: JSON.stringify({ ...PROPOSAL, abandon: true }), timedOut: false }
+        },
+      },
+    })
+
+    for (let i = 0; i < PL_MAX_REMEDIATION_ATTEMPTS; i += 1) {
+      expect((await runRemediationStep(storage, taskId, abandoning)).status).toBe('abandon_recommended')
+    }
+    const beyond = await runRemediationStep(storage, taskId, abandoning)
 
     expect(executions).toBe(PL_MAX_REMEDIATION_ATTEMPTS)
     expect(beyond.status).toBe('attempts_exhausted')
+    expect(tallyConflictStage(storage, taskId, 'remediation'))
+      .toEqual({ judgments: PL_MAX_REMEDIATION_ATTEMPTS, technicalFailures: 0, lifetimeTechnicalFailures: 0 })
   })
 
   it('ledger が読めない場合も試行として記録する（通知ループを作らない）', async () => {
@@ -721,7 +846,9 @@ describe('有界性と記録', () => {
     }))
 
     expect(result.failureCode).toBe('ledger_unreadable')
-    expect(countRemediationAttempts(storage, taskId)).toBe(1)
+    // Round は ledger を読む前に開く（starting 行 + 失敗行）。
+    expect(countRemediationAttempts(storage, taskId)).toBe(2)
+    expect(tallyConflictStage(storage, taskId, 'remediation').technicalFailures).toBe(1)
   })
 
   it('ledger から項目が消えている場合も試行として記録する', async () => {
@@ -730,7 +857,8 @@ describe('有界性と記録', () => {
     const result = await runRemediationStep(storage, taskId, deps())
 
     expect(result.failureCode).toBe('item_not_in_ledger')
-    expect(countRemediationAttempts(storage, taskId)).toBe(1)
+    expect(countRemediationAttempts(storage, taskId)).toBe(2)
+    expect(tallyConflictStage(storage, taskId, 'remediation').technicalFailures).toBe(1)
   })
 
   it('provenance（provider / model / 未確認の分離相手）を audit へ残す', async () => {
@@ -741,11 +869,120 @@ describe('有界性と記録', () => {
     }))
     const entries = storage.auditLog.findByEntity('pl_remediation', `remediate:${taskId}`)
 
-    expect(entries).toHaveLength(1)
+    // 新しい順: [適用行, Round 開始行]。
+    expect(entries).toHaveLength(2)
+    expect(entries[1]?.detail).toMatch(/^round=\S+ epoch=\d+ stage=remediation outcome=starting$/)
+    expect(entries[0]?.detail).toMatch(/^round=\S+ epoch=\d+ /)
     expect(entries[0]?.detail).toContain('provider=codex')
     expect(entries[0]?.detail).toContain('model=gpt-5.6-sol')
     // PL の provider は vendor を解決できないので、分離を主張せず記録する。
     expect(entries[0]?.detail).toContain('unverified_separation=opencode-go')
+  })
+})
+
+describe('parse 済みの提案は後段が失敗しても判定として残る（独立レビュー P2a）', () => {
+  it('runner が ok=false でも stdout に完全な提案があれば provider 付きで記録する（採用しない。正式経路へ出ていないので判定ではない）', async () => {
+    const { storage, taskId } = seedConflictedTask()
+    let adopted = false
+
+    const result = await runRemediationStep(storage, taskId, deps({
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async () => ({ ok: false, stdout: JSON.stringify(PROPOSAL), error: 'exit 1 after output', timedOut: false }),
+      },
+      adopt: async () => { adopted = true; throw new Error('must not adopt a proposal from a failed run') },
+    }))
+
+    expect(result.status).toBe('remediation_failed')
+    expect(adopted).toBe(false)
+    // 提案は正式経路（Gate・採用・Design Review）へ出ていないので Round は技術的失敗（2026-10-26 Round 会計）。
+    // 著者除外は `classifyConflictRecoveryRow()` が従来どおり行う（provider は著者として残る）。
+    expect(tallyConflictStage(storage, taskId, 'remediation'))
+      .toEqual({ judgments: 0, technicalFailures: 1, lifetimeTechnicalFailures: 1 })
+    const rows = stageEntries(storage, taskId, 'remediation').map((e) => e.detail ?? '')
+    expect(rows).toHaveLength(2)
+    expect(rows[0]).toContain('provider=codex')
+    expect(rows[0]).toContain('outcome=runner_failed_after_proposal')
+  })
+
+  it('runner が ok=false で stdout が空 / 不完全なら従来どおり技術的失敗', async () => {
+    for (const stdout of ['', '{"diagnosis":"途中で切れた']) {
+      const { storage, taskId } = seedConflictedTask()
+
+      await runRemediationStep(storage, taskId, deps({
+        runnerDeps: {
+          runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+          execute: async () => ({ ok: false, stdout, error: 'boom', timedOut: false }),
+        },
+      }))
+
+      expect(tallyConflictStage(storage, taskId, 'remediation'))
+        .toEqual({ judgments: 0, technicalFailures: 1, lifetimeTechnicalFailures: 1 })
+    }
+  })
+
+  it('parse 後、fspec 行を書く前に storage / 認可が throw しても provider 付きの行を1行だけ残す（正式経路へ出ていないので技術的失敗）', async () => {
+    const { storage, taskId } = seedConflictedTask()
+    const record = storage.auditLog.record.bind(storage.auditLog)
+    let armed = false
+    storage.auditLog.record = ((entry: Parameters<typeof record>[0]) => {
+      // 提案の parse 後、remediation 以外の audit（Gate の認可記録）が落ちる状況を作る。
+      if (armed && entry.entityType !== 'pl_remediation') throw new Error('storage unavailable')
+      return record(entry)
+    }) as typeof storage.auditLog.record
+
+    await expect(runRemediationStep(storage, taskId, deps({
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async () => { armed = true; return { ok: true, stdout: JSON.stringify(PROPOSAL), timedOut: false } },
+      },
+    }))).rejects.toThrow('storage unavailable')
+
+    const rows = stageEntries(storage, taskId, 'remediation').map((e) => e.detail ?? '')
+    expect(rows).toHaveLength(2)
+    expect(rows[0]).toContain('provider=codex')
+    expect(rows[0]).toContain('outcome=proposal_parsed_apply_exception')
+    expect(tallyConflictStage(storage, taskId, 'remediation'))
+      .toEqual({ judgments: 0, technicalFailures: 1, lifetimeTechnicalFailures: 1 })
+  })
+
+  it('applyRevisedSpec が判定行（adopting）を書いた後に throw したら、追加の行を書かない（二重計上しない）', async () => {
+    const { storage, taskId } = seedConflictedTask()
+
+    await expect(runRemediationStep(storage, taskId, deps({
+      adopt: async () => { throw new Error('adoption crashed') },
+    }))).rejects.toThrow('adoption crashed')
+
+    const rows = stageEntries(storage, taskId, 'remediation').map((e) => e.detail ?? '')
+    expect(rows).toHaveLength(2)
+    expect(rows[0]).toContain('outcome=adopting')
+    // adopting（採用予約）は返金しない判定。
+    expect(tallyConflictStage(storage, taskId, 'remediation').judgments).toBe(1)
+  })
+
+  it('壊れた応答（unusable）は設計成果物を出していないので技術的失敗（旧 epoch の行は現在の上限に入らない）', async () => {
+    const { storage, taskId } = seedConflictedTask()
+    storage.auditLog.record({
+      actor: 'api', operation: 'pl_independent_remediation', entityType: 'pl_remediation',
+      entityId: `remediate:${taskId}`, result: 'success',
+      detail: 'provider=codex model=m stage=remediation rejected_specs=1 outcome=unusable',
+    })
+    const used: string[] = []
+
+    await runRemediationStep(storage, taskId, deps({
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async (raw: string) => {
+          used.push((JSON.parse(raw) as { provider: string }).provider)
+          return { ok: false, stdout: '', error: 'boom', timedOut: false }
+        },
+      },
+    }))
+
+    // 旧形式の unusable 行は epoch 0 の技術的失敗: 総数には入り、現在の epoch の上限には入らない。
+    expect(tallyConflictStage(storage, taskId, 'remediation'))
+      .toEqual({ judgments: 0, technicalFailures: 1, lifetimeTechnicalFailures: 2 })
+    expect(used).toHaveLength(1)
   })
 })
 
@@ -882,5 +1119,158 @@ describe('applyRevisedSpec — rawScope と submittedScope を取り違えない
 
     expect(details).toContain('rejected_fspec=')
     expect(details).not.toContain('rejected_fspec=-')
+  })
+})
+/**
+ * **判定がまだ出ていない fresh Review は否定扱いしない**（独立レビュー round 5・2026-10-16）。
+ *
+ * requeued を still_not_aligned に潰すと、後で rekick が ALIGNED evidence を登録しても誰も
+ * Job を作らない。pending として返し、継続は保存済み状態から既存 `recoverReadyTasksWithoutJob()`
+ * が導く（同じ `createInitialImplementWorkflow()`・stepKey 一意で1回だけ）。
+ */
+describe('fresh Review が判定を出さなかった（requeued）場合', () => {
+  // 判定の出なかった attempt の後の retry cooldown（retryCooldown.ts）は時計で明けさせる。
+  afterEach(() => { vi.useRealTimers() })
+
+  function runnerDeps(stdout: string) {
+    return {
+      runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+      execute: async () => ({ ok: true, stdout, timedOut: false }),
+    }
+  }
+
+  async function remediateWithPendingReview() {
+    const seeded = seedConflictedTask({ roadmapTaskKey: 'conflicted-item#2' })
+    const { storage, taskId } = seeded
+    const result = await runRemediationStep(storage, taskId, deps({
+      adopt: (s, input) => adoptRoadmapItem(s, input, {
+        ensureInitialWorkflows: (st, pid) => ensureInitialWorkflowsForActiveTasks(st, pid, runnerDeps('null')),
+      }),
+    }))
+    return { ...seeded, result }
+  }
+
+  it('review_pending を返し、Job を作らず、run は queued のまま残る', async () => {
+    const { storage, taskId, result } = await remediateWithPendingReview()
+
+    expect(result).toMatchObject({ status: 'review_pending', taskId })
+    expect(storage.jobs.findByTaskId(taskId)).toEqual([])
+    expect(storage.designReviewRuns.findLatestByTaskId(taskId)?.status).toBe('queued')
+  })
+
+  it('rekick で同じ run が ALIGNED になれば、既存の回収が Job を1回だけ作る（rekick 自体は作らない）', async () => {
+    const { storage, taskId } = await remediateWithPendingReview()
+    const run = storage.designReviewRuns.findLatestByTaskId(taskId)!
+
+    // design_review_idle → rekick_design_review が使う経路と同じ dispatcher。
+    passDesignReviewRetryCooldown()
+    const rekicked = await executeQueuedRun(storage, run, runnerDeps(ALIGNED_RESULT_JSON))
+    expect(rekicked).toMatchObject({ kind: 'review', result: { status: 'evidence_registered' } })
+    expect(storage.jobs.findByTaskId(taskId)).toEqual([])
+
+    const first = await recoverReadyTasksWithoutJob(storage, runnerDeps(ALIGNED_RESULT_JSON))
+    const second = await recoverReadyTasksWithoutJob(storage, runnerDeps(ALIGNED_RESULT_JSON))
+
+    expect(first.recovered).toBe(1)
+    expect(second.recovered).toBe(0)
+    expect(storage.jobs.findByTaskId(taskId)).toHaveLength(1)
+    // 同じ run を再度 rekick しても終端済みなので何も起きない。
+    expect(await executeQueuedRun(storage, storage.designReviewRuns.findById(run.id)!, runnerDeps(ALIGNED_RESULT_JSON)))
+      .toMatchObject({ kind: 'review', result: { status: 'not_claimable' } })
+    expect(storage.jobs.findByTaskId(taskId)).toHaveLength(1)
+  })
+
+  it('attempt 上限で failed になれば、既存の design_review_failed attention になる', async () => {
+    const { storage, taskId } = await remediateWithPendingReview()
+    const runId = storage.designReviewRuns.findLatestByTaskId(taskId)!.id
+    for (let i = 0; i < 5; i += 1) {
+      const current = storage.designReviewRuns.findById(runId)!
+      if (current.status !== 'queued') break
+      passDesignReviewRetryCooldown()
+      await executeQueuedRun(storage, current, runnerDeps('null'))
+    }
+
+    expect(storage.designReviewRuns.findById(runId)?.status).toBe('failed')
+    expect(buildSystemState(storage).attention.some((item) =>
+      item.kind === 'design_review_failed' && item.referenceId === runId)).toBe(true)
+  })
+})
+/**
+ * **古い ALIGNED evidence が、同じ設計に対する新しい CONFLICT を上書きしない**（独立レビュー round 8・2026-10-16）。
+ *
+ * 以前は evidence だけを見る Gate が古い ALIGNED を受理し、回収経路が Job を作り、
+ * Remediation は「evidence がある＝ALIGNED」として CONFLICT を見失った。
+ */
+describe('古い ALIGNED evidence → 新しい同じ hash の CONFLICT', () => {
+  afterEach(() => { vi.useRealTimers() })
+
+  it('回収経路は Job を作らず、Job Gate も通らず、Remediation は CONFLICT を対象にする', async () => {
+    const storage = createSQLiteStorage(':memory:')
+    const project = storage.projects.create({
+      name: 'AIteamOS', goal: 'g', designPhilosophy: [], status: 'running',
+    })
+    const task = storage.tasks.create({
+      projectId: project.id, title: 'CONFLICT した項目',
+      description: buildAdoptedDescription(LEDGER_BODY, '当初の広い scope'),
+      status: 'pending', assignee: 'developer_ai', dependencies: [],
+      allowedPaths: ['apps/api/src'], acceptanceCriteria: ['当初の受入条件'],
+      roadmapTaskKey: 'conflicted-item', phase: 1, roadmapActive: true,
+    } as Parameters<IStorage['tasks']['create']>[0])
+    const designText = buildInitialImplementAiCliPrompt(task)
+    const designTextHash = computeDesignTextHash(designText)
+
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-16T09:00:00.000Z'))
+    // 1. 以前の review が同じ設計を ALIGNED にした。
+    storage.designReviewEvidence.create({
+      taskId: task.id, reviewKind: 'task', subjectId: task.id, designTextHash,
+      reviewLoad: 'low', decision: 'ALIGNED', independentReviewRequired: false,
+    } as Parameters<IStorage['designReviewEvidence']['create']>[0])
+    vi.setSystemTime(new Date('2026-10-16T09:10:00.000Z'))
+    // 2. その後、同じ設計の新しい review が本物の CONFLICT を出した。
+    const run = storage.designReviewRuns.create({
+      taskId: task.id, taskTitle: task.title, designText, designTextHash, changedFiles: [],
+    })
+    const claimed = storage.designReviewRuns.claim(run.id, 3)
+    storage.designReviewRuns.complete(run.id, claimed.claimToken as string, 'succeeded', CONFLICT_RESULT_JSON)
+
+    expect(checkImplementJobDesignReviewEvidence(
+      { taskId: task.id, aiCliMode: 'implement', aiCliPrompt: designText },
+      storage.designReviewEvidence,
+    )).toMatchObject({ ok: false, code: 'DESIGN_REVIEW_SUPERSEDED' })
+
+    const recovered = await recoverReadyTasksWithoutJob(storage, {
+      runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+      execute: async () => { throw new Error('the recovery sweep must not run a review') },
+    })
+    expect(recovered.recovered).toBe(0)
+    expect(storage.jobs.findByTaskId(task.id)).toEqual([])
+
+    expect(findRemediationSubject(storage, task.id)?.task.id).toBe(task.id)
+  })
+})
+
+describe('Remediation runner は TARGET_ROOT 未設定でも target root で AI CLI を動かす（2026-10-23 Production）', () => {
+  it('TARGET_ROOT が無いとき workingDir は /workspace/target（Stable の runner workingDir ではない）', async () => {
+    const { storage, taskId } = seedConflictedTask()
+    const saved = process.env.TARGET_ROOT
+    let captured: { workingDir?: string } | undefined
+    try {
+      delete process.env.TARGET_ROOT
+      await runRemediationStep(storage, taskId, deps({
+        runnerDeps: {
+          runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: '/srv/ai-team/stable-checkout',
+          execute: async (input: string) => {
+            captured = JSON.parse(input) as { workingDir?: string }
+            return { ok: false, stdout: '', timedOut: false }
+          },
+        },
+      }))
+    } finally {
+      if (saved === undefined) delete process.env.TARGET_ROOT
+      else process.env.TARGET_ROOT = saved
+    }
+
+    expect(captured?.workingDir).toBe(resolve('/workspace/target'))
   })
 })

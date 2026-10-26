@@ -36,6 +36,7 @@ import {
   challengeableDisputes,
   getBaseRoadmapId,
   parseCritique,
+  parseFirstJsonObject,
   selectCriticModel,
   challengeTarget,
   type Critique,
@@ -43,7 +44,7 @@ import {
   type FindingAssessment,
 } from '@ai-team/shared'
 import { getValidRoadmapItems } from '@ai-team/worker/scripts/roadmap/roadmapParser.js'
-import { requestText } from '../aiExplain/cheapAiClient'
+import { PL_ADOPTION_PROPOSAL_AGENT, requestText } from '../aiExplain/cheapAiClient'
 import {
   buildDefaultCoordinatorDeps,
   createAndExecuteDesignReview,
@@ -51,22 +52,35 @@ import {
   type CoordinatorDeps,
   type RunnerExecution,
 } from '../designReview/designReviewCoordinator'
-import { createInitialImplementWorkflow } from '../ctoAi/initialImplementWorkflow'
+import {
+  createInitialImplementWorkflow,
+  INITIAL_WORKFLOW_JOB_EXISTS,
+  initialWorkflowStepKey,
+} from '../ctoAi/initialImplementWorkflow'
 import { extractImplementationScope, extractItemDescription } from '../ctoAi/roadmapAdoption'
-import type { IStorage } from '../storage/interface'
+import type { DesignReviewRun, IStorage } from '../storage/interface'
+import { configuredTargetRoot } from '../utils/pathGuard'
+import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { ADOPTION_REPOSITORY_MAP, resolveLedgerPath } from './adoptionStep'
 import {
   applyRevisedSpec,
+  beginConflictRound,
   buildDefaultRemediationDeps,
-  countRemediationAttempts,
+  conflictRecoveryAdapterTimeoutMs,
   findRemediationSubject,
+  isConflictStageAvailable,
   PL_MAX_REMEDIATION_ATTEMPTS,
+  PL_MAX_LIFETIME_TECHNICAL_FAILURES_PER_STAGE,
+  PL_MAX_TECHNICAL_FAILURES_PER_STAGE,
   priorCriticModels,
   priorCriticProviders,
   recordRemediationFailure,
   runRemediationStep,
   shortSpecKey,
   stageEntries,
+  tallyConflictStage,
+  type ConflictRound,
+  type ConflictStageTally,
   type PlRemediationDeps,
   type RemediationSubject,
 } from './remediationStep'
@@ -85,8 +99,18 @@ export type ConflictStage = 'critic' | 'pl_revision' | 'challenge' | 'remediatio
 export interface ConflictStageSelection {
   stage: ConflictStage
   reason: string
+  /** critic stage の判定数（設計成果物を出した Round）。 */
   criticRounds: number
+  /** remediation stage の判定数（設計成果物を出した Round）。 */
   remediationAttempts: number
+  /** 現在の accounting epoch で成果物を出さなかった critic Round の数。 */
+  criticTechnicalFailures: number
+  /** 現在の accounting epoch で成果物を出さなかった remediation Round の数。 */
+  remediationTechnicalFailures: number
+  /** epoch を問わない critic の技術的失敗 Round 数（総上限の判定用）。 */
+  criticLifetimeTechnicalFailures: number
+  /** epoch を問わない remediation の技術的失敗 Round 数（総上限の判定用）。 */
+  remediationLifetimeTechnicalFailures: number
 }
 
 /**
@@ -96,24 +120,53 @@ export interface ConflictStageSelection {
  * 固定 stage ではないからである（CEO 指示 2026-09-18）。
  */
 export function selectConflictStage(storage: IStorage, taskId: string): ConflictStageSelection {
-  const criticRounds = stageEntries(storage, taskId, 'critic').length
-  const remediationAttempts = countRemediationAttempts(storage, taskId)
-  const base = { criticRounds, remediationAttempts }
+  // **予算は判定だけを数える。** runner が判定を返さなかった行（runner_failed 等）は
+  // stage ごとの技術的失敗として別に数え、`PL_MAX_TECHNICAL_FAILURES_PER_STAGE` で打ち切る
+  // （予算は Round 単位で `tallyConflictStage()` だけが数える。2026-10-23 / 2026-10-26 `#2cae0d07`）。
+  const critic = tallyConflictStage(storage, taskId, 'critic')
+  const remediation = tallyConflictStage(storage, taskId, 'remediation')
+  const base = {
+    criticRounds: critic.judgments,
+    remediationAttempts: remediation.judgments,
+    criticTechnicalFailures: critic.technicalFailures,
+    remediationTechnicalFailures: remediation.technicalFailures,
+    criticLifetimeTechnicalFailures: critic.lifetimeTechnicalFailures,
+    remediationLifetimeTechnicalFailures: remediation.lifetimeTechnicalFailures,
+  }
 
   if (findRemediationSubject(storage, taskId) === undefined) {
     return { stage: 'terminal', reason: 'task is not stopped by a design review CONFLICT', ...base }
   }
-  if (criticRounds < PL_MAX_CRITIC_ROUNDS) {
-    return { stage: 'critic', reason: `critic round ${criticRounds + 1}/${PL_MAX_CRITIC_ROUNDS}`, ...base }
+  if (isConflictStageAvailable(critic, PL_MAX_CRITIC_ROUNDS)) {
+    return { stage: 'critic', reason: `critic round ${critic.judgments + 1}/${PL_MAX_CRITIC_ROUNDS}`, ...base }
   }
-  if (remediationAttempts < PL_MAX_REMEDIATION_ATTEMPTS) {
+  if (isConflictStageAvailable(remediation, PL_MAX_REMEDIATION_ATTEMPTS)) {
     return {
       stage: 'remediation',
-      reason: 'critic-assisted revision did not resolve it; escalating to independent remediation',
+      reason: critic.judgments >= PL_MAX_CRITIC_ROUNDS
+        ? 'critic-assisted revision did not resolve it; escalating to independent remediation'
+        : `critic stage hit ${describeTechnicalFailures(critic)} without a judgment;`
+          + ' escalating to independent remediation',
+      ...base,
+    }
+  }
+  if (remediation.judgments < PL_MAX_REMEDIATION_ATTEMPTS) {
+    // 判定予算は残っているが、技術的失敗が上限に達した。既存の terminal 経路のまま、理由だけ区別する。
+    return {
+      stage: 'terminal',
+      reason: `technical failures exhausted the remediation stage (${describeTechnicalFailures(remediation)}`
+        + ' without a judgment)',
       ...base,
     }
   }
   return { stage: 'terminal', reason: 'critic rounds and remediation attempts are both exhausted', ...base }
+}
+
+/** 技術的失敗の上限を、どちらの上限（epoch / 総数）で打ち切ったか分かる形で表す。 */
+function describeTechnicalFailures(tally: ConflictStageTally): string {
+  return `${tally.technicalFailures} technical failure(s) in this accounting epoch`
+    + ` (limit ${PL_MAX_TECHNICAL_FAILURES_PER_STAGE}),`
+    + ` ${tally.lifetimeTechnicalFailures} in total (limit ${PL_MAX_LIFETIME_TECHNICAL_FAILURES_PER_STAGE})`
 }
 
 // ────────────────────────────────────────────────────────────
@@ -265,15 +318,9 @@ export interface PlRevision {
 }
 
 export function parsePlRevision(raw: string): PlRevision | undefined {
-  const match = raw.match(/```json\s*([\s\S]+?)\s*```/) ?? raw.match(/(\{[\s\S]+\})/)
-  if (!match) return undefined
-
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(match[1] ?? match[0]) as unknown
-  } catch {
-    return undefined
-  }
+  // 最初の完全な JSON object だけを取り出す（後ろの余計な `}` や補足文で全体を捨てない）。
+  const parsed = parseFirstJsonObject(raw)
+  if (parsed === undefined) return undefined
   if (typeof parsed !== 'object' || parsed === null) return undefined
   const obj = parsed as Record<string, unknown>
 
@@ -346,6 +393,13 @@ export type ConflictRoundStatus =
   | 'challenge_not_aligned'
   /** 同一 (spec, finding) の再評価は既に使い切っている。 */
   | 'challenge_cap_reached'
+  /**
+   * 再評価 / 修正版の fresh Review が**まだ判定を出していない**（run が queued に戻った）。
+   * 否定的な判定ではないので escalation しない。run は design_review_idle → rekick で再開され、
+   * ALIGNED なら既存 `recoverReadyTasksWithoutJob()` が `createInitialImplementWorkflow()` で
+   * Job を作る（stepKey 一意で1回だけ）。CONFLICT なら次の Round がその判定から始まる。
+   */
+  | 'review_pending'
   /** Independent Remediation へ移行した（結果は `remediation` に入る）。 */
   | 'remediation'
   /** Round 予算を使い切った。 */
@@ -384,6 +438,19 @@ export interface ConflictResolutionDeps {
 
 /** PL の修正に使えるトークン数。既存 `PL_ADOPTION_MAX_TOKENS` と同じ桁に収める。 */
 const PL_REVISION_MAX_TOKENS = 900
+
+/**
+ * PL revision の既定呼び出し。**JSON だけを返す専用 agent を選ぶ。**
+ *
+ * 既定 agent は tool を持つため、モデルが tool 呼び出しを `<tool_call>` の**本文**として返し、
+ * JSON が1つも出ない（2026-10-23 本番 `#2cae0d07`: Critic 2 Round とも `unparsable_revision`。
+ * 同じ prompt の実測で既定 agent は 2/2 が `<tool_call>` 本文、専用 agent は 2/2 が parse 可能）。
+ * adoption proposal と同じ症状なので、同じ agent を使う（agent の prompt は「要求された JSON を1つだけ返す」
+ * という汎用の指示で、adoption 固有の内容を持たない）。
+ */
+export function defaultPlRevise(system: string, user: string): Promise<string> {
+  return requestText(system, user, { retryTransientOnce: true, agent: PL_ADOPTION_PROPOSAL_AGENT }, PL_REVISION_MAX_TOKENS)
+}
 
 /**
  * 同一 (material spec, finding) に対する再評価キー。
@@ -462,7 +529,7 @@ async function runChallenge(
   storage: IStorage,
   subject: RemediationSubject,
   dispute: FindingAssessment,
-
+  round: ConflictRound,
   deps: ConflictResolutionDeps,
 ): Promise<ConflictRoundResult> {
   const taskId = subject.task.id
@@ -481,13 +548,26 @@ async function runChallenge(
     }
   }
 
+  // **別の同一性の review が active なら、Challenge を消費せず待つ。** active run は Task ごとに
+  // 1本なので、ここで再評価を要求しても別の設計の run しか返らない（create() は契約上それを返さず
+  // contention を投げる）。それを消費してしまうと、この Challenge は一度も評価されずに失われる。
+  // ここから create() までの間に await は無いので、判定と作成の間に別経路は割り込めない。
+  const active = storage.designReviewRuns.findActiveByTaskId(taskId)
+  if (active !== undefined && !isSameReviewIdentity(active, subject)) {
+    return {
+      ...base,
+      status: 'review_pending',
+      reason: `another design review (run ${active.id}) is active for this task; the challenge waits for it`,
+    }
+  }
+
   // **先に消費を記録する。** 後で書くと、途中で落ちた場合に何度でも引けてしまう。
   // `orig_provider` / `orig_model` は取得不能なので `unavailable` と明示する
   // （owner: review-provider-exhausted-alternate-rereview）。
   recordRemediationFailure(
     storage,
     taskId,
-    `stage=challenge chal=${key} orig_provider=unavailable orig_model=unavailable`
+    `${round.prefix} stage=challenge chal=${key} orig_provider=unavailable orig_model=unavailable`
     + ` orig_verdict=CONFLICT finding=${dispute.source} grounds=${dispute.grounds ?? '-'}`
     + ` evidence=${dispute.evidence !== undefined ? 'yes' : 'no'} outcome=starting`,
   )
@@ -507,12 +587,34 @@ async function runChallenge(
     deps.coordinatorDeps ?? buildDefaultCoordinatorDeps(),
   )
 
+  // **requeued は判定ではない。** 評価済み（outcome=evaluated）とも否定とも記録しない。
+  // 再評価 run は queued のまま残り、design_review_idle → rekick で同じ run が判定まで進む。
+  // Challenge は1回きりのまま —— 新しい run を引き直さず、この run の判定がこの Challenge の
+  // 判定になる（上の starting 行は「この Challenge は始まった」の記録として残す）。
+  // `contended` / 読み直しても終端していない `not_claimable` / `stale` も同じく判定待ち。
+  if (
+    outcome.status === 'requeued' || outcome.status === 'contended'
+    || outcome.status === 'not_claimable' || outcome.status === 'stale'
+  ) {
+    recordRemediationFailure(
+      storage,
+      taskId,
+      `${round.prefix} stage=challenge chal=${key} orig_verdict=CONFLICT outcome=pending`
+      + ` reason=${outcome.decision ?? outcome.status}`,
+    )
+    return {
+      ...base,
+      status: 'review_pending',
+      reason: 'the fresh re-evaluation has not produced a judgment yet; the queued run will be resumed',
+    }
+  }
+
   const verdict = outcome.decision ?? outcome.status
   // verdict reversal を観測可能な事実として残す（新しい metrics backend は作らない）。
   recordRemediationFailure(
     storage,
     taskId,
-    `stage=challenge chal=${key} orig_verdict=CONFLICT chal_verdict=${verdict}`
+    `${round.prefix} stage=challenge chal=${key} orig_verdict=CONFLICT chal_verdict=${verdict}`
     + ` reversal=${outcome.status === 'evidence_registered' ? 'yes' : 'no'} outcome=evaluated`,
   )
 
@@ -531,17 +633,54 @@ async function runChallenge(
   // ALIGNED evidence が出た。**既存 Job Gate に従って進む**（override はしない）。
   const ensureJob = deps.ensureJob ?? createInitialImplementWorkflow
   const job = await ensureJob(storage, taskId, deps.coordinatorDeps ?? buildDefaultCoordinatorDeps())
+  // **Job が既に在るなら成功である。** ALIGNED の後、既存の `recoverReadyTasksWithoutJob()` 等が
+  // 先に初回 Job を作っていると ensureJob は skipped を返す。保存済みの Job を読み直し、
+  // **「既に在る」で skip し、かつ canonical な初回 Job がレビューした prompt のもの**のときだけ
+  // released とみなす。他の skip 理由（park 等）は従来どおり失敗。
+  const released = job.status === 'created'
+    || (job.status === 'skipped' && job.reason === INITIAL_WORKFLOW_JOB_EXISTS
+      && hasCanonicalInitialJobForReviewedPrompt(storage, subject))
 
   return {
     ...base,
-    status: job.status === 'created' ? 'challenge_aligned' : 'challenge_not_aligned',
-    ...(job.status === 'created'
+    status: released ? 'challenge_aligned' : 'challenge_not_aligned',
+    ...(released
       ? {}
       : {
           failureCode: 'gate_did_not_release',
           reason: `re-evaluation aligned but the existing job gate did not create a job: ${job.reason}`,
         }),
   }
+}
+
+/**
+ * active run が、この Challenge が再評価する frozen spec と同じ review か。
+ *
+ * storage の再利用条件（`reuseActiveRun`）と同じ同一性で比べる: design hash・changedFiles（集合）・
+ * successor intent。Challenge は repair ではないので `repairSourceJobId` が無い run だけが同じ review である。
+ * intent を見ないと、同じ prompt の repair 目的 run があるときに Challenge を消費した直後に
+ * create() が contention になり、Challenge が評価されずに失われる（独立レビュー round 7）。
+ */
+function isSameReviewIdentity(run: DesignReviewRun, subject: RemediationSubject): boolean {
+  return run.repairSourceJobId === undefined
+    && run.designTextHash === subject.reviewedDesignTextHash
+    && JSON.stringify([...run.changedFiles].sort()) === JSON.stringify([...subject.reviewedChangedFiles].sort())
+}
+
+/**
+ * ensureJob が「初回 workflow Job は既に在る」で skip したとき、その Job が**この Challenge が
+ * レビューした prompt から作られた canonical な初回 Job**か。
+ *
+ * canonical key（`task:<taskId>:initial-implement`）と prompt の同一性の両方を要求する。
+ * 同じ prompt の repair / resume Job は初回 Job ではないので数えない。
+ */
+function hasCanonicalInitialJobForReviewedPrompt(storage: IStorage, subject: RemediationSubject): boolean {
+  const canonicalKey = initialWorkflowStepKey(subject.task.id)
+  return storage.jobs.findByTaskId(subject.task.id).some((job) =>
+    job.workflowStepKey === canonicalKey
+    && job.aiCliMode === 'implement'
+    && job.aiCliPrompt !== undefined
+    && computeDesignTextHash(job.aiCliPrompt) === subject.reviewedDesignTextHash)
 }
 
 /**
@@ -564,6 +703,10 @@ async function runCriticRound(
   const taskId = subject.task.id
   const base = { stage: 'critic' as const, taskId }
 
+  // **Round を先に開く。** ここから先の失敗（runner・crash・PL revision・Challenge）はこの Round に属し、
+  // Round が設計成果物を出さなければ技術的失敗1回として数える（`tallyConflictStage()`）。
+  const round = beginConflictRound(storage, taskId, 'critic')
+
   // ── Critic model（Preference のみ。**不足しても失敗しない**）──────
   const selection = selectCriticModel({
     previousProviders: priorCriticProviders(storage, taskId),
@@ -571,7 +714,7 @@ async function runCriticRound(
   })
   const { candidate } = selection
   const provenance =
-    `stage=critic provider=${candidate.provider} model=${candidate.model}`
+    `${round.prefix} stage=critic provider=${candidate.provider} model=${candidate.model}`
     + ` vendor=${selection.vendor} reused_model=${selection.reusedModel ? 'yes' : 'no'}`
     + ` reused_vendor=${selection.reusedVendor ? 'yes' : 'no'}`
 
@@ -591,8 +734,11 @@ async function runCriticRound(
         priorRevisions: priorRevisionSummaries(storage, taskId),
       }),
     ].join('\n'),
-    workingDir: process.env.TARGET_ROOT ?? runnerDeps.workingDir,
+    // AI CLI は TARGET_ROOT 配下でしか動かない（AiCliAdapter の workingDir 検査）。TARGET_ROOT 未設定時の
+    // fallback を Stable の repoRoot にすると Production では必ず拒否される（2026-10-23 実測）。
+    workingDir: configuredTargetRoot(),
     useLegacyLandlockSandbox: candidate.provider === 'codex',
+    timeoutMs: conflictRecoveryAdapterTimeoutMs(runnerDeps),
   })
 
   let execution: RunnerExecution
@@ -611,7 +757,13 @@ async function runCriticRound(
 
   // **試行は必ず記録する**（記録しないと Round 予算が効かない）。
   if (!execution.ok) {
-    recordRemediationFailure(storage, taskId, `${provenance} outcome=runner_failed`)
+    // stdout に完全な Critique があれば判定として数える（会計のみ。その Critique は使わない）。
+    const parsedBeforeFailure = execution.stdout !== '' && parseCritique(execution.stdout) !== undefined
+    recordRemediationFailure(
+      storage,
+      taskId,
+      `${provenance} outcome=${parsedBeforeFailure ? 'runner_failed_after_critique' : 'runner_failed'}`,
+    )
     return {
       ...base,
       status: 'critic_failed',
@@ -656,14 +808,14 @@ async function runCriticRound(
   const target = challengeTarget(critique, subject.findings.map((f) => f.source))
   if (target !== undefined) {
     const dispute = target
-    const challenge = await runChallenge(storage, subject, dispute, deps)
+    const challenge = await runChallenge(storage, subject, dispute, round, deps)
     if (challenge.status !== 'challenge_cap_reached') {
       return { ...challenge, ...withCritic }
     }
     // 上限を使い切っている場合は通常の PL revision へ落ちる（**止めない**）。
   }
 
-  return { ...(await runPlRevision(storage, subject, ledgerBody, critique, deps)), ...withCritic }
+  return { ...(await runPlRevision(storage, subject, ledgerBody, critique, round, deps)), ...withCritic }
 }
 
 /** 過去 Round で PL が行った変更の要約（audit から復元。新しい state は作らない）。 */
@@ -688,13 +840,13 @@ async function runPlRevision(
   subject: RemediationSubject,
   ledgerBody: string,
   critique: Critique,
+  round: ConflictRound,
   deps: ConflictResolutionDeps,
 ): Promise<ConflictRoundResult> {
   const taskId = subject.task.id
   const base = { stage: 'pl_revision' as const, taskId }
 
-  const revise = deps.revise
-    ?? ((system: string, user: string) => requestText(system, user, { retryTransientOnce: true }, PL_REVISION_MAX_TOKENS))
+  const revise = deps.revise ?? defaultPlRevise
 
   let raw: string
   try {
@@ -720,6 +872,9 @@ async function runPlRevision(
       ].join('\n'),
     )
   } catch (error: unknown) {
+    // 失敗を見える形で残す（以前は行が無く、Critic 行だけが判定として残っていた）。
+    // `fspec=` が無いので、この Round は設計成果物を出していない = 技術的失敗として数えられる。
+    recordRemediationFailure(storage, taskId, `${round.prefix} stage=pl_revision outcome=revision_failed`)
     return {
       ...base,
       status: 'revision_rejected',
@@ -730,6 +885,7 @@ async function runPlRevision(
 
   const revision = parsePlRevision(raw)
   if (!revision) {
+    recordRemediationFailure(storage, taskId, `${round.prefix} stage=pl_revision outcome=revision_unusable`)
     return {
       ...base,
       status: 'revision_rejected',
@@ -751,7 +907,7 @@ async function runPlRevision(
     // ** にする。**  のままだと、1 Round で Critic 行と
     // 適用行の2行が critic として数えられ、**1 Round で2 Round 分の予算を消費**する
     // （独立レビュー指摘。実際に Critic は1 Round しか回らなかった）。
-    provenance: 'stage=pl_revision',
+    provenance: `${round.prefix} stage=pl_revision`,
     ...(deps.adopt !== undefined ? { adopt: deps.adopt } : {}),
   })
 
@@ -760,6 +916,9 @@ async function runPlRevision(
   }
   if (outcome.status === 'still_not_aligned') {
     return { ...base, status: 'revised_not_aligned', failureCode: outcome.failureCode, reason: outcome.reason }
+  }
+  if (outcome.status === 'review_pending') {
+    return { ...base, status: 'review_pending', taskId: outcome.taskId, reason: outcome.reason }
   }
   return { ...base, status: 'revision_rejected', failureCode: outcome.failureCode, reason: outcome.reason }
 }

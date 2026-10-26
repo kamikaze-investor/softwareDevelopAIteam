@@ -1,17 +1,23 @@
-import { describe, expect, it, beforeAll, afterAll } from 'vitest'
+import { describe, expect, it, beforeAll, afterAll, afterEach, vi } from 'vitest'
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import { tmpdir } from 'node:os'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
-import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
-import { ensureInitialWorkflowsForActiveTasks } from '../ctoAi/projectInitialization'
+import { buildInitialImplementAiCliPrompt, INITIAL_WORKFLOW_JOB_EXISTS } from '../ctoAi/initialImplementWorkflow'
+import { ensureInitialWorkflowsForActiveTasks, recoverReadyTasksWithoutJob } from '../ctoAi/projectInitialization'
+import { executeQueuedRun } from '../designReview/queuedRunDispatch'
+import { passDesignReviewRetryCooldown } from '../designReview/retryCooldownTestClock'
 import { adoptRoadmapItem, buildAdoptedDescription } from '../ctoAi/roadmapAdoption'
 import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePolicy'
 import {
   PL_MAX_REMEDIATION_ATTEMPTS,
   countRemediationAttempts,
+  CONFLICT_RECOVERY_ACCOUNTING_EPOCH,
+  CONFLICT_RECOVERY_RUNNER_TIMEOUT_MS,
+  buildDefaultRemediationDeps,
+  conflictRecoveryAdapterTimeoutMs,
   recordRemediationFailure,
   stageEntries,
 } from './remediationStep'
@@ -155,6 +161,24 @@ function seed(options: { resultJson?: string; roadmapTaskKey?: string } = {}): {
   return { storage, taskId: task.id, designText }
 }
 
+/**
+ * 設計成果物を出した Critic Round を1つ記録する（critique → PL revision の具体的 spec）。
+ *
+ * 2026-10-26 から予算は Round 単位で、`critiqued` 行だけでは判定にならない（成果物を出さなかった
+ * Round は技術的失敗）。判定済みの Round を前提にするテストはこの形で seed する。
+ */
+let seededRound = 0
+function recordCriticJudgment(storage: IStorage, taskId: string, criticDetail = 'provider=codex model=gpt-5.6-sol'): void {
+  seededRound += 1
+  const prefix = `round=seeded-${seededRound} epoch=${CONFLICT_RECOVERY_ACCOUNTING_EPOCH}`
+  recordRemediationFailure(storage, taskId, `${prefix} stage=critic ${criticDetail} outcome=critiqued`)
+  recordRemediationFailure(
+    storage,
+    taskId,
+    `${prefix} stage=pl_revision proposed=h${seededRound} fspec=seeded${seededRound} rejected_fspec=- outcome=adopting`,
+  )
+}
+
 /** Critic runner を差し替える deps。 */
 function deps(critique: unknown, over: Record<string, unknown> = {}) {
   return {
@@ -180,22 +204,37 @@ describe('selectConflictStage — 既存 state の observer', () => {
   it('Critic Round を使い切ったら remediation へ移る', () => {
     const { storage, taskId } = seed()
     for (let i = 0; i < PL_MAX_CRITIC_ROUNDS; i += 1) {
-      recordRemediationFailure(storage, taskId, 'stage=critic outcome=critiqued')
+      recordCriticJudgment(storage, taskId)
     }
 
     expect(selectConflictStage(storage, taskId).stage).toBe('remediation')
   })
 
-  it('Critic も Remediation も尽きたら terminal', () => {
+  it('Critic も Remediation も判定予算が尽きたら terminal（runner_failed ではなく parse 済みの提案で尽きる）', () => {
+    // 以前は remediation runner_failed ×2 で terminal としていたが、それは判定 0 件の取り残し
+    // （2026-10-23 `#2cae0d07`）を固定していた。判定予算は parse 済みの提案だけが消費する。
     const { storage, taskId } = seed()
     for (let i = 0; i < PL_MAX_CRITIC_ROUNDS; i += 1) {
-      recordRemediationFailure(storage, taskId, 'stage=critic outcome=critiqued')
+      recordCriticJudgment(storage, taskId)
+    }
+    recordRemediationFailure(storage, taskId, 'stage=remediation outcome=abandon')
+    recordRemediationFailure(storage, taskId, 'stage=remediation proposed=h fspec=abc rejected_fspec=- outcome=not_different')
+
+    const selection = selectConflictStage(storage, taskId)
+    expect(selection.stage).toBe('terminal')
+    expect(selection.reason).toBe('critic rounds and remediation attempts are both exhausted')
+  })
+
+  it('Critic 判定が尽き remediation runner_failed ×2 だけなら remediation がまだ使える', () => {
+    const { storage, taskId } = seed()
+    for (let i = 0; i < PL_MAX_CRITIC_ROUNDS; i += 1) {
+      recordCriticJudgment(storage, taskId)
     }
     for (let i = 0; i < PL_MAX_REMEDIATION_ATTEMPTS; i += 1) {
       recordRemediationFailure(storage, taskId, 'stage=remediation outcome=runner_failed')
     }
 
-    expect(selectConflictStage(storage, taskId).stage).toBe('terminal')
+    expect(selectConflictStage(storage, taskId).stage).toBe('remediation')
   })
 
   it('**challenge は selector から返らない**（固定 stage ではなく条件分岐）', () => {
@@ -442,11 +481,7 @@ describe('Critic model の Preference と fallback', () => {
     // Critic Round を使い切っていれば次は remediation であって terminal ではない。
     const { storage, taskId } = seed()
     for (const model of ['gpt-5.6-sol', 'claude-opus-5']) {
-      recordRemediationFailure(
-        storage,
-        taskId,
-        `stage=critic provider=x model=${model} outcome=critiqued`,
-      )
+      recordCriticJudgment(storage, taskId, `provider=x model=${model}`)
     }
 
     expect(selectConflictStage(storage, taskId).stage).toBe('remediation')
@@ -509,6 +544,63 @@ describe('audit / observability', () => {
   })
 })
 
+describe('Round 単位の会計の配線（2026-10-26）', () => {
+  it('PL revision が壊れた応答なら revision_unusable 行を残し、その Round は技術的失敗（Critic 判定を消費しない）', async () => {
+    const { storage, taskId } = seed()
+
+    const result = await runConflictResolutionRound(storage, taskId, deps(SUPPORTED_CRITIQUE, {
+      revise: async () => '<tool_call><function=bash><parameter=command>ls</parameter></function></tool_call>',
+    }) as never)
+
+    expect(result.status).toBe('revision_rejected')
+    const rows = storage.auditLog.findByEntity('pl_remediation', `remediate:${taskId}`).map((e) => e.detail ?? '')
+    // 新しい順: revision_unusable / critiqued / starting。すべて同じ Round。
+    expect(rows).toHaveLength(3)
+    const round = /^round=(\S+) /.exec(rows[2] ?? '')?.[1]
+    expect(round).toBeDefined()
+    for (const row of rows) expect(row.startsWith(`round=${round} `)).toBe(true)
+    expect(rows[0]).toContain('stage=pl_revision outcome=revision_unusable')
+    expect(selectConflictStage(storage, taskId)).toMatchObject({ stage: 'critic', criticRounds: 0, criticTechnicalFailures: 1 })
+  })
+
+  it('Round 開始行は runner より前に書かれる（runner 中に落ちても Round が残る）', async () => {
+    const { storage, taskId } = seed()
+    let rowsAtRunner: string[] = []
+
+    await runConflictResolutionRound(storage, taskId, deps(SUPPORTED_CRITIQUE, {
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async () => {
+          rowsAtRunner = storage.auditLog.findByEntity('pl_remediation', `remediate:${taskId}`).map((e) => e.detail ?? '')
+          return { ok: false, stdout: '', error: 'process died', timedOut: false }
+        },
+      },
+    }) as never)
+
+    expect(rowsAtRunner).toHaveLength(1)
+    expect(rowsAtRunner[0]).toMatch(/^round=\S+ epoch=\d+ stage=critic outcome=starting$/)
+  })
+
+  it('critic / remediation の runner へ外側期限より短い adapter 期限を渡す', async () => {
+    expect(buildDefaultRemediationDeps().timeoutMs).toBe(CONFLICT_RECOVERY_RUNNER_TIMEOUT_MS)
+    expect(conflictRecoveryAdapterTimeoutMs(buildDefaultRemediationDeps())).toBe(CONFLICT_RECOVERY_RUNNER_TIMEOUT_MS - 30_000)
+
+    const { storage, taskId } = seed()
+    const timeouts: unknown[] = []
+    const runnerDeps = {
+      runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+      timeoutMs: CONFLICT_RECOVERY_RUNNER_TIMEOUT_MS,
+      execute: async (raw: string) => {
+        timeouts.push((JSON.parse(raw) as { timeoutMs?: number }).timeoutMs)
+        return { ok: false, stdout: '', error: 'boom', timedOut: false }
+      },
+    }
+    await runConflictResolutionRound(storage, taskId, deps(SUPPORTED_CRITIQUE, { runnerDeps }) as never)
+
+    expect(timeouts).toEqual([CONFLICT_RECOVERY_RUNNER_TIMEOUT_MS - 30_000])
+  })
+})
+
 describe('有界性', () => {
   it('Critic runner 失敗も Round として記録する（記録しないと予算が効かない）', async () => {
     const { storage, taskId } = seed()
@@ -521,9 +613,31 @@ describe('有界性', () => {
     }) as never)
 
     expect(result.status).toBe('critic_failed')
-    // Critic の失敗は **Critic Round の予算**を消費する（Remediation の予算とは別勘定）。
-    expect(stageEntries(storage, taskId, 'critic').length).toBe(1)
+    // Critic の失敗は Critic stage の技術的失敗1回（Round 開始行 + 失敗行。Remediation とは別勘定）。
+    expect(stageEntries(storage, taskId, 'critic').length).toBe(2)
+    expect(selectConflictStage(storage, taskId)).toMatchObject({ criticRounds: 0, criticTechnicalFailures: 1 })
     expect(countRemediationAttempts(storage, taskId)).toBe(0)
+  })
+
+  it('Critic runner が ok=false なら stdout に完全な Critique があっても使わず、成果物が無いので技術的失敗', async () => {
+    const { storage, taskId } = seed()
+    let revised = false
+
+    const result = await runConflictResolutionRound(storage, taskId, deps(SUPPORTED_CRITIQUE, {
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async () => ({ ok: false, stdout: JSON.stringify(SUPPORTED_CRITIQUE), error: 'exit 1', timedOut: false }),
+      },
+      revise: async () => { revised = true; return '' },
+    }) as never)
+
+    expect(result.status).toBe('critic_failed')
+    expect(revised).toBe(false)
+    const rows = stageEntries(storage, taskId, 'critic').map((e) => e.detail ?? '')
+    expect(rows).toHaveLength(2)
+    expect(rows[0]).toContain('provider=')
+    expect(rows[0]).toContain('outcome=runner_failed_after_critique')
+    expect(selectConflictStage(storage, taskId)).toMatchObject({ criticRounds: 0, criticTechnicalFailures: 1 })
   })
 
   it('Critique が壊れていても Round として記録する', async () => {
@@ -532,8 +646,9 @@ describe('有界性', () => {
     const result = await runConflictResolutionRound(storage, taskId, deps('not a critique') as never)
 
     expect(result.status).toBe('critique_unusable')
-    // Critic の失敗は **Critic Round の予算**を消費する（Remediation の予算とは別勘定）。
-    expect(stageEntries(storage, taskId, 'critic').length).toBe(1)
+    // 壊れた Critique は成果物を出していない = Critic stage の技術的失敗1回（技術的失敗の上限で有界）。
+    expect(stageEntries(storage, taskId, 'critic').length).toBe(2)
+    expect(selectConflictStage(storage, taskId)).toMatchObject({ criticRounds: 0, criticTechnicalFailures: 1 })
     expect(countRemediationAttempts(storage, taskId)).toBe(0)
   })
 })
@@ -600,5 +715,199 @@ describe('parsePlRevision', () => {
   it('空の allowedPaths / acceptanceCriteria は拒否する', () => {
     expect(parsePlRevision(JSON.stringify({ ...PL_REVISION, allowedPaths: [] }))).toBeUndefined()
     expect(parsePlRevision(JSON.stringify({ ...PL_REVISION, acceptanceCriteria: [] }))).toBeUndefined()
+  })
+})
+/**
+ * **Challenge の再評価が判定を出さなかった（requeued）場合**（独立レビュー round 5・2026-10-16）。
+ *
+ * 評価済み・否定として記録せず pending で返す。同じ run が rekick で判定まで進み、ALIGNED なら
+ * 既存 `recoverReadyTasksWithoutJob()` が Job を1回だけ作る。Challenge を引き直すことはしない。
+ */
+describe('Challenge の再評価が requeued になった場合', () => {
+  // 判定の出なかった attempt の後の retry cooldown（retryCooldown.ts）は時計で明けさせる。
+  afterEach(() => { vi.useRealTimers() })
+
+  function coordinator(stdout: string) {
+    return {
+      runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+      execute: async () => ({ ok: true, stdout, timedOut: false }),
+    }
+  }
+
+  it('review_pending を返し、evaluated と記録せず、Job も作らない', async () => {
+    const { storage, taskId } = seed()
+
+    const result = await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
+      coordinatorDeps: coordinator('null'),
+      ensureJob: async () => { throw new Error('must not create a job before a judgment') },
+    }) as never)
+
+    expect(result).toMatchObject({ stage: 'challenge', status: 'review_pending' })
+    const details = stageEntries(storage, taskId, 'challenge').map((entry) => entry.detail ?? '')
+    expect(details.some((detail) => detail.includes('outcome=evaluated'))).toBe(false)
+    expect(details.some((detail) => detail.includes('outcome=pending'))).toBe(true)
+    expect(storage.designReviewRuns.findLatestByTaskId(taskId)?.status).toBe('queued')
+  })
+
+  it('同じ run が rekick で ALIGNED になれば、既存の回収が Job を1回だけ作る', async () => {
+    const { storage, taskId } = seed()
+    await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
+      coordinatorDeps: coordinator('null'),
+    }) as never)
+    const run = storage.designReviewRuns.findLatestByTaskId(taskId)!
+
+    passDesignReviewRetryCooldown()
+    await executeQueuedRun(storage, run, coordinator(ALIGNED_RESULT_JSON))
+    expect(storage.designReviewEvidence.findLatestByTaskId(taskId)?.decision).toBe('ALIGNED')
+    expect(storage.jobs.findByTaskId(taskId)).toEqual([])
+
+    expect((await recoverReadyTasksWithoutJob(storage, coordinator(ALIGNED_RESULT_JSON))).recovered).toBe(1)
+    expect((await recoverReadyTasksWithoutJob(storage, coordinator(ALIGNED_RESULT_JSON))).recovered).toBe(0)
+    expect(storage.jobs.findByTaskId(taskId)).toHaveLength(1)
+  })
+})
+describe('Challenge と他の review / 回収経路の重なり（独立レビュー round 6）', () => {
+  it('別の設計の review が active なら Challenge を消費せず pending（再評価も呼ばない）', async () => {
+    const { storage, taskId } = seed()
+    let otherId = ''
+
+    const result = await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
+      // Critic を待っている間に、同じ Task へ別の設計の review（例: resume instruction）が起票された。
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async () => {
+          otherId = storage.designReviewRuns.create({
+            taskId, taskTitle: 'other', designText: 'a different resume instruction',
+            designTextHash: computeDesignTextHash('a different resume instruction'), changedFiles: [],
+          }).id
+          return { ok: true, stdout: JSON.stringify(DISPUTED_CRITIQUE), timedOut: false }
+        },
+      },
+      reEvaluate: async () => { throw new Error('must not re-evaluate while another review is active') },
+    }) as never)
+
+    expect(result).toMatchObject({ stage: 'challenge', status: 'review_pending' })
+    expect(result.reason).toContain(otherId)
+    // starting 行が無い = Challenge は消費されていない。
+    expect(stageEntries(storage, taskId, 'challenge')).toEqual([])
+  })
+
+  it('ALIGNED の後に回収経路が先に初回 Job を作っていても、challenge_aligned として扱う', async () => {
+    const { storage, taskId, designText } = seed()
+    const task = storage.tasks.findById(taskId)!
+
+    const result = await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
+      reEvaluate: async () => {
+        // 再評価が ALIGNED になった直後に、recoverReadyTasksWithoutJob() が同じ prompt で Job を作った。
+        storage.jobs.create({
+          taskId, projectId: task.projectId, agentRole: 'developer_ai', status: 'queued',
+          workflowStepKey: `task:${taskId}:initial-implement`,
+          safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+          aiCliMode: 'implement', aiCliPrompt: designText,
+        } as never)
+        return { status: 'evidence_registered', decision: 'ALIGNED' }
+      },
+      ensureJob: async () => ({ taskId, status: 'skipped', reason: 'initial workflow job already exists' }),
+    }) as never)
+
+    expect(result.status).toBe('challenge_aligned')
+    expect(storage.jobs.findByTaskId(taskId)).toHaveLength(1)
+  })
+
+  it('ensureJob が skipped で、レビューした prompt の Job も無ければ従来どおり not_aligned', async () => {
+    const { storage, taskId } = seed()
+
+    const result = await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
+      reEvaluate: async () => ({ status: 'evidence_registered', decision: 'ALIGNED' }),
+      ensureJob: async () => ({ taskId, status: 'skipped', reason: 'task was parked by abort_task' }),
+    }) as never)
+
+    expect(result).toMatchObject({ status: 'challenge_not_aligned', failureCode: 'gate_did_not_release' })
+  })
+})
+describe('Challenge の同一性と「既に在る」の判定（独立レビュー round 7）', () => {
+  function criticThat(onRun: () => void) {
+    return {
+      runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+      execute: async () => { onRun(); return { ok: true, stdout: JSON.stringify(DISPUTED_CRITIQUE), timedOut: false } },
+    }
+  }
+
+  it('同じ text / files でも repair 目的の active run なら別の review として pending（Challenge を消費しない）', async () => {
+    const { storage, taskId, designText } = seed()
+
+    const result = await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
+      runnerDeps: criticThat(() => {
+        storage.designReviewRuns.create({
+          taskId, taskTitle: 'repair', designText, designTextHash: computeDesignTextHash(designText),
+          changedFiles: [], repairSourceJobId: 'source-job-1',
+        })
+      }),
+      reEvaluate: async () => { throw new Error('must not re-evaluate against a repair-purpose run') },
+    }) as never)
+
+    expect(result).toMatchObject({ stage: 'challenge', status: 'review_pending' })
+    expect(stageEntries(storage, taskId, 'challenge')).toEqual([])
+  })
+
+  // Remediation の対象は Job 0 件の Task なので、Job は再評価の最中（ALIGNED の直後）に現れる形で再現する。
+  async function challengeWith(workflowStepKey: string | undefined, reason: string) {
+    const { storage, taskId, designText } = seed()
+    const projectId = storage.tasks.findById(taskId)!.projectId
+    // '__CANONICAL__' は初回 workflow の canonical key（task:<taskId>:initial-implement）を表す。
+    const key = workflowStepKey === '__CANONICAL__' ? `task:${taskId}:initial-implement` : workflowStepKey
+    const result = await runConflictResolutionRound(storage, taskId, deps(DISPUTED_CRITIQUE, {
+      reEvaluate: async () => {
+        if (key !== undefined) {
+          storage.jobs.create({
+            taskId, projectId, agentRole: 'developer_ai', status: 'queued', workflowStepKey: key,
+            safeCommand: { kind: 'test', workingDir: '/workspace/target' }, aiCliMode: 'implement', aiCliPrompt: designText,
+          } as never)
+        }
+        return { status: 'evidence_registered', decision: 'ALIGNED' }
+      },
+      ensureJob: async () => ({ taskId, status: 'skipped', reason }),
+    }) as never)
+    return result.status
+  }
+
+  it('同じ prompt の repair / resume Job は canonical な初回 Job ではないので released にしない', async () => {
+    expect(await challengeWith('repair:some-job:1', INITIAL_WORKFLOW_JOB_EXISTS)).toBe('challenge_not_aligned')
+    expect(await challengeWith('resume:some-job:1', INITIAL_WORKFLOW_JOB_EXISTS)).toBe('challenge_not_aligned')
+  })
+
+  it('skip 理由が「既に在る」以外なら、canonical な初回 Job が在っても released にしない', async () => {
+    const status = await challengeWith('__CANONICAL__', 'task was parked by abort_task')
+    expect(status).toBe('challenge_not_aligned')
+  })
+
+  it('「既に在る」で、canonical な初回 Job がレビューした prompt のものなら released', async () => {
+    expect(await challengeWith('__CANONICAL__', INITIAL_WORKFLOW_JOB_EXISTS)).toBe('challenge_aligned')
+  })
+})
+
+describe('Critic runner は TARGET_ROOT 未設定でも target root で AI CLI を動かす（2026-10-23 Production）', () => {
+  it('TARGET_ROOT が無いとき workingDir は /workspace/target（Stable の runner workingDir ではない）', async () => {
+    const { storage, taskId } = seed()
+    const saved = process.env.TARGET_ROOT
+    let captured: { workingDir?: string } | undefined
+    try {
+      delete process.env.TARGET_ROOT
+      await runConflictResolutionRound(storage, taskId, deps(SUPPORTED_CRITIQUE, {
+        readLedger: () => LEDGER,
+        runnerDeps: {
+          runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: '/srv/ai-team/stable-checkout',
+          execute: async (input: string) => {
+            captured = JSON.parse(input) as { workingDir?: string }
+            return { ok: true, stdout: JSON.stringify(SUPPORTED_CRITIQUE), timedOut: false }
+          },
+        },
+      }) as never)
+    } finally {
+      if (saved === undefined) delete process.env.TARGET_ROOT
+      else process.env.TARGET_ROOT = saved
+    }
+
+    expect(captured?.workingDir).toBe(resolve('/workspace/target'))
   })
 })

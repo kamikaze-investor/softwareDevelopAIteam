@@ -39,6 +39,8 @@
  * この性質のおかげで、**レーン分類を誤っても CEO を迂回することが原理的に起きない**:
  * B / C / D で未配線のものはすべて人へ届き、A だけが既存 Gate 経由で自動実行へ進む。
  * そして A は「既存の bounded recovery が実在する」機械的事実が立ったときにしか選ばれない。
+ * 例外は Gate 段階の技術停止（rule 6.8 / 6.9、`technicalStop`）で、A のまま budget 0 の
+ * `technical_exhausted` として止まる（自動実行もせず CEO にも上げず、attention には残る）。
  *
  * ## 効果検証可能性（Design Philosophy 8）
  *
@@ -52,6 +54,7 @@
 import { ALWAYS_FORBIDDEN_PATTERNS } from '@ai-team/worker/src/guards/fileChangeGuard.js'
 import {
   DESIGN_REVIEW_MAX_ATTEMPTS,
+  isUsableRunnerOutput,
   recomputeDecision,
   type RawStrategicResult,
 } from '../designReview/designReviewCoordinator'
@@ -60,16 +63,23 @@ import {
   isReachableByAutonomousLoop,
   recoveryReleasesProjectSlot,
 } from '../humanRecovery/recoveryAudit'
-import { countRemediationAttempts, PL_MAX_REMEDIATION_ATTEMPTS } from './remediationStep'
+import {
+  PL_MAX_REMEDIATION_ATTEMPTS,
+  PL_MAX_TECHNICAL_FAILURES_PER_STAGE,
+  tallyConflictStage,
+} from './remediationStep'
 import { findTechnicalResumeImplementation } from './technicalResumePolicy'
 import {
   predictHumanRecoveryDriver,
   type HumanRecoveryNextDriver,
 } from '../humanRecovery/recoverBlockedTask'
-import type { AuditLogEntry, Job } from '@ai-team/shared'
+import type { AuditLogEntry, GateTechnicalStopCode, Job } from '@ai-team/shared'
+import { gateTechnicalStopCodeOfJob, isLiveApprovedApproval, isLiveWaitingApproval } from '@ai-team/shared'
 import type { DesignReviewRun, IStorage } from '../storage/interface'
+import { isUsableAlignedEvidence } from '../designReviewEvidencePolicy'
 import { retryStepKeyFor } from '../designReview/repairPolicy'
 import { isTerminalJobStatus } from '../jobResultApplicationPolicy'
+import { classifyApprovedRunBlock } from '../approvedRunBlock'
 import {
   classifyGitCommitResumeLineage,
   parseGitCommitResumeStepKey,
@@ -78,6 +88,12 @@ import {
 // ────────────────────────────────────────────────────────────
 // 語彙
 // ────────────────────────────────────────────────────────────
+
+/**
+ * 技術停止の理由コード。Worker が stderr に残す Gate の理由コード（rule 6.8）に加え、
+ * 理由コードの無い「承認済み git_commit の Gate 段階の拒否」（rule 6.9）を表す値を1つだけ持つ。
+ */
+export type TechnicalStopCode = GateTechnicalStopCode | 'approved_commit_gate_refusal'
 
 /** 解決レーン。**増やさない。** 分類を増やす前に、既存4つで表せないかを先に疑うこと。 */
 export const BLOCKED_LANES = [
@@ -195,6 +211,12 @@ export interface BlockedDiagnosis {
   /** `low` は「機械的事実で特定できなかった」の意味。**low で自動実行はしない。** */
   confidence: 'high' | 'low'
   observation?: BlockedObservation
+  /**
+   * Gate 段階の技術停止（rule 6.8 / 6.9）の理由コード。立っているとき、PL はこの対象を自動 recovery せず
+   * CEO にも上げず、既存の `technical_exhausted`（対象単位・重複排除）として記録して見せ続ける
+   * （`executionLoop.ts` の `technicalRecoveryExhaustion()`）。原因を直した後の明示 resume は従来どおり admit される。
+   */
+  technicalStop?: TechnicalStopCode
   /** 人間向けの説明。**routing には一切使わない。** */
   summary: string
 }
@@ -263,7 +285,7 @@ function isSecret(file: string): boolean {
 // Design Review の判定を実レコードから読む
 // ────────────────────────────────────────────────────────────
 
-/** 最新 Design Review run の機械的な要約。**判定は `resultJson` の実値から読む。** */
+/** 最新 Design Review run の機械的な要約。**判定は `resultJson` を API と同じ関数で再計算した値。** */
 export interface LatestDesignReviewVerdict {
   runId: string
   status: DesignReviewRun['status']
@@ -277,7 +299,10 @@ export interface LatestDesignReviewVerdict {
    * 同じ扱いにすると、**結果はあるのに『結果なし』の短い文面**を人へ出すことになる。
    */
   hasResult: boolean
-  /** `finalDecision`（ALIGNED / CONFLICT / UNCERTAIN / REVIEW_UNAVAILABLE）。読めなければ undefined。 */
+  /**
+   * API が再計算した判定（ALIGNED / CONFLICT / UNCERTAIN / REVIEW_UNAVAILABLE）。runner の
+   * `finalDecision` 自己申告ではない。結果が読めなければ undefined。
+   */
   decision?: string
   /** Integration Review の要約。**人向けの説明にだけ使う。** */
   summary?: string
@@ -307,12 +332,21 @@ export function readLatestDesignReview(
   if (run.resultJson === undefined) return base
 
   try {
-    const parsed = JSON.parse(run.resultJson) as Record<string, unknown>
-    const decision = parsed.finalDecision
-    const summary = (parsed.integrationReviewResult as Record<string, unknown> | undefined)?.summary
+    const parsed: unknown = JSON.parse(run.resultJson)
+    if (!isUsableRunnerOutput(parsed)) return base
+    // **判定は runner の自己申告（`finalDecision`）ではなく、API と同じ再計算で決める。**
+    // 生値を返すと、`finalDecision` を持たない #255 形の CONFLICT が判定なしになり、逆に
+    // focus は CONFLICT なのに `finalDecision: ALIGNED` と書いた出力が ALIGNED に見える。
+    // この値は Triage の分類・PL の通知本文・Operator 表示がそのまま使うので、ここで正す
+    // （独立レビュー指摘・2026-10-16。task_blocked_without_job 経路と同じ recompute）。
+    const decision = recomputeDecision(parsed, run.reviewKind, run.changedFiles).decision
+    const integration = parsed.integrationReviewResult
+    const summary = typeof integration === 'object' && integration !== null
+      ? (integration as { summary?: unknown }).summary
+      : undefined
     return {
       ...base,
-      ...(typeof decision === 'string' ? { decision } : {}),
+      decision,
       ...(typeof summary === 'string' ? { summary } : {}),
     }
   } catch {
@@ -349,6 +383,16 @@ interface Facts {
   rejectedApprovalId?: string
   /** fixed-anchor generation が壊れており、自動 resume へ倒してはならない。 */
   gitCommitResumeLineageInvalidReason?: string
+  /**
+   * blocked git_commit Job 自身の linked Approval が **APPROVED（未 consume）** のまま。
+   * 人は承認し Gate も ALLOW したのに、Worker 側の policy が実行を拒んだ形（integrated E2E・P1）。
+   */
+  approvedLinkedGitCommitId?: string
+  /**
+   * blocked Job 自身の linked Approval が **live な WAITING_FOR_USER**。その間 resume は admit されないので、
+   * 出口はその承認を承認すること（または期限切れ後の resume）になる（D2 rule 6.8 の案内文に使う）。
+   */
+  liveWaitingLinkedApprovalId?: string
   review?: LatestDesignReviewVerdict
   alignedEvidenceId?: string
 }
@@ -414,6 +458,19 @@ function gatherFacts(storage: IStorage, item: AttentionItem): Facts {
     return { rejection: rejectionOf(source, source.approvalId) }
   })()
   const linkedRejection = linkedGitCommit.rejection
+  const approvedLinkedGitCommitId = (() => {
+    if (!job || job.safeCommand.kind !== 'git_commit' || !job.approvalId) return undefined
+    const linked = storage.approvalRequests.findById(job.approvalId)
+    if (!linked || linked.taskId !== job.taskId || linked.requestedAction !== 'git_commit') return undefined
+    // 期限切れ・読めない期限の APPROVED はもう誰の authority にもならない（consume が使わせない）。
+    return isLiveApprovedApproval(linked) ? linked.id : undefined
+  })()
+  const liveWaitingLinkedApprovalId = (() => {
+    if (!job || !job.approvalId) return undefined
+    const linked = storage.approvalRequests.findById(job.approvalId)
+    if (!linked || linked.taskId !== job.taskId) return undefined
+    return isLiveWaitingApproval(linked) ? linked.id : undefined
+  })()
   const review = item.taskId !== undefined ? readLatestDesignReview(storage, item.taskId) : undefined
   const evidence =
     item.taskId !== undefined
@@ -431,8 +488,11 @@ function gatherFacts(storage: IStorage, item: AttentionItem): Facts {
     ...(linkedGitCommit.invalidReason !== undefined
       ? { gitCommitResumeLineageInvalidReason: linkedGitCommit.invalidReason }
       : {}),
+    ...(approvedLinkedGitCommitId !== undefined ? { approvedLinkedGitCommitId } : {}),
+    ...(liveWaitingLinkedApprovalId !== undefined ? { liveWaitingLinkedApprovalId } : {}),
     ...(review !== undefined ? { review } : {}),
-    ...(evidence?.decision === 'ALIGNED' && evidence.reviewKind === 'task'
+    // 新しい同じ設計の判定に覆された ALIGNED は根拠にしない（isUsableAlignedEvidence）。
+    ...(evidence?.reviewKind === 'task' && isUsableAlignedEvidence(evidence, storage.designReviewEvidence)
       ? { alignedEvidenceId: evidence.id }
       : {}),
   }
@@ -491,6 +551,13 @@ function hasLiveJob(facts: Facts): boolean {
  * 同じ run に対して Triage と Remediation が違う結論を出す。
  * 読めない・再計算できないものは `undefined`（＝ CONFLICT と決めつけない。fail-closed）。
  */
+/** Remediation 予算の事実表示。予算は判定数、技術的失敗は別の上限で数える。 */
+function remediationBudgetFact(storage: IStorage, taskId: string): string {
+  const tally = tallyConflictStage(storage, taskId, 'remediation')
+  return `${tally.judgments}/${PL_MAX_REMEDIATION_ATTEMPTS}`
+    + ` (technical_failures=${tally.technicalFailures}/${PL_MAX_TECHNICAL_FAILURES_PER_STAGE})`
+}
+
 function recomputedDecisionOf(storage: IStorage, taskId: string | undefined): string | undefined {
   if (taskId === undefined) return undefined
   const run = storage.designReviewRuns.findLatestByTaskId(taskId)
@@ -629,7 +696,7 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
     const stalled = facts.review
     // **判定は runner の自己申告ではなく API 側の再計算で決める。**
     //
-    // `readLatestDesignReview()` が返す `decision` は top-level `finalDecision` の生値である。
+    // （以前の `readLatestDesignReview()` は top-level `finalDecision` の生値を返していた。現在は同じ再計算値。）
     // #255 が書く CONFLICT は `{"focusedReviewResults":[...]}` だけで **`finalDecision` を持たない**
     // ので、生値で `=== 'CONFLICT'` と比べると**本番で最も多い形が丸ごと漏れる**
     // （独立レビュー round 3 指摘。round 2 で「ALIGNED 以外」を絞った際に入れた退行）。
@@ -690,7 +757,8 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
           ? [{
             fact: 'remediation.attempts',
             id: item.taskId,
-            value: `${countRemediationAttempts(storage, item.taskId)}/${PL_MAX_REMEDIATION_ATTEMPTS}`,
+            // 予算は判定数で、技術的失敗は別の上限で数える（`classifyConflictRecoveryRow()`）。
+            value: remediationBudgetFact(storage, item.taskId),
           }]
           : []),
       ],
@@ -912,6 +980,94 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
   // （2026-09-23 production で、人の REJECT が同一 diff の承認待ちへ戻った）。
   // `rootCauseClass` は増やさず、既存 schema の値だけで
   // 「既存 resume は在るが、AI が自動実行してよい復旧ではない」を表現する。
+  // ── 6.8 Gate の技術的不整合で止まった Job（command kind を問わない）── D2 v4（2026-10-17）
+  //
+  // Worker の resolvePolicy が承認の判断ではなく技術的な不整合（risk_rule_skew: Worker / API の rule の版ずれ、
+  // approval_contract_violation: Gate 応答の組が契約外）で re_check にした Job は、理由を stderr に
+  // `<code>: ...` として残す（`findGateTechnicalStopCode`）。下の 7 へ落とすと auto_recovery → PL resume →
+  // 同じ不整合で再停止、の連鎖になる（非 git の safe-work kind でも同じ）。原因（版ずれ等）は AI の
+  // resume では直らないので自動実行しない。**CEO にも上げない**（技術停止であって Decision Authority の判断ではない。
+  // specs/22 1-2 / 14-3: ceo_required は DA trigger からのみ導出する）。lane は技術レーン（auto_recovery）のまま
+  // `technicalStop` を立て、PL は既存の `technical_exhausted`（対象単位・重複排除・理由コードつき）として記録して
+  // 止める。job_blocked は attention に残り続ける（見える停止）。Authority の変更は要求しない。
+  // 原因を直した後の明示 resume が出口（git_commit なら新しい承認が求められる）。
+  // 照合は stderr の先頭だけ（findGateTechnicalStopCode）で、さらにコマンドが一度も実行されていない Job に限る
+  // （Gate 段階の停止は exitCode も stdout ログも持たない。実行後の出力で技術停止を詐称させない）。
+  // CEO が却下した git_commit は下の 7 の却下の扱い（指示つき Human Resume）を優先する。
+  const technicalStopCode = facts.ceoRejectedGitCommit !== true ? gateTechnicalStopCodeOfJob(facts.job) : undefined
+  if (facts.job !== undefined && technicalStopCode !== undefined && !hasLiveJob(facts)) {
+    return {
+      ...result,
+      rootCauseClass: 'unknown',
+      blockingLayer: 'approval',
+      evidence: [
+        { fact: 'job.status', id: facts.job.id, value: 'blocked' },
+        { fact: 'gate technical stop code (job.stderr)', id: facts.job.id, value: technicalStopCode },
+        { fact: 'job.stderr', id: facts.job.id, value: (facts.job.stderr ?? '').slice(0, 200) },
+        ...(facts.approvedLinkedGitCommitId !== undefined
+          ? [{ fact: 'approval_request.status (linked, unconsumed, live)', id: facts.approvedLinkedGitCommitId, value: 'APPROVED' }]
+          : []),
+      ],
+      recoverable: false,
+      existingRecoveryAvailable: true,
+      requiresAuthorityChange: false,
+      confidence: 'high',
+      recommendedLane: 'auto_recovery',
+      technicalStop: technicalStopCode,
+      summary:
+        `Gate の技術的な不整合（${technicalStopCode}）で ${facts.job.safeCommand.kind} が停止した。`
+        + '承認の判断ではなく、未解決の技術的制約（Authority の境界ではない）。'
+        + '自動 resume は同じ不整合で再停止するだけなので行わず、CEO 判断も求めない（技術停止として見せ続ける）。'
+        + (facts.liveWaitingLinkedApprovalId !== undefined
+          // live な WAITING の間 resume は admit されない。出口は既存の承認を承認すること。
+          ? `原因を直した後、承認一覧で承認 ${facts.liveWaitingLinkedApprovalId} を承認する（承認待ちの間は resume できない）。`
+          : '原因を直した後に resume すれば再開でき、git_commit なら新しい承認が求められる。'),
+    }
+  }
+
+  // ── 6.9 承認済みなのに Worker が実行を拒んだ git_commit ─────────────────────
+  //
+  // linked Approval は APPROVED（未 consume）で、Gate は ALLOW + call_consume を返したが、Worker が
+  // Gate 段階で実行しなかった（両 Guard は通過）。下の 7 へ落とすと auto_recovery → PL resume →
+  // 新しい承認 → CEO 承認 → また同じ停止、の無限往復になりうるので、自動 recovery しない。
+  // 6.8 と同じく **CEO にも上げず**、技術停止（`technicalStop`）として既存の `technical_exhausted` に記録して
+  // 見せ続ける（specs/22 1-2 / 14-3: 技術的制約は Decision Authority の判断ではない）。
+  // **D2（2026-10-17）以後、これは Authority の境界ではなく未解決の技術的制約である。** Worker は承認済みの
+  // ALLOW + call_consume をローカルのリスクで格下げしない。Worker の技術的不整合（risk_rule_skew 等）は
+  // stderr の理由コードで上の 6.8 が先に扱うので、ここへ来るのは consume の想定外の拒否など原因コードの
+  // 無い停止だけ。unknown とし、Authority の変更は要求しない。原因を直した後の resume が出口。
+  // **Worker が送った証拠（guardResult / quarantine）が Gate 段階の拒否を示すときだけ**（Codex round 2）。
+  // Permission 拒否・File Change Guard・quarantine は既存の rule（1〜3・7）がそれぞれ扱う。保存側
+  // （`jobs.update` の停止理由）と同じ `classifyApprovedRunBlock()` で判定する。
+  if (
+    facts.job?.status === 'blocked'
+    && facts.approvedLinkedGitCommitId !== undefined
+    && classifyApprovedRunBlock(facts.job) === 'gate_refusal'
+    && !hasLiveJob(facts)
+  ) {
+    return {
+      ...result,
+      rootCauseClass: 'unknown',
+      blockingLayer: 'approval',
+      evidence: [
+        { fact: 'approval_request.status (linked, unconsumed)', id: facts.approvedLinkedGitCommitId, value: 'APPROVED' },
+        { fact: 'job.status', id: facts.job.id, value: 'blocked' },
+        { fact: 'job.stderr', id: facts.job.id, value: (facts.job.stderr ?? '').slice(0, 200) },
+      ],
+      recoverable: false,
+      existingRecoveryAvailable: true,
+      requiresAuthorityChange: false,
+      confidence: 'high',
+      recommendedLane: 'auto_recovery',
+      technicalStop: 'approved_commit_gate_refusal',
+      summary:
+        'CEO が承認し Gate も許可した git_commit を、Worker が Gate 段階で実行しなかった'
+        + '（承認は APPROVED のまま未使用）。未解決の技術的制約（consume の想定外の拒否など）で、'
+        + 'Authority の境界ではない。原因を直した後に既存の resume で再開できる。'
+        + '自動 resume は同じ停止を繰り返しうるので行わず、CEO 判断も求めない（技術停止として見せ続ける）。',
+    }
+  }
+
   if (facts.job?.status === 'blocked' && !hasLiveJob(facts)) {
     const ceoRejected = facts.ceoRejectedGitCommit === true
     return {
@@ -1087,8 +1243,10 @@ function ceoDecisionAndOptions(
         'protected な runtime / infrastructure への最小変更を、Maintenance Lane（Tier B）として '
         + '外部実行者へ出してよいか。',
       options: [
-        'Tier B として最小差分だけを外部実行者へ出し、Independent Review / CI を通して '
-        + '`reconcile_external_completion` で戻す',
+        'Tier B として最小差分だけを外部実行者へ出し、Independent Review / CI を通したら、'
+        + '先に `abort_task` で park し（Worker が worktree を観測して blocked Job を解放する）、'
+        + 'その後 `reconcile_external_completion` で戻す。'
+        + '**blocked Job が残ったままでは `TASK_HAS_BLOCKED_JOBS` で取り込めない**',
         'protected 領域に触れない代替設計を Independent Remediation へ回す',
         'この Task を park する（`abort_task`）',
       ],
@@ -1269,6 +1427,7 @@ export function formatTriageAuditDetail(diagnosis: BlockedDiagnosis): string {
   return (
     `lane=${diagnosis.recommendedLane} cause=${diagnosis.rootCauseClass} `
     + `layer=${diagnosis.blockingLayer} conf=${diagnosis.confidence}`
+    + (diagnosis.technicalStop !== undefined ? ` stop=${diagnosis.technicalStop}` : '')
   )
 }
 

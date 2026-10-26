@@ -17,9 +17,13 @@ domain fact の判断（authority / safety / lifecycle / completion / supersessi
 
 - [ ] **Semantic question**: このコードが判断している domain fact を1文で言える
 - [ ] **Canonical authority**: その意味を所有する既存の spec / policy / type / function を特定でき、
-      このコードはそこへ問い合わせている（同じ判断を自前で組み立てていない）
-- [ ] **Representation relied upon**: string shape / prefix・suffix / ID format / naming /
+      このコードはそこへ問い合わせている（同じ判断を自前で組み立てていない。2つ目の独立した
+      predicate / mapping / status 一覧 / rule の複製を新たに作っていない）
+- [ ] **Representation relied upon**: string shape / prefix・suffix / ID format / naming・表記揺れ /
       ordering・"latest" / timestamp / message text / fixture の形を、意味の代わりにしていない
+- [ ] **Distinct meanings**: この変更が新たに統合・拡張する predicate / 値 / flag について、意味が
+      異なる fact（例: can view と can edit、terminal と succeeded）を1つにまとめていない。
+      異なるなら各 fact と owner を名指しで分けている（既存の統合は対象外）
 - [ ] **Representation classification**: 依存している表現が contractual（persisted schema /
       external API / event format / stable identifier）か incidental かを区別している。
       判別できない persisted / 外部観測可能な表現は contractual として扱い、
@@ -36,7 +40,12 @@ domain fact の判断（authority / safety / lifecycle / completion / supersessi
 ## ⚪ ADVISORY（指摘するが blocking しない）
 
 - [ ] **Duplicate authority**: 同じ意味を複数の consumer がそれぞれ解釈していない
-      （新たに増やす変更なら IMPORTANT として扱う）
+      （新たに増やす変更なら上の Canonical authority として IMPORTANT で扱う）
+- [ ] **Owner placement**: この変更が触れる owner が複数ある / consumer から自然に届かない場所にある場合、
+      新しい層を足すより、owner を1つに寄せる最小の構造変更（移動 / 委譲 / 複製の削除）を提案する
+- [ ] **Same-cause consumers**: 修正対象の再推論が見つかったとき、同じ fact を解釈している他の
+      consumer が渡された material に見えるなら、それも同じ原因として挙げる
+      （根本原因の横断確認。`evidence-not-spec`。material 外の全数調査は要求しない）
 - [ ] **Test adequacy**: semantic boundary のテストが両方向ある
   - same meaning / different representation → same result
   - similar representation / different meaning → different result

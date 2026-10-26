@@ -1,5 +1,6 @@
 import Fastify, { type FastifyInstance } from 'fastify'
-import { createHash } from 'node:crypto'
+import { setCredentialClass } from '../auth/credentialClass'
+import { createHash, randomUUID } from 'node:crypto'
 import { describe, expect, it } from 'vitest'
 import { canonicalizeJobUpdate, type Job, type Task } from '@ai-team/shared'
 import { computeDesignTextHash } from '../designReviewEvidencePolicy'
@@ -33,6 +34,11 @@ async function withApp(run: (app: FastifyInstance) => Promise<void>): Promise<vo
   ])
   resetStorage()
   const app = Fastify()
+  // C-1: the Worker's result delivery is authenticated as the Worker (apiTokenAuth sets the class in
+  // production). These route tests have no auth plugin, so stand in for it on the Worker's PATCH /api/jobs/:id.
+  app.addHook('onRequest', async (req) => {
+    if (req.method === 'PATCH' && /^\/api\/jobs\/[^/?]+(\?|$)/.test(req.url)) setCredentialClass(req, 'worker')
+  })
   app.register(approvalGateRoutes, { prefix: '/api' })
   app.register(taskRoutes, { prefix: '/api/tasks' })
   app.register(jobRoutes, { prefix: '/api/jobs' })
@@ -119,7 +125,8 @@ async function gitCommitsOf(taskId: string): Promise<Job[]> {
   return (await storage()).jobs.findByTaskId(taskId).filter((job) => job.safeCommand.kind === 'git_commit')
 }
 
-async function approve(app: FastifyInstance, review: Job, payload: Record<string, unknown> = approved) {
+// The Worker delivers `success` only as an Outbox event; a direct write is refused (R-FINAL-OPPATCH).
+async function approve(app: FastifyInstance, review: Job, payload: Record<string, unknown> = withOutbox(approved, randomUUID())) {
   const res = await app.inject({ method: 'PATCH', url: `/api/jobs/${review.id}`, payload })
   expect(res.statusCode).toBe(200)
 }

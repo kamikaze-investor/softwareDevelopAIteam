@@ -43,6 +43,22 @@ beforeEach(() => {
 })
 
 describe('runRemediation', () => {
+  it('API が決めた adapter 期限を渡す（runner の外側期限より先に adapter が切れて stderr が残る）', async () => {
+    const { run } = adapterReturning({ stdout: '{"diagnosis":"d"}' })
+
+    await runRemediation(input({ timeoutMs: 870_000 }))
+
+    expect(run).toHaveBeenCalledWith(expect.objectContaining({ timeoutMs: 870_000 }))
+  })
+
+  it('期限が指定されなければ adapter の既定のまま（timeoutMs を渡さない）', async () => {
+    const { run } = adapterReturning({ stdout: '{"diagnosis":"d"}' })
+
+    await runRemediation(input())
+
+    expect(run.mock.calls[0]?.[0]).not.toHaveProperty('timeoutMs')
+  })
+
   it('model が空なら実行しない（CLI 既定モデルへ落とさない）', async () => {
     const { run } = adapterReturning({ stdout: '{}' })
 

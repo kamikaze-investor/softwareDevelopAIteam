@@ -53,6 +53,8 @@ import {
   type ExecuteDesignReviewResult,
 } from '../designReview/designReviewCoordinator'
 import { executeQueuedRun, toExecuteDesignReviewResult } from '../designReview/queuedRunDispatch'
+import { designReviewRetryNotBeforeMs } from '../designReview/retryCooldown'
+import { resolveReviewedImplementation } from '../designReview/repairFlow'
 import {
   CHEAP_AI_PROPOSER_ID,
   PL_ADOPTION_PROPOSAL_AGENT,
@@ -89,9 +91,6 @@ import {
 import { requestTechnicalAbort } from './abortTask'
 import {
   countConflictAttempts,
-  countRemediationAttempts,
-  findRemediationSubject,
-  PL_MAX_REMEDIATION_ATTEMPTS,
   recordRemediationFailure,
   runRemediationStep,
   type PlRemediationDeps,
@@ -102,14 +101,15 @@ import {
   type ConflictResolutionDeps,
 } from './conflictResolutionStep'
 import type { AuditLogEntry } from '@ai-team/shared'
-import type { IStorage } from '../storage/interface'
-import { recordResumeActor } from '../designReview/resumeActor'
-import { resumeBlockedTaskWithDesignReview } from '../designReview/resumeBlockedTask'
+import type { DesignReviewRun, IStorage } from '../storage/interface'
+import { computeDesignTextHash, isUsableAlignedEvidence } from '../designReviewEvidencePolicy'
+import { RESUME_DESIGN_REVIEW_PENDING, resumeBlockedTaskWithDesignReview } from '../designReview/resumeBlockedTask'
 import {
   countPlTechnicalResumes,
   PL_MAX_TECHNICAL_RESUMES_PER_TASK,
   taskTechnicalResumeAuditKey,
   technicalRecoveryTargetKey,
+  findPlTargetAuditEntries,
   technicalResumeBudget,
 } from './technicalResumePolicy'
 import {
@@ -121,6 +121,7 @@ import {
 import {
   authorizePlAction,
   PlActionBlockedError,
+  requiredApprovalRequestAction,
   requiredTargetKindFor,
   type GateEvidenceRef,
   type PlActionTarget,
@@ -162,6 +163,19 @@ const ACTIONABLE_ATTENTION_KINDS: readonly AttentionItem['kind'][] = [
   // （CEO 決定・2026-09-18）ので PL に実行させない。ここに載せるのは「CEO へ届ける」ためだけで、
   // 外すと `GET /api/state` には出るが誰も知らせないまま止まり続ける。
   'task_blocked_without_job',
+  // workspace quarantine。**通知だけ**する（下の NOTIFY_ONLY 参照）。解除は観測 + known-good を
+  // 要求する既存経路に限り、PL には実行させない。ここに無かったため PL は一度も escalate せず、
+  // 一方で採用は「全 attention が escalate 済み / exhausted」を要求するので、**どこか1件の
+  // quarantine が全 Project の採用を通知なしに止めていた**（lifecycle repair W5）。
+  'workspace_quarantined',
+  // 自力では進まない所有者（paused / draft Project の Job、done / park された Task の blocked 行）が
+  // 共有 workspace を握り、running Project の claim が止まっている。**通知だけ**する。
+  // 解消（Project の再開・放棄、既存 abort_task の観測による解放）は CEO の判断（lifecycle repair W5）。
+  'workspace_held_by_stalled_owner',
+  // running Project の queued Job が閾値を過ぎても claim されず、他の attention も説明していない。
+  // **通知だけ**する（Worker の停止・所有権 ambiguous を PL は直せない）。referenceId = Job id なので
+  // 同じ Job は1回だけ届く（lifecycle repair C2 / RC5）。
+  'job_queued_long',
   // blocked は notify-only にしない。blocked reason を読んで sanctioned な復旧を選ばせる
   // （CEO 指示・2026-09-15）。executor が無い・判断不能なら fail-closed で Escalation へ倒れる。
   'job_blocked',
@@ -187,6 +201,10 @@ const ATTENTION_PRIORITY: readonly AttentionItem['kind'][] = [
   // blocked かつ Job 0 件は、他のどの経路からも解消できない（人の明示操作だけが解く）ため
   // 早く人へ届ける。**ここに無いと `selectTarget()` が走査せず永久に選ばれない。**
   'task_blocked_without_job',
+  // quarantine も人の判断（観測と再受け入れ）だけが解く。1回だけ CEO へ届ける。
+  'workspace_quarantined',
+  'workspace_held_by_stalled_owner',
+  'job_queued_long',
   // blocked は workflow を止めているので早く見る。
   // **`ACTIONABLE_ATTENTION_KINDS` に入れてもここに無ければ永久に選ばれない**（selectTarget が
   // この順序を走査するため）。両方に入れること。
@@ -350,6 +368,33 @@ export interface PlLoopDeps {
  */
 let inFlight = false
 
+/**
+ * **audit に試行を残せないときの、プロセス内の対象別試行カウンタ**（Codex round 3）。
+ *
+ * 試行回数と technical_exhausted は audit（SQLite）に残すのが正本だが、DB の書き込み経路そのものが
+ * 壊れている（インフラ障害）と、それも残せず同じ対象を毎 tick 無限に試すことになる。対象の処理が例外で
+ * 終わったら（＝書き込みに失敗した）ここで数え、同じ `PL_MAX_ATTEMPTS_PER_TARGET` で打ち切る。
+ * プロセス再起動でリセットされる（障害が直っていれば audit の正本に戻る）。正常時は増えない。
+ */
+const inProcessFailedAttempts = new Map<string, number>()
+const inProcessFallbackLogged = new Set<string>()
+
+function hasExhaustedInProcessAttempts(targetKey: string): boolean {
+  return (inProcessFailedAttempts.get(targetKey) ?? 0) >= PL_MAX_ATTEMPTS_PER_TARGET
+}
+
+function recordInProcessFailedAttempt(targetKey: string, error: unknown): void {
+  inProcessFailedAttempts.set(targetKey, (inProcessFailedAttempts.get(targetKey) ?? 0) + 1)
+  if (inProcessFallbackLogged.has(targetKey)) return
+  inProcessFallbackLogged.add(targetKey)
+  // 対象ごとに1回だけ。error の message だけを出す（payload / 秘密は載せない）。
+  console.error(
+    `[pl-loop] handling target ${targetKey} failed (audit/storage write may be failing); using the `
+    + `in-process attempt counter, bound=${PL_MAX_ATTEMPTS_PER_TARGET}: `
+    + `${error instanceof Error ? error.message : String(error)}`.slice(0, 500),
+  )
+}
+
 /** 直前の tick が Operator Request を処理したか（自律ループとの交互実行に使う）。 */
 let lastTickHandledOperatorRequest = false
 
@@ -370,6 +415,14 @@ const NOTIFY_ONLY_ATTENTION_KINDS: readonly AttentionItem['kind'][] = [
   // `PL_ACTION_KINDS` に対応する語彙が無いため、仮にここから外しても PL は
   // `forbidden` にしか到達できない。二重に閉じている。
   'task_blocked_without_job',
+  // workspace quarantine。**PL には直せない**（解除は Worker の観測 + known-good を要する既存経路だけ）。
+  // 1回 escalate すれば `hasEscalated()` で以後は「CEO 判断待ち」として数えられ、
+  // その Project 以外の採用を止めなくなる。解除条件そのものはここでは一切変えない。
+  'workspace_quarantined',
+  // 進まない所有者が workspace を握っている。PL には Project の再開・放棄も stale 行の解放もできない。
+  'workspace_held_by_stalled_owner',
+  // claim されない queued Job。PL には Worker の再起動も所有権の観測もできない。
+  'job_queued_long',
 ]
 
 /**
@@ -408,19 +461,91 @@ function hasStalledLongEnough(item: AttentionItem): boolean {
  * 自律 tick の選択と Operator Request からの対象指定の**両方がこの1つを使う**。
  * Operator Request はこの条件を緩めない（Escalation 済み・停滞前の対象は依頼があっても扱わない）。
  */
-function isActionableNow(storage: IStorage, item: AttentionItem): boolean {
+function isActionableNow(storage: IStorage, item: AttentionItem, resumeInstruction?: string): boolean {
   return (
     ACTIONABLE_ATTENTION_KINDS.includes(item.kind)
     // **Independent Remediation は Escalation 済みでも対象にする。**
     // `hasEscalated()` は Task の生涯にわたる記録で、キー（`task_ready_without_job:<taskId>`）は
     // 変わらない。CONFLICT はまず notify-only で1回 Escalate されるため、ここを素通しに
     // しないと **Remediation が構造的に一度も走れない**（既に止まっている本番 Task も含む）。
-    // 予算は `countRemediationAttempts()` が却下テキスト単位で別に持つので、
+    // 予算は `selectConflictStage()` が却下テキスト単位で別に持つので、
     // 通知が鳴り続けることはない。
     && (!hasEscalated(storage, targetKeyOf(item)) || isRemediableConflict(storage, item))
     && !hasExhaustedTargetTechnicalRecovery(storage, item)
+    && !hasExhaustedInProcessAttempts(targetKeyOf(item))
     && hasStalledLongEnough(item)
+    && designReviewRetryWaitUntil(storage, item, resumeInstruction) === undefined
   )
+}
+
+/** retry cooldown を待つ間、PL が診断を回さない attention kind（どちらも resume で同じ run を再実行する）。 */
+const WAITS_FOR_DESIGN_REVIEW_RETRY_KINDS: readonly AttentionItem['kind'][] = ['job_blocked', 'job_failed']
+
+/**
+ * その Task の直近 Design Review run が、判定の出なかった attempt の後の retry cooldown 中なら
+ * 明ける時刻（ISO）。そうでなければ undefined。
+ *
+ * cooldown 中は `claim()` が拒むので、resume しても同じ run は動かず pending になるだけである。
+ * そこへ毎 tick provider 診断を払わない（lifecycle repair C3-c）。**待つだけで、試行も Escalation も
+ * 記録しない。** 判定は `claim()` と同じ壁時計で行う（「いま claim できるか」と同じ問い）。
+ * cooldown が明ければ undefined になり、従来の選択（`design_review_idle` の rekick を含む）へ戻るので、
+ * 配線済みの executor を先取りしない。
+ *
+ * **待たせるのは、その Job の復旧がこの run に依存すると記録から証明できるときだけ**
+ * （`isRetryRunLinkedToAttentionJob()`）。証明できなければ従来どおり actionable のまま残す
+ * （同じ Task の無関係な Job の停止を、最大 30 分黙らせない。独立レビュー指摘・C3-c）。
+ */
+function designReviewRetryWaitUntil(
+  storage: IStorage,
+  item: AttentionItem,
+  resumeInstruction: string | undefined,
+): string | undefined {
+  if (item.taskId === undefined || !WAITS_FOR_DESIGN_REVIEW_RETRY_KINDS.includes(item.kind)) return undefined
+  const run = storage.designReviewRuns.findLatestByTaskId(item.taskId)
+  if (run === undefined) return undefined
+  const notBeforeMs = designReviewRetryNotBeforeMs(run)
+  if (notBeforeMs === undefined || Date.now() >= notBeforeMs) return undefined
+  return isRetryRunLinkedToAttentionJob(storage, run, item, resumeInstruction)
+    ? new Date(notBeforeMs).toISOString()
+    : undefined
+}
+
+/**
+ * attention の Job の復旧が、この Design Review run の判定を待っていることを、保存済みの
+ * 同一性・lineage だけで証明する。どれにも当たらなければ false（= 待たせない）。
+ *
+ * - **repair 目的の run**（`repairSourceJobId` あり）: attention の Job がその source 実装 Job 自身か、
+ *   その実装を review した Job（`resolveReviewedImplementation()` の lineage）である。
+ * - **resume review**（`repairSourceJobId` なし）: run の `resumeSourceJobId`（resume-with-design-review が
+ *   起票時に、resume しようとした Job の id を記録したもの）が attention の Job と**完全一致**する。
+ *   timestamp や「最新 Job」からは推論しない（RC1）。NULL（legacy・他経路の run）は証明なし。
+ *   後から来た別の Job は id が一致しないので、同じ Task でも actionable のまま残る。
+ *   さらに run の `designTextHash` が、PL がこの Job に使う resume prompt
+ *   （`buildPlResumeAiCliPrompt(task, resumeInstruction)`）の hash と一致すること。別の instruction
+ *   （例: Human resume の run）なら PL の resume はその run を待たないので待たせない。
+ */
+function isRetryRunLinkedToAttentionJob(
+  storage: IStorage,
+  run: DesignReviewRun,
+  item: AttentionItem,
+  resumeInstruction: string | undefined,
+): boolean {
+  const job = item.jobId === undefined ? undefined : storage.jobs.findById(item.jobId)
+  if (job === undefined || job.taskId !== item.taskId) return false
+
+  if (run.repairSourceJobId !== undefined) {
+    if (job.id === run.repairSourceJobId) return true
+    if (job.aiCliMode !== 'review') return false
+    const reviewed = resolveReviewedImplementation(storage, job.id)
+    return reviewed.ok && reviewed.implementJob.id === run.repairSourceJobId
+  }
+
+  if (run.resumeSourceJobId === undefined || run.resumeSourceJobId !== job.id) return false
+  const task = storage.tasks.findById(job.taskId)
+  return task !== undefined
+    && run.designTextHash === computeDesignTextHash(
+      buildPlResumeAiCliPrompt(task, resumeInstruction ?? DEFAULT_RESUME_INSTRUCTION),
+    )
 }
 
 /**
@@ -450,6 +575,19 @@ function technicalRecoveryExhaustion(
   }
 
   const targetAttempts = countPriorAttempts(storage, targetKeyOf(item))
+  // Gate 段階の技術停止（triage rule 6.8）は自動 recovery の budget が最初から 0 である: AI の resume は
+  // 同じ不整合で再停止するだけで、CEO 判断の対象でもない（specs/22 1-2 / 14-3）。最初の観測で対象単位の
+  // technical_exhausted として記録し（理由コードは detail の `stop=`）、attention には残したまま自動試行から外す。
+  // 原因を直した後の明示 resume は新しい Job を作るので、この記録には縛られない。
+  if (diagnosis.technicalStop !== undefined) {
+    return {
+      scope: 'target',
+      auditKey: targetKeyOf(item),
+      attempts: targetAttempts,
+      limit: 0,
+      diagnosis,
+    }
+  }
   if (targetAttempts >= PL_MAX_ATTEMPTS_PER_TARGET) {
     return {
       scope: 'target',
@@ -486,11 +624,11 @@ function recordTechnicalRecoveryExhaustion(
   item: AttentionItem,
   exhaustion: TechnicalRecoveryExhaustion,
 ): void {
-  const prior = storage.auditLog.findByEntity(AUDIT_ENTITY_TYPE, exhaustion.auditKey)
+  // legacy な Task 単位キーの exhaustion も同じ target のものとして数える（findPlTargetAuditEntries）。
+  const prior = findPlTargetAuditEntries(storage, exhaustion.auditKey)
   if (prior.some((entry) =>
     entry.operation === AUDIT_OPERATION
     && entry.entityType === AUDIT_ENTITY_TYPE
-    && entry.entityId === exhaustion.auditKey
     && entry.result === 'technical_exhausted')) return
 
   storage.auditLog.record({
@@ -608,8 +746,7 @@ function selfResolutionBlockedReason(diagnosis: BlockedDiagnosis): string {
 const STRUCTURED_AUDIT_FIELDS = /\b(?:lane|cause|layer|conf|kind|adoption|code)=[^\s]+/g
 
 function attemptHistoryFor(storage: IStorage, targetKey: string): string[] {
-  return storage.auditLog
-    .findByEntity(AUDIT_ENTITY_TYPE, targetKey)
+  return findPlTargetAuditEntries(storage, targetKey)
     .filter((entry) => ATTEMPT_RESULTS.includes(entry.result))
     .slice(0, PL_ESCALATION_HISTORY_LINES)
     .reverse()
@@ -627,8 +764,10 @@ function attemptHistoryFor(storage: IStorage, targetKey: string): string[] {
  */
 function isRemediableConflict(storage: IStorage, item: AttentionItem): boolean {
   if (item.kind !== 'task_ready_without_job' || item.taskId === undefined) return false
-  if (findRemediationSubject(storage, item.taskId) === undefined) return false
-  return countRemediationAttempts(storage, item.taskId) < PL_MAX_REMEDIATION_ATTEMPTS
+  // **予算判定は `selectConflictStage()` へ一本化する**（subject の有無もそこが見る）。
+  // 判定数と技術的失敗数は `tallyConflictStage()` が Round 単位で分けて数え、どれかの stage が
+  // まだ使えるなら対象にする。判定 0 件の runner_failed だけで対象外にしない（2026-10-23 `#2cae0d07`）。
+  return selectConflictStage(storage, item.taskId).stage !== 'terminal'
 }
 
 /**
@@ -662,7 +801,7 @@ async function remediateConflict(
   } catch (error: unknown) {
     const message = error instanceof Error ? error.message : String(error)
     // **例外も Remediation の試行として数える。** PL target 側だけに記録すると
-    // `countRemediationAttempts()` が 0 のままで対象から外れず、再現する例外
+    // 試行が0行のままで対象から外れず、再現する例外
     // （runner の spawn 失敗等）を毎 tick 繰り返す。
     //
     // ただし **step 側が既にこの試行を計上していたら足さない。** step は採用を await する前に
@@ -686,6 +825,15 @@ async function remediateConflict(
   const reason = result?.reason ?? round.reason
   const provider = result?.provider ?? round.criticProvider
   const model = result?.model ?? round.criticModel
+
+  // **fresh Review がまだ判定を出していない（requeued）。** 否定的な判定ではないので
+  // 試行として数えず（'idle' は ATTEMPT_RESULTS に入らない）、escalation もしない。
+  // queued run は design_review_idle → rekick で再開され、ALIGNED なら既存
+  // `recoverReadyTasksWithoutJob()` が Job を作る。CONFLICT ならこの Round の続きがそこから始まる。
+  if (status === 'review_pending') {
+    record(storage, key, 'idle', `stage=${round.stage} outcome=${status} ${reason ?? ''}`)
+    return { status: 'idle', reason: `design review pending (stage=${round.stage}): ${reason ?? ''}` }
+  }
 
   /** 設計が既存 Review Pipeline を通って実装へ進める状態になったか。 */
   const resolved = status === 'remediated'
@@ -779,7 +927,7 @@ import {
  * PL の自律ループがその attention をどう扱っているかの**読み取り専用**の要約。
  * Operator Request への回答材料であり、ループの判断そのものには使わない。
  */
-function describePlLoopStatus(storage: IStorage, item: AttentionItem) {
+function describePlLoopStatus(storage: IStorage, item: AttentionItem, resumeInstruction?: string) {
   const key = targetKeyOf(item)
   return {
     handledByPlLoop: ACTIONABLE_ATTENTION_KINDS.includes(item.kind),
@@ -787,7 +935,7 @@ function describePlLoopStatus(storage: IStorage, item: AttentionItem) {
     priorAttempts: countPriorAttempts(storage, key),
     maxAttempts: PL_MAX_ATTEMPTS_PER_TARGET,
     escalatedToCeo: hasEscalated(storage, key),
-    actionableNow: isActionableNow(storage, item),
+    actionableNow: isActionableNow(storage, item, resumeInstruction),
   }
 }
 
@@ -809,18 +957,20 @@ async function actOnOperatorTarget(
     return { attempted: false, status: 'not_found', reason: 'the target is no longer an attention item' }
   }
   observeTechnicalRecoveryExhaustion(storage, item)
-  if (!isActionableNow(storage, item)) {
+  if (!isActionableNow(storage, item, deps.resumeInstruction)) {
     const reason = !ACTIONABLE_ATTENTION_KINDS.includes(item.kind)
       ? `the PL has no executor for ${item.kind}; it is only observed`
       : hasEscalated(storage, targetKeyOf(item)) && !isRemediableConflict(storage, item)
         ? 'already escalated to the CEO; the PL waits for the CEO decision'
         : hasExhaustedTargetTechnicalRecovery(storage, item)
           ? 'technical recovery budget exhausted; the PL will not resume this target'
-          : 'not stalled long enough yet; the PL will look at it automatically'
+          : designReviewRetryWaitUntil(storage, item, deps.resumeInstruction) !== undefined
+            ? `the Design Review retry is cooling down until ${designReviewRetryWaitUntil(storage, item, deps.resumeInstruction)}; the PL will look at it automatically`
+            : 'not stalled long enough yet; the PL will look at it automatically'
     return { attempted: false, status: 'not_eligible', reason }
   }
 
-  const result = await handleTarget(storage, deps, item, state)
+  const result = await handleTargetBounded(storage, deps, item, state)
   return {
     attempted: true,
     status: result.status,
@@ -832,14 +982,12 @@ async function actOnOperatorTarget(
 }
 
 export function countPriorAttempts(storage: IStorage, targetKey: string): number {
-  return storage.auditLog
-    .findByEntity(AUDIT_ENTITY_TYPE, targetKey)
+  return findPlTargetAuditEntries(storage, targetKey)
     .filter((entry) => ATTEMPT_RESULTS.includes(entry.result)).length
 }
 
 function hasEscalated(storage: IStorage, targetKey: string): boolean {
-  return storage.auditLog
-    .findByEntity(AUDIT_ENTITY_TYPE, targetKey)
+  return findPlTargetAuditEntries(storage, targetKey)
     .some((entry) => entry.result === 'escalated')
 }
 
@@ -1129,6 +1277,7 @@ export function buildPlResumeAiCliPrompt(
 function collectSystemEvidence(
   storage: IStorage,
   item: AttentionItem,
+  actionKind: string,
 ): GateEvidenceRef[] {
   if (item.taskId === undefined) return []
 
@@ -1148,14 +1297,21 @@ function collectSystemEvidence(
   //
   // 最新が ALIGNED でない / task-kind でない場合は**何も積まない**（古いものへ遡らない）。
   const latest = storage.designReviewEvidence.findLatestByTaskId(item.taskId)
-  if (latest?.decision === 'ALIGNED' && latest.reviewKind === 'task') {
+  // 新しい同じ設計の判定に覆された ALIGNED は積まない（isUsableAlignedEvidence）。
+  if (latest?.reviewKind === 'task' && isUsableAlignedEvidence(latest, storage.designReviewEvidence)) {
     evidence.push({ gate: 'design_review', designReviewEvidenceId: latest.id })
   }
 
-  // Approval Gate: **承認済み**の approval request だけを積む。
+  // Approval Gate: **今実行しようとしている action 向けの承認済み** approval request だけを積む。
   // WAITING / STALE / EXPIRED は充足ではないので積まない（seam 側でも弾かれる）。
-  const approval = storage.approvalRequests.findActiveByTaskId(item.taskId)
-  if (approval?.status === 'APPROVED') {
+  //
+  // 以前は Task の最新 active 行をそのまま積んでいた。最新行が別 action の WAITING だと、同じ Task に
+  // この action 向けの APPROVED があっても積めず、逆に最新行が別 action の APPROVED だとそれを根拠に
+  // していた（2026-10-16 監査 RC6）。action は seam と同じ `requiredApprovalRequestAction()` で決める。
+  const expectedAction = requiredApprovalRequestAction(actionKind)
+  const approval = storage.approvalRequests.findByTaskId(item.taskId)
+    .find((request) => request.status === 'APPROVED' && request.requestedAction === expectedAction)
+  if (approval !== undefined) {
     evidence.push({ gate: 'approval_gate', approvalRequestId: approval.id })
   }
 
@@ -1209,8 +1365,17 @@ function tailText(value: string | undefined, max: number): string | undefined {
  * **ここに載せることは「実行してよい」を意味しない。** 可否は必ず `authorizePlAction()` が決める。
  * 載せるのは「PL に考えさせる選択肢」であり、Gate に落ちれば実行されない。
  * 一覧に無い値を PL が出した場合は Policy が未知値として forbidden にする。
+ *
+ * **このループに executor が配線された action だけを返す**（`PL_ACTION_EXECUTORS` が唯一の正本）。
+ * 以前は `retry_job` / `clear_workspace_quarantine` も候補に並び、PL が選ぶと Gate を通っても
+ * `no executor wired` で失敗して attempt を焼き、最後は誰にも知らされない `technical_exhausted`
+ * に落ちていた（lifecycle repair W5）。候補の意図は下の一覧に残し、提示は配線済みに絞る。
  */
 export function allowedActionsFor(kind: AttentionItem['kind']): readonly string[] {
+  return candidateActionsFor(kind).filter(hasWiredPlExecutor)
+}
+
+function candidateActionsFor(kind: AttentionItem['kind']): readonly string[] {
   switch (kind) {
     case 'design_review_idle':
     case 'design_review_failed':
@@ -1425,25 +1590,43 @@ export function verifyOutcome(
   return 'normalized'
 }
 
-async function executeAction(
+type PlActionExecutor = (
   storage: IStorage,
-  kind: string,
   item: AttentionItem,
   deps: Required<Pick<PlLoopDeps, 'rekickDesignReview'>> & PlLoopDeps,
   technicalResume: boolean,
-): Promise<{ ok: boolean; summary: string }> {
-  if (kind === 'escalate_to_ceo') {
+) => Promise<{ ok: boolean; summary: string; stale?: boolean; pending?: boolean }>
+
+/**
+ * このループで実際に実行できる action と、その executor。
+ *
+ * **PL に提示する候補（`allowedActionsFor()`）はこの表から導く。** 一覧を手で写すと、
+ * executor の無い action が候補に残り、選ばれるたびに attempt を焼いて黙って枯渇する
+ * （lifecycle repair W5）。executor を足すときはここに足せば候補にも現れる。
+ */
+const PL_ACTION_EXECUTORS: Readonly<Record<string, PlActionExecutor>> = {
+  escalate_to_ceo: async () => {
     // Escalation は「実行」ではなく報告である。ここでは成功扱いにせず、呼び出し側が escalated を返す。
     return { ok: true, summary: 'escalation requested by PL' }
-  }
+  },
 
-  if (kind === 'rekick_design_review') {
+  rekick_design_review: async (storage, item, deps) => {
     if (item.taskId === undefined) {
       return { ok: false, summary: 'attention has no taskId; cannot locate the design review run' }
     }
-    const run = storage.designReviewRuns.findLatestByTaskId(item.taskId)
-    if (!run) {
-      return { ok: false, summary: `no design review run for task ${item.taskId}` }
+    // **attention が名指した run だけを動かす。** 診断（await）の間に run が差し替わる・
+    // 状態が進むことがある。Task の最新 run を引き直すと、PL が見ていない別 episode の run を
+    // rekick してしまう。名指した run がもう actionable でなければ stale として何もせず、
+    // 試行も消費しない（呼び出し側が audit を書かない）。
+    const run = item.referenceId !== undefined ? storage.designReviewRuns.findById(item.referenceId) : undefined
+    if (!run || run.taskId !== item.taskId) {
+      return { ok: false, stale: true, summary: `design review run ${item.referenceId ?? '(none)'} is not this task's attention run` }
+    }
+    const stillActionable = item.kind === 'design_review_idle'
+      ? run.status === 'queued' && run.startedAt === undefined
+      : item.kind === 'design_review_failed' && run.status === 'failed'
+    if (!stillActionable) {
+      return { ok: false, stale: true, summary: `design review run ${run.id} is no longer ${item.kind} (status=${run.status})` }
     }
     // **盲目的な re-kick をしない**（CEO 指示）。attempt を使い切った run は再実行しても
     // `not_claimable` になるだけなので、Escalation 側へ倒す。
@@ -1456,16 +1639,16 @@ async function executeAction(
 
     const result = await deps.rekickDesignReview(storage, run.id)
     return { ok: result.status !== 'stale', summary: `design review rekick: ${result.status}` }
-  }
+  },
 
-  if (kind === 'observe_state') {
+  observe_state: async () => {
     // 「待つ」。既存の復旧が進行中だと PL が判断した場合。何も実行しない。
     // 状態が変わらなければ verification が `unchanged` になり、technical budget 到達を
     // `technical_exhausted` audit に残して以後の自動試行を止める。
     return { ok: true, summary: 'waiting: PL judged that an existing recovery is already in progress' }
-  }
+  },
 
-  if (kind === 'resume_task') {
+  resume_task: async (storage, item, deps, technicalResume) => {
     if (item.taskId === undefined) {
       return { ok: false, summary: 'attention has no taskId; cannot resume' }
     }
@@ -1484,26 +1667,68 @@ async function executeAction(
         task,
         deps.resumeInstruction ?? DEFAULT_RESUME_INSTRUCTION,
       ),
+      // **この経路は定義上 PL である。** PL は in-process で動き HTTP credential を持たない
+      // ので、route 側の認証では区別できない。ここで `pl` と記録しておくことで、
+      // repair budget の generation 境界がこの resume を跨がない（予算は再発行されない）。
+      // 記録は storage が resume Job の作成と同じ transaction で書く（G-01）。
+      resumedBy: {
+        actorClass: 'pl',
+        evidence: 'in_process_pl',
+        ...(technicalResume ? { technicalResume: true } : {}),
+      },
       ...(deps.coordinatorDeps !== undefined ? { coordinatorDeps: deps.coordinatorDeps } : {}),
     })
+    // 判定がまだ出ていない Design Review は否定ではない。試行を消費せず、attention を残す。
+    // 次の tick で同じ（決定的な）instruction を再送すれば、active-run dedup で同じ run が
+    // 再開され、ALIGNED evidence があれば resume が通る。
+    if (!resumed.ok && resumed.code === RESUME_DESIGN_REVIEW_PENDING) {
+      return { ok: false, pending: true, summary: `resume pending: ${resumed.reason}` }
+    }
+    // authority evidence が書けず resume ごと rollback された（何も変わっていない）。再試行は安全だが、
+    // 永続的な書き込み失敗なら毎 tick 黙って繰り返すことになる（Codex round 2）。pending にせず
+    // 技術的な失敗の試行として数え、既存の technical budget で止める（尽きれば technical_exhausted）。
+    if (!resumed.ok && resumed.code === 'RESUME_COMMIT_FAILED') {
+      return { ok: false, summary: `resume commit failed (technical; retried within the technical budget): ${resumed.reason}` }
+    }
+    // 生きた人の判断（APPROVED / WAITING の abort_task 等）がある。PL はそれを上書きしない。
+    // 正当な人の判断待ちなので試行を消費せず（idle）、escalation も起こさない。
+    // Design Review を待つ間に resume 対象が変わった（何も作られていない）。否定ではないので試行を消費せず、
+    // 次の tick で新しい対象に対して改めて判断する（C3-c）。
+    if (!resumed.ok && resumed.code === 'RESUME_TARGET_CHANGED') {
+      return { ok: false, pending: true, summary: `resume pending: ${resumed.reason}` }
+    }
+    if (!resumed.ok && resumed.code === 'HUMAN_DECISION_PENDING') {
+      return { ok: false, pending: true, summary: `resume waiting for a human decision: ${resumed.reason}` }
+    }
+    // 進行中の repair Design Review run が Task を動かしている。試行を消費せずに待つ（lifecycle repair C3 / D3-1）。
+    if (!resumed.ok && resumed.code === 'REPAIR_REVIEW_IN_FLIGHT') {
+      return { ok: false, pending: true, summary: `resume waiting for the in-flight repair review: ${resumed.reason}` }
+    }
     if (!resumed.ok) {
       return { ok: false, summary: `resume refused: ${resumed.reason}` }
     }
-    // **この経路は定義上 PL である。** PL は in-process で動き HTTP credential を持たない
-    // ので、route 側の認証では区別できない。ここで `pl` と記録しておくことで、
-    // repair budget の generation 境界がこの resume を跨がない（予算は再発行されない）。
-    recordResumeActor(storage, {
-      jobId: resumed.job.id,
-      taskId: item.taskId,
-      actorClass: 'pl',
-      evidence: 'in_process_pl',
-      ...(technicalResume ? { technicalResume: true } : {}),
-    })
     return { ok: true, summary: `resume queued job ${resumed.job.id}` }
-  }
+  },
+}
 
-  // Gate は通ったが v1 に executor が無い操作。**勝手に別の操作で代替しない。**
-  return { ok: false, summary: `no executor wired for '${kind}' in this loop version` }
+/** その action にこのループの executor が配線されているか。 */
+export function hasWiredPlExecutor(kind: string): boolean {
+  return Object.prototype.hasOwnProperty.call(PL_ACTION_EXECUTORS, kind)
+}
+
+async function executeAction(
+  storage: IStorage,
+  kind: string,
+  item: AttentionItem,
+  deps: Required<Pick<PlLoopDeps, 'rekickDesignReview'>> & PlLoopDeps,
+  technicalResume: boolean,
+): ReturnType<PlActionExecutor> {
+  const executor = hasWiredPlExecutor(kind) ? PL_ACTION_EXECUTORS[kind] : undefined
+  if (executor === undefined) {
+    // 候補には出さないが、念のため残す。**勝手に別の操作で代替しない。**
+    return { ok: false, summary: `no executor wired for '${kind}' in this loop version` }
+  }
+  return executor(storage, item, deps, technicalResume)
 }
 
 /**
@@ -1545,7 +1770,7 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
     const operatorRequest = lastTickHandledOperatorRequest ? undefined : await runOperatorRequestStep(storage, {
       ...(deps.answerOperatorRequest ? { answer: deps.answerOperatorRequest } : {}),
       escalate: deps.escalate ?? defaultEscalate,
-      describePlLoopStatus: (target) => describePlLoopStatus(storage, target),
+      describePlLoopStatus: (target) => describePlLoopStatus(storage, target, deps.resumeInstruction),
       targetKeyOf,
       actOnTarget: (targetKey) => actOnOperatorTarget(storage, deps, targetKey),
       ...(deps.now ? { now: deps.now } : {}),
@@ -1571,7 +1796,7 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
     // 実測 25 秒）を走らせ、最後に「already escalated」で捨てることになる。
     // CEO の判断待ちの間ずっとモデル枠を焼く挙動であり、
     // 「一時的・既知の異常による不要な PL 起動を減らす」という本項目の目的に反する。
-    const actionable = before.attention.filter((item) => isActionableNow(storage, item))
+    const actionable = before.attention.filter((item) => isActionableNow(storage, item, deps.resumeInstruction))
     const item = selectTarget(actionable)
     if (!item) {
       // **手が空いたら次の Roadmap 項目を採用する。**
@@ -1604,9 +1829,30 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
       }
     }
 
-    return await handleTarget(storage, deps, item, before)
+    return await handleTargetBounded(storage, deps, item, before)
   } finally {
     inFlight = false
+  }
+}
+
+/**
+ * `handleTarget()` の唯一の呼び出し口（自律 tick と Operator Request の両方）。
+ *
+ * 例外は従来どおり呼び出し側へ返す。ただし audit に試行を残せていない可能性があるので、
+ * プロセス内で数えて同じ上限で打ち切る（DB 書き込み障害で無限に再試行しない。Codex round 3/4）。
+ * 上限に達した対象は `isActionableNow()` が外すので、どちらの経路からも再び選ばれない。
+ */
+async function handleTargetBounded(
+  storage: IStorage,
+  deps: PlLoopDeps,
+  item: AttentionItem,
+  before: SystemStateSnapshot,
+): Promise<PlTickResult> {
+  try {
+    return await handleTarget(storage, deps, item, before)
+  } catch (error: unknown) {
+    recordInProcessFailedAttempt(targetKeyOf(item), error)
+    throw error
   }
 }
 
@@ -1661,7 +1907,15 @@ async function handleTarget(
   // `protected_path` だけが、現 Task の通常 Executor では recovery が変えられない
   // high-confidence / Task-caused / non-transient class。回数枯渇では発火しない。
   // HTTP ADMIN /abort はこの経路を通らず、従来どおり APPROVED approval_gate を要求する。
-  if (diagnosis.rootCauseClass === 'protected_path' && item.taskId !== undefined) {
+  // `workspace_quarantined` は notify-only として届けるだけにする（W5 で通知対象に加えたが、
+  // 隔離中の workspace に対して cleanup を伴う Abort を新たに起こさない）。
+  if (
+    diagnosis.rootCauseClass === 'protected_path'
+    && item.taskId !== undefined
+    && item.kind !== 'workspace_quarantined'
+    && item.kind !== 'workspace_held_by_stalled_owner'
+    && item.kind !== 'job_queued_long'
+  ) {
     const abort = requestTechnicalAbort(storage, {
       taskId: item.taskId,
       attention: item,
@@ -1720,7 +1974,9 @@ async function handleTarget(
       status: 'idle',
       target,
       triage,
-      reason: `${exhaustion.scope} technical recovery budget exhausted; CEO decision was not requested by count`,
+      reason: exhaustion.diagnosis.technicalStop !== undefined
+        ? `technical Gate stop (${exhaustion.diagnosis.technicalStop}) is not auto-recovered; CEO decision was not requested`
+        : `${exhaustion.scope} technical recovery budget exhausted; CEO decision was not requested by count`,
       attempt,
     }
   }
@@ -1819,7 +2075,7 @@ async function handleTarget(
       target: plActionTarget,
       // 根拠は**システムが観測した実レコード**から積む。PL の申告は渡さない。
       // 該当が無ければ空のままで、Gate が missing として止める（fail-closed）。
-      evidence: collectSystemEvidence(storage, item),
+      evidence: collectSystemEvidence(storage, item, proposal.kind),
     })
   } catch (error: unknown) {
     if (error instanceof PlActionBlockedError) {
@@ -1875,6 +2131,19 @@ async function handleTarget(
         )
       }),
   }, diagnosis.rootCauseClass === 'review_execution_failed')
+
+  // 対象が既に actionable でない（run の差し替え等）、または Design Review の判定がまだ出ていない
+  // （pending）。どちらも否定的な結果ではなく何も実行していないので、試行として記録しない。
+  if (execution.stale || execution.pending) {
+    return {
+      status: 'idle',
+      target,
+      triage,
+      proposedKind: proposal.kind,
+      reason: execution.stale ? `stale target: ${execution.summary}` : execution.summary,
+      attempt,
+    }
+  }
 
   // ── Verify（実行側の戻り値だけで成功としない）────────────────────
   const after = buildSystemState(storage, deps.now ? { now: deps.now } : {})
@@ -1982,7 +2251,12 @@ async function maybeAdoptNext(
   }
 
   if (result.status === 'no_candidate') {
-    // ledger を全部やり切った状態。異常ではないので記録も Escalation もしない。
+    // ledger を全部やり切った状態。異常ではないので Escalation はしない。
+    // ただし「全項目が Candidate promotion 待ち」は終わったのではなく**外部の promotion を待って
+    // 止まっている**状態で、以前は何も残らず静かに停滞した（lifecycle repair W5）。
+    if (result.failureCode === 'awaiting_promotion') {
+      recordAwaitingPromotion(storage, key, result.reason ?? '')
+    }
     return undefined
   }
 
@@ -2004,6 +2278,27 @@ async function maybeAdoptNext(
     ...(result.reason !== undefined ? { reason: result.reason } : {}),
     attempt,
   }
+}
+
+/** `adoption=no_candidate code=awaiting_promotion` の行。分類は detail の構造化欄だけで判定する。 */
+const AWAITING_PROMOTION_DETAIL_PREFIX = 'adoption=no_candidate code=awaiting_promotion '
+
+/**
+ * promotion 待ちの停滞を既存 `pl_loop_target:adopt:<projectId>` に1行だけ残す。
+ *
+ * result は `idle` にする（`ATTEMPT_RESULTS` に入らないので採用予算も失敗分類も動かさない）。
+ * **毎 tick 書かない。** 直近の行が既に同じ記録なら何もしない（`technical_exhausted` と同じ dedup 形）。
+ * 間に採用試行・成功・Escalation が挟まれば、再び promotion 待ちになった時点で新しく残る。
+ */
+function recordAwaitingPromotion(storage: IStorage, key: string, reason: string): void {
+  const latest = storage.auditLog.findByEntity(AUDIT_ENTITY_TYPE, key)[0]
+  if (
+    latest !== undefined
+    && latest.operation === AUDIT_OPERATION
+    && latest.result === 'idle'
+    && (latest.detail ?? '').startsWith(AWAITING_PROMOTION_DETAIL_PREFIX)
+  ) return
+  record(storage, key, 'idle', `${AWAITING_PROMOTION_DETAIL_PREFIX}target=- ${reason}`)
 }
 
 async function escalateTo(

@@ -1,4 +1,5 @@
 import type { JobWorkspaceBaseline } from '@ai-team/shared'
+import { getCredentialClass } from '../auth/credentialClass'
 import { completeAbortCleanup } from '../pl/abortTask'
 import { TECHNICAL_ABORT_WORKER_REFUSAL_CODES } from '../pl/technicalAbortEvidence'
 import type { FastifyInstance } from 'fastify'
@@ -20,6 +21,8 @@ import {
   executeQueuedRepair,
   isWorkspaceQuarantined,
   prepareRepairFlow,
+  recordRepairAdmissionSkipped,
+  REPAIR_ADMISSION_SKIPPED_OPERATION,
   resolveReviewedImplementation,
 } from '../designReview/repairFlow'
 import {
@@ -329,6 +332,13 @@ const KnownGoodFactsSchema = z.object({
   blindSpotsAbsent: z.boolean(),
 })
 
+/** 報告が名指す technical cleanup generation（carrier の marker 3つ）。 */
+const CleanupGenerationSchema = z.object({
+  abortCleanupRequestedAt: z.string().min(1),
+  abortTechnicalEvidenceId: z.string().min(1),
+  abortTechnicalStateFingerprint: z.string().min(1),
+}).strict()
+
 // abort cleanup も quarantine 解除と**同じ材料**を同じ厳密さで要求する。
 // 所有権の解放は quarantine 解除より重く、緩い検証で通してよい理由がない。
 const AbortCleanupResultBody = z.union([
@@ -341,9 +351,15 @@ const AbortCleanupResultBody = z.union([
       restoredPathCount: z.number().int().nonnegative(),
       removedPathCount: z.number().int().nonnegative(),
     }).strict().optional(),
+    // technical cleanup の報告で必須（無ければ completeAbortCleanup が GENERATION_MISMATCH で拒否する）。
+    // manual cleanup では送らない。
+    cleanupGeneration: CleanupGenerationSchema.optional(),
   }).strict(),
   z.object({
     refusalCode: z.enum(TECHNICAL_ABORT_WORKER_REFUSAL_CODES),
+    // technical cleanup の拒否でも必須（無ければ GENERATION_MISMATCH）: 遅れて届いた古い generation の拒否が
+    // 新しい generation を退役・quarantine させないため。
+    cleanupGeneration: CleanupGenerationSchema.optional(),
   }).strict(),
 ])
 
@@ -392,6 +408,20 @@ function buildOutboxEvent(
   }
 
   return { ok: true, outboxEvent: { eventId, payloadHash: computedPayloadHash } }
+}
+
+/**
+ * この review の admission skip が既に audit に在るか（再送で同じ行を重ねないため）。
+ * 読めなければ false（記録する側へ倒す。skip の記録が欠けるより重複のほうが害が小さい）。
+ */
+function hasRecordedAdmissionSkip(storage: ReturnType<typeof getStorage>, taskId: string, reviewJobId: string): boolean {
+  try {
+    return storage.auditLog.findByEntity('task', taskId).some((entry) =>
+      entry.operation === REPAIR_ADMISSION_SKIPPED_OPERATION
+      && (entry.detail ?? '').split(' ').includes(`review_job_id=${reviewJobId}`))
+  } catch {
+    return false
+  }
 }
 
 function outboxResponse(job: Job, outboxEvent: OutboxEventInput | undefined, deduplicated: boolean): Job | (Job & { outbox: { eventId: string; deduplicated: boolean } }) {
@@ -501,6 +531,14 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
     if (!task) {
       return reply.status(404).send({ error: 'Task not found' })
     }
+    // Job の projectId は Task の Project と一致しなければならない。食い違う行は、Project 単位の
+    // lifecycle 判定（pause / archive / 所有権）を Job の自己申告でずらせてしまう（lifecycle repair W5）。
+    if (result.data.projectId !== task.projectId) {
+      return reply.status(409).send({
+        error: 'Job projectId must match the Task projectId',
+        code: 'JOB_PROJECT_MISMATCH',
+      })
+    }
 
     const project = storage.projects.findById(task.projectId)
     if (!project) {
@@ -541,8 +579,14 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       })
     }
 
-    const job = storage.jobs.create(jobInput)
-    return reply.status(201).send(job)
+    // 別 Task が workspace を所有していれば作らない（claim guard と同じ所有者述語・同じ transaction。
+    // 手動 Job は workflowStepKey を持たず所有者と数えられるので、2 本目は multiple_live_owners の
+    // deadlock になる。lifecycle repair C3）。
+    const created = storage.jobs.createManualJob(jobInput)
+    if (!created.ok) {
+      return reply.status(409).send({ error: created.reason, code: created.code })
+    }
+    return reply.status(201).send(created.job)
   })
 
   app.patch<{ Params: { id: string } }>('/:id/fail-if-running', async (req, reply) => {
@@ -621,6 +665,9 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       ...('refusalCode' in parsed.data
         ? {
             refusalCode: parsed.data.refusalCode,
+            ...(parsed.data.cleanupGeneration !== undefined
+              ? { cleanupGeneration: parsed.data.cleanupGeneration }
+              : {}),
             knownGood: {
               gitOperationMarkers: [],
               worktreeClean: false,
@@ -637,6 +684,9 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
               : {}),
             ...(parsed.data.cleanupSummary !== undefined
               ? { cleanupSummary: parsed.data.cleanupSummary }
+              : {}),
+            ...(parsed.data.cleanupGeneration !== undefined
+              ? { cleanupGeneration: parsed.data.cleanupGeneration }
               : {}),
           }),
     })
@@ -703,8 +753,92 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       return reply.status(404).send({ error: 'Job not found' })
     }
 
+    // **`success` は Worker 自身の結果配送（Outbox event 付き）だけが書ける**（lifecycle repair residual
+    // R-FINAL-OPPATCH）。汎用 Task CRUD が lifecycle の所有する status を書けないのと同じ扱いである。
+    //
+    // success の下流（post-implement review の作成・git_commit の Task 完了 + continuation・resulting commit の
+    // bind）は Worker の結果欄（changedFiles / guardResult / exitCode / commitHash / end fingerprint）を前提にする。
+    // eventId の無い直接の `success`（operator の ADMIN / legacy credential）はそれを持たないので、
+    //   - implement: review が作られず、後から届く Worker の本物の success は「適用先の状態に無い配送」として
+    //     何も適用されずに ack される。Task は pending・最新 Job = success・worktree は dirty のまま、
+    //     attention も PL の駆動も無い**黙った停止**になる（residuals.lifecycle.test.ts で実測）
+    //   - git_commit: commit していないのに Task が done になり continuation が走る
+    // Worker は terminal 結果を必ず `persistTerminalUpdate()`（eventId 付き）で送り、eventId 無しで送るのは
+    // claim（→ running）だけなので、この拒否は Worker の配送を何も変えない。止まった running Job の出口は
+    // 従来どおり `PATCH /:id/fail-if-running`・eventId 無しの failed / blocked・requeue（→ queued）である。
+    // **Outbox event の由来も確かめる**（Codex review r5）: eventId と payloadHash は呼び出し側が計算できるので、
+    // split credential では Worker credential の配送だけを Worker の結果として受ける。ADMIN が event 欄を付けても
+    // success は書けない。legacy（単一 token）は由来を区別できないため従来どおり。credential class の無い
+    // （認証を通っていない）配送は Worker の由来ではない（C-1）: 未認証の success 書き込みを受け付けない。
+    // **現在の status に関係なく、再送判定・適用できない配送の受理より先に**確かめる（C-1 Codex review）。
+    // 既に success の Job へ偽の success を送っても、そこから structured result の保存や次 Job の作成へ
+    // 進めない。本物の Worker の完全な再送は eventId と Worker credential を持つのでここを通り、下で dedup される。
+    const credentialClass = getCredentialClass(req)
+    const workerProvenance = credentialClass === 'worker' || credentialClass === 'legacy'
+    if ((outboxEvent === undefined || !workerProvenance) && jobUpdate.status === 'success') {
+      return reply.status(409).send({
+        error: 'success can only be recorded by the Worker\'s own result delivery (an Outbox event); '
+          + 'a direct status write cannot carry the result fields the workflow needs. '
+          + 'To stop a stuck job, use PATCH /api/jobs/:id/fail-if-running or set it to failed / blocked',
+        code: 'JOB_SUCCESS_REQUIRES_WORKER_RESULT',
+      })
+    }
+
+    // **完全な再送（同じ eventId・同じ payloadHash が適用済み）は、状態に依存する事前検証より先に
+    // 認識する**（lifecycle repair C2）。fingerprint の write-once / running-only 検査は「まだ適用して
+    // いない遷移」に対する規則で、適用済みの event を再送すると必ず 409 になる。応答が失われた
+    // 端末 PATCH の再送が 409 を受けると、Worker の Outbox event は pending のまま残り intake が止まる。
+    // 再送はこの後の storage 呼び出しで deduplicated として元の結果を返す（状態は変えない）。
+    // 同じ eventId で payload が違う再送（conflict）は従来どおり拒否される。
+    const isExactReplay = storage.jobs.classifyOutboxEvent(existing.id, outboxEvent) === 'deduplicated'
+
+    // **適用できない Outbox 配送は、状態に依存する事前検証より先に「適用済み・何も適用しない」で受ける**
+    // （lifecycle repair C3。H-02 の一般化）。
+    //
+    // Outbox 配送（eventId 付き）が、もう適用先の状態に無い Job へ届いた（例: Worker の端末 event が
+    // pending の間に operator PATCH が running の Job を failed にした）。以前は
+    //   - fingerprint の running-only 検査が先に 409 を返し、再送が永久に 409 → Worker の intake が止まる
+    //   - status だけを落として stderr / commitHash / guardResult / failureMetadata（quarantined を含む）を
+    //     既存行へ重ね、success なのに quarantined のような矛盾した行で作業を隠す
+    // の 2 つが起きた。適用できないと分かった配送は event を記録（Worker が捨てられる）して payload を
+    // 1 つも適用せず、下流の処理（review / repair / continuation）も走らせずに 200 + 現在の Job を返す。
+    // claim（→ running）は対象外: 拒否された claim は記録しない既存契約（W5）を保つ。
+    //
+    // **同じ status への配送も含める**（lifecycle repair final）。Worker の Outbox は Job ごとに
+    // terminal event を 1 つしか持たない（`recordPending`）ので、eventId の違う同 status 配送は
+    // 「別の経路（operator PATCH 等）が先にその status にした」ことを意味する。例: operator が running を
+    // failed にした後、Worker の `failed` + workspaceEndFingerprint が届く。以前は同 status を除外していた
+    // ため下の running-only 検査で 409 になり、再送が永久に 409 → Worker の intake 全体が止まった。
+    // 同じ eventId の完全な再送は `isExactReplay` で先に dedup される。
+    const isNonApplicableOutboxDelivery = (job: Job): boolean => (
+      jobUpdate.status !== undefined
+      && jobUpdate.status !== 'running'
+      && !canApplyJobResultStatus(job.status, jobUpdate.status)
+    )
+    if (outboxEvent !== undefined && !isExactReplay && isNonApplicableOutboxDelivery(existing)) {
+      const acknowledged = storage.jobs.acknowledgeOutboxEventWithoutApplying(
+        existing.id,
+        outboxEvent,
+        isNonApplicableOutboxDelivery,
+      )
+      if (acknowledged.ok) {
+        req.log.warn(
+          { jobId: existing.id, from: acknowledged.job.status, to: jobUpdate.status },
+          'outbox delivery acknowledged without applying anything (job is no longer in a state it applies to)',
+        )
+        return reply.send(outboxResponse(acknowledged.job, outboxEvent, acknowledged.deduplicated))
+      }
+      if (acknowledged.code === 'OUTBOX_HASH_MISMATCH') {
+        return reply.status(409).send({ error: acknowledged.reason })
+      }
+      if (acknowledged.code === 'JOB_NOT_FOUND') {
+        return reply.status(404).send({ error: 'Job not found' })
+      }
+      // NOW_APPLICABLE: 読み直した時点で適用先の状態にある。通常の経路で評価する。
+    }
+
     const workspaceEndFingerprint = jobUpdate.failureMetadata?.workspaceEndFingerprint
-    if (workspaceEndFingerprint !== undefined) {
+    if (workspaceEndFingerprint !== undefined && !isExactReplay) {
       if (existing.failureMetadata?.workspaceEndFingerprint !== undefined) {
         return reply.status(409).send({
           error: 'workspaceEndFingerprint is write-once and has already been recorded',
@@ -761,7 +895,8 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
     // これは遅れて届いた報告ではなく「park された Task をもう一度動かせ」という要求なので、
     // stale 遷移として黙って落とすのではなく、理由を返して拒否する。
     if (
-      jobUpdate.status !== undefined
+      !isExactReplay
+      && jobUpdate.status !== undefined
       && isLiveJob({ status: jobUpdate.status })
       && storage.tasks.isParked(existing.taskId)
     ) {
@@ -777,6 +912,33 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
     // Worker側のexecution FSMとは責務が異なるため同一化しない。
     // 同一statusの再送（from === to）はDB stateを変えないが、statusを削ると下流の
     // 判定（review approved等）まで変わってしまうため、そのまま通す。
+    // （eventId の違う同 status の Outbox 配送は、上の acknowledge で既に返っているのでここへ来ない。）
+    //
+    // **200 + no-op は Outbox 配送（eventId 付き）にだけ使う。** at-least-once の遅延・重複 result は
+    // Worker の Outbox からしか来ない（`persistTerminalUpdate`）。eventId の無い要求は配送の再送では
+    // なく直接の遷移要求なので、適用しないなら 200 で「成功したように」見せず 409 で断る
+    // （例: operator の blocked→failed が 200 なのに何も変わらなかった。lifecycle repair C2）。
+    // eventId の無い claim（Worker の queued→running）が terminal 化済みの Job に届いた場合は、
+    // Worker が確定拒否として扱える既存の JOB_CLAIM_REFUSED で断る（200 を返すと Worker は claim
+    // 成功と取り違えて terminal な Job を実行しうる）。
+    if (
+      jobUpdate.status !== undefined &&
+      jobUpdate.status !== existing.status &&
+      !canApplyJobResultStatus(existing.status, jobUpdate.status) &&
+      outboxEvent === undefined
+    ) {
+      if (jobUpdate.status === 'running') {
+        return reply.status(409).send({
+          error: `Job claim refused: the job is already ${existing.status}`,
+          code: 'JOB_CLAIM_REFUSED',
+        })
+      }
+      return reply.status(409).send({
+        error: `Job transition ${existing.status} -> ${jobUpdate.status} is not applicable `
+          + `(applicable from ${existing.status}: ${describeApplicableJobStatuses(existing.status)})`,
+        code: 'JOB_TRANSITION_NOT_APPLICABLE',
+      })
+    }
     if (
       jobUpdate.status !== undefined &&
       jobUpdate.status !== existing.status &&
@@ -893,7 +1055,16 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       // **対象の implement Job は保存済み lineage から引く。** Human Resume で再実行された
       // review は `resume:<元review>:1` になり、以前の `implement:<id>:review` 一致だけでは
       // repair も escalation も作られずに終わっていた（2026-09-28 production・Task `9fdee5a3`）。
-      if (!approved && !persisted.deduplicated) {
+      //
+      // **deduplicated な再送でも Stage 2 を評価し直す**（lifecycle repair C2 / H-02）。review 結果の
+      // 永続化（Outbox 記録を含む）と Stage 2 は別 transaction なので、その間に API が落ちる
+      // （または run 作成が投げる）と、Worker の再送は deduplicated になり、以前はここで Stage 2 を
+      // 飛ばしていた —— Task は failed な最新 review と live Job / run 無しの pending のまま残り、
+      // resume も stored-review recovery も blocked を要求するので出口が無かった。
+      // 再評価は冪等である: repair Job は stepKey 一意、active run は prepareRepairFlow が止め、
+      // escalate は同じ blocked への遷移、終端済みの run は下の identity 照合で二重に作らない。
+      if (!approved) {
+        const replay = persisted.deduplicated === true
         const reviewed = resolveReviewedImplementation(storage, existing.id)
         if (!reviewed.ok && existing.workflowStepKey !== undefined) {
           // workflow 上の review なのに実装へ辿れない。黙って終わらせず理由を残す（fail-closed）。
@@ -917,11 +1088,30 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
                 reviewJobId: existing.id,
                 runId: reviewPreparation.runId,
               }, 'review requested changes but repair was not admitted; stage 2 skipped')
+              // log は流れて消える。blocked な Task では audit にも残す（状態は変えない。L4）。
+              // 再送では、同じ review の skip が既に記録されていれば重ねない。
+              if (!replay || !hasRecordedAdmissionSkip(storage, existing.taskId, existing.id)) {
+                recordRepairAdmissionSkipped(storage, {
+                  taskId: existing.taskId,
+                  reviewJobId: existing.id,
+                  implementJobId: implementJob.id,
+                  skip: reviewPreparation,
+                })
+              }
             } else if (reviewPreparation.action === 'escalate') {
-              escalateTaskToHuman(storage, existing.taskId)
+              escalateTaskToHuman(storage, existing.taskId, reviewPreparation.reason)
             } else if (reviewPreparation.action === 'queue') {
-              const run = storage.designReviewRuns.create(reviewPreparation.run)
-              kickQueuedDesignReview(storage, req.log, run, reviewPreparation.stepKey)
+              // 再送で、同じ repair 計画（同じ source・同じ design text）の run が既に在るなら
+              // Stage 2 は前回の処理で始まっている（終端していても作り直さない = 判定の引き直しをしない）。
+              const started = replay
+                ? storage.designReviewRuns.findByTaskId(existing.taskId).find((run) =>
+                    run.repairSourceJobId === reviewPreparation.run.repairSourceJobId
+                    && run.designTextHash === reviewPreparation.run.designTextHash)
+                : undefined
+              if (started === undefined) {
+                const run = storage.designReviewRuns.create(reviewPreparation.run)
+                kickQueuedDesignReview(storage, req.log, run, reviewPreparation.stepKey)
+              }
             }
           } catch (err) {
             req.log.error({ err, jobId: existing.id }, 'failed to start stage 2 from review')
@@ -985,6 +1175,14 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
           reviewJobId: existing.id,
           runId: refusalPreparation.runId,
         }, 'review refusal repair was not admitted; falling back to Human escalation')
+        if (reviewed?.ok === true) {
+          recordRepairAdmissionSkipped(storage, {
+            taskId: existing.taskId,
+            reviewJobId: existing.id,
+            implementJobId: reviewed.implementJob.id,
+            skip: refusalPreparation,
+          })
+        }
       } else if (refusalPreparation !== undefined) {
         const persisted = storage.jobs.updateWithOutboxEvent(
           existing.id,
@@ -999,7 +1197,7 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
           return reply.status(persisted.code === 'JOB_NOT_FOUND' ? 404 : 500).send({ error: persisted.reason })
         }
         if (refusalPreparation.action === 'escalate') {
-          escalateTaskToHuman(storage, existing.taskId)
+          escalateTaskToHuman(storage, existing.taskId, refusalPreparation.reason)
         } else if (persisted.queuedDesignReviewRun && refusalPreparation.action === 'queue') {
           kickQueuedDesignReview(storage, req.log, persisted.queuedDesignReviewRun, refusalPreparation.stepKey)
         }
@@ -1182,7 +1380,7 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
       : undefined
 
     if (preparation?.action === 'escalate') {
-      escalateTaskToHuman(storage, existing.taskId)
+      escalateTaskToHuman(storage, existing.taskId, preparation.reason)
     }
 
     // outboxEventの有無にかかわらず同じatomic経路を使う。
@@ -1198,6 +1396,21 @@ export async function jobRoutes(app: FastifyInstance): Promise<void> {
         return reply.status(409).send({ error: updated.reason })
       }
       return reply.status(updated.code === 'JOB_NOT_FOUND' ? 404 : 500).send({ error: updated.reason })
+    }
+    // claim（queued -> running）が storage で拒否された（quarantine / Project が running でない /
+    // 別 Task が live な所有者）。
+    // 以前は 200 + queued の Job を返しており、Worker はそれを claim 成功と区別できなかった。
+    // 非 2xx にして Worker に実行させない（lifecycle repair W5）。Job は queued のまま残る。
+    if (
+      jobUpdate.status === 'running'
+      && existing.status === 'queued'
+      && !updated.deduplicated
+      && updated.job.status !== 'running'
+    ) {
+      return reply.status(409).send({
+        error: 'Job claim refused: the workspace is quarantined, the Project is not running, or another Task owns the workspace',
+        code: 'JOB_CLAIM_REFUSED',
+      })
     }
     if (updated.queuedDesignReviewRun && preparation?.action === 'queue') {
       kickQueuedDesignReview(storage, req.log, updated.queuedDesignReviewRun, preparation.stepKey)

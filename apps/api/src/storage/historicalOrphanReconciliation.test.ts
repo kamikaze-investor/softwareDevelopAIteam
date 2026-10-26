@@ -111,7 +111,7 @@ function approveAbort(storage: IStorage, taskId: string): string {
     status: 'WAITING_FOR_USER',
     expiresAt: new Date(Date.now() + 60_000).toISOString(),
   } as Parameters<IStorage['approvalRequests']['create']>[0])
-  storage.approvalRequests.updateStatus(approval.id, 'APPROVED')
+  storage.approvalRequests.recordDecision(approval.id, 'APPROVED', undefined, { credentialClass: 'admin' })
   return approval.id
 }
 

@@ -1,6 +1,7 @@
 // @ai-team/shared — 共有型定義
 
 export * from './types/project'
+export { parseFirstJsonObject } from './firstJsonObject'
 export * from './types/task'
 export * from './types/job'
 export * from './types/memory'
@@ -38,6 +39,12 @@ export {
   SAFE_ONLY_PATTERNS,
   ALWAYS_CRITICAL_RULES,
   APPROVAL_REQUEST_TTL_MINUTES,
+  SAFE_WORK_COMMAND_KINDS,
+  isSafeWorkCommandKind,
+  GATE_TECHNICAL_STOP_CODES,
+  findGateTechnicalStopCode,
+  gateTechnicalStopCodeOfJob,
+  type GateTechnicalStopCode,
   runRiskReview,
   resolveEffectiveStatus,
   decideGateOutcome,
@@ -83,6 +90,9 @@ export type {
 export * from './aiCliTimeout'
 export * from './roadmapTaskIdentity'
 export * from './taskOccupancy'
+export * from './approvalLiveness'
+export * from './resumeAdmission'
+export * from './recoverAdmission'
 export * from './roadmapTopology'
 export {
   PL_ACTION_KINDS,

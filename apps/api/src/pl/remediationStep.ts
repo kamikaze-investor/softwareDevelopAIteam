@@ -51,14 +51,10 @@
  * **Review を走らせる前に拒否する**（`repairPolicy` の `requireDifferentApproach` と同じ趣旨）。
  */
 
+import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import type { Task } from '@ai-team/shared'
-import {
-  buildDesignContract,
-  loadEngineeringPrinciples,
-  selectPrincipleSlugs,
-} from '@ai-team/shared/src/engineeringPrinciples.js'
 import {
   extractDesignReviewFindings,
   getBaseRoadmapId,
@@ -72,8 +68,8 @@ import {
 } from '@ai-team/shared'
 import { getValidRoadmapItems } from '@ai-team/worker/scripts/roadmap/roadmapParser.js'
 import { classifyReviewLoad } from '@ai-team/worker/src/approvalLevel/reviewLoadClassifier.js'
-import { mapFileToFocuses } from '@ai-team/worker/src/approvalLevel/focusSelector.js'
 import {
+  DESIGN_REVIEW_RUNNER_TIMEOUT_MS,
   executeRunner,
   recomputeDecision,
   type CoordinatorDeps,
@@ -81,8 +77,9 @@ import {
   type RunnerExecution,
 } from '../designReview/designReviewCoordinator'
 import { CHEAP_AI_CONFIG } from '../aiExplain/cheapAiClient'
-import { computeDesignTextHash } from '../designReviewEvidencePolicy'
+import { computeDesignTextHash, isUsableAlignedEvidence } from '../designReviewEvidencePolicy'
 import { buildInitialImplementAiCliPrompt } from '../ctoAi/initialImplementWorkflow'
+import { buildTaskDesignContract } from '../implementPrompt'
 import {
   adoptRoadmapItem,
   buildAdoptedDescription,
@@ -90,6 +87,7 @@ import {
   extractItemDescription,
 } from '../ctoAi/roadmapAdoption'
 import type { IStorage } from '../storage/interface'
+import { configuredTargetRoot } from '../utils/pathGuard'
 import { ADOPTION_REPOSITORY_MAP, authorizeAdoptionScope, resolveLedgerPath } from './adoptionStep'
 
 /**
@@ -144,7 +142,22 @@ const PL_PROPOSAL_AUTHOR_MODEL = CHEAP_AI_CONFIG.model
  * 「元設計者へ解決案生成を戻さない」という本経路の前提そのものが崩れる（独立レビュー指摘）。
  *
  * 材料は自前の audit 行の provenance だけである（新しいテーブルは作らない）。
+ *
+ * **著者は提案を書いた判定行の provider だけである。** runner_failed / preflight 失敗の provider は
+ * 提案を1つも書いていないので著者ではない。数えると、判定 0 件のまま両 flagship が著者として
+ * 除外され、Remediation が `no_independent_flagship` でしか終われなくなる（2026-10-23 `#2cae0d07`）。
+ * 分類は `classifyConflictRecoveryRow()` の1箇所だけを使う。
+ *
+ * `unusable`（応答はあったが構造が壊れていた）は判定予算を消費するが、著者には数えない。
+ * 著者独立性の目的は「却下された設計を書いた側に書き直させない」ことで、壊れた応答は
+ * 提出も却下もされる設計を含まないからである。parse 済みの提案（abandon / fspec 行 /
+ * runner 失敗後に stdout から parse できた提案 / 適用中の例外）を書いた provider は除外される。
  */
+function priorRemediationAuthors(storage: IStorage, taskId: string): string[] {
+  return priorProvidersForStage(storage, taskId, 'remediation', { authorsOnly: true })
+}
+
+/** この chain で Remediation に使った provider（Preference の順位付け用。著者判定には使わない）。 */
 function priorRemediationProviders(storage: IStorage, taskId: string): string[] {
   return priorProvidersForStage(storage, taskId, 'remediation')
 }
@@ -186,13 +199,274 @@ export function stageEntries(
     })
 }
 
+/**
+ * 1つの stage で、判定（judgment）を生まなかった技術的失敗を許す回数。
+ *
+ * **判定予算（`PL_MAX_CRITIC_ROUNDS` / `PL_MAX_REMEDIATION_ATTEMPTS`）とは別に数える。**
+ * 以前は stage の全行を判定予算として数えていたため、runner が即座に落ちただけの行
+ * （判定を1つも生んでいない）で予算が尽き、Task が判定 0 件のまま `terminal` に取り残された
+ * （2026-10-23 Production `#2cae0d07`: critic runner_failed ×2 + remediation runner_failed ×2）。
+ *
+ * それでも技術的失敗は**無制限には再試行しない**。stage ごとにこの上限で打ち切り、
+ * 打ち切られた stage は使えないものとして扱う（critic → remediation へ進む / remediation → terminal）。
+ */
+export const PL_MAX_TECHNICAL_FAILURES_PER_STAGE = 3
+
+/** 予算を持つ CONFLICT 復旧 stage。challenge / pl_revision は独自の予算を持たない。 */
+export type BudgetedConflictStage = 'critic' | 'remediation'
+
+/** CONFLICT 復旧 audit 行の分類。 */
+export type ConflictRecoveryRowKind = 'judgment' | 'technical'
+
+/**
+ * 既存の CONFLICT 復旧 audit 行を1行ずつ「判定」と「技術的失敗」に分ける。
+ *
+ * **予算には使わない。** 予算は Round 単位で `tallyConflictStage()` が数える（行単位では、成果物を
+ * 出さなかった Round の `critiqued` 行が判定として課金されていた。2026-10-23 `#2cae0d07`）。
+ * この関数の用途は著者除外（`priorProvidersForStage({ authorsOnly })`）だけで、著者の定義
+ * （parse 済みの提案を書いた provider）は変えていない。
+ *
+ * **技術的失敗は明示した allowlist だけである**（`TECHNICAL_FAILURE_OUTCOMES`）。いずれも
+ * model が応答を返す前に止まった行で、記録している箇所は次のとおり:
+ *   - `runner_failed` … critic / remediation の runner が ok=false で、stdout にも完全な結果が無い
+ *   - `exception` … PL ループが step の例外を記録する（`executionLoop.ts` remediateConflict。
+ *     step がこの試行を何も記録していなかったときだけ書かれる）
+ *   - `item_not_in_ledger` / `ledger_unreadable` … model を呼ぶ前の ledger 読み取り失敗
+ *     （remediation: `runRemediationStep`、critic: `runConflictResolutionRound` の readLedgerBody）
+ *   - `no_independent_flagship` … remediation の model 選択（preflight）で候補が無い
+ *
+ * **それ以外はすべて判定（fail-closed）。** `critique_unusable` / `unusable`（model は応答したが
+ * 構造が壊れていた）も、未知の outcome も、`outcome=` の無い旧形式の行も判定予算を消費する。
+ * schema を守らない応答で追加の抽選を得させないためである（独立レビュー指摘）。
+ *
+ * 旧形式の行に特例は置かない（allowlist だけで分類する）。critic 行に `fspec=` が付いた旧形式
+ * （pl_revision を別 stage にする前の2行目）を特例で技術扱いにすると、未知の outcome まで
+ * fail-open になる（独立レビュー指摘）。Production に該当行は無く（2026-10-23 実測）、仮にあっても
+ * 予算を早く使い切る側（fail-closed）に倒れるだけである。Challenge の行は `stage=challenge` に
+ * 載るので critic の予算にはそもそも入らない。
+ *
+ * 旧来の行は削除せず、この関数で**読み替える**だけである（DB migration なし）。
+ */
+export function classifyConflictRecoveryRow(
+  stage: BudgetedConflictStage,
+  detail: string | undefined,
+): ConflictRecoveryRowKind {
+  const text = detail ?? ''
+  const outcome = conflictRowOutcome(text)
+  if (outcome !== undefined && TECHNICAL_FAILURE_OUTCOMES.includes(outcome)) return 'technical'
+  return 'judgment'
+}
+
+function conflictRowOutcome(detail: string | undefined): string | undefined {
+  return /\boutcome=(\S+)/.exec(detail ?? '')?.[1]
+}
+
+/** 判定を生まなかった技術的失敗として数える outcome（明示 allowlist。未知の outcome は判定扱い）。 */
+export const TECHNICAL_FAILURE_OUTCOMES: readonly string[] = [
+  'runner_failed',
+  'exception',
+  'item_not_in_ledger',
+  'ledger_unreadable',
+  'no_independent_flagship',
+]
+
+/**
+ * 判定のうち、model が応答したが構造化された結果にならなかったもの。予算は消費するが、
+ * 提案を1つも書いていないので Remediation の著者には数えない（`priorRemediationAuthors()`）。
+ */
+const MALFORMED_RESPONSE_OUTCOMES: readonly string[] = ['unusable', 'critique_unusable']
+
+export interface ConflictStageTally {
+  judgments: number
+  /** 現在の accounting epoch に属する技術的失敗 Round 数（上限 `PL_MAX_TECHNICAL_FAILURES_PER_STAGE`）。 */
+  technicalFailures: number
+  /** epoch を問わない技術的失敗 Round 数（上限 `PL_MAX_LIFETIME_TECHNICAL_FAILURES_PER_STAGE`）。 */
+  lifetimeTechnicalFailures: number
+}
+
+/**
+ * CONFLICT 復旧の会計 epoch。**復旧経路の欠陥を直す reviewed PR だけが上げる。**
+ *
+ * 技術的失敗の上限（stage ごと 3）は現在の epoch の Round だけを数える。修正前の欠陥で落ちた Round
+ * （例: 2026-10-23 `#2cae0d07` の workingDir 4件・300 秒 timeout 1件）が、修正後の試行枠を
+ * 埋め続けないようにするためである。**判定（judgment）は epoch に関係なく生涯で数え、戻さない。**
+ * 行は消さない・書き換えない（audit に残り、表示にも出る）。
+ *
+ * deploy や再起動では変わらない（HEAD や起動時刻を境界にすると、無関係な deploy や crash loop のたびに
+ * 枠が開く。独立レビュー round 1 指摘）。epoch を跨いだ総数は
+ * `PL_MAX_LIFETIME_TECHNICAL_FAILURES_PER_STAGE` で必ず打ち切る。
+ *
+ * - 0: epoch 導入前の行（`epoch=` が無い）
+ * - 1: Round 単位の会計・PL revision の JSON-only agent（#407）・runner 900 秒（2026-10-26）
+ */
+export const CONFLICT_RECOVERY_ACCOUNTING_EPOCH = 1
+
+/** epoch を跨いだ技術的失敗 Round の総上限（stage ごと）。 */
+export const PL_MAX_LIFETIME_TECHNICAL_FAILURES_PER_STAGE = 2 * PL_MAX_TECHNICAL_FAILURES_PER_STAGE
+
+/**
+ * 1回の critic / remediation Round の同一性。Round 内のすべての audit 行の detail **先頭**に置く
+ * （detail は 500 字で切られるので、末尾に置くと消えうる。独立レビュー round 2 指摘）。
+ */
+export interface ConflictRound {
+  readonly prefix: string
+}
+
+/**
+ * Round を始める。**fallible な処理（ledger 読み取り・model 選択・runner）より前に**
+ * `outcome=starting` 行を書く。runner 中や直後にプロセスが落ちても Round が残り、
+ * 技術的失敗として数えられる（書かないと crash の繰り返しが上限を素通りする。独立レビュー round 2 指摘）。
+ * この行が書けなければ例外のまま上へ返す（fail-closed）。
+ */
+export function beginConflictRound(storage: IStorage, taskId: string, stage: BudgetedConflictStage): ConflictRound {
+  const prefix = `round=${randomUUID()} epoch=${CONFLICT_RECOVERY_ACCOUNTING_EPOCH}`
+  recordRemediation(storage, taskId, `${prefix} stage=${stage} outcome=starting`)
+  return { prefix }
+}
+
+interface ParsedConflictRow {
+  round?: string
+  epoch: number
+  /** `stage=` の無い旧形式の行は remediation（`stageEntries()` と同じ扱い）。 */
+  stage: string
+  outcome?: string
+  hasSpec: boolean
+}
+
+function parseConflictRow(detail: string | undefined): ParsedConflictRow {
+  const text = detail ?? ''
+  const epoch = /^(?:round=\S+ )?epoch=(\d+)/.exec(text)?.[1]
+  return {
+    round: /^round=(\S+)/.exec(text)?.[1],
+    epoch: epoch !== undefined ? Number(epoch) : 0,
+    stage: /\bstage=(\w+)/.exec(text)?.[1] ?? 'remediation',
+    outcome: conflictRowOutcome(text),
+    hasSpec: /\bfspec=\S+/.test(text),
+  }
+}
+
+/**
+ * Round が設計成果物を正式経路へ出したか（= 判定）。**出した時点で課金し、後で返さない。**
+ *
+ * - critic Round: その Round の PL revision が具体的 spec（`fspec=`）を出した、または
+ *   Challenge（同一設計の再評価）を予約した（`stage=challenge` の行）
+ * - remediation Round: 具体的 spec（`fspec=`）を出した、または `abandon`（設計上の終端結論）
+ *
+ * `fspec=` 行は `not_different`（再抽選防止 guard）・Gate 拒否・`adopting`（採用予約）のいずれでも
+ * 判定である。下流の Design Review が判定を出さずに失敗しても返金しない（同じ run/hash は既存の
+ * Design Review 再開経路が扱う。新しい設計を引き直させない。独立レビュー round 1 指摘）。
+ */
+function isArtifactRow(row: ParsedConflictRow): boolean {
+  if (row.stage === 'challenge') return true
+  if (row.stage === 'pl_revision') return row.hasSpec
+  if (row.stage === 'remediation') return row.hasSpec || row.outcome === 'abandon'
+  return false
+}
+
+interface ConflictRecoveryUnit {
+  stage: string
+  epoch: number
+  judgment: boolean
+}
+
+/**
+ * audit 行を **Round** にまとめて分類する。予算の唯一の読み口。
+ *
+ * **予算の単位は行ではなく Round である。** 行単位で数えていたため、Critic が `critiqued` を書いた後に
+ * PL revision が壊れた応答しか返さなかった Round が判定として課金されていた（2026-10-23 `#2cae0d07`:
+ * 設計成果物 0 件のまま Critic 2/2）。成果物を出さなかった Round は、何行書いたかに関係なく
+ * 技術的失敗1回である。
+ *
+ * - `round=` 付きの行: 同じ id の行を1 Round にまとめる
+ * - `round=` の無い行（epoch 導入前の行・Round 開始前の preflight 失敗・PL ループの exception 行）:
+ *   単一 writer 時代の並び（**時系列順**）で読む。critic の `critiqued` 行は、次の critic 行より前に
+ *   `stage=pl_revision fspec=` 行か `stage=challenge` 行が続いたときだけ判定。それ以外の行は1行1 Round
+ *
+ * 行は消さない・書き換えない（DB migration なし）。
+ */
+function conflictRecoveryUnits(storage: IStorage, taskId: string): ConflictRecoveryUnit[] {
+  const rows = storage.auditLog
+    .findByEntity(AUDIT_ENTITY_TYPE, remediationKey(taskId))
+    .filter((entry) => entry.operation === AUDIT_OPERATION)
+    // findByEntity は新しい順（created_at DESC, rowid DESC）。並びで読むので時系列へ戻す。
+    .reverse()
+    .map((entry) => parseConflictRow(entry.detail))
+
+  const units: ConflictRecoveryUnit[] = []
+  const rounds = new Map<string, ConflictRecoveryUnit>()
+  let pendingLegacyCritic: ConflictRecoveryUnit | undefined
+
+  for (const row of rows) {
+    if (row.round !== undefined) {
+      let unit = rounds.get(row.round)
+      if (unit === undefined) {
+        unit = { stage: row.stage, epoch: row.epoch, judgment: false }
+        rounds.set(row.round, unit)
+        units.push(unit)
+      }
+      if (isArtifactRow(row)) unit.judgment = true
+      continue
+    }
+
+    if (row.stage === 'critic') {
+      const unit = { stage: 'critic', epoch: row.epoch, judgment: false }
+      units.push(unit)
+      pendingLegacyCritic = row.outcome === 'critiqued' ? unit : undefined
+      continue
+    }
+    if (row.stage === 'pl_revision' || row.stage === 'challenge') {
+      if (pendingLegacyCritic !== undefined && isArtifactRow(row)) {
+        pendingLegacyCritic.judgment = true
+        pendingLegacyCritic = undefined
+      }
+      continue
+    }
+    units.push({ stage: row.stage, epoch: row.epoch, judgment: isArtifactRow(row) })
+  }
+  return units
+}
+
+/** stage の判定数と技術的失敗数を既存 audit から数える（新しい state は持たない）。 */
+export function tallyConflictStage(
+  storage: IStorage,
+  taskId: string,
+  stage: BudgetedConflictStage,
+): ConflictStageTally {
+  const tally: ConflictStageTally = { judgments: 0, technicalFailures: 0, lifetimeTechnicalFailures: 0 }
+  for (const unit of conflictRecoveryUnits(storage, taskId)) {
+    if (unit.stage !== stage) continue
+    if (unit.judgment) {
+      tally.judgments += 1
+      continue
+    }
+    tally.lifetimeTechnicalFailures += 1
+    if (unit.epoch === CONFLICT_RECOVERY_ACCOUNTING_EPOCH) tally.technicalFailures += 1
+  }
+  return tally
+}
+
+/**
+ * stage がまだ使えるか: 判定予算が残り、現在の epoch の技術的失敗が上限未満で、
+ * epoch を跨いだ技術的失敗も総上限未満。
+ */
+export function isConflictStageAvailable(tally: ConflictStageTally, maxJudgments: number): boolean {
+  return tally.judgments < maxJudgments
+    && tally.technicalFailures < PL_MAX_TECHNICAL_FAILURES_PER_STAGE
+    && tally.lifetimeTechnicalFailures < PL_MAX_LIFETIME_TECHNICAL_FAILURES_PER_STAGE
+}
+
 function priorProvidersForStage(
   storage: IStorage,
   taskId: string,
   stage: 'critic' | 'remediation' | 'challenge' | 'pl_revision',
+  options: { authorsOnly?: boolean } = {},
 ): string[] {
   const providers: string[] = []
   for (const entry of stageEntries(storage, taskId, stage)) {
+    if (options.authorsOnly === true
+      && (stage === 'critic' || stage === 'remediation')
+      && (classifyConflictRecoveryRow(stage, entry.detail) !== 'judgment'
+        || MALFORMED_RESPONSE_OUTCOMES.includes(conflictRowOutcome(entry.detail) ?? ''))) continue
     const provider = /\bprovider=([\w-]+)/.exec(entry.detail ?? '')?.[1]
     if (provider !== undefined && !providers.includes(provider)) providers.push(provider)
   }
@@ -236,6 +510,13 @@ export type PlRemediationStatus =
   | 'adoption_rejected'
   /** 採用し直したが fresh Review が通らず Job が作られなかった。 */
   | 'still_not_aligned'
+  /**
+   * 採用し直した fresh Review が**まだ判定を出していない**（runner が判定を返さず run が
+   * queued に戻った）。否定的な判定ではないので escalation しない。run は
+   * design_review_idle → rekick で再開され、ALIGNED になれば既存の
+   * `recoverReadyTasksWithoutJob()` が同じ `createInitialImplementWorkflow()` で Job を作る。
+   */
+  | 'review_pending'
   /** fresh Review が通り implement Job が作られた。 */
   | 'remediated'
 
@@ -320,8 +601,12 @@ export function findRemediationSubject(
   if (run.status !== 'succeeded') return undefined
 
   // evidence が登録されていれば ALIGNED である（非 ALIGNED は evidence を作らない）。
+  // ただし**同じ設計に対する新しい判定が正**。この run が evidence より新しい CONFLICT なら
+  // evidence は覆されており、ここで CONFLICT を見失ってはならない（isUsableAlignedEvidence）。
   const evidence = storage.designReviewEvidence.findLatestByTaskId(task.id)
-  if (evidence?.designTextHash === run.designTextHash) return undefined
+  if (evidence?.designTextHash === run.designTextHash && isUsableAlignedEvidence(evidence, storage.designReviewEvidence)) {
+    return undefined
+  }
 
   // **判定は runner の自己申告（`finalDecision`）を採用せず、API と同じ関数で再計算する。**
   // Job Gate / evidence 登録が使っているのと同一の `recomputeDecision()` を通すので、
@@ -406,6 +691,9 @@ function remediationKey(taskId: string): string {
  * 全行を数えると **Critic Round が Remediation の予算を食い潰す** —— 実際にそうなっていて、
  * Critic を2 Round 行った時点で Remediation へ到達できなくなっていた（テストで検出）。
  * stage ごとに予算が独立していることが、段階フローの前提である。
+ *
+ * **これは記録された行数であり、予算ではない。** 予算は判定と技術的失敗を分けて数える
+ * `tallyConflictStage()` / `hasRemediationBudgetLeft()` が持つ（2026-10-23 `#2cae0d07`）。
  */
 export function countRemediationAttempts(storage: IStorage, taskId: string): number {
   return stageEntries(storage, taskId, 'remediation').length
@@ -421,7 +709,10 @@ export function countRemediationAttempts(storage: IStorage, taskId: string): num
  * いまの呼び出し元は Human Recovery の `nextDriver` 判定と `triageBlocked()` の CEO 案内。
  */
 export function hasRemediationBudgetLeft(storage: IStorage, taskId: string): boolean {
-  return countRemediationAttempts(storage, taskId) < PL_MAX_REMEDIATION_ATTEMPTS
+  return isConflictStageAvailable(
+    tallyConflictStage(storage, taskId, 'remediation'),
+    PL_MAX_REMEDIATION_ATTEMPTS,
+  )
 }
 
 /**
@@ -479,7 +770,8 @@ function recordRemediation(storage: IStorage, taskId: string, detail: string): v
     entityId: remediationKey(taskId),
     result: 'success',
     // 秘密情報・提案本文は載せない。provenance と hash だけを残す。
-    detail: detail.slice(0, 500),
+    // Round に属さない行にも epoch を先頭に付ける（無いと epoch 0 = 導入前の行として読まれ、上限を素通りする）。
+    detail: (detail.startsWith('round=') ? detail : `epoch=${CONFLICT_RECOVERY_ACCOUNTING_EPOCH} ${detail}`).slice(0, 500),
   })
 }
 
@@ -576,19 +868,11 @@ export function buildRemediationPrompt(input: {
 /**
  * Remediation AI へ渡す Design Contract。
  *
- * **実装 prompt と同じ関数から作る**（`buildInitialImplementAiCliPrompt()` と同じ
- * `selectPrincipleSlugs` + `buildDesignContract`）。別に組み立てると、Remediation が
- * 従う原則と実装側が従う原則がずれる。
+ * **実装 prompt と同じ owner（`buildTaskDesignContract()`）から作る**。別に組み立てると、
+ * Remediation が従う原則と実装側が従う原則がずれる。
  */
 function buildRemediationDesignContract(allowedPaths: readonly string[]): string {
-  const principles = loadEngineeringPrinciples()
-  return buildDesignContract({
-    slugs: selectPrincipleSlugs(
-      { predictedFocuses: [...allowedPaths].flatMap(mapFileToFocuses) },
-      principles,
-    ),
-    principles,
-  })
+  return buildTaskDesignContract({ allowedPaths: [...allowedPaths] })
 }
 
 // ────────────────────────────────────────────────────────────
@@ -605,10 +889,37 @@ export interface PlRemediationDeps {
 }
 
 /** Remediation runner の既定起動設定。`buildDefaultRoadmapGeneratorDeps()` と同じ形。 */
+/**
+ * critic / remediation runner の外側の期限。
+ *
+ * Design Review と同じ 300 秒では足りない。remediation は flagship（Codex gpt-5.6-sol / xhigh）が
+ * read-only でリポジトリを読みながら提案を書くので、2026-10-26 の再現（Production と同じ prompt・
+ * model・effort・sandbox）で **357 秒・exit 0・parse 可能な提案**だった。2026-10-23 の Production は
+ * 300 秒で打ち切られ、判定を出せたはずの Round が技術的失敗になっていた。implement の AI CLI 期限と
+ * 同じ 900 秒にする（実測の約 2.5 倍）。Design Review runner の期限は変えない。
+ */
+export const CONFLICT_RECOVERY_RUNNER_TIMEOUT_MS = 900_000
+
+/** runner 内側（AI CLI adapter）の期限を外側より短くする幅。 */
+const CONFLICT_RECOVERY_ADAPTER_TIMEOUT_MARGIN_MS = 30_000
+
+/**
+ * runner へ渡す adapter 側の期限。**外側の期限より必ず先に切れるようにする。**
+ *
+ * 内外が同じ値だと、外側（runner プロセス起動の数秒前から数えている）が必ず先に発火し、runner ごと
+ * 殺される。adapter が返すはずの `provider_timeout` と stderr は失われ、残るのは
+ * 「timed out after 300000ms」だけになる（2026-10-23 実測）。外側は backstop に退かせる。
+ */
+export function conflictRecoveryAdapterTimeoutMs(runnerDeps: CoordinatorDeps): number {
+  const outer = runnerDeps.timeoutMs ?? DESIGN_REVIEW_RUNNER_TIMEOUT_MS
+  return Math.max(1_000, outer - CONFLICT_RECOVERY_ADAPTER_TIMEOUT_MARGIN_MS)
+}
+
 export function buildDefaultRemediationDeps(): CoordinatorDeps {
   const repoRoot = process.env.DESIGN_REVIEW_REPO_ROOT ?? path.resolve(process.cwd(), '../..')
 
   return {
+    timeoutMs: CONFLICT_RECOVERY_RUNNER_TIMEOUT_MS,
     runnerCommand: process.env.DESIGN_REVIEW_RUNNER_COMMAND ?? 'npx',
     runnerArgs: [
       ...(process.env.DESIGN_REVIEW_RUNNER_COMMAND ? [] : ['tsx']),
@@ -664,16 +975,24 @@ export async function runRemediationStep(
     return { status: 'not_applicable', taskId, reason: 'task is not stopped by a design review CONFLICT' }
   }
 
-  const attempts = countRemediationAttempts(storage, taskId)
-  if (attempts >= PL_MAX_REMEDIATION_ATTEMPTS) {
+  const tally = tallyConflictStage(storage, taskId, 'remediation')
+  if (!isConflictStageAvailable(tally, PL_MAX_REMEDIATION_ATTEMPTS)) {
     return {
       status: 'attempts_exhausted',
       taskId,
       roadmapId: initialSubject.roadmapId,
       failureCode: 'attempts_exhausted',
-      reason: `independent remediation already ran ${attempts} time(s) for this task`,
+      reason: tally.judgments >= PL_MAX_REMEDIATION_ATTEMPTS
+        ? `independent remediation already produced ${tally.judgments} judgment(s) for this task`
+        : `independent remediation hit ${tally.technicalFailures} technical failure(s) in this accounting epoch`
+          + ` (limit ${PL_MAX_TECHNICAL_FAILURES_PER_STAGE}), ${tally.lifetimeTechnicalFailures} in total`
+          + ` (limit ${PL_MAX_LIFETIME_TECHNICAL_FAILURES_PER_STAGE}) without a judgment;`
+          + ' technical failures exhausted the stage',
     }
   }
+
+  // **Round を先に開く。** ここから先の失敗（ledger・model 選択・runner・crash）はこの Round に属する。
+  const round = beginConflictRound(storage, taskId, 'remediation')
 
   // ── ledger 本文（Source of Truth）────────────────────────────
   let ledgerBody: string
@@ -687,7 +1006,7 @@ export async function runRemediationStep(
     const item = items.find((candidate) => candidate.id === roadmapId)
     if (!item) {
       // ledger が直るまで結果は変わらない。記録して有界にする（下の catch と同じ理由）。
-      recordRemediation(storage, taskId, 'outcome=item_not_in_ledger')
+      recordRemediation(storage, taskId, `${round.prefix} stage=remediation outcome=item_not_in_ledger`)
       return {
         status: 'not_applicable',
         taskId,
@@ -702,7 +1021,7 @@ export async function runRemediationStep(
     // 記録しないと `countRemediationAttempts()` が 0 のままで対象から外れず、
     // ledger が読めない間ずっと毎 tick 同じ Escalation を出し続ける
     // （2026-09-17 に「63分で同一内容の LINE が18通」として実測された形と同じ）。
-    recordRemediation(storage, taskId, 'outcome=ledger_unreadable')
+    recordRemediation(storage, taskId, `${round.prefix} stage=remediation outcome=ledger_unreadable`)
     return {
       status: 'not_applicable',
       taskId,
@@ -721,7 +1040,8 @@ export async function runRemediationStep(
   const selection = selectRemediationModel({
     // 1回目は PL（vendor 未解決）、2回目以降は前回の Remediation 著者も除外対象になる。
     // **Remediation 著者は Task Design を書いた側**なので、ここは hard 側で正しい。
-    authorProviders: [PL_PROPOSAL_AUTHOR_PROVIDER, ...priorProviders],
+    // 著者は判定（parse 済みの提案）を生んだ provider だけ。runner 失敗は著者ではない。
+    authorProviders: [PL_PROPOSAL_AUTHOR_PROVIDER, ...priorRemediationAuthors(storage, taskId)],
     // **vendor が解決できない相手にも、model 単位の分離は必ず効かせる。**
     authorModels: [PL_PROPOSAL_AUTHOR_MODEL],
     // 初回 implement Job の Design Review は常に `changedFiles: []` で走る
@@ -735,7 +1055,7 @@ export async function runRemediationStep(
   })
   if (!selection.ok) {
     // provider 構成が変わるまで結果は変わらないので、ここも試行として記録して有界にする。
-    recordRemediation(storage, taskId, 'outcome=no_independent_flagship')
+    recordRemediation(storage, taskId, `${round.prefix} stage=remediation outcome=no_independent_flagship`)
     return {
       status: 'no_independent_model',
       taskId,
@@ -747,7 +1067,7 @@ export async function runRemediationStep(
 
   const { candidate } = selection
   const provenance =
-    `provider=${candidate.provider} model=${candidate.model} vendor=${selection.vendor}`
+    `${round.prefix} provider=${candidate.provider} model=${candidate.model} vendor=${selection.vendor}`
     + ` excluded=${selection.excludedVendors.join('+') || '-'}`
     // 分離を確認できなかった相手を黙って落とさない。
     + ` unverified_separation=${selection.unresolvedAuthors.join('+') || '-'}`
@@ -769,9 +1089,12 @@ export async function runRemediationStep(
         ledgerBody,
       }),
     ].join('\n'),
-    workingDir: process.env.TARGET_ROOT ?? runnerDeps.workingDir,
+    // AI CLI は TARGET_ROOT 配下でしか動かない（AiCliAdapter の workingDir 検査）。TARGET_ROOT 未設定時の
+    // fallback を Stable の repoRoot にすると Production では必ず拒否される（2026-10-23 実測）。
+    workingDir: configuredTargetRoot(),
     // この VPS では Codex が repo を読むために必要（deprecated な暫定経路）。
     useLegacyLandlockSandbox: candidate.provider === 'codex',
+    timeoutMs: conflictRecoveryAdapterTimeoutMs(runnerDeps),
   })
 
   let execution: RunnerExecution
@@ -790,7 +1113,15 @@ export async function runRemediationStep(
 
   // **試行は必ず記録する。** 記録しないと上限が効かず、同じ失敗を無限に繰り返せる。
   if (!execution.ok) {
-    recordRemediation(storage, taskId, `${provenance} outcome=runner_failed`)
+    // **stdout に完全な提案があれば、それは判定である**（会計のみ。採用・適用はしない）。
+    // runner が提案を書いた後に落ちた場合を技術的失敗として数えると、parse 済みの提案が
+    // 判定予算を消費せず、その provider も著者として残らない（独立レビュー指摘）。
+    const parsedBeforeFailure = execution.stdout !== '' && parseRemediationProposal(execution.stdout) !== undefined
+    recordRemediation(
+      storage,
+      taskId,
+      `${provenance} outcome=${parsedBeforeFailure ? 'runner_failed_after_proposal' : 'runner_failed'}`,
+    )
     return {
       status: 'remediation_failed',
       taskId,
@@ -834,18 +1165,33 @@ export async function runRemediationStep(
   // ── 修正版 spec を適用する（guard → Gate → 採用 → fresh Review の共有経路）──
   //
   // **PL revision と同じ関数を通す。** 誰が spec を書いたかで関門が変わってはならない。
-  const outcome = await applyRevisedSpec(storage, {
-    subject,
-    ledgerBody,
-    submittedScope: buildRemediatedScope(proposal),
-    rawScope: proposal.implementationScope,
-    allowedPaths: proposal.allowedPaths,
-    acceptanceCriteria: proposal.acceptanceCriteria,
-    riskOpinionLevel: 'INDEPENDENT_REMEDIATION',
-    rationale: proposal.resolution,
-    provenance: provenance,
-    ...(deps.adopt !== undefined ? { adopt: deps.adopt } : {}),
-  })
+  //
+  // **parse 済みの提案は、後段が throw しても判定として残す。** `applyRevisedSpec()` が
+  // `fspec=` 行を書く前（Gate・storage・hash の準備中）に落ちると、PL ループは provider の無い
+  // `outcome=exception`（技術的失敗）しか書けず、判定予算も著者記録も失われる（独立レビュー指摘）。
+  // 既に判定行が書かれていれば足さない（二重計上しない）。PL ループ側は試行数が増えていれば
+  // exception 行を書かないので、ここで1行になる。
+  const rowsBeforeApply = countConflictAttempts(storage, taskId)
+  let outcome: ApplyRevisedSpecOutcome
+  try {
+    outcome = await applyRevisedSpec(storage, {
+      subject,
+      ledgerBody,
+      submittedScope: buildRemediatedScope(proposal),
+      rawScope: proposal.implementationScope,
+      allowedPaths: proposal.allowedPaths,
+      acceptanceCriteria: proposal.acceptanceCriteria,
+      riskOpinionLevel: 'INDEPENDENT_REMEDIATION',
+      rationale: proposal.resolution,
+      provenance: provenance,
+      ...(deps.adopt !== undefined ? { adopt: deps.adopt } : {}),
+    })
+  } catch (error: unknown) {
+    if (countConflictAttempts(storage, taskId) === rowsBeforeApply) {
+      recordRemediation(storage, taskId, `${provenance} outcome=proposal_parsed_apply_exception`)
+    }
+    throw error
+  }
 
   const common = {
     taskId,
@@ -866,6 +1212,9 @@ export async function runRemediationStep(
       reason: outcome.reason,
     }
   }
+  if (outcome.status === 'review_pending') {
+    return { ...common, status: 'review_pending', taskId: outcome.taskId, reason: outcome.reason }
+  }
   return {
     ...common,
     status: outcome.status === 'blocked'
@@ -879,6 +1228,7 @@ export async function runRemediationStep(
 /** 修正版 spec を適用した結果。Remediation と PL revision が共有する。 */
 export type ApplyRevisedSpecOutcome =
   | { status: 'applied'; taskId: string; proposedHash: string; specKey: string }
+  | { status: 'review_pending'; taskId: string; reason: string; proposedHash: string; specKey: string }
   | {
       status: 'not_materially_different' | 'blocked' | 'adoption_rejected' | 'still_not_aligned'
       failureCode: string
@@ -1037,6 +1387,30 @@ export async function applyRevisedSpec(
     (job) => job.aiCliPrompt !== undefined && computeDesignTextHash(job.aiCliPrompt) === proposedHash,
   )
   if (!applied) {
+    // **判定がまだ出ていないだけなら否定扱いしない。** この spec の fresh Review run が
+    // queued のまま残っている（runner が判定を返さず requeue された）なら pending として返す。
+    // 判定は保存済みの run から引き直す（メモリ上の結果を持ち回らない）。
+    const active = storage.designReviewRuns.findActiveByTaskId(result.taskId)
+    if (active !== undefined && active.designTextHash === proposedHash) {
+      return {
+        status: 'review_pending',
+        taskId: result.taskId,
+        reason: `the fresh design review of the revised design has not produced a judgment yet (run ${active.id} is ${active.status})`,
+        proposedHash,
+        specKey,
+      }
+    }
+    // 別の設計の review が active で、この spec の review を始められなかった（contention）。
+    // この spec は**まだ一度も審査されていない**ので「通らなかった」とは言えない。
+    if (active !== undefined) {
+      return {
+        status: 'review_pending',
+        taskId: result.taskId,
+        reason: `another design review (run ${active.id}) is active for this task; the revised design has not been reviewed yet`,
+        proposedHash,
+        specKey,
+      }
+    }
     return {
       status: 'still_not_aligned',
       failureCode: 'fresh_review_not_aligned',

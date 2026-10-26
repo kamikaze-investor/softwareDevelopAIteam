@@ -14,10 +14,13 @@ import type {
   QAResult,
   ReviewResult,
   Task,
+  TaskDetail,
   TaskFailureClassification,
+  TaskHumanDecisionFact,
   TaskSummary,
   WatchdogEvent,
 } from '@ai-team/shared'
+import { evaluateRecoverAdmission, evaluateResumeAdmission, isLiveWaitingApproval } from '@ai-team/shared'
 
 export function parseDateTime(value: string): number {
   const time = Date.parse(value)
@@ -116,7 +119,8 @@ export function deriveJobDisplayState(
     return isWatchdogConfirmedStalled(job, watchdogEvents) ? 'running_stalled' : 'running_healthy'
   }
   if (job.status === 'blocked') {
-    return findLinkedApproval(job, approvalRequests)?.status === 'WAITING_FOR_USER'
+    // 期限切れ WAITING は誰も待っていない（shared `isLiveWaitingApproval`。監査 A-02）。
+    return isLiveWaitingApproval(findLinkedApproval(job, approvalRequests))
       ? 'approval_waiting'
       : 'blocked'
   }
@@ -252,7 +256,8 @@ export function hasWaitingLinkedApproval(
   approvalRequests: ApprovalRequest[],
 ): boolean {
   const latestJob = sortJobsByNewestFirst(jobs)[0]
-  return findLinkedApproval(latestJob, approvalRequests)?.status === 'WAITING_FOR_USER'
+  // 期限切れ WAITING で手動操作を恒久ロックしない（承認も resume 拒否もされない行。監査 A-02）。
+  return isLiveWaitingApproval(findLinkedApproval(latestJob, approvalRequests))
 }
 
 /**
@@ -301,43 +306,76 @@ export function canReflectChanges(jobs: Job[], approvalRequests: ApprovalRequest
 }
 
 /**
+ * Resume / Recover の前提判定に Task 側から渡す事実（`GET /api/tasks/:id` の `TaskDetail`）。
+ *
+ * `parked` / `projectStatus` は optional にしてある。**この 2 つを返さない古い API に対しては
+ * 判定できないので、ボタンを出さない**（押しても断られる操作へ CEO を誘導しない側へ倒す）。
+ */
+export type TaskAdmissionFacts =
+  Pick<Task, 'status'> & Partial<Pick<TaskDetail, 'parked' | 'projectStatus' | 'repairDesignReviewInFlight'>>
+
+/**
+ * 判定へ渡す Job の並び。API の `resumeBlockedTask()` と同じ **createdAt の新しい順**。
+ *
+ * 表示用の `sortJobsByNewestFirst()`（startedAt 優先）を使わない —— 「最新 Job」の定義が
+ * API とずれると、同じ関数を呼んでも結論がずれる。`GET /api/jobs` は既に
+ * `created_at DESC, rowid DESC` で返すので、安定 sort で同時刻の順序はそのまま保つ。
+ */
+function jobsInAdmissionOrder(jobs: Job[]): Job[] {
+  return [...jobs].sort((a, b) => parseDateTime(b.createdAt) - parseDateTime(a.createdAt))
+}
+
+/**
  * resume UI（追加指示して再開）を表示すべきか。
  *
- * API側 `resumeBlockedTask` が受理する2パターンに対応する:
- *   1. 最新Jobがguard違反等で直接blockedになったケース（従来どおり）
- *   2. Design Review CONFLICT/NOT_ALIGNED等でrepair flowがTaskをblockedへ
- *      escalateしたが、Job自体はfailedのまま残っているケース
- *      （`escalateTaskToHuman` はJobを更新せずTask.statusだけをblockedにするため）。
- * 2番目を見落とすと、Design Review escalationされたTaskは資格があるのに
- * resume UIが一切表示されず、CEOがMobileから復旧できなくなる。
+ * **判定は共有の `evaluateResumeAdmission()` だけが行う**（API の `resumeBlockedTask()` と同じ関数・
+ * 同じ入力）。ここで条件を書き直すと、2026-10-16 監査 P4 のように「Mobile は Resume を出すのに
+ * API は断る」（park・古い Job の quarantine・別の live な承認待ち・done Task・非 running Project・
+ * live Job）／「API は受けるのに Mobile は隠す」（期限切れの linked WAITING）が再発する。
  */
 export function canShowResumeUI(
-  task: Task,
+  task: TaskAdmissionFacts,
   jobs: Job[],
   approvalRequests: ApprovalRequest[],
+  nowMs: number = Date.now(),
 ): boolean {
-  const latestJob = sortJobsByNewestFirst(jobs)[0]
+  if (typeof task.parked !== 'boolean') return false
+  // 事実が無い（古い API）なら出さない（parked と同じく fail-closed。判定の正本は API）。
+  if (typeof task.repairDesignReviewInFlight !== 'boolean') return false
+  return evaluateResumeAdmission({
+    taskStatus: task.status,
+    parked: task.parked,
+    projectStatus: task.projectStatus ?? undefined,
+    jobs: jobsInAdmissionOrder(jobs),
+    repairDesignReviewInFlight: task.repairDesignReviewInFlight,
+    // Mobile の操作は CEO（ADMIN credential）なので人の resume として判定する（API と同じ規則）。
+    resumedByHuman: true,
+    approvals: approvalRequests,
+    nowMs,
+  }).ok
+}
 
-  // MOB-001 / P1 Phase 2: quarantine は resume で解けない。
-  // workspace の状態を確認できていないから所有権を保持しているのであって、
-  // 追加指示を出しても API 側の quarantine guard が claim を拒否する。
-  // ここで resume UI を出すと、CEO を「押しても失敗する操作」へ誘導することになる。
-  if (isQuarantined(latestJob)) {
-    return false
-  }
-
-  const isJobDirectlyBlocked = latestJob?.status === 'blocked'
-  const isEscalatedFailure = task.status === 'blocked' && latestJob?.status === 'failed'
-
-  if (!isJobDirectlyBlocked && !isEscalatedFailure) {
-    return false
-  }
-
-  if (findLinkedApproval(latestJob, approvalRequests)?.status === 'WAITING_FOR_USER') {
-    return false
-  }
-
-  return true
+/**
+ * 「復旧（再開待ちに戻す）」— `POST /api/tasks/:id/recover` — を表示すべきか。
+ *
+ * Job 0 件のまま blocked で止まった Task は resume できない（`NO_JOBS`）。判定は共有の
+ * `evaluateRecoverAdmission()`（API の `recoverBlockedTask()` の precheck と同じ関数）。
+ */
+export function canShowRecoverUI(
+  task: TaskAdmissionFacts,
+  jobs: Job[],
+  approvalRequests: ApprovalRequest[],
+  nowMs: number = Date.now(),
+): boolean {
+  if (typeof task.parked !== 'boolean') return false
+  return evaluateRecoverAdmission({
+    taskStatus: task.status,
+    parked: task.parked,
+    projectStatus: task.projectStatus,
+    jobCount: jobs.length,
+    approvals: approvalRequests,
+    nowMs,
+  }).ok
 }
 
 /**
@@ -628,21 +666,16 @@ export type StoredReviewApprovalState = 'none' | 'waiting' | 'approved'
 
 export function storedReviewApprovalState(
   reviewJobId: string,
-  approvalRequests: ApprovalRequest[],
-  now: Date = new Date(),
+  humanTaskDecisions: readonly TaskHumanDecisionFact[] | undefined,
 ): StoredReviewApprovalState {
   const action = `repair_from_stored_review:${reviewJobId}`
-  // **期限切れは数えない。** backend は未失効のものしか使わないので、期限切れの APPROVED を
-  // 「承認済み」と出すと、押しても新しい承認待ちになって案内と食い違う（独立レビュー指摘）。
-  const unexpired = (request: ApprovalRequest): boolean => {
-    const expiresAt = Date.parse(request.expiresAt)
-    return Number.isNaN(expiresAt) ? false : expiresAt > now.getTime()
-  }
-  const related = approvalRequests.filter(
-    (request) => request.requestedAction === action && unexpired(request),
-  )
-  if (related.some((request) => request.status === 'APPROVED')) return 'approved'
-  if (related.some((request) => request.status === 'WAITING_FOR_USER')) return 'waiting'
+  // **authority を生の ApprovalRequest status から組み立て直さない**（lifecycle repair C3）。
+  // API の `TaskDetail.humanTaskDecisions` は期限切れ・決定主体（approval_actor=human）の無い APPROVED を
+  // 既に除いてある。backend は主体の無い APPROVED を consume せず SUPERSEDED にするので、それを
+  // 「承認済み」と出すと押しても新しい承認待ちになって案内と食い違う。事実が無い（古い API）なら 'none'。
+  const related = (humanTaskDecisions ?? []).filter((decision) => decision.requestedAction === action)
+  if (related.some((decision) => decision.state === 'approved')) return 'approved'
+  if (related.some((decision) => decision.state === 'waiting')) return 'waiting'
   return 'none'
 }
 
@@ -669,11 +702,10 @@ export type StoredReviewRecoveryView =
  * 動かず、**承認後にもう一度この操作を呼んで初めて** APPROVED を consume して queued にする。
  */
 export function storedReviewRecoveryView(
-  task: Task,
+  task: Task & Partial<Pick<TaskDetail, 'humanTaskDecisions'>>,
   jobs: Job[],
   reviews: ReviewResult[],
   qaResults: QAResult[] | null,
-  approvalRequests: ApprovalRequest[] = [],
 ): StoredReviewRecoveryView {
   const candidate = findStoredReviewRecoveryCandidate(task, jobs, reviews)
   if (!candidate) return { kind: 'hidden' }
@@ -681,7 +713,7 @@ export function storedReviewRecoveryView(
 
   const derived = deriveSafeCommandQaEvidence(candidate.implementJob)
   return {
-    approval: storedReviewApprovalState(candidate.reviewJob.id, approvalRequests),
+    approval: storedReviewApprovalState(candidate.reviewJob.id, task.humanTaskDecisions),
     candidate,
     derived,
     kind: 'ready',
