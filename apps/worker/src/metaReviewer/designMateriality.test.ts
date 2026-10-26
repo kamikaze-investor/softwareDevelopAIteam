@@ -428,3 +428,36 @@ describe('M5 trial (2026-10-26) の解析失敗への対応', () => {
     expect(observation.rawResponseExcerpt?.text.length).toBe(RAW_EXCERPT_CHARS)
   })
 })
+
+describe('M5 trial rerun (2026-10-26): subject 名の key に書かれた説明', () => {
+  const signals = computeMaterialitySignals(fileDiff('apps/api/src/x.ts', ["-  | 'challenge_aligned'"]))
+  const sid = signals[0].id
+  const body = (candidate: Record<string, unknown>) => JSON.stringify({
+    material: true, candidates: [candidate], signalDisposition: [{ signalId: sid, disposition: 'supports_candidate:c1', reason: '' }],
+  })
+
+  it('"design_contract": "…" を mechanism として読む', () => {
+    const parsed = parseDetection(body({ id: 'c1', kind: 'redefines', subject: 'design_contract', design_contract: 'Manual abort cleanup contract', file: 'f.ts', evidence: 'e' }), signals)
+    expect(parsed.ok && parsed.value.candidates[0].mechanism).toBe('Manual abort cleanup contract')
+  })
+
+  it('mechanism があればそちらを優先する', () => {
+    const parsed = parseDetection(body({ id: 'c1', kind: 'redefines', subject: 'authority_boundary', mechanism: 'm', authority_boundary: 'other', file: 'f.ts', evidence: 'e' }), signals)
+    expect(parsed.ok && parsed.value.candidates[0].mechanism).toBe('m')
+  })
+
+  it('どちらも無ければ invalid_candidate:mechanism', () => {
+    expect(parseDetection(body({ id: 'c1', kind: 'redefines', subject: 'state_transition', file: 'f.ts', evidence: 'e' }), signals))
+      .toEqual({ ok: false, reason: 'invalid_candidate:mechanism' })
+  })
+})
+
+it('mechanism の key があって不正な値なら、subject 名の key で救わない', () => {
+  const signals = computeMaterialitySignals(fileDiff('apps/api/src/x.ts', ["-  | 'challenge_aligned'"]))
+  const raw = JSON.stringify({
+    material: true,
+    candidates: [{ id: 'c1', kind: 'redefines', subject: 'design_contract', mechanism: 123, design_contract: 'fallback', file: 'f.ts', evidence: 'e' }],
+    signalDisposition: [{ signalId: signals[0].id, disposition: 'supports_candidate:c1', reason: '' }],
+  })
+  expect(parseDetection(raw, signals)).toEqual({ ok: false, reason: 'invalid_candidate:mechanism' })
+})
