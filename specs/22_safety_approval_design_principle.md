@@ -476,6 +476,22 @@ Risk Level・HIGH/CRITICAL・Approval Level 3 だけを理由に CEO へ上げ�
 **停止回数は CEO escalation 条件にしない。** 同じ Roadmap item が何度止まっても、それは技術的 escalation と
 Safety Evidence 強化の trigger である。技術的に難しいだけなら、何回失敗しても CEO に技術判断を求めない。
 
+**CONFLICT 復旧の予算会計は技術判断（B）であり、DA trigger (2) の authority 定義ではない**（2026-10-26）。
+Critic / Remediation の判定予算と技術的失敗の上限は、復旧を有限回で終わらせるための liveness の上限である。
+次の3点は技術判断で決めてよい（DA (2) の対象外）:
+- 何を判定として数えるか。判定とは、設計成果物を正式な Design Review 経路へ出した Round のことである。
+- 何を技術的失敗として数えるか。成果物を出さなかった Round（runner 失敗・timeout・壊れた応答・crash）がこれにあたる。
+- 技術的失敗をどの会計 epoch で数えるか。epoch は reviewed な修正でだけ変える。
+
+ただし次は変えない:
+- 判定は Task の生涯で数え、返金しない。
+- binding な CONFLICT を覆さない。ALIGNED を強制しない。
+- 修正版は必ず fresh な formal Design Review を通り、判定の反転には DA trigger 7 が適用される。
+- 技術的失敗は epoch を跨いだ総上限で必ず打ち切る。
+
+判定予算の回数そのもの（Critic 2・Remediation 2）を増やす変更は本規定の対象外である。
+それは同一設計の再審査回数を増やすので、DA (2) として扱う。
+
 **実例（Technical Recovery 条件が揃っていたのに ADMIN Human Resume 待ちになった）**:
 - `463563d0`（2026-10-02）
 - `b6d4097a` 1 回目（10-02 → 10-07、約 4.5 日。唯一の running Project を占有し続け、自律採用が全停止）

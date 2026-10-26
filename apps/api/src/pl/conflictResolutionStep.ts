@@ -63,10 +63,13 @@ import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { ADOPTION_REPOSITORY_MAP, resolveLedgerPath } from './adoptionStep'
 import {
   applyRevisedSpec,
+  beginConflictRound,
   buildDefaultRemediationDeps,
+  conflictRecoveryAdapterTimeoutMs,
   findRemediationSubject,
   isConflictStageAvailable,
   PL_MAX_REMEDIATION_ATTEMPTS,
+  PL_MAX_LIFETIME_TECHNICAL_FAILURES_PER_STAGE,
   PL_MAX_TECHNICAL_FAILURES_PER_STAGE,
   priorCriticModels,
   priorCriticProviders,
@@ -75,6 +78,8 @@ import {
   shortSpecKey,
   stageEntries,
   tallyConflictStage,
+  type ConflictRound,
+  type ConflictStageTally,
   type PlRemediationDeps,
   type RemediationSubject,
 } from './remediationStep'
@@ -93,14 +98,18 @@ export type ConflictStage = 'critic' | 'pl_revision' | 'challenge' | 'remediatio
 export interface ConflictStageSelection {
   stage: ConflictStage
   reason: string
-  /** critic stage の判定数（`outcome=critiqued`）。 */
+  /** critic stage の判定数（設計成果物を出した Round）。 */
   criticRounds: number
-  /** remediation stage の判定数（parse 済みの提案）。 */
+  /** remediation stage の判定数（設計成果物を出した Round）。 */
   remediationAttempts: number
-  /** 判定を生まなかった critic 行の数。 */
+  /** 現在の accounting epoch で成果物を出さなかった critic Round の数。 */
   criticTechnicalFailures: number
-  /** 判定を生まなかった remediation 行の数。 */
+  /** 現在の accounting epoch で成果物を出さなかった remediation Round の数。 */
   remediationTechnicalFailures: number
+  /** epoch を問わない critic の技術的失敗 Round 数（総上限の判定用）。 */
+  criticLifetimeTechnicalFailures: number
+  /** epoch を問わない remediation の技術的失敗 Round 数（総上限の判定用）。 */
+  remediationLifetimeTechnicalFailures: number
 }
 
 /**
@@ -112,7 +121,7 @@ export interface ConflictStageSelection {
 export function selectConflictStage(storage: IStorage, taskId: string): ConflictStageSelection {
   // **予算は判定だけを数える。** runner が判定を返さなかった行（runner_failed 等）は
   // stage ごとの技術的失敗として別に数え、`PL_MAX_TECHNICAL_FAILURES_PER_STAGE` で打ち切る
-  // （分類は `classifyConflictRecoveryRow()` の1箇所だけ。2026-10-23 `#2cae0d07`）。
+  // （予算は Round 単位で `tallyConflictStage()` だけが数える。2026-10-23 / 2026-10-26 `#2cae0d07`）。
   const critic = tallyConflictStage(storage, taskId, 'critic')
   const remediation = tallyConflictStage(storage, taskId, 'remediation')
   const base = {
@@ -120,6 +129,8 @@ export function selectConflictStage(storage: IStorage, taskId: string): Conflict
     remediationAttempts: remediation.judgments,
     criticTechnicalFailures: critic.technicalFailures,
     remediationTechnicalFailures: remediation.technicalFailures,
+    criticLifetimeTechnicalFailures: critic.lifetimeTechnicalFailures,
+    remediationLifetimeTechnicalFailures: remediation.lifetimeTechnicalFailures,
   }
 
   if (findRemediationSubject(storage, taskId) === undefined) {
@@ -133,7 +144,7 @@ export function selectConflictStage(storage: IStorage, taskId: string): Conflict
       stage: 'remediation',
       reason: critic.judgments >= PL_MAX_CRITIC_ROUNDS
         ? 'critic-assisted revision did not resolve it; escalating to independent remediation'
-        : `critic stage hit ${critic.technicalFailures} technical failure(s) without a judgment;`
+        : `critic stage hit ${describeTechnicalFailures(critic)} without a judgment;`
           + ' escalating to independent remediation',
       ...base,
     }
@@ -142,12 +153,19 @@ export function selectConflictStage(storage: IStorage, taskId: string): Conflict
     // 判定予算は残っているが、技術的失敗が上限に達した。既存の terminal 経路のまま、理由だけ区別する。
     return {
       stage: 'terminal',
-      reason: `technical failures exhausted the remediation stage (${remediation.technicalFailures}`
-        + `/${PL_MAX_TECHNICAL_FAILURES_PER_STAGE} without a judgment)`,
+      reason: `technical failures exhausted the remediation stage (${describeTechnicalFailures(remediation)}`
+        + ' without a judgment)',
       ...base,
     }
   }
   return { stage: 'terminal', reason: 'critic rounds and remediation attempts are both exhausted', ...base }
+}
+
+/** 技術的失敗の上限を、どちらの上限（epoch / 総数）で打ち切ったか分かる形で表す。 */
+function describeTechnicalFailures(tally: ConflictStageTally): string {
+  return `${tally.technicalFailures} technical failure(s) in this accounting epoch`
+    + ` (limit ${PL_MAX_TECHNICAL_FAILURES_PER_STAGE}),`
+    + ` ${tally.lifetimeTechnicalFailures} in total (limit ${PL_MAX_LIFETIME_TECHNICAL_FAILURES_PER_STAGE})`
 }
 
 // ────────────────────────────────────────────────────────────
@@ -516,7 +534,7 @@ async function runChallenge(
   storage: IStorage,
   subject: RemediationSubject,
   dispute: FindingAssessment,
-
+  round: ConflictRound,
   deps: ConflictResolutionDeps,
 ): Promise<ConflictRoundResult> {
   const taskId = subject.task.id
@@ -554,7 +572,7 @@ async function runChallenge(
   recordRemediationFailure(
     storage,
     taskId,
-    `stage=challenge chal=${key} orig_provider=unavailable orig_model=unavailable`
+    `${round.prefix} stage=challenge chal=${key} orig_provider=unavailable orig_model=unavailable`
     + ` orig_verdict=CONFLICT finding=${dispute.source} grounds=${dispute.grounds ?? '-'}`
     + ` evidence=${dispute.evidence !== undefined ? 'yes' : 'no'} outcome=starting`,
   )
@@ -586,7 +604,7 @@ async function runChallenge(
     recordRemediationFailure(
       storage,
       taskId,
-      `stage=challenge chal=${key} orig_verdict=CONFLICT outcome=pending`
+      `${round.prefix} stage=challenge chal=${key} orig_verdict=CONFLICT outcome=pending`
       + ` reason=${outcome.decision ?? outcome.status}`,
     )
     return {
@@ -601,7 +619,7 @@ async function runChallenge(
   recordRemediationFailure(
     storage,
     taskId,
-    `stage=challenge chal=${key} orig_verdict=CONFLICT chal_verdict=${verdict}`
+    `${round.prefix} stage=challenge chal=${key} orig_verdict=CONFLICT chal_verdict=${verdict}`
     + ` reversal=${outcome.status === 'evidence_registered' ? 'yes' : 'no'} outcome=evaluated`,
   )
 
@@ -690,6 +708,10 @@ async function runCriticRound(
   const taskId = subject.task.id
   const base = { stage: 'critic' as const, taskId }
 
+  // **Round を先に開く。** ここから先の失敗（runner・crash・PL revision・Challenge）はこの Round に属し、
+  // Round が設計成果物を出さなければ技術的失敗1回として数える（`tallyConflictStage()`）。
+  const round = beginConflictRound(storage, taskId, 'critic')
+
   // ── Critic model（Preference のみ。**不足しても失敗しない**）──────
   const selection = selectCriticModel({
     previousProviders: priorCriticProviders(storage, taskId),
@@ -697,7 +719,7 @@ async function runCriticRound(
   })
   const { candidate } = selection
   const provenance =
-    `stage=critic provider=${candidate.provider} model=${candidate.model}`
+    `${round.prefix} stage=critic provider=${candidate.provider} model=${candidate.model}`
     + ` vendor=${selection.vendor} reused_model=${selection.reusedModel ? 'yes' : 'no'}`
     + ` reused_vendor=${selection.reusedVendor ? 'yes' : 'no'}`
 
@@ -721,6 +743,7 @@ async function runCriticRound(
     // fallback を Stable の repoRoot にすると Production では必ず拒否される（2026-10-23 実測）。
     workingDir: configuredTargetRoot(),
     useLegacyLandlockSandbox: candidate.provider === 'codex',
+    timeoutMs: conflictRecoveryAdapterTimeoutMs(runnerDeps),
   })
 
   let execution: RunnerExecution
@@ -790,14 +813,14 @@ async function runCriticRound(
   const target = challengeTarget(critique, subject.findings.map((f) => f.source))
   if (target !== undefined) {
     const dispute = target
-    const challenge = await runChallenge(storage, subject, dispute, deps)
+    const challenge = await runChallenge(storage, subject, dispute, round, deps)
     if (challenge.status !== 'challenge_cap_reached') {
       return { ...challenge, ...withCritic }
     }
     // 上限を使い切っている場合は通常の PL revision へ落ちる（**止めない**）。
   }
 
-  return { ...(await runPlRevision(storage, subject, ledgerBody, critique, deps)), ...withCritic }
+  return { ...(await runPlRevision(storage, subject, ledgerBody, critique, round, deps)), ...withCritic }
 }
 
 /** 過去 Round で PL が行った変更の要約（audit から復元。新しい state は作らない）。 */
@@ -822,6 +845,7 @@ async function runPlRevision(
   subject: RemediationSubject,
   ledgerBody: string,
   critique: Critique,
+  round: ConflictRound,
   deps: ConflictResolutionDeps,
 ): Promise<ConflictRoundResult> {
   const taskId = subject.task.id
@@ -853,6 +877,9 @@ async function runPlRevision(
       ].join('\n'),
     )
   } catch (error: unknown) {
+    // 失敗を見える形で残す（以前は行が無く、Critic 行だけが判定として残っていた）。
+    // `fspec=` が無いので、この Round は設計成果物を出していない = 技術的失敗として数えられる。
+    recordRemediationFailure(storage, taskId, `${round.prefix} stage=pl_revision outcome=revision_failed`)
     return {
       ...base,
       status: 'revision_rejected',
@@ -863,6 +890,7 @@ async function runPlRevision(
 
   const revision = parsePlRevision(raw)
   if (!revision) {
+    recordRemediationFailure(storage, taskId, `${round.prefix} stage=pl_revision outcome=revision_unusable`)
     return {
       ...base,
       status: 'revision_rejected',
@@ -884,7 +912,7 @@ async function runPlRevision(
     // ** にする。**  のままだと、1 Round で Critic 行と
     // 適用行の2行が critic として数えられ、**1 Round で2 Round 分の予算を消費**する
     // （独立レビュー指摘。実際に Critic は1 Round しか回らなかった）。
-    provenance: 'stage=pl_revision',
+    provenance: `${round.prefix} stage=pl_revision`,
     ...(deps.adopt !== undefined ? { adopt: deps.adopt } : {}),
   })
 

@@ -772,7 +772,10 @@ describe('有界性と記録', () => {
     }))
 
     expect(result.status).toBe('remediation_failed')
-    expect(countRemediationAttempts(storage, taskId)).toBe(1)
+    // Round 開始行（outcome=starting）+ 失敗行。Round としては技術的失敗1回。
+    expect(countRemediationAttempts(storage, taskId)).toBe(2)
+    expect(tallyConflictStage(storage, taskId, 'remediation'))
+      .toEqual({ judgments: 0, technicalFailures: 1, lifetimeTechnicalFailures: 1 })
   })
 
   it('runner 失敗は判定予算ではなく技術的失敗上限で打ち切り、上限後は実行せず attempts_exhausted を返す', async () => {
@@ -796,7 +799,11 @@ describe('有界性と記録', () => {
     }
     // runner 失敗は著者ではないので3回とも flagship を選んで実行し、3回とも技術的失敗として数える。
     const tally = tallyConflictStage(storage, taskId, 'remediation')
-    expect(tally).toEqual({ judgments: 0, technicalFailures: PL_MAX_TECHNICAL_FAILURES_PER_STAGE })
+    expect(tally).toEqual({
+      judgments: 0,
+      technicalFailures: PL_MAX_TECHNICAL_FAILURES_PER_STAGE,
+      lifetimeTechnicalFailures: PL_MAX_TECHNICAL_FAILURES_PER_STAGE,
+    })
     const executionsAtCap = executions
     const beyond = await runRemediationStep(storage, taskId, failing)
 
@@ -826,7 +833,7 @@ describe('有界性と記録', () => {
     expect(executions).toBe(PL_MAX_REMEDIATION_ATTEMPTS)
     expect(beyond.status).toBe('attempts_exhausted')
     expect(tallyConflictStage(storage, taskId, 'remediation'))
-      .toEqual({ judgments: PL_MAX_REMEDIATION_ATTEMPTS, technicalFailures: 0 })
+      .toEqual({ judgments: PL_MAX_REMEDIATION_ATTEMPTS, technicalFailures: 0, lifetimeTechnicalFailures: 0 })
   })
 
   it('ledger が読めない場合も試行として記録する（通知ループを作らない）', async () => {
@@ -839,7 +846,9 @@ describe('有界性と記録', () => {
     }))
 
     expect(result.failureCode).toBe('ledger_unreadable')
-    expect(countRemediationAttempts(storage, taskId)).toBe(1)
+    // Round は ledger を読む前に開く（starting 行 + 失敗行）。
+    expect(countRemediationAttempts(storage, taskId)).toBe(2)
+    expect(tallyConflictStage(storage, taskId, 'remediation').technicalFailures).toBe(1)
   })
 
   it('ledger から項目が消えている場合も試行として記録する', async () => {
@@ -848,7 +857,8 @@ describe('有界性と記録', () => {
     const result = await runRemediationStep(storage, taskId, deps())
 
     expect(result.failureCode).toBe('item_not_in_ledger')
-    expect(countRemediationAttempts(storage, taskId)).toBe(1)
+    expect(countRemediationAttempts(storage, taskId)).toBe(2)
+    expect(tallyConflictStage(storage, taskId, 'remediation').technicalFailures).toBe(1)
   })
 
   it('provenance（provider / model / 未確認の分離相手）を audit へ残す', async () => {
@@ -859,7 +869,10 @@ describe('有界性と記録', () => {
     }))
     const entries = storage.auditLog.findByEntity('pl_remediation', `remediate:${taskId}`)
 
-    expect(entries).toHaveLength(1)
+    // 新しい順: [適用行, Round 開始行]。
+    expect(entries).toHaveLength(2)
+    expect(entries[1]?.detail).toMatch(/^round=\S+ epoch=\d+ stage=remediation outcome=starting$/)
+    expect(entries[0]?.detail).toMatch(/^round=\S+ epoch=\d+ /)
     expect(entries[0]?.detail).toContain('provider=codex')
     expect(entries[0]?.detail).toContain('model=gpt-5.6-sol')
     // PL の provider は vendor を解決できないので、分離を主張せず記録する。
@@ -868,7 +881,7 @@ describe('有界性と記録', () => {
 })
 
 describe('parse 済みの提案は後段が失敗しても判定として残る（独立レビュー P2a）', () => {
-  it('runner が ok=false でも stdout に完全な提案があれば、判定として provider 付きで数える（採用はしない）', async () => {
+  it('runner が ok=false でも stdout に完全な提案があれば provider 付きで記録する（採用しない。正式経路へ出ていないので判定ではない）', async () => {
     const { storage, taskId } = seedConflictedTask()
     let adopted = false
 
@@ -882,9 +895,12 @@ describe('parse 済みの提案は後段が失敗しても判定として残る�
 
     expect(result.status).toBe('remediation_failed')
     expect(adopted).toBe(false)
-    expect(tallyConflictStage(storage, taskId, 'remediation')).toEqual({ judgments: 1, technicalFailures: 0 })
+    // 提案は正式経路（Gate・採用・Design Review）へ出ていないので Round は技術的失敗（2026-10-26 Round 会計）。
+    // 著者除外は `classifyConflictRecoveryRow()` が従来どおり行う（provider は著者として残る）。
+    expect(tallyConflictStage(storage, taskId, 'remediation'))
+      .toEqual({ judgments: 0, technicalFailures: 1, lifetimeTechnicalFailures: 1 })
     const rows = stageEntries(storage, taskId, 'remediation').map((e) => e.detail ?? '')
-    expect(rows).toHaveLength(1)
+    expect(rows).toHaveLength(2)
     expect(rows[0]).toContain('provider=codex')
     expect(rows[0]).toContain('outcome=runner_failed_after_proposal')
   })
@@ -900,11 +916,12 @@ describe('parse 済みの提案は後段が失敗しても判定として残る�
         },
       }))
 
-      expect(tallyConflictStage(storage, taskId, 'remediation')).toEqual({ judgments: 0, technicalFailures: 1 })
+      expect(tallyConflictStage(storage, taskId, 'remediation'))
+        .toEqual({ judgments: 0, technicalFailures: 1, lifetimeTechnicalFailures: 1 })
     }
   })
 
-  it('parse 後、fspec 行を書く前に storage / 認可が throw しても provider 付きの判定行を1行だけ残す', async () => {
+  it('parse 後、fspec 行を書く前に storage / 認可が throw しても provider 付きの行を1行だけ残す（正式経路へ出ていないので技術的失敗）', async () => {
     const { storage, taskId } = seedConflictedTask()
     const record = storage.auditLog.record.bind(storage.auditLog)
     let armed = false
@@ -922,10 +939,11 @@ describe('parse 済みの提案は後段が失敗しても判定として残る�
     }))).rejects.toThrow('storage unavailable')
 
     const rows = stageEntries(storage, taskId, 'remediation').map((e) => e.detail ?? '')
-    expect(rows).toHaveLength(1)
+    expect(rows).toHaveLength(2)
     expect(rows[0]).toContain('provider=codex')
     expect(rows[0]).toContain('outcome=proposal_parsed_apply_exception')
-    expect(tallyConflictStage(storage, taskId, 'remediation')).toEqual({ judgments: 1, technicalFailures: 0 })
+    expect(tallyConflictStage(storage, taskId, 'remediation'))
+      .toEqual({ judgments: 0, technicalFailures: 1, lifetimeTechnicalFailures: 1 })
   })
 
   it('applyRevisedSpec が判定行（adopting）を書いた後に throw したら、追加の行を書かない（二重計上しない）', async () => {
@@ -936,11 +954,13 @@ describe('parse 済みの提案は後段が失敗しても判定として残る�
     }))).rejects.toThrow('adoption crashed')
 
     const rows = stageEntries(storage, taskId, 'remediation').map((e) => e.detail ?? '')
-    expect(rows).toHaveLength(1)
+    expect(rows).toHaveLength(2)
     expect(rows[0]).toContain('outcome=adopting')
+    // adopting（採用予約）は返金しない判定。
+    expect(tallyConflictStage(storage, taskId, 'remediation').judgments).toBe(1)
   })
 
-  it('壊れた応答（unusable）は判定予算を消費する（fail-closed）が、Remediation は止まらず次を試す', async () => {
+  it('壊れた応答（unusable）は設計成果物を出していないので技術的失敗（旧 epoch の行は現在の上限に入らない）', async () => {
     const { storage, taskId } = seedConflictedTask()
     storage.auditLog.record({
       actor: 'api', operation: 'pl_independent_remediation', entityType: 'pl_remediation',
@@ -959,7 +979,9 @@ describe('parse 済みの提案は後段が失敗しても判定として残る�
       },
     }))
 
-    expect(tallyConflictStage(storage, taskId, 'remediation')).toEqual({ judgments: 1, technicalFailures: 1 })
+    // 旧形式の unusable 行は epoch 0 の技術的失敗: 総数には入り、現在の epoch の上限には入らない。
+    expect(tallyConflictStage(storage, taskId, 'remediation'))
+      .toEqual({ judgments: 0, technicalFailures: 1, lifetimeTechnicalFailures: 2 })
     expect(used).toHaveLength(1)
   })
 })

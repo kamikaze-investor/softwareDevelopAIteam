@@ -14,6 +14,10 @@ import { checkImplementJobDesignReviewEvidence } from '../designReviewEvidencePo
 import {
   PL_MAX_REMEDIATION_ATTEMPTS,
   countRemediationAttempts,
+  CONFLICT_RECOVERY_ACCOUNTING_EPOCH,
+  CONFLICT_RECOVERY_RUNNER_TIMEOUT_MS,
+  buildDefaultRemediationDeps,
+  conflictRecoveryAdapterTimeoutMs,
   recordRemediationFailure,
   stageEntries,
 } from './remediationStep'
@@ -157,6 +161,24 @@ function seed(options: { resultJson?: string; roadmapTaskKey?: string } = {}): {
   return { storage, taskId: task.id, designText }
 }
 
+/**
+ * 設計成果物を出した Critic Round を1つ記録する（critique → PL revision の具体的 spec）。
+ *
+ * 2026-10-26 から予算は Round 単位で、`critiqued` 行だけでは判定にならない（成果物を出さなかった
+ * Round は技術的失敗）。判定済みの Round を前提にするテストはこの形で seed する。
+ */
+let seededRound = 0
+function recordCriticJudgment(storage: IStorage, taskId: string, criticDetail = 'provider=codex model=gpt-5.6-sol'): void {
+  seededRound += 1
+  const prefix = `round=seeded-${seededRound} epoch=${CONFLICT_RECOVERY_ACCOUNTING_EPOCH}`
+  recordRemediationFailure(storage, taskId, `${prefix} stage=critic ${criticDetail} outcome=critiqued`)
+  recordRemediationFailure(
+    storage,
+    taskId,
+    `${prefix} stage=pl_revision proposed=h${seededRound} fspec=seeded${seededRound} rejected_fspec=- outcome=adopting`,
+  )
+}
+
 /** Critic runner を差し替える deps。 */
 function deps(critique: unknown, over: Record<string, unknown> = {}) {
   return {
@@ -182,7 +204,7 @@ describe('selectConflictStage — 既存 state の observer', () => {
   it('Critic Round を使い切ったら remediation へ移る', () => {
     const { storage, taskId } = seed()
     for (let i = 0; i < PL_MAX_CRITIC_ROUNDS; i += 1) {
-      recordRemediationFailure(storage, taskId, 'stage=critic outcome=critiqued')
+      recordCriticJudgment(storage, taskId)
     }
 
     expect(selectConflictStage(storage, taskId).stage).toBe('remediation')
@@ -193,7 +215,7 @@ describe('selectConflictStage — 既存 state の observer', () => {
     // （2026-10-23 `#2cae0d07`）を固定していた。判定予算は parse 済みの提案だけが消費する。
     const { storage, taskId } = seed()
     for (let i = 0; i < PL_MAX_CRITIC_ROUNDS; i += 1) {
-      recordRemediationFailure(storage, taskId, 'stage=critic outcome=critiqued')
+      recordCriticJudgment(storage, taskId)
     }
     recordRemediationFailure(storage, taskId, 'stage=remediation outcome=abandon')
     recordRemediationFailure(storage, taskId, 'stage=remediation proposed=h fspec=abc rejected_fspec=- outcome=not_different')
@@ -206,7 +228,7 @@ describe('selectConflictStage — 既存 state の observer', () => {
   it('Critic 判定が尽き remediation runner_failed ×2 だけなら remediation がまだ使える', () => {
     const { storage, taskId } = seed()
     for (let i = 0; i < PL_MAX_CRITIC_ROUNDS; i += 1) {
-      recordRemediationFailure(storage, taskId, 'stage=critic outcome=critiqued')
+      recordCriticJudgment(storage, taskId)
     }
     for (let i = 0; i < PL_MAX_REMEDIATION_ATTEMPTS; i += 1) {
       recordRemediationFailure(storage, taskId, 'stage=remediation outcome=runner_failed')
@@ -459,11 +481,7 @@ describe('Critic model の Preference と fallback', () => {
     // Critic Round を使い切っていれば次は remediation であって terminal ではない。
     const { storage, taskId } = seed()
     for (const model of ['gpt-5.6-sol', 'claude-opus-5']) {
-      recordRemediationFailure(
-        storage,
-        taskId,
-        `stage=critic provider=x model=${model} outcome=critiqued`,
-      )
+      recordCriticJudgment(storage, taskId, `provider=x model=${model}`)
     }
 
     expect(selectConflictStage(storage, taskId).stage).toBe('remediation')
@@ -526,6 +544,63 @@ describe('audit / observability', () => {
   })
 })
 
+describe('Round 単位の会計の配線（2026-10-26）', () => {
+  it('PL revision が壊れた応答なら revision_unusable 行を残し、その Round は技術的失敗（Critic 判定を消費しない）', async () => {
+    const { storage, taskId } = seed()
+
+    const result = await runConflictResolutionRound(storage, taskId, deps(SUPPORTED_CRITIQUE, {
+      revise: async () => '<tool_call><function=bash><parameter=command>ls</parameter></function></tool_call>',
+    }) as never)
+
+    expect(result.status).toBe('revision_rejected')
+    const rows = storage.auditLog.findByEntity('pl_remediation', `remediate:${taskId}`).map((e) => e.detail ?? '')
+    // 新しい順: revision_unusable / critiqued / starting。すべて同じ Round。
+    expect(rows).toHaveLength(3)
+    const round = /^round=(\S+) /.exec(rows[2] ?? '')?.[1]
+    expect(round).toBeDefined()
+    for (const row of rows) expect(row.startsWith(`round=${round} `)).toBe(true)
+    expect(rows[0]).toContain('stage=pl_revision outcome=revision_unusable')
+    expect(selectConflictStage(storage, taskId)).toMatchObject({ stage: 'critic', criticRounds: 0, criticTechnicalFailures: 1 })
+  })
+
+  it('Round 開始行は runner より前に書かれる（runner 中に落ちても Round が残る）', async () => {
+    const { storage, taskId } = seed()
+    let rowsAtRunner: string[] = []
+
+    await runConflictResolutionRound(storage, taskId, deps(SUPPORTED_CRITIQUE, {
+      runnerDeps: {
+        runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+        execute: async () => {
+          rowsAtRunner = storage.auditLog.findByEntity('pl_remediation', `remediate:${taskId}`).map((e) => e.detail ?? '')
+          return { ok: false, stdout: '', error: 'process died', timedOut: false }
+        },
+      },
+    }) as never)
+
+    expect(rowsAtRunner).toHaveLength(1)
+    expect(rowsAtRunner[0]).toMatch(/^round=\S+ epoch=\d+ stage=critic outcome=starting$/)
+  })
+
+  it('critic / remediation の runner へ外側期限より短い adapter 期限を渡す', async () => {
+    expect(buildDefaultRemediationDeps().timeoutMs).toBe(CONFLICT_RECOVERY_RUNNER_TIMEOUT_MS)
+    expect(conflictRecoveryAdapterTimeoutMs(buildDefaultRemediationDeps())).toBe(CONFLICT_RECOVERY_RUNNER_TIMEOUT_MS - 30_000)
+
+    const { storage, taskId } = seed()
+    const timeouts: unknown[] = []
+    const runnerDeps = {
+      runnerCommand: 'noop', runnerArgs: [], homeDirectory: ledgerRoot, workingDir: ledgerRoot,
+      timeoutMs: CONFLICT_RECOVERY_RUNNER_TIMEOUT_MS,
+      execute: async (raw: string) => {
+        timeouts.push((JSON.parse(raw) as { timeoutMs?: number }).timeoutMs)
+        return { ok: false, stdout: '', error: 'boom', timedOut: false }
+      },
+    }
+    await runConflictResolutionRound(storage, taskId, deps(SUPPORTED_CRITIQUE, { runnerDeps }) as never)
+
+    expect(timeouts).toEqual([CONFLICT_RECOVERY_RUNNER_TIMEOUT_MS - 30_000])
+  })
+})
+
 describe('有界性', () => {
   it('Critic runner 失敗も Round として記録する（記録しないと予算が効かない）', async () => {
     const { storage, taskId } = seed()
@@ -538,12 +613,13 @@ describe('有界性', () => {
     }) as never)
 
     expect(result.status).toBe('critic_failed')
-    // Critic の失敗は **Critic Round の予算**を消費する（Remediation の予算とは別勘定）。
-    expect(stageEntries(storage, taskId, 'critic').length).toBe(1)
+    // Critic の失敗は Critic stage の技術的失敗1回（Round 開始行 + 失敗行。Remediation とは別勘定）。
+    expect(stageEntries(storage, taskId, 'critic').length).toBe(2)
+    expect(selectConflictStage(storage, taskId)).toMatchObject({ criticRounds: 0, criticTechnicalFailures: 1 })
     expect(countRemediationAttempts(storage, taskId)).toBe(0)
   })
 
-  it('Critic runner が ok=false でも stdout に完全な Critique があれば判定として数え、その Critique は使わない', async () => {
+  it('Critic runner が ok=false なら stdout に完全な Critique があっても使わず、成果物が無いので技術的失敗', async () => {
     const { storage, taskId } = seed()
     let revised = false
 
@@ -558,10 +634,10 @@ describe('有界性', () => {
     expect(result.status).toBe('critic_failed')
     expect(revised).toBe(false)
     const rows = stageEntries(storage, taskId, 'critic').map((e) => e.detail ?? '')
-    expect(rows).toHaveLength(1)
+    expect(rows).toHaveLength(2)
     expect(rows[0]).toContain('provider=')
     expect(rows[0]).toContain('outcome=runner_failed_after_critique')
-    expect(selectConflictStage(storage, taskId)).toMatchObject({ criticRounds: 1, criticTechnicalFailures: 0 })
+    expect(selectConflictStage(storage, taskId)).toMatchObject({ criticRounds: 0, criticTechnicalFailures: 1 })
   })
 
   it('Critique が壊れていても Round として記録する', async () => {
@@ -570,8 +646,9 @@ describe('有界性', () => {
     const result = await runConflictResolutionRound(storage, taskId, deps('not a critique') as never)
 
     expect(result.status).toBe('critique_unusable')
-    // Critic の失敗は **Critic Round の予算**を消費する（Remediation の予算とは別勘定）。
-    expect(stageEntries(storage, taskId, 'critic').length).toBe(1)
+    // 壊れた Critique は成果物を出していない = Critic stage の技術的失敗1回（技術的失敗の上限で有界）。
+    expect(stageEntries(storage, taskId, 'critic').length).toBe(2)
+    expect(selectConflictStage(storage, taskId)).toMatchObject({ criticRounds: 0, criticTechnicalFailures: 1 })
     expect(countRemediationAttempts(storage, taskId)).toBe(0)
   })
 })
