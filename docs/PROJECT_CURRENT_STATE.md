@@ -353,7 +353,6 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Design Review runner が本番経路でのみ 120s timeout する（Root Cause 未確定）**（state: planned）
 - **Review provider が枯渇したとき、別 provider へ正式に再審査を依頼できるようにする**（state: planned）
 - **traversal / loop に termination guarantee があるかの横断監査（read-only）**（state: planned）
-- **master Ruleset の code-owner review が GitHub で強制されていない（`required_approving_review_count=0`）**（state: deferred）
 - **#409 が除いた「最初の `{` から最後の `}`」JSON 抽出が、#406 の materiality parser で再導入され M5 の recall を黙って下げる**（state: planned）
 - **監視責務の段階分離（Deterministic Watchdog → Lightweight Monitor → VPS PL）（state: planned）
 - **ChatGPT から AIteamOS を inspect / audit / explain できるようにする（MCP）**（state: deferred）
