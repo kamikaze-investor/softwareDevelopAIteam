@@ -1272,8 +1272,8 @@ describe('checkRoadmapCompletionAwaitingPromotion — Safety Evidence path（#34
     return { storage, projectId, taskId: first.taskId, sourceJobId }
   }
 
-  // gate-policy-v3（2026-10-16）以降の evidence と、Production に残る v2 の evidence の両方を同じ証明として扱う。
-  it.each(['gate-policy-v2', 'gate-policy-v3'])('%s の bind 済み ALLOW evidence はどちらも promotion 待ちとして検出する', async (policyVersion) => {
+  // gate-policy-v3（2026-10-16）・v4（2026-10-23）以降の evidence と、Production に残る v2 の evidence を同じ証明として扱う。
+  it.each(['gate-policy-v2', 'gate-policy-v3', 'gate-policy-v4'])('%s の bind 済み ALLOW evidence はどちらも promotion 待ちとして検出する', async (policyVersion) => {
     const { storage, projectId, taskId, sourceJobId } = await withEvidenceCompletion({ policyVersion })
 
     expect(checkRoadmapCompletionAwaitingPromotion(storage, projectId, 'first-item', LEDGER_IDS)).toEqual([
@@ -1299,8 +1299,8 @@ describe('checkRoadmapCompletionAwaitingPromotion — Safety Evidence path（#34
     ['evidence が別 Job のもの', { onOtherJob: true }],
     ['decision が ALLOW でない', { decision: 'BLOCKED' }],
     ['bindingVerification が authoritative でない', { bindingVerification: 'diff_text_hash' }],
-    ['policyVersion が gate-policy-v2 / v3 でない', { policyVersion: 'gate-policy-v1' }],
-    ['policyVersion が未知の版（v4）', { policyVersion: 'gate-policy-v4' }],
+    ['policyVersion が gate-policy-v2 / v3 / v4 でない', { policyVersion: 'gate-policy-v1' }],
+    ['policyVersion が未知の版（v5）', { policyVersion: 'gate-policy-v5' }],
     ['targetBranch が Candidate でない', { targetBranch: 'master' }],
     ['source Job に commitHash が無い', { sourceWithoutCommitHash: true }],
     ['source Job に CONSUMED でない approval（APPROVED）が link されている', { linkedApprovalStatus: 'APPROVED' }],
