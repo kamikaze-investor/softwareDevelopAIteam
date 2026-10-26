@@ -507,7 +507,12 @@ export function parseDetection(raw: string, signals: readonly MaterialitySignal[
   if (!Array.isArray(json.candidates) || !Array.isArray(json.signalDisposition)) return { ok: false, reason: 'missing_arrays' }
 
   const candidates: MaterialityCandidate[] = []
-  for (const c of json.candidates as Array<Record<string, unknown>>) {
+  for (const raw of json.candidates as Array<Record<string, unknown>>) {
+    // model は subject が mechanism 以外だと説明を subject 名の key（"design_contract": "…" 等）に書くことがある
+    // （M5 trial 2026-10-26 で3件とも）。同じ内容なので、mechanism の key が**無いときだけ** mechanism として読む
+    const c = raw && !Object.hasOwn(raw, 'mechanism') && oneOf(CANDIDATE_SUBJECTS, raw.subject) && isString(raw[raw.subject])
+      ? { ...raw, mechanism: raw[raw.subject] }
+      : raw
     // 採点に使う欄（id・kind・subject・mechanism・file・evidence。target 照合は mechanism + evidence を読む）は厳格
     const bad = !c ? 'candidate' : !isString(c.id) ? 'id' : !oneOf(CANDIDATE_KINDS, c.kind) ? 'kind'
       : !oneOf(CANDIDATE_SUBJECTS, c.subject) ? 'subject' : !isString(c.mechanism) ? 'mechanism'

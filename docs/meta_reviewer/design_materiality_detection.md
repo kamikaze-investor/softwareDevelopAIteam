@@ -52,6 +52,7 @@ base 側の設計記録（roadmap / decisions / specs / AGENTS.md）のうち、
 次の JSON **だけ**を返す（```json fence 可）。`material` は `candidates` が空でないことと一致させる。
 
 - `kind` と `subject` は上に挙げた値の**どれか1つをそのまま**書く（別の語・複数値にしない）
+- 何が変わるかの説明は、`subject` が何であっても**常に `mechanism` という key** に書く（`"design_contract": …` のように subject 名を key にしない）
 - `file` は**リポジトリ相対の path を1つだけ**書く（その判断の中心になる file）。1つの判断が複数 file に
   またがるなら、主な file を `file` に書き、残りは `evidence` に書く
 
