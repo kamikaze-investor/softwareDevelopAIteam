@@ -285,6 +285,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **repair 予算が Task 全体の件数で数えられ、独立した失敗が同じ予算を食っていた／人の再開でも予算が戻らなかった**
 - **未設定値から作った credential hash が「形式上正しいもの」として通り、空 token を受理する**
 - **legacy `API_TOKEN` → ADMIN / WORKER split credential cutover の正式 owner（CEO / Operator 判断）**
+- **Cross-Task Drift Audit: 個々には妥当な変更の組合せによる構造ドリフトを、決まった境界で反証する**
 - **Mobile 内の運用指示窓口（Operator Chat）**
 - **`failed` な Job は `attention` に出ないため、Task が止まったまま PL から見えない**
 - **PL が次の Roadmap 項目を自分で選んで採用できるようにする（自律ループの最後の外部依存）**
@@ -364,6 +365,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **段階投入（feature flag / canary / 段階配信）が無い**（state: deferred）
 - **Principle Registry の適用範囲拡張と、実データによる閾値の自己再評価**（state: planned）
 - **Design Review CONFLICT で止まった採用を、独立した flagship AI が作り直す（Independent Remediation）**（state: in_progress）
+- **CONFLICT recovery の「この試行は判定か」に owner が2つあり、#2cae0d07 と同じ停止が別 outcome で残る**（state: planned）
 - **Remediation の試行受付が原子的でない（複数 API プロセス前提でのみ問題になる）**（state: deferred）
 - **System One Decision Layer の一般化（Principle 以外の Question category / 外部 Decision Engine 評価）**（state: deferred）
 - **Lifecycle 横断監査（RC1〜RC6）と一括修復 W1〜W7: 同じ意味を経路ごとに別の表現・述語で判定していた**（state: in_progress）

@@ -165,6 +165,15 @@ Production / Secret等の**Authority・Safety Boundaryを一切変更しない**
     （semantic change を100%機械検出できるものではない）。
   comment / wording / formatting / rename / test追加のみ / 実装詳細のみ では発火しない。
   PL は deterministic trigger 外でも追加 Challenge を発火できる。
+  - **Cross-Task Challenge**（2026-10-26）: 1 Task ずつの Review では見えない、複数の merge 済み変更の
+    **組合せ**による歪み（同じ意味の owner の重複・層ごとの再解釈・偶発的表現への依存・不要な状態や分岐の増加・
+    Authority / Approval Tuple の実質変化・同じ failure class の生き残り）を反証する。
+    PL は **Production deploy の後**（`--deployed <sha>`）と、変更を merge した後に `pnpm cross-task-audit due` を実行し、
+    `due: true` なら `packet` を Challenger へ渡して `findings` で検証する。発火条件・window・DA の機械格上げは
+    script（`apps/worker/scripts/crossTaskAudit/`）が正本で、PL は判断しない。**何も止めない**（Gate ではなく、
+    deploy 後の時間待ちと同じく非 blocking）。technical finding は通常の roadmap / PR 経路で AI が処理し、
+    DA 候補は PL が `specs/22` 1-2 に照らして処分を記録して、本当に該当するものだけを最終報告で CEO へ伝える
+    （承認依頼にしない）。記録・効果測定は `docs/project_memory/decisions/cross_task_drift_audit_design.md`。
   Strategic Alignment / Focused / Integration / Independent Review の既存責務は変更しない。
   **「非自明なら毎回」実行しない。** 反証の期待価値が高い次の場合に限定する:
   Safety Boundary／Authority・Permission／State Transition／DB・State Integrity／

@@ -2146,6 +2146,10 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
       Evolutionの責務定義（本ファイル944-1030行）と重複する独立実装を作っていないこと
 
       (2026-10-22 roadmap integrity audit: 「改善案は CEO Proposal → CEO 承認」は Decision Authority Principle（2026-10-02、`specs/22` 1-2・1-3）より前の記述。CEO へ上げるのは DA trigger に当たる改善（Goal・Policy・authority 等）だけで、技術的な改善は Evidence を伴う通常の Task 経路で扱う。CEO Proposal を Approval Gate の行で運ばない（`approval_rules.md` §A・B-5: Task の承認待ちは1件で、新しい起票は既存の WAITING を置換する）。着手時にこの差分を整合させる)
+
+      **2026-10-26 追記（Cross-Task Drift Audit の記録も入力）**: `docs/project_memory/decisions/cross_task_audit_*.md` の finding 表
+      （`xta-<base7>-NN`、問い別・採否・escaped）は本項目の durable input である（`cross-task-drift-audit`）。
+      取り込みは principle_sensor と同じく backfill 可能にし、反復する finding の clustering は本項目が持つ。
 **統合設計確定（2026-09-01、CEO承認。項目6・7・8・9の関係を以下に固定する）**:
 Natural-language Project Definition → AI structured constraints → Readiness → Roadmap
 generation → deterministic constraint validation → whole-roadmap independent Design
@@ -10378,6 +10382,33 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       記録ファイルにあり、D1〜D5 は別項目として未登録、mutation は推論で未実測、PL loop 配下の await は未列挙（同記録 §6）。
 
 
+<!-- roadmap:id=cross-task-drift-audit state=done -->
+0. [x] **Cross-Task Drift Audit: 個々には妥当な変更の組合せによる構造ドリフトを、決まった境界で反証する** —
+      2026-10-26登録・完了（v1）。設計判断と効果測定の正本は `docs/project_memory/decisions/cross_task_drift_audit_design.md`、
+      各回の記録は `docs/project_memory/decisions/cross_task_audit_<date>.md`。
+
+      **なぜ**: 既存 Review はすべて 1 Task / 1 diff / 1 PR しか見ない（実装後 review は他ファイルを見るなと指示され、
+      `semantic_integrity.md` は「material 外の全数調査は要求しない」）。複数変更の組合せが作る歪み
+      （同じ意味の owner の重複・層ごとの再解釈・偶発的表現への依存・不要な状態や分岐・Authority / Approval Tuple の実質変化・
+      同じ failure class の生き残り）を見る責務は、これまで手作業の横断監査（`repository_rot_audit_2026_09_15.md`、
+      `termination_guarantee_audit_2026_10_16.md`、`lifecycle-semantic-integrity-batch-repair` の RC1〜RC6、#396）にしか無かった。
+
+      **入れたもの**: deterministic な `apps/worker/scripts/crossTaskAudit/`（`pnpm cross-task-audit due | packet | findings`）と、
+      AGENTS.md 3-2 Design Challenger の **Cross-Task Challenge** トリガー。発火は Production deploy / fix chain /
+      CODEOWNERS surface の重複（`evaluateDue()` が正本。固定の「N Task ごと」ではない）。DA 候補は機械で格上げのみ。
+      最新の監査記録の head が次の window の base（新しい storage なし）。
+
+      **作らないもの**: runtime 変更・Gate・status・scheduler・DB・Approval・AI provider 呼び出し・集計 script。
+      **何も止めない。**
+
+      **関連（重複しない境界）**:
+      - `project-auto-incident-pattern-improvement`（planned）— 監査記録は同項目の durable input。反復 finding の clustering は同項目へ移す
+      - PR #406 design materiality detector（merge 済み・observe-only）— 1 diff 内の責務の除去・導入。本項目は window の組合せで、member 検出を重複実装しない
+      - `docs/meta_reviewer/checklists/semantic_integrity.md` — owner / 表現の問いの正本。本項目は参照するだけ
+
+      **再評価（`observation-closes-loop`）**: 3 回目の監査記録に「仕組みの評価」節を置き、
+      発火回数・finding の採用率（false positive）・escaped・コストから、継続 / 発火条件の変更 / 集計 script の要否 / 廃止を決める。
+
 <!-- roadmap:id=monitoring-tiering-watchdog-monitor-pl state=planned -->
 3. [ ] **監視責務の段階分離（Deterministic Watchdog → Lightweight Monitor → VPS PL）— VPS PL 完成後の最適化** — 2026-09-14登録。
       **【着手条件（CEO 指示・2026-09-14）: `vps-pl-execution-loop` の最小実装と VPS 上の実運用 E2E が
@@ -11573,6 +11604,41 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       **Operational E2E**: production Task は既に手動復旧済みなので**同じ事故を再現しない**。
       fixture / isolated 環境で上記 Acceptance Criteria を固定し、**自然な CONFLICT が出た時に
       production E2E へ進む**。
+
+<!-- roadmap:id=conflict-recovery-judgment-owner-split state=planned -->
+5. [ ] **CONFLICT recovery の「この試行は判定か」に owner が2つあり、#2cae0d07 と同じ停止が別 outcome で残る** —
+      2026-10-26登録（Cross-Task Drift Audit `cross_task_audit_2026_10_26.md` の finding `xta-d7b3ee1-01`〜`04`。
+      window d7b3ee15..97567fd1 = #395〜#408。PL が master `c6be983c` のコードを読んで 01〜03 を確認済み。テストでの再現は未実施）。
+
+      **確認された事実**:
+      - (01) 著者判定 `priorProvidersForStage(authorsOnly)` は #404 の行単位分類 `classifyConflictRecoveryRow()`
+        （allowlist 外の outcome はすべて判定）を使い、予算 `tallyConflictStage()` は #408 の Round 単位分類
+        `isArtifactRow()`（`fspec=` / `abandon` / challenge だけが判定）を使う。`runner_failed_after_proposal` と
+        `proposal_parsed_apply_exception` は前者では判定（著者になる）、後者では技術的失敗（判定予算を使わない）。
+        書き込み側のコメント（`remediationStep.ts` の `runner_failed_after_proposal` 付近）と分類関数の docstring は
+        「判定予算を消費する」と書いたままで、テストは両方の答えを固定している
+      - (02) そのため、提案を出したあと runner が落ちる / 適用が throw する試行が2回あると、flagship 候補2つ
+        （`FLAGSHIP_REMEDIATION_CANDIDATES`）が判定 0 件のまま著者として除外され、3回目が `no_independent_flagship`、
+        per-epoch 上限で terminal になる。**#2cae0d07 と同じ形**（#404 は `runner_failed` についてだけ閉じた）
+      - (03) 「この CONFLICT Task をまだ PL が動かすか」を、PL（`isRemediableConflict` → `selectConflictStage()`）は
+        critic / remediation のどちらかが使えれば yes とし、Human Recovery の `nextDriver()` は
+        `hasRemediationBudgetLeft()`（remediation だけ）で判定する。critic だけが残っているとき、Recovery は
+        `attention_only` と答えるが PL は動かす
+      - (04・未検証) epoch・per-epoch 上限・lifetime 上限の3つが重なっている。PL ループの `outcome=exception`
+        fallback は Round 開始行が先に書かれるため到達しない可能性がある
+
+      **方向（Challenger 案。着手時に反証する）**: 著者は判定 Round（`isArtifactRow()` 側）から取り、行単位の
+      `classifyConflictRecoveryRow()` を著者判定から外す（意味の owner を Round 側の1つにする。`canonical-domain-meaning`）。
+      Human Recovery の driver 判定は `selectConflictStage()` へ委譲する。
+
+      **Acceptance Criteria**:
+      - `runner_failed_after_proposal` / `proposal_parsed_apply_exception` が2回続いた Task が `no_independent_flagship` で
+        terminal にならない（テストで固定。修正前に失敗することを確認する）
+      - 著者判定と判定予算が同じ owner から導かれる
+      - Human Recovery の `nextDriver()` と PL の `isRemediableConflict()` が同じ入力で同じ答えを返す（テストで固定）
+      - (04) は確認結果を本項目に書く（不要なら削る、必要なら理由を書く）
+
+      **やらないこと**: 新しい status / Gate / budget 定数の追加。予算上限の値の変更。
 
 <!-- roadmap:id=remediation-attempt-admission-not-atomic state=deferred -->
 5. [ ] **Remediation の試行受付が原子的でない（複数 API プロセス前提でのみ問題になる）** —
