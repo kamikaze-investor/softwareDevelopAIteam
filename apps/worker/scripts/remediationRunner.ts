@@ -42,6 +42,11 @@ export interface RemediationRunnerInput {
   workingDir: string
   /** legacy Landlock sandbox を使うか（この VPS で repo を読むために必要。deprecated な暫定経路）。 */
   useLegacyLandlockSandbox?: boolean
+  /**
+   * AI CLI adapter の期限（ms）。API 側が runner の外側期限より短く決める。adapter が先に切れれば
+   * `provider_timeout` と stderr が返る。未指定なら adapter の既定（300 秒）。
+   */
+  timeoutMs?: number
 }
 
 function readStdin(): string {
@@ -70,6 +75,7 @@ export async function runRemediation(input: RemediationRunnerInput): Promise<str
     model: input.model,
     ...(input.reasoningEffort ? { reasoningEffort: input.reasoningEffort } : {}),
     ...(input.useLegacyLandlockSandbox ? { useLegacyLandlockSandbox: true } : {}),
+    ...(input.timeoutMs !== undefined && input.timeoutMs > 0 ? { timeoutMs: input.timeoutMs } : {}),
   })
 
   if (result.blocked) {
