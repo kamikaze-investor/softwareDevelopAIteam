@@ -467,3 +467,9 @@ it('introduces の候補は responsibility=introduced を受け付ける（M5 tr
   const parsed = parseEvaluation(JSON.stringify({ evaluations: [{ candidateId: 'c2', responsibility: 'introduced', recordConsistency: 'no_record', ceoDirectedProvenance: 'yes' }] }), cands)
   expect(parsed.ok && parsed.value[0].responsibility).toBe('introduced')
 })
+
+it('introduced を消す・替える候補に答えたら不成立（狭い判定から外さない）', () => {
+  const cands = [{ id: 'c1', kind: 'removes' as const, subject: 'mechanism' as const, mechanism: 'Challenge stage', file: 'f.ts', evidence: 'e' }]
+  expect(parseEvaluation(JSON.stringify({ evaluations: [{ candidateId: 'c1', responsibility: 'introduced', recordConsistency: 'consistent', ceoDirectedProvenance: 'no' }] }), cands))
+    .toEqual({ ok: false, reason: 'invalid_evaluation:introduced_for_non_addition' })
+})

@@ -576,6 +576,11 @@ export function parseEvaluation(raw: string, candidates: readonly MaterialityCan
       : !oneOf(PROVENANCE, e.ceoDirectedProvenance) ? 'ceoDirectedProvenance'
       : !['provenanceEvidence', 'correctness', 'simplicity', 'naturalness'].every((k) => optionalText(e[k])) ? 'text_field' : undefined
     if (bad) return { ok: false, reason: `invalid_evaluation:${bad}` }
+    // introduced は追加（kind=introduces）の候補にだけ使える。消す・替える・意味を変える候補を introduced と答えたら
+    // 狭い判定（correctnessFlags）から外れてしまうので、不成立にする
+    if (e.responsibility === 'introduced' && candidates.find((c) => c.id === e.candidateId)?.kind !== 'introduces') {
+      return { ok: false, reason: 'invalid_evaluation:introduced_for_non_addition' }
+    }
     // moved は移り先を名指しできて初めて moved である
     if (e.responsibility === 'moved' && !isString(e.newOwner)) return { ok: false, reason: 'moved_without_owner' }
     const text = (v: unknown) => (typeof v === 'string' ? v : '')
