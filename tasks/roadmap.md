@@ -1956,6 +1956,11 @@ TaskからJobを作る処理も、Job完了後に次Taskへ進む処理も存在
 
       **運用ルール（即時）**: BLOCKED に対して PR 本文の編集 + close / reopen で再実行しない。
 
+      **no-verdict の一因の候補（2026-10-26、M5 trial 40302787189 で実測）**: gemini-2.5 系は thinking も
+      `maxOutputTokens` に数える。live Meta Review と同じ 8192 の上限で、出力 8,187 token のうち本文は 327 token だけで、
+      JSON が途中で切れた。live の Meta Review も同じ上限・同じ model 系なので、Gemini の「no valid verdict」
+      （例: #404 の 1,217 文字の応答）→ Copilot fallback の一部はこれで説明できる可能性がある。**未検証・live は未変更**。
+
 <!-- roadmap:id=project-auto-worker-core-split state=deferred -->
 1. [ ] **Worker安全コアの物理分離** — CONTROL REPOSITORY保護対象を「安全コア」単位へ縮小する。
       実行・Approval・Risk Scan・fail-closedは保護対象として残し、Context Pack構築・Task選定・
