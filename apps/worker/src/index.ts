@@ -1061,11 +1061,22 @@ async function confirmRunningTransition(
  * （待つと Outbox 再送と queued Job 取得へ到達できなくなる）。
  * 回収件数のログは API 側が出す。ここでは retry も gate 判定もしない。
  */
+/**
+ * poll cycle の先頭で待つ reconcile 呼び出しの期限。
+ *
+ * どちらの endpoint も sweep を起動して即座に 202 を返すので、PATCH と同じ期限で足りる。
+ * **期限が無いと、応答が返らない API 1回で poll loop 全体が止まる**: Outbox の再送も、本当の配送失敗の
+ * 3 cycle CRITICAL も、continuation 待ちの backstop も実行されなくなる（終了保証監査 2026-10-16 の推奨）。
+ * 期限切れは既存の catch で warn して次の処理へ進む（失敗しても次の cycle で再び呼ばれる）。
+ */
+const RECONCILE_TIMEOUT_MS = PATCH_TIMEOUT_MS
+
 export async function reconcileTaskContinuations(): Promise<void> {
   try {
     const response = await fetch(`${API_BASE}/api/task-continuations/reconcile`, {
       method: 'POST',
       headers: buildApiAuthHeaders(),
+      signal: AbortSignal.timeout(RECONCILE_TIMEOUT_MS),
     })
     if (!response.ok) {
       console.warn(`[Worker] task continuation reconcile failed: HTTP ${response.status}`)
@@ -1080,6 +1091,7 @@ export async function reconcileSupervisedRuns(): Promise<void> {
     const response = await fetch(`${API_BASE}/api/supervised-runs/reconcile`, {
       method: 'POST',
       headers: buildApiAuthHeaders(),
+      signal: AbortSignal.timeout(RECONCILE_TIMEOUT_MS),
     })
     if (!response.ok) {
       console.warn(`[Worker] supervised run reconcile failed: HTTP ${response.status}`)

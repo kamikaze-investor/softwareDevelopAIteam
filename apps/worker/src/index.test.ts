@@ -57,6 +57,8 @@ vi.mock('./jobStateManager.js', async (importOriginal) => {
 import {
   patchJobWithRetry,
   pollJobs,
+  reconcileSupervisedRuns,
+  reconcileTaskContinuations,
   persistJobResult,
   processQueuedWork,
   reportAbortCleanupObservations,
@@ -1925,5 +1927,30 @@ describe('Outbox 滞留通知 — continuation が恒久的に壊れていても
     expect(notifierMocks.sendAlert).toHaveBeenCalledWith(
       expect.objectContaining({ severity: 'critical', title: 'Worker Outbox resend is blocked' }),
     )
+  })
+})
+
+describe('poll cycle 先頭の reconcile 呼び出しに期限がある（応答の無い API で loop 全体を止めない）', () => {
+  it.each([
+    ['task continuation', reconcileTaskContinuations, '/api/task-continuations/reconcile'],
+    ['supervised run', reconcileSupervisedRuns, '/api/supervised-runs/reconcile'],
+  ] as const)('%s reconcile の fetch は AbortSignal を持つ', async (_label, reconcile, path) => {
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockResolvedValue(new Response(null, { status: 202 }))
+
+    await reconcile()
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining(path),
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    )
+  })
+
+  it('期限切れ（abort）は warn して例外を外へ出さない（次の処理へ進む）', async () => {
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockRejectedValue(new DOMException('The operation was aborted due to timeout', 'TimeoutError'))
+
+    await expect(reconcileTaskContinuations()).resolves.toBeUndefined()
+    await expect(reconcileSupervisedRuns()).resolves.toBeUndefined()
   })
 })
