@@ -297,7 +297,10 @@ export function evaluateDue(input: DueInput): DueResult {
     reasons.push(`fix chain: ${input.fixChains.map((l) => `${l.pr ? `#${l.pr}` : l.sha.slice(0, 8)} cites ${l.cites.map((n) => `#${n}`).join(',')}`).join('; ')}`)
   }
   if (authorityChanges.length >= 2) reasons.push(`${authorityChanges.length} changes touched the CODEOWNERS authority surface`)
-  return { due: reasons.length > 0, reasons, authorityChanges }
+  if (reasons.length === 0) {
+    return { due: false, reasons: ['no deploy boundary, fix chain or authority overlap yet; run again with --deployed <sha> after the next Production deploy'], authorityChanges }
+  }
+  return { due: true, reasons, authorityChanges }
 }
 
 // ---------------------------------------------------------------------------
