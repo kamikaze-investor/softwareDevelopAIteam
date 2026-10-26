@@ -22,6 +22,7 @@
  * である。**候補表を他の場所へ二重に持たないため、暫定表もここ1箇所だけに置く。**
  */
 
+import { parseFirstJsonObject } from './firstJsonObject'
 import { resolveReviewVendor, type ReviewVendor } from './reviewSeparation'
 
 /** Remediation に使ってよい model。**flagship のみを載せる。** */
@@ -507,15 +508,9 @@ function stringArray(value: unknown): string[] | undefined {
  * 型が違えば拒否する。
  */
 export function parseRemediationProposal(raw: string): RemediationProposal | undefined {
-  const match = raw.match(/```json\s*([\s\S]+?)\s*```/) ?? raw.match(/(\{[\s\S]+\})/)
-  if (!match) return undefined
-
-  let parsed: unknown
-  try {
-    parsed = JSON.parse(match[1] ?? match[0])
-  } catch {
-    return undefined
-  }
+  // 最初の完全な JSON object だけを取り出す（後ろの余計な `}` や補足文で全体を捨てない）。
+  const parsed = parseFirstJsonObject(raw)
+  if (parsed === undefined) return undefined
 
   const obj = asRecord(parsed)
   if (!obj) return undefined
