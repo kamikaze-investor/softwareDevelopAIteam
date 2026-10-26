@@ -11,7 +11,7 @@
  * - **本当の配送失敗**（API 不達・認証失敗・continuation と無関係な非 2xx・再送の例外）が1回でも
  *   あった滞留 → 従来どおり `OUTBOX_BLOCKED_ALERT_CYCLES` cycle で CRITICAL
  * - **すべての再送が「受理済み・continuation pending」の 503 だった滞留** → 想定内として扱い、
- *   continuation 自体が詰まったとみなせる `OUTBOX_CONTINUATION_PENDING_ALERT_CYCLES` cycle まで待つ
+ *   continuation 自体が詰まったとみなせる `OUTBOX_CONTINUATION_PENDING_ALERT_MS`（滞留開始からの壁時計）まで待つ
  *   （詰まった continuation は本当の障害なので、通知を消しはしない）
  *
  * **event は捨てない。** この判定は通知だけを決め、Outbox の保持・再送・Job intake の停止は変えない。
@@ -21,14 +21,21 @@
 export const OUTBOX_BLOCKED_ALERT_CYCLES = 3
 
 /**
- * continuation pending の 503 だけが続く滞留で CRITICAL を上げるまでの poll cycle 数。
- * poll 間隔 5 秒で 10 分。continuation の Design Review runner 期限（300 秒）と再試行を十分に超える。
+ * continuation pending の 503 だけが続く滞留で CRITICAL を上げるまでの**経過時間**（滞留開始から）。
+ *
+ * **cycle 数ではなく壁時計で数える。** 1 cycle には PATCH の retry と backoff（計 1.5 秒）と poll 間隔が
+ * 入り、pending 行が増えるほど長くなるので、cycle 数では上限時間を保証できない（独立レビュー指摘）。
+ * 一致する eventId は「Job の結果は永続化された」ことの証明であって「continuation が進んでいる」ことの
+ * 証明ではない。continuation が恒久的に壊れていても、この時間で必ず CRITICAL になる。
+ * 正常な continuation（2026-09-11 実測 36 秒）の十数倍で、Design Review runner の期限（300 秒）を超える。
  */
-export const OUTBOX_CONTINUATION_PENDING_ALERT_CYCLES = 120
+export const OUTBOX_CONTINUATION_PENDING_ALERT_MS = 10 * 60 * 1000
 
 export interface OutboxAlertState {
   /** pending が連続して残った poll cycle 数。 */
   streak: number
+  /** この滞留が始まった時刻（ms）。滞留していなければ undefined。 */
+  stallStartedAtMs: number | undefined
   /** この滞留の中で、continuation pending 以外の失敗が1回でもあったか。 */
   sawGenuineFailure: boolean
   /** この滞留で既に通知したか（1回の滞留につき1回だけ通知する）。 */
@@ -36,7 +43,7 @@ export interface OutboxAlertState {
 }
 
 export function initialOutboxAlertState(): OutboxAlertState {
-  return { streak: 0, sawGenuineFailure: false, alertSent: false }
+  return { streak: 0, stallStartedAtMs: undefined, sawGenuineFailure: false, alertSent: false }
 }
 
 export interface OutboxResendCycle {
@@ -52,18 +59,20 @@ export interface OutboxResendCycle {
 export function nextOutboxAlertState(
   state: OutboxAlertState,
   cycle: OutboxResendCycle,
+  nowMs: number,
 ): { state: OutboxAlertState; shouldAlert: boolean } {
   if (!cycle.pendingRemains) return { state: initialOutboxAlertState(), shouldAlert: false }
 
   const next: OutboxAlertState = {
     streak: state.streak + 1,
+    stallStartedAtMs: state.stallStartedAtMs ?? nowMs,
     sawGenuineFailure: state.sawGenuineFailure || !cycle.onlyContinuationPending,
     alertSent: state.alertSent,
   }
-  const threshold = next.sawGenuineFailure
-    ? OUTBOX_BLOCKED_ALERT_CYCLES
-    : OUTBOX_CONTINUATION_PENDING_ALERT_CYCLES
-  if (next.alertSent || next.streak < threshold) return { state: next, shouldAlert: false }
+  const due = next.sawGenuineFailure
+    ? next.streak >= OUTBOX_BLOCKED_ALERT_CYCLES
+    : nowMs - (next.stallStartedAtMs ?? nowMs) >= OUTBOX_CONTINUATION_PENDING_ALERT_MS
+  if (next.alertSent || !due) return { state: next, shouldAlert: false }
   return { state: { ...next, alertSent: true }, shouldAlert: true }
 }
 

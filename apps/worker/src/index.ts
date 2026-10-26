@@ -1140,7 +1140,7 @@ export async function pollJobs(): Promise<never> {
         const alertDecision = nextOutboxAlertState(outboxAlert, {
           pendingRemains: outboxStore.hasPending(),
           onlyContinuationPending: resendCount > 0 && onlyContinuationPending,
-        })
+        }, Date.now())
         outboxAlert = alertDecision.state
         if (alertDecision.shouldAlert) await notifyOutboxDeliveryBlocked()
       } else {

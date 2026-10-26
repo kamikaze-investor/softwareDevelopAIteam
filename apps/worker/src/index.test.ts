@@ -1900,3 +1900,30 @@ describe('Outbox 滞留通知 — 本当の失敗を抑止しない（Tier B 独
     expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(1)
   })
 })
+
+describe('Outbox 滞留通知 — continuation が恒久的に壊れていても壁時計で必ず鳴る', () => {
+  it('continuation pending の 503 だけが 10 分を超えて続けば CRITICAL を1回出す', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockImplementation(async (url: string | URL | Request) => (
+      String(url).includes('/api/jobs/job-1')
+        ? new Response(JSON.stringify({ id: 'job-1', outbox: { eventId: 'e1', deduplicated: false } }), { status: 503 })
+        : new Response(JSON.stringify([]), { status: 200 })
+    ))
+    outboxMocks.hasPending.mockReturnValue(true)
+    outboxMocks.resendPending.mockImplementation(async (patchFn: (id: string, p: unknown) => Promise<boolean>) => {
+      await patchFn('job-1', { status: 'success', eventId: 'e1', payloadHash: 'h' })
+    })
+
+    void pollJobs()
+    await flushPollCycle()
+    await vi.advanceTimersByTimeAsync(9 * 60 * 1000)
+    expect(notifierMocks.sendAlert).not.toHaveBeenCalled()
+
+    await vi.advanceTimersByTimeAsync(2 * 60 * 1000)
+    expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(1)
+    expect(notifierMocks.sendAlert).toHaveBeenCalledWith(
+      expect.objectContaining({ severity: 'critical', title: 'Worker Outbox resend is blocked' }),
+    )
+  })
+})
