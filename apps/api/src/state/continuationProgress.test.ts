@@ -209,3 +209,23 @@ describe('reportContinuationProgress — 1件の評価失敗で報告全体を�
     expect(reports).toEqual([expect.objectContaining({ continuationId: s.continuationId, stuckForMs: 12 * MIN })])
   })
 })
+
+describe('時計の巻き戻し — 未来の時刻を前進・新しさの根拠にしない（fail-closed）', () => {
+  it('許容幅を超えて未来の claim は live とみなさない', () => {
+    const s = seed()
+    const run = createCanonicalRun(s)
+    s.storage.designReviewRuns.claim(run.id, 3)
+    const claimedAt = Date.parse(s.storage.designReviewRuns.findById(run.id)?.startedAt ?? '')
+    // 時計が 1 時間巻き戻った後の評価（claim 時刻が未来になる）。
+    const nowMs = claimedAt - 60 * MIN
+
+    expect(progressAt(s, nowMs).stuckForMs).toBeGreaterThanOrEqual(DEFAULT_STALL_HINT_MS)
+  })
+
+  it('許容幅の内側（書き込みと読み取りの順序差）は now として扱い、誤報しない', () => {
+    const s = seed()
+    const t0 = startedAt(s)
+
+    expect(progressAt(s, t0 - 5_000).stuckForMs).toBe(0)
+  })
+})

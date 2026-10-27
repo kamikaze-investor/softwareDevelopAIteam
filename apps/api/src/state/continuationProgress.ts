@@ -40,10 +40,19 @@ export interface ContinuationProgress {
   detail: string
 }
 
-function parseMs(value: string | undefined): number | undefined {
+/** 書き込みと読み取りの順序差として許す未来方向のずれ。これを超える未来の時刻は不正とみなす。 */
+export const CONTINUATION_CLOCK_SKEW_TOLERANCE_MS = 60_000
+
+/**
+ * 記録の時刻を読む。**`nowMs` より `CONTINUATION_CLOCK_SKEW_TOLERANCE_MS` を超えて未来の時刻は不正**として
+ * undefined を返す（fail-closed）。時計の巻き戻し後に未来の `createdAt` / `startedAt` を信じると、停滞が
+ * 「0 秒」「live」に見え続け、その時刻が来るまで無音になる（独立レビュー指摘）。許容幅の内側は now として扱う。
+ */
+function parseMs(value: string | undefined, nowMs: number): number | undefined {
   if (value === undefined) return undefined
   const ms = Date.parse(value)
-  return Number.isFinite(ms) ? ms : undefined
+  if (!Number.isFinite(ms) || ms > nowMs + CONTINUATION_CLOCK_SKEW_TOLERANCE_MS) return undefined
+  return Math.min(ms, nowMs)
 }
 
 /**
@@ -68,7 +77,7 @@ export function evaluateContinuationProgress(
   // 書き換わるので、前進ではない書き込みが停滞の時計を戻し続けうる（独立レビュー指摘）。running への遷移時刻の
   // 記録は無いので、pause 中は下で 0 を返すだけにし、再開直後に前進が無ければ早めに鳴る側へ倒す（fail-safe）。
   // 読めなければ 0（= 十分古い）として扱う（fail-closed）。
-  const episodeStartMs = parseMs(continuation.createdAt) ?? 0
+  const episodeStartMs = parseMs(continuation.createdAt, nowMs) ?? 0
   const stuckSince = (sinceMs: number): number => Math.max(0, nowMs - Math.max(episodeStartMs, sinceMs))
 
   if (project.status !== 'running') {
@@ -97,8 +106,8 @@ export function evaluateContinuationProgress(
     ? checkImplementJobDesignReviewEvidence({ taskId: task.id, aiCliMode: 'implement', aiCliPrompt }, storage.designReviewEvidence)
     : undefined
   const settledAtMs = initialJob !== undefined
-    ? parseMs(initialJob.createdAt)
-    : gate?.ok === true && gate.evidence !== undefined ? parseMs(gate.evidence.createdAt) : undefined
+    ? parseMs(initialJob.createdAt, nowMs)
+    : gate?.ok === true && gate.evidence !== undefined ? parseMs(gate.evidence.createdAt, nowMs) : undefined
   if (initialJob !== undefined || (gate?.ok === true && gate.evidence !== undefined)) {
     facts.push(initialJob !== undefined
       ? `initial job ${initialJob.id} exists (created ${initialJob.createdAt}) but the continuation has not settled`
@@ -128,7 +137,7 @@ export function evaluateContinuationProgress(
     return { taskId: task.id, stuckForMs: stuckSince(episodeStartMs), detail: facts.join('; ') }
   }
 
-  const startedMs = parseMs(canonical.startedAt)
+  const startedMs = parseMs(canonical.startedAt, nowMs)
   const cooldownMs = designReviewRetryNotBeforeMs(canonical)
   facts.push(
     `canonical run ${canonical.id} ${canonical.status} attempt ${canonical.attemptCount}`
@@ -141,8 +150,8 @@ export function evaluateContinuationProgress(
   // 最後に動いた時刻（claim・終了・作成の最も遅いもの）から停滞を数える。
   const lastActivityMs = Math.max(
     startedMs ?? 0,
-    parseMs(canonical.completedAt) ?? 0,
-    parseMs(canonical.createdAt) ?? 0,
+    parseMs(canonical.completedAt, nowMs) ?? 0,
+    parseMs(canonical.createdAt, nowMs) ?? 0,
   )
   return { taskId: task.id, stuckForMs: stuckSince(lastActivityMs), detail: facts.join('; ') }
 }
@@ -178,7 +187,7 @@ export function reportContinuationProgress(storage: IStorage, nowMs: number): Co
         stuckForMs = progress.stuckForMs
         taskId = progress.taskId
       } catch {
-        stuckForMs = Math.max(0, nowMs - (parseMs(continuation.createdAt) ?? 0))
+        stuckForMs = Math.max(0, nowMs - (parseMs(continuation.createdAt, nowMs) ?? 0))
       }
       reports.push({ continuationId: continuation.id, projectId: project.id, taskId, stuckForMs })
     }
