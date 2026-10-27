@@ -56,7 +56,7 @@ jobs:
     steps:
       # default branch の checker だけを取得する。PR head は checkout しない。
       - name: Checkout checker (default branch only)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event.repository.default_branch }}
           sparse-checkout: .github/scripts

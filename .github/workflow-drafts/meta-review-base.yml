@@ -17,8 +17,10 @@ name: Meta Review (base)
 # - 判定は commit status `Meta Review (base)` として PR head に付ける。required check にするときは
 #   source を GitHub Actions に固定する（bot の PAT は workflow を追加できず、source 固定で PAT からの
 #   status 偽造も防げる）。
-# - **判定の re-roll を許さない**: 完了した審査が BLOCKED を返した内容（同じ commit、または同じ tree の別 commit）に
-#   後から success を付けない（`reopened` でも再審査しない）。infra 失敗（`error:`）は再実行で上書きできる。
+# - **判定の re-roll を許さない**: 完了した審査が BLOCKED を返した内容（同じ commit、この PR の同じ tree の別 commit、
+#   force-push で外された同じ tree の旧 head）に後から success を付けない（`reopened` でも再審査しない）。
+#   infra 失敗（`error:`）は再実行で上書きできる。残るもの: 同じ tree を別 PR として出し直す経路、
+#   bot の classic token による run の force-cancel（token を Actions 書き込み権限の無いものへ替えるまで）。
 # - fork からの PR は審査しない（secret 付きで誰でも起動できるため）。status は failure（fail closed）。
 #
 # 段階:
@@ -54,7 +56,7 @@ jobs:
     steps:
       # default branch のコードだけを作業ツリーに置く。
       - name: Checkout reviewer (default branch)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
@@ -80,7 +82,7 @@ jobs:
           fi
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: '20'
 
@@ -128,7 +130,7 @@ jobs:
     steps:
       # model を実行しない。review job の出力を検証して status と comment を付けるだけ。
       - name: Post status and comment
-        uses: actions/github-script@v7
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
         env:
           OUTCOME: ${{ needs.review.outputs.outcome }}
           RESULT_B64: ${{ needs.review.outputs.result }}
@@ -151,7 +153,9 @@ jobs:
             // A provider failure is written as status 'blocked' WITHOUT providerUsed (autoReview.ts);
             // every real verdict (including the fail-closed CODEOWNERS block) carries providerUsed.
             // Only real verdicts may become sticky; provider failures are infra errors a rerun may clear.
-            const realVerdict = verdictValid && typeof result.providerUsed === 'string'
+            // An empty diff is approved by autoReview.ts without calling a provider (no providerUsed);
+            // an approval is never a fail-closed artifact, so it counts as a real verdict.
+            const realVerdict = verdictValid && (typeof result.providerUsed === 'string' || result.status === 'approved')
             const completed = realVerdict && (process.env.OUTCOME === 'success' || result.status === 'blocked')
 
             let state
@@ -174,7 +178,14 @@ jobs:
             if (state === 'success') {
               const commits = await github.paginate(github.rest.pulls.listCommits, { owner, repo, pull_number: pr.number, per_page: 100 })
               const head = await github.rest.git.getCommit({ owner, repo, commit_sha: sha })
-              const sameTree = [...new Set([sha, ...commits.filter((c) => c.commit.tree.sha === head.data.tree.sha).map((c) => c.sha)])]
+              // Heads that were force-pushed away are no longer in listCommits; read them from the PR timeline.
+              const forced = await github.graphql(
+                'query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){timelineItems(itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT],first:100){nodes{... on HeadRefForcePushedEvent{beforeCommit{oid tree{oid}}}}}}}}',
+                { o: owner, r: repo, n: pr.number },
+              )
+              const forcedSame = (forced.repository.pullRequest.timelineItems.nodes ?? [])
+                .map((e) => e?.beforeCommit).filter((c) => c && c.tree.oid === head.data.tree.sha).map((c) => c.oid)
+              const sameTree = [...new Set([sha, ...commits.filter((c) => c.commit.tree.sha === head.data.tree.sha).map((c) => c.sha), ...forcedSame])]
               for (const s of sameTree) {
                 const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, { owner, repo, ref: s, per_page: 100 })
                 if (statuses.some((st) => st.context === CONTEXT && st.state === 'failure' && (st.description ?? '').startsWith('verdict: blocked'))) {

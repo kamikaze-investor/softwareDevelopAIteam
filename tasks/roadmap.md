@@ -10479,6 +10479,13 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       (S3) fork PR は審査せず failure / pnpm・Copilot CLI の version 固定 / status の risk は enum に限定。
       判定の意味は既存と同じで、success は「マージを止める指摘が無い」（changes_requested も success）。
 
+      **Codex 独立レビュー（gpt-5.6-sol、2026-10-27）で入れた対策**: 同じ commit を head とする全 open PR が通らない限り
+      `Code Owner Approval` を success にしない / fork PR は failure / 評価中の base 移動も検出 / force-push で外された同じ tree の旧 head の
+      BLOCKED も sticky / 空 diff の approved を正規の判定として扱う / action を commit SHA に固定。
+      **残る（Codex 指摘・CEO の credential 操作が要る）**: bot は classic OAuth token（`repo` scope）で、workflow run を force-cancel できる。
+      BLOCKED を記録される前に止めて再実行させる経路が残るので、Actions 書き込み権限の無い fine-grained token へ替える。
+      **残る（範囲外）**: 同じ tree を別 PR として出し直す経路。PR 本文・diff による prompt injection（`meta-review-verdict-driven-by-pr-body`）。
+
       **残るもの**: `Typecheck & Test` は性質上 PR のコードを実行する（test script を骨抜きにする PR は Meta Review / 横断監査で拾う）。
       共有の Gemini key を並走期間中は二重に使う（0c で解消）。
 

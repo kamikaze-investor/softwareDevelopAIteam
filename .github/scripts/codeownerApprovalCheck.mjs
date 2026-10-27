@@ -46,6 +46,10 @@ async function decide(prNumber, defaultBranch) {
   if (pr.base.ref !== defaultBranch) {
     return { sha: headSha, state: 'failure', description: `base ${pr.base.ref} is not ${defaultBranch}; approval is only decided for PRs into ${defaultBranch}` }
   }
+  // Fork PRs are not decided here (same boundary as the base-run Meta Review): fail closed.
+  if (pr.head.repo?.full_name !== REPO) {
+    return { sha: headSha, state: 'failure', description: 'fork PR: Code Owner Approval is not decided for forks (fail closed)' }
+  }
   const files = await paginate(`/repos/${REPO}/pulls/${prNumber}/files`)
   if (files.length >= MAX_PR_FILES) {
     return { sha: headSha, state: 'failure', description: `PR lists ${files.length}+ files; cannot see all changed paths (fail closed)` }
@@ -57,8 +61,31 @@ async function decide(prNumber, defaultBranch) {
   // Files and reviews were read after the head: if the PR moved meanwhile, this decision mixes two
   // states. Post nothing; the event that moved it runs the check again.
   const after = await (await gh(`/repos/${REPO}/pulls/${prNumber}`)).json()
-  if (after.head.sha !== headSha || after.base.ref !== pr.base.ref) return { skip: `PR moved to ${after.head.sha.slice(0, 7)} during evaluation` }
+  if (after.head.sha !== headSha || after.base.ref !== pr.base.ref || after.base.sha !== pr.base.sha) {
+    return { skip: `PR moved to ${after.head.sha.slice(0, 7)} during evaluation` }
+  }
   return { sha: headSha, state: result.state, description: result.description }
+}
+
+const SEVERITY = { success: 0, pending: 1, failure: 2, error: 3 }
+
+/**
+ * A status belongs to the commit, so every open PR whose head is this commit must pass: one
+ * approved PR must not cover another unapproved (or non-default-base) PR on the same SHA.
+ * The worst decision wins; if any of them moved during evaluation, post nothing.
+ */
+async function decideSha(prNumber, defaultBranch) {
+  const first = await decide(prNumber, defaultBranch)
+  if ('skip' in first) return first
+  const siblings = (await (await gh(`/repos/${REPO}/commits/${first.sha}/pulls`)).json())
+    .filter((p) => p.state === 'open' && p.head.sha === first.sha && p.number !== prNumber)
+  let worst = first
+  for (const p of siblings) {
+    const d = await decide(p.number, defaultBranch)
+    if ('skip' in d) return d
+    if (SEVERITY[d.state] > SEVERITY[worst.state]) worst = { ...d, description: `#${p.number}: ${d.description}`.slice(0, 140) }
+  }
+  return worst
 }
 
 async function prNumbersFromEvent() {
@@ -86,7 +113,7 @@ async function main() {
   for (const n of numbers) {
     let decision
     try {
-      decision = await decide(n, defaultBranch)
+      decision = await decideSha(n, defaultBranch)
       if ('skip' in decision) {
         console.log(`#${n} skipped: ${decision.skip}`)
         continue
