@@ -333,7 +333,9 @@ describe('runOneScreenReconcile — create → human approve → execute', () =>
       .mockRejectedValueOnce(new Error('network'))
       .mockResolvedValueOnce({ message: RECONCILE_DONE_MESSAGE, ok: true })
     expect((await runOneScreenReconcile(confirmation, d)).ok).toBe(false)
-    expect(await runOneScreenReconcile(confirmation, d)).toMatchObject({ ok: true, outcome: 'done' })
+    // 再試行は押し直し = 確認ダイアログを作り直す（いまの承認状況 = 承認済み new-1 を示す）
+    const retryConfirmation = { ...confirmation, approval: { approvalRequestId: 'new-1', kind: 'approved' } as const }
+    expect(await runOneScreenReconcile(retryConfirmation, d)).toMatchObject({ ok: true, outcome: 'done' })
     expect(d.createRequest).toHaveBeenCalledTimes(1)
     expect(d.approveRequest).toHaveBeenCalledTimes(1)
     expect(d.execute).toHaveBeenLastCalledWith(pkg, 'new-1')
