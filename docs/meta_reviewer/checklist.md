@@ -82,11 +82,11 @@ DA (3) の「公開範囲・公開 route」は、**AIteamOS の外の利用者�
 - gate・承認・Job intake など実行可否への効果（通知が実行可否の判定の一部なら、その判定を変えない）
 
 ある event の通知の時刻を遅らせる場合は、さらに次の両方を確認できること:
-- 遅らせる対象が正常系の誤報であり、同じ類の本当の失敗は production の経路で実際に発火する代替の経路により、有界な時間内に必要な受信者へ届く
-- 新しい時間の上限が、base branch に既にある canonical rule（この prompt に本文が提供された approval rules・Decision Authority の excerpt）が明示的に定める範囲に収まる。roadmap 項目は作業 scope を示す文脈にすぎず、base にある項目でも時間の上限・遅延の許容の根拠にしない（roadmap 項目は過去の PR で AI が追加しうる）。差分が追加・変更した rule、PR 本文、commit message、テスト名も根拠にしない。上限を定める canonical rule が提供されていなければ A とする
+- 遅らせる対象が正常系の誤報であり、同じ類の本当の失敗は production の経路で実際に発火する経路により、base より遅くない時間で必要な受信者へ届く（本当の失敗が base より遅れて届きうる遅延は、検知の速さと誤報の量の trade-off であり、技術的な修正ではない）
+- 遅らせた通知にも有限の上限があり（有界でない待ちにしない）、その上限と上の配達を、required CI が実行するこの差分の tests が実際に確かめている。roadmap 項目（base にある項目も過去の PR で AI が追加しうる）・PR 本文・commit message・テスト名は、これらを確認した根拠にしない
 
 次は A（`requiresCeoApproval: true`）である:
-- 本当の失敗のある類について、通知を無くす、または上の条件を満たさずに遅らせる・有界でない待ちにする（Safety boundary の弱体化。`specs/22` §1-2）
+- 本当の失敗のある類について、通知を無くす、base より遅れて届きうるようにする、または有界でない待ちにする（Safety boundary の弱体化。`specs/22` §1-2）
 - base で承認された意味の上で失敗である event の類を、失敗でないと再分類する、または その severity を下げる（base の意味に照らして実装の誤報を直すことはこれに当たらないが、上の B の前提をすべて確認できる場合に限る）
 - CEO へ通知する条件そのもの（`CLAUDE.md`「Escalation Rules」・DA trigger）や必要な受信者を変える
 - 通知が gate・承認・Job intake など実行可否を決める判定の一部であり、その判定を変える
