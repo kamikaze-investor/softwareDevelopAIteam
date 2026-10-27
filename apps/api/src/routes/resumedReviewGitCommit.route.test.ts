@@ -74,7 +74,7 @@ async function chain(firstReviewDone = true, existingProjectId?: string): Promis
   const base = { taskId: task.id, projectId: project.id, agentRole: 'developer_ai' }
   const implementJob = s.jobs.create({
     ...base, status: 'success',
-    safeCommand: { kind: 'test', workingDir: '/workspace/target', params: {} },
+    safeCommand: { kind: 'test', workingDir: '/workspace/target', params: { verificationProfile: 'implement' } },
     aiCliProvider: 'claude_code', aiCliMode: 'implement', aiCliPrompt: 'original implementation prompt',
     workflowStepKey: `task:${task.id}:initial-implement`,
   } as never)
@@ -304,6 +304,8 @@ describe('D4: resumed review 由来の git_commit を CEO が REJECT した後�
       expect(body.aiCliMode).toBe('implement')
       expect(body.aiCliProvider).toBe(c.implementJob.aiCliProvider)
       expect(body.safeCommand.kind).toBe(c.implementJob.safeCommand.kind)
+      // REJECT 後の resume も Implement の verification profile を引き継ぐ。
+      expect(body.safeCommand).toEqual(c.implementJob.safeCommand)
       expect(body.workflowStepKey).toBe(`resume:${commit!.id}:1`)
     })
   })
