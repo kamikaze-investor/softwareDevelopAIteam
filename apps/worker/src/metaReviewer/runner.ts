@@ -302,6 +302,8 @@ const MAX_ROADMAP_STATE_SEMANTICS_CHARS = 2_000
 const ROADMAP_ACTIVE_STATES: ReadonlySet<string> = new Set(['planned', 'in_progress'])
 
 const ROADMAP_MARKER = /^\s*<!--\s*roadmap:id=(\S+)\s+state=([a-z_]+)\b[^>]*-->/
+/** 根拠に選べる Roadmap id の形。境界判定（mentionIndex）が完全一致を保証できる文字だけにする。 */
+const ROADMAP_EVIDENCE_ID = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 
 export type RoadmapEvidenceUnusableReason = 'stale' | 'modified_by_this_pr' | 'truncated'
 
@@ -368,8 +370,15 @@ export function selectBaseRoadmapEvidence(baseRoadmap: string, gitDiff: string):
   })
   const { roadmap, other } = splitDiffByRoadmap(gitDiff)
   const references = addedLines(other)
+  // 根拠に選ぶのは小文字英数字と `-` だけの id に限る（実際の id はすべてこの形）。他の記号を含む id は、
+  // `fix.item+(1)+suffix` が `fix.item+(1)` も名指ししてしまうように完全一致を保証できないので選ばない（fail closed）。
+  // 本文の終わりは全 marker で決めるため、markers 自体からは除かない。
   const referenced = markers
-    .map((marker, index) => ({ marker, index, at: mentionIndex(references, marker.id) }))
+    .map((marker, index) => ({
+      marker,
+      index,
+      at: ROADMAP_EVIDENCE_ID.test(marker.id) ? mentionIndex(references, marker.id) : -1,
+    }))
     .filter((entry) => entry.at >= 0)
     .sort((a, b) => a.at - b.at)
 
@@ -405,7 +414,9 @@ export function extractRoadmapStateSemantics(baseRoadmap: string): string | unde
 
 /** 本文を data として囲む fence。本文中のどの backtick の連続よりも長くし、本文が fence を閉じられないようにする。 */
 function dataFence(body: string): string {
-  const longest = Math.max(0, ...Array.from(body.matchAll(/`+/g), (match) => match[0].length))
+  // spread（Math.max(...runs)）は run の数だけ引数を積み、巨大な diff で RangeError になる。1つずつ数える。
+  let longest = 0
+  for (const match of body.matchAll(/`+/g)) longest = Math.max(longest, match[0].length)
   return '`'.repeat(Math.max(3, longest + 1))
 }
 

@@ -115,10 +115,35 @@ describe('selectBaseRoadmapEvidence — base の版・追加行が名指しし�
     expect(selection.unusable).toEqual([])
   })
 
-  it('正規表現の特殊文字を含む id も、文字どおりに照合する', () => {
-    const roadmap = ['<!-- roadmap:id=fix.item+(1) state=planned -->', '0. [ ] **特殊文字の項目**'].join('\n')
-    expect(selectBaseRoadmapEvidence(roadmap, diffFor('apps/x.ts', ['// fix.item+(1)'])).items.map((item) => item.id)).toEqual(['fix.item+(1)'])
-    expect(selectBaseRoadmapEvidence(roadmap, diffFor('apps/x.ts', ['// fixXitem+(1)'])).items).toEqual([])
+  it('小文字英数字と - 以外を含む id は選ばない（記号の id は完全一致を保証できない: fix.item+(1)+suffix が fix.item+(1) も名指しする）', () => {
+    const roadmap = [
+      '<!-- roadmap:id=fix.item+(1) state=planned -->', '0. [ ] **記号の項目**',
+      '<!-- roadmap:id=fix.item+(1)+suffix state=planned -->', '1. [ ] **衝突する項目**',
+    ].join('\n')
+    const selection = selectBaseRoadmapEvidence(roadmap, diffFor('apps/x.ts', ['// fix.item+(1)+suffix']))
+    expect(selection.items).toEqual([])
+    expect(selection.unusable).toEqual([])
+  })
+
+  it('選ばない記号の id の marker も、直前の項目の本文の終わりとして扱う（本文が次の項目へはみ出さない）', () => {
+    const roadmap = [
+      '<!-- roadmap:id=fix-item state=planned -->', '0. [ ] **項目**',
+      '<!-- roadmap:id=odd.item state=planned -->', '1. [ ] **別の項目の本文**',
+    ].join('\n')
+    const [item] = selectBaseRoadmapEvidence(roadmap, diffFor('apps/x.ts', ['// fix-item'])).items
+    expect(item?.body.split('\n')).toEqual(['<!-- roadmap:id=fix-item state=planned -->', '0. [ ] **項目**'])
+  })
+
+  it('小文字英数字と - の id は、後ろに . などが続いても別の id と衝突しない', () => {
+    const roadmap = ['<!-- roadmap:id=fix-item state=planned -->', '0. [ ] **項目**'].join('\n')
+    expect(selectBaseRoadmapEvidence(roadmap, diffFor('apps/x.ts', ['// see fix-item.'])).items.map((item) => item.id)).toEqual(['fix-item'])
+    expect(selectBaseRoadmapEvidence(roadmap, diffFor('apps/x.ts', ['// fix-item-2'])).items).toEqual([])
+  })
+
+  it('backtick の run が非常に多い diff でも prompt を組み立てられる（spread による RangeError を起こさない）', () => {
+    const manyRuns = Array.from({ length: 200_000 }, () => '`a').join('')
+    const request = buildMetaReviewRequest('t', 'title', ['apps/x.ts'], REPO_ROOT, diffFor('apps/x.ts', [manyRuns]))
+    expect(() => buildMetaReviewPrompt(request, REPO_ROOT)).not.toThrow()
   })
 
   it(`根拠になりうる項目は上限（${MAX_ROADMAP_EVIDENCE_ITEMS}件）まで。超えた分は id だけを返す`, () => {
