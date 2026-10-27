@@ -323,6 +323,22 @@ function splitDiffByRoadmap(gitDiff: string): { roadmap: string; other: string }
   }
 }
 
+/**
+ * Roadmap の diff の hunk が触る **base 側の行範囲**（0-based・半開区間）。本文だけの編集（marker や id を含まない
+ * hunk）でも、その項目が変更されたと分かるようにする（独立レビュー指摘）。
+ */
+function roadmapHunkRanges(roadmapDiff: string): Array<[number, number]> {
+  const ranges: Array<[number, number]> = []
+  for (const match of roadmapDiff.matchAll(/^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@/gm)) {
+    const start = Number(match[1])
+    const count = match[2] === undefined ? 1 : Number(match[2])
+    // count 0 は start 行の直後への挿入: その行を含む項目を変更したものとして扱う。
+    const from = Math.max(0, start - 1)
+    ranges.push([from, from + Math.max(count, 1)])
+  }
+  return ranges
+}
+
 /** diff の追加行だけ（`+++` 見出しを除く）。削除行・文脈行では選ばない。 */
 function addedLines(diff: string): string {
   return diff.split('\n').filter((line) => line.startsWith('+') && !line.startsWith('+++')).join('\n')
@@ -352,6 +368,7 @@ export function selectBaseRoadmapEvidence(baseRoadmap: string, gitDiff: string):
   })
   const { roadmap, other } = splitDiffByRoadmap(gitDiff)
   const references = addedLines(other)
+  const hunks = roadmapHunkRanges(roadmap)
   const referenced = markers
     .map((marker, index) => ({ marker, index, at: mentionIndex(references, marker.id) }))
     .filter((entry) => entry.at >= 0)
@@ -362,9 +379,12 @@ export function selectBaseRoadmapEvidence(baseRoadmap: string, gitDiff: string):
   for (const { marker, index } of referenced) {
     const end = markers[index + 1]?.line ?? lines.length
     const body = lines.slice(marker.line, end).join('\n').trimEnd()
+    // hunk が項目の行範囲に重なる（本文だけの編集を含む）か、diff が id を名指ししていれば、この PR が変更した。
+    const touched = hunks.some(([from, to]) => from < end && to > marker.line)
+      || (roadmap !== '' && mentionIndex(roadmap, marker.id) >= 0)
     const reason: RoadmapEvidenceUnusableReason | undefined = !ROADMAP_ACTIVE_STATES.has(marker.state)
       ? 'stale'
-      : roadmap !== '' && mentionIndex(roadmap, marker.id) >= 0
+      : touched
         ? 'modified_by_this_pr'
         : body.length > MAX_ROADMAP_EVIDENCE_ITEM_CHARS ? 'truncated' : undefined
     if (reason !== undefined) unusable.push({ id: marker.id, state: marker.state, reason })
@@ -568,6 +588,9 @@ export function buildMetaReviewPrompt(
     ...canonicalPrincipleIds.map((id) => `- ${id}`),
   ].join('\n')
   const prBodySection = buildUntrustedPrBodySection(request.prBody)
+  // diff は PR が書いた data。中の Markdown fence（文脈行の ``` を含む）で囲みを閉じられないよう、
+  // 中のどの backtick の連続よりも長い fence で囲む（独立レビュー指摘）。通常の diff では従来どおり ``` になる。
+  const diffFence = dataFence(request.gitDiff)
 
   return `${systemPrompt}
 
@@ -610,9 +633,9 @@ ${request.relatedSpecs.map((s) => `- ${s}`).join('\n')}
 ${prBodySection}
 
 **Git Diff**:
-\`\`\`diff
+${diffFence}diff
 ${request.gitDiff}
-\`\`\`
+${diffFence}
 
 上記のdiffを確認し、MetaReviewResultのJSON形式で回答してください。
 `

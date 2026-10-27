@@ -369,7 +369,8 @@ describe('Meta Reviewer 判定契約 — DA (3) の「公開」と通知の変�
 
       it('遅らせる場合は、誤報であること・production で発火する代替経路の有界な配達・上限の canonical / roadmap 根拠を要求する', () => {
         expect(text).toContain('- 遅らせる対象が正常系の誤報であり、同じ類の本当の失敗は production の経路で実際に発火する代替の経路により、有界な時間内に必要な受信者へ届く')
-        expect(text).toContain('- 新しい時間の上限が、base branch に既にある canonical rule、または base branch に既にある CEO 承認済みの roadmap 項目に根拠を持ち、その本文がこの prompt に提供されている。差分が追加・変更した roadmap 項目・rule、PR 本文、commit message、テスト名は根拠にしない')
+        expect(text).toContain('- 新しい時間の上限が、base branch に既にある canonical rule、または base branch に既にある `planned` / `in_progress` の roadmap 項目（作業 scope を示す文脈であり、承認ではない）が明示的に求める範囲に収まり、その本文がこの prompt に提供されている。roadmap 項目は B の根拠そのものではなく、B かどうかは上の不変条件をすべて確認できるかだけで決まる。差分が追加・変更した roadmap 項目・rule、PR 本文、commit message、テスト名は根拠にしない')
+        expect(text).not.toContain('CEO 承認済みの roadmap 項目')
       })
 
       it('通知の反例は A のまま（失敗の類の通知を無くす・条件外の遅延・再分類 / severity 低下・CEO 通知条件 / 受信者の変更・実行可否の判定の変更）', () => {
