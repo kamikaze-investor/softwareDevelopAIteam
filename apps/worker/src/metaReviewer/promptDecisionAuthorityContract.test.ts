@@ -292,10 +292,10 @@ describe('Meta Reviewer 判定契約 — DA (2) の rule は実際に model へ�
     const approvalRules = readFileSync(path.join(REPO_ROOT, 'docs/project_memory/rules/approval_rules.md'), 'utf-8')
     expect(built).toContain('### 承認済み canonical approval rules (base branch)')
     expect(built).toContain(approvalRules.trimEnd())
-    expect(built.indexOf('### 承認済み canonical approval rules (base branch)')).toBeLessThan(built.indexOf('**Git Diff**:'))
+    expect(built.indexOf('### 承認済み canonical approval rules (base branch)')).toBeLessThan(built.indexOf('**Git Diff**（'))
 
     // rule は diff より前にあり、prompt は末尾の回答指示まで揃っている
-    expect(built.indexOf('### DA trigger (2)')).toBeLessThan(built.indexOf('**Git Diff**:'))
+    expect(built.indexOf('### DA trigger (2)')).toBeLessThan(built.indexOf('**Git Diff**（'))
     expect(built).toContain(diff)
     expect(built.trimEnd().endsWith('上記のdiffを確認し、MetaReviewResultのJSON形式で回答してください。')).toBe(true)
   })
