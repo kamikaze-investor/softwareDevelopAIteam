@@ -10449,6 +10449,33 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
 
       **やらないこと**: `required_approving_review_count` の変更（Option A・通常 PR に承認を追加する）。新しい Approval 経路。
 
+<!-- roadmap:id=meta-review-base-run state=in_progress -->
+0. [~] **Stage 0: Meta Review を base（default branch）のコードで実行し、required check の source を固定する** —
+      2026-10-27登録（CEO 決定 2026-10-27「Stage 0 approved」）。CEO 承認権限の縮小・Safety 境界の緩和・Goal / Design Philosophy の変更は含まない。
+
+      **確認された事実**: `meta-review.yml` は `pull_request` で動き、PR の lockfile で `pnpm install` し、PR 自身の
+      autoReview.ts・runner・prompt・checklist（と `GEMINI_API_KEY`）で、その PR を審査する。PR は自分を審査する reviewer を書き換えられる。
+      また既存 required check 2 本（`Typecheck & Test`・`Meta Reviewer AI (Gemini)`）は source（integration_id）未固定で、
+      bot の `repo` scope PAT から `POST /statuses` で success を偽造できる（2026-10-27 実測）。
+
+      **方式（既存 Meta Review の改善。新しい Review 工程・Gate は足さない）**: `.github/workflows/meta-review-base.yml`
+      （`pull_request_target`。default branch の reviewer コード・lockfile・prompt・checklist を使い、PR の commit は
+      `git fetch` で object として取り込むだけ。結果を commit status `Meta Review (base)` として PR head に付け、PR comment も投稿）。
+      bot の token は `workflow` scope を持たないので、bot 作成の PR は status を偽造する workflow を追加できない。
+
+      **段階（1 PR で切り替えると、その PR 自身に required check が付かず merge できなくなるため）**:
+      - 0a: `meta-review-base.yml` を追加し既存と並走（`codeowner-approval-required-check` と同じ PR。CEO が workflow を追加）
+      - 0b（CEO・Ruleset）: 実 PR 2〜3 件で `Meta Review (base)` が付き判定が妥当なことを PL が確認した後、
+        required check `Meta Reviewer AI (Gemini)` を `Meta Review (base)` に置き換え、`Typecheck & Test`・`Code Owner Approval`・
+        `Meta Review (base)` の source をすべて GitHub Actions に固定する
+      - 0c（CEO）: `meta-review.yml` を削除する（workflow の削除も `workflow` scope が要る）
+
+      **検証すること（PL）**: 実 PR で (1) `Meta Review (base)` が PR head に付く (2) PR で prompt / reviewer を変えても判定に効かない
+      (3) source 固定後、bot の PAT で付けた同名 status が required check を満たさない (4) bot は自分の PR を承認できない。結果を本項目に書いて done にする。
+
+      **残るもの**: `Typecheck & Test` は性質上 PR のコードを実行する（test script を骨抜きにする PR は Meta Review / 横断監査で拾う）。
+      共有の Gemini key を並走期間中は二重に使う（0c で解消）。
+
 <!-- roadmap:id=meta-review-verdict-driven-by-pr-body state=deferred -->
 0. [ ] **Meta Review が diff に無い記述（PR 説明文だけ）を根拠に BLOCKED と判定する** —
       2026-10-27登録（CEO 指示: 別の品質課題として記録。PR 説明文を書き換えて判定を通す行為は行わない）。
