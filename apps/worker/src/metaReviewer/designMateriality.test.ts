@@ -226,14 +226,29 @@ describe('parseDetection — strict', () => {
     expect(parsed.ok).toBe(true)
   })
 
+  it('material が候補の有無と食い違えば不成立（llm の予測を書き換えない）', () => {
+    expect(parseDetection(JSON.stringify({ material: false, candidates: [candidate], signalDisposition: [] }), signals))
+      .toEqual({ ok: false, reason: 'material_mismatch' })
+    expect(parseDetection(JSON.stringify({ candidates: [candidate], signalDisposition: [] }), signals))
+      .toEqual({ ok: false, reason: 'material_not_boolean' })
+  })
+
+  it('未知の kind（採点に使う欄）は不成立', () => {
+    expect(parseDetection(JSON.stringify({ material: true, candidates: [{ ...candidate, kind: 'tweaks' }], signalDisposition: [] }), signals))
+      .toEqual({ ok: false, reason: 'invalid_candidate:kind' })
+  })
+
   it.each([
-    ['material と candidates が食い違う', { material: false, candidates: [candidate], signalDisposition: [{ signalId: sid, disposition: 'supports_candidate:c1', reason: '' }] }, 'material_mismatch'],
-    ['S1 に disposition が無い', { material: true, candidates: [candidate], signalDisposition: [] }, 'signal_not_disposed'],
-    ['存在しない candidate を指す', { material: true, candidates: [candidate], signalDisposition: [{ signalId: sid, disposition: 'supports_candidate:c9', reason: '' }] }, 'unknown_disposition'],
-    ['detection が正しさを判断する disposition（behavior_preserving）は受け付けない', { material: false, candidates: [], signalDisposition: [{ signalId: sid, disposition: 'behavior_preserving', reason: '' }] }, 'unknown_disposition'],
-    ['未知の kind', { material: true, candidates: [{ ...candidate, kind: 'tweaks' }], signalDisposition: [] }, 'invalid_candidate:kind'],
-  ])('%s → 不成立', (_label, body, reason) => {
-    expect(parseDetection(JSON.stringify(body), signals)).toEqual({ ok: false, reason })
+    ['S1 に disposition が無い → 残す', { material: true, candidates: [candidate], signalDisposition: [] }, [`signal_not_disposed:${sid}`], true, 0],
+    ['存在しない candidate を指す disposition は捨てる', { material: true, candidates: [candidate], signalDisposition: [{ signalId: sid, disposition: 'supports_candidate:c9', reason: '' }] }, ['unknown_disposition:supports_candidate:c9', `signal_not_disposed:${sid}`], true, 0],
+    ['正しさを判断する disposition（behavior_preserving）は捨てる', { material: false, candidates: [], signalDisposition: [{ signalId: sid, disposition: 'behavior_preserving', reason: '' }] }, ['unknown_disposition:behavior_preserving', `signal_not_disposed:${sid}`], false, 0],
+  ])('%s', (_label, body, warnings, material, dispositions) => {
+    const parsed = parseDetection(JSON.stringify(body), signals)
+    expect(parsed.ok).toBe(true)
+    if (!parsed.ok) return
+    expect(parsed.warnings).toEqual(warnings)
+    expect(parsed.value.material).toBe(material)
+    expect(parsed.value.signalDisposition).toHaveLength(dispositions)
   })
 
   it('JSON が無ければ不成立', () => {
@@ -252,10 +267,24 @@ describe('parseEvaluation — strict', () => {
     expect(parseEvaluation(JSON.stringify({ evaluations: [evaluation] }), candidates).ok).toBe(true)
   })
 
-  it('candidate の欠落・余計な評価は不成立', () => {
-    expect(parseEvaluation(JSON.stringify({ evaluations: [] }), candidates)).toEqual({ ok: false, reason: 'evaluation_candidate_mismatch' })
+  it('使える評価が1件も無ければ不成立。未知の候補への評価は捨てて warning に残す', () => {
+    expect(parseEvaluation(JSON.stringify({ evaluations: [] }), candidates)).toEqual({ ok: false, reason: 'no_usable_evaluation' })
     expect(parseEvaluation(JSON.stringify({ evaluations: [evaluation, { ...evaluation, candidateId: 'c2' }] }), candidates))
-      .toEqual({ ok: false, reason: 'evaluation_candidate_mismatch' })
+      .toMatchObject({ ok: true, warnings: ['unknown_candidate:c2'] })
+  })
+
+  it('同じ候補への評価: 判定が同じなら1つにまとめ、違えば全部捨てる（順番で結果を変えない）', () => {
+    const lost = { ...evaluation, responsibility: 'lost' }
+    const preserved = { ...evaluation, responsibility: 'preserved' }
+    expect(parseEvaluation(JSON.stringify({ evaluations: [lost, lost] }), candidates)).toMatchObject({ ok: true, warnings: ['duplicate_evaluation:c1'] })
+    for (const order of [[preserved, lost], [lost, preserved]]) {
+      expect(parseEvaluation(JSON.stringify({ evaluations: order }), candidates)).toEqual({ ok: false, reason: 'no_usable_evaluation' })
+    }
+  })
+
+  it('評価の無い候補は unevaluated として残す', () => {
+    const two = [...candidates, { ...candidates[0], id: 'c2' }]
+    expect(parseEvaluation(JSON.stringify({ evaluations: [evaluation] }), two)).toMatchObject({ ok: true, warnings: ['unevaluated:c2'] })
   })
 })
 
@@ -345,26 +374,28 @@ describe('独立レビュー指摘（code review round 1）の回帰', () => {
   const sid = signals[0].id
   const candidate = { id: 'c1', kind: 'removes', subject: 'mechanism', mechanism: 'm', file: 'apps/api/src/x.ts', evidence: 'e' }
 
-  it('detection: 同じ signal への disposition の重複・未知の signal id は不成立', () => {
+  it('detection: 同じ signal への複数の disposition は残し、未知の signal id の disposition は捨てる', () => {
     const dup = { material: true, candidates: [candidate], signalDisposition: [
       { signalId: sid, disposition: 'supports_candidate:c1', reason: '' },
       { signalId: sid, disposition: 'unrelated', reason: '' },
     ] }
-    expect(parseDetection(JSON.stringify(dup), signals)).toEqual({ ok: false, reason: 'duplicate_disposition' })
+    const parsedDup = parseDetection(JSON.stringify(dup), signals)
+    expect(parsedDup.ok && parsedDup.value.signalDisposition).toHaveLength(2)
+    expect(parsedDup.ok && parsedDup.warnings).toEqual([])
     const unknown = { material: true, candidates: [candidate], signalDisposition: [
       { signalId: sid, disposition: 'supports_candidate:c1', reason: '' },
       { signalId: 'ffffffffffff', disposition: 'unrelated', reason: '' },
     ] }
-    expect(parseDetection(JSON.stringify(unknown), signals)).toEqual({ ok: false, reason: 'unknown_signal' })
+    expect(parseDetection(JSON.stringify(unknown), signals)).toMatchObject({ ok: true, warnings: ['unknown_signal:ffffffffffff'] })
   })
 
-  it('evaluation: moved なのに newOwner が無ければ不成立', () => {
+  it('evaluation: moved なのに newOwner が無い評価は捨てる（唯一の評価なら不成立）', () => {
     const body = { evaluations: [{
       candidateId: 'c1', responsibility: 'moved', newOwner: null, recordConsistency: 'no_record',
       ceoDirectedProvenance: 'unknown', provenanceEvidence: '', correctness: '', simplicity: '', naturalness: '',
     }] }
     expect(parseEvaluation(JSON.stringify(body), [{ ...candidate, kind: 'removes', subject: 'mechanism' }]))
-      .toEqual({ ok: false, reason: 'moved_without_owner' })
+      .toEqual({ ok: false, reason: 'no_usable_evaluation' })
   })
 })
 
@@ -410,12 +441,14 @@ describe('M5 trial (2026-10-26) の解析失敗への対応', () => {
       .toEqual({ ok: false, reason: 'invalid_candidate:file' })
   })
 
-  it('評価の newOwner・所見が欠けても受け付け、判定の欄が不正なら欄名を返す', () => {
+  it('評価の newOwner・所見が欠けても受け付け、判定の欄が不正な評価は欄名つきで捨てる', () => {
     const cands = [{ ...base, kind: 'removes' as const, subject: 'mechanism' as const, evidence: '' }]
     const ok = parseEvaluation(JSON.stringify({ evaluations: [{ candidateId: 'c1', responsibility: 'lost', recordConsistency: 'no_record', ceoDirectedProvenance: 'no' }] }), cands)
     expect(ok.ok && ok.value[0]).toMatchObject({ newOwner: null, correctness: '', provenanceEvidence: '' })
-    expect(parseEvaluation(JSON.stringify({ evaluations: [{ candidateId: 'c1', responsibility: 'gone', recordConsistency: 'no_record', ceoDirectedProvenance: 'no' }] }), cands))
-      .toEqual({ ok: false, reason: 'invalid_evaluation:responsibility' })
+    const bad = { candidateId: 'c1', responsibility: 'gone', recordConsistency: 'no_record', ceoDirectedProvenance: 'no' }
+    const good = { candidateId: 'c1', responsibility: 'lost', recordConsistency: 'no_record', ceoDirectedProvenance: 'no' }
+    expect(parseEvaluation(JSON.stringify({ evaluations: [bad] }), cands)).toEqual({ ok: false, reason: 'no_usable_evaluation' })
+    expect(parseEvaluation(JSON.stringify({ evaluations: [bad, good] }), cands)).toMatchObject({ ok: true, warnings: ['invalid_evaluation:responsibility'] })
   })
 
   it('解析できなかった応答は先頭だけを rawResponseExcerpt に残す', async () => {
@@ -460,4 +493,48 @@ it('mechanism の key があって不正な値なら、subject 名の key で救
     signalDisposition: [{ signalId: signals[0].id, disposition: 'supports_candidate:c1', reason: '' }],
   })
   expect(parseDetection(raw, signals)).toEqual({ ok: false, reason: 'invalid_candidate:mechanism' })
+})
+
+it('introduces の候補は responsibility=introduced を受け付ける（M5 trial 2026-10-26）', () => {
+  const cands = [{ id: 'c2', kind: 'introduces' as const, subject: 'mechanism' as const, mechanism: 'one-tap abort', file: 'f.ts', evidence: 'e' }]
+  const parsed = parseEvaluation(JSON.stringify({ evaluations: [{ candidateId: 'c2', responsibility: 'introduced', recordConsistency: 'no_record', ceoDirectedProvenance: 'yes' }] }), cands)
+  expect(parsed.ok && parsed.value[0].responsibility).toBe('introduced')
+})
+
+it('introduced を消す・替える候補に答えた評価は使わない（狭い判定から外さない。評価なしとして数える）', () => {
+  const cands = [
+    { id: 'c1', kind: 'removes' as const, subject: 'mechanism' as const, mechanism: 'Challenge stage', file: 'f.ts', evidence: 'e' },
+    { id: 'c2', kind: 'introduces' as const, subject: 'mechanism' as const, mechanism: 'new', file: 'g.ts', evidence: 'e' },
+  ]
+  const parsed = parseEvaluation(JSON.stringify({ evaluations: [
+    { candidateId: 'c1', responsibility: 'introduced', recordConsistency: 'consistent', ceoDirectedProvenance: 'no' },
+    { candidateId: 'c2', responsibility: 'introduced', recordConsistency: 'no_record', ceoDirectedProvenance: 'no' },
+  ] }), cands)
+  expect(parsed).toMatchObject({ ok: true, warnings: ['introduced_for_non_addition:c1', 'unevaluated:c1'] })
+  expect(parsed.ok && parsed.value.map((e) => e.candidateId)).toEqual(['c2'])
+})
+
+it('観測は parseWarnings に stage 付きで残す（M5 trial 2026-10-27: 1つの signal が2つの候補を支えた）', async () => {
+  const diff = fileDiff('apps/api/src/x.ts', ["-  | 'challenge_aligned'"])
+  const sid = computeMaterialitySignals(diff)[0].id
+  const detection = JSON.stringify({
+    material: true,
+    candidates: [
+      { id: 'c1', kind: 'redefines', subject: 'mechanism', mechanism: 'budget', file: 'a.ts', evidence: 'e' },
+      { id: 'c2', kind: 'redefines', subject: 'state_transition', mechanism: 'stage', file: 'b.ts', evidence: 'e' },
+    ],
+    signalDisposition: [
+      { signalId: sid, disposition: 'supports_candidate:c1', reason: '' },
+      { signalId: sid, disposition: 'supports_candidate:c2', reason: '' },
+    ],
+  })
+  const evaluation = JSON.stringify({ evaluations: [{ candidateId: 'c1', responsibility: 'moved', newOwner: 'x', recordConsistency: 'no_record', ceoDirectedProvenance: 'no' }] })
+  let n = 0
+  const observation = await observeDesignMateriality(
+    { title: 't', diff, records: { listRecordFiles: () => [], read: () => undefined }, detectionInstructions: 'D', evaluationInstructions: 'E' },
+    async () => (n++ === 0 ? detection : evaluation),
+  )
+  expect(observation.status).toBe('ok')
+  expect(observation.detection?.material).toBe(true)
+  expect(observation.parseWarnings).toEqual(['evaluation:unevaluated:c2'])
 })
