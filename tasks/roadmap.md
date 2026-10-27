@@ -10432,7 +10432,9 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
          **今後 workflow を変える PR も同じ形にする**: bot が PR を作り、CEO が workflow を branch へ push して承認する。
          CEO 自身が作成した PR は、作成者免除が無いので CODEOWNERS 対象を含むと pending のまま merge できない
       1. **CEO（人）**: Settings → Rules → `master` → Require status checks に `Code Owner Approval` を追加し、**source を GitHub Actions に固定する**
-         （integration_id 15368。固定しないと write 権限の PAT で `POST /statuses` を直接呼んで success を偽造できる）。AI credential は Ruleset を変更できない
+         （integration_id 15368。固定しないと write 権限の PAT で `POST /statuses` を直接呼んで success を偽造できる）。AI credential は Ruleset を変更できない。
+         **既存の required check 2 本（`Typecheck & Test`・`Meta Reviewer AI (Gemini)`）も同じく source を GitHub Actions に固定する**
+         （2026-10-27 実測: どちらも integration_id 未指定で、bot の `repo` scope PAT で success を偽造できる状態。本項目とは独立に今すでに開いている穴）
       2. **PL**: 実 PR で検証する（CODEOWNERS 対象外の PR = 即 success / 対象 PR = 承認まで pending → 承認で success）。結果を本項目に書いて done にする。
          既存の open PR は status を持たないので、push / reopen / タイトル編集のどれかで一度再判定させる（作成者が CEO の古い PR は、
          CODEOWNERS 対象を含むなら pending のままになる。作成者免除を外したため。GitHub は作成者自身の承認を認めない）

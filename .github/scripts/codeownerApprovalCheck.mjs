@@ -65,11 +65,13 @@ async function prNumbersFromEvent() {
   const event = JSON.parse(readFileSync(/** @type {string} */ (process.env.GITHUB_EVENT_PATH), 'utf8'))
   if (event.pull_request) return [event.pull_request.number]
   if (event.workflow_run) {
-    const listed = (event.workflow_run.pull_requests ?? []).map((p) => p.number)
-    if (listed.length > 0) return listed
-    // Fork PRs are not listed on workflow_run; find them by the reviewed head SHA.
-    const pulls = await (await gh(`/repos/${REPO}/commits/${event.workflow_run.head_sha}/pulls`)).json()
-    return pulls.map((p) => p.number)
+    // A review event does not reliably name its PR: `workflow_run.pull_requests` is empty for fork
+    // PRs and other cases, and the run's head_sha is not guaranteed to be the PR head. Re-decide
+    // every open PR into the default branch instead; each decision only reads, and posts on that
+    // PR's own current head.
+    const base = (await (await gh(`/repos/${REPO}`)).json()).default_branch
+    const open = await paginate(`/repos/${REPO}/pulls?state=open&base=${encodeURIComponent(base)}`)
+    return open.map((p) => p.number)
   }
   throw new Error(`unsupported event: ${process.env.GITHUB_EVENT_NAME}`)
 }
