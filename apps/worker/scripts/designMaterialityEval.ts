@@ -564,17 +564,22 @@ const PREDICTORS: Record<string, Predictor> = {
 }
 
 /**
- * correctness が「記録された責務が失われる・記録と食い違う・CEO 指示の設計を保たない」と判定した候補があるか。
- * 追加（introduces）だけの候補は数えない。評価が得られていない run は false（未検出として数える）。
+ * correctness が「記録された責務が失われる・記録と食い違う・CEO 指示の設計を保たない」と判定した候補、
+ * または保たれていない Authority 境界の候補（追加を含む）があるか。それ以外の追加（introduces）の候補は数えない。
+ * 評価が得られていない run は false（未検出として数える）。
  */
 export function correctnessFlags(o: MaterialityObservation): boolean {
   if (o.status !== 'ok') return false
-  const kindOf = new Map((o.detection?.candidates ?? []).map((c) => [c.id, c.kind]))
-  return (o.evaluations ?? []).some((e) => kindOf.get(e.candidateId) !== 'introduces' && (
-    e.responsibility === 'lost'
-    || e.recordConsistency === 'contradicts_unupdated_record'
-    || (e.ceoDirectedProvenance === 'yes' && e.responsibility !== 'preserved')
-  ))
+  const byId = new Map((o.detection?.candidates ?? []).map((c) => [c.id, c]))
+  return (o.evaluations ?? []).some((e) => {
+    const candidate = byId.get(e.candidateId)
+    // 狭い正解は Authority 境界の変更を（追加も含めて）必ず数える（rubric-narrow.md）。保たれているなら変更ではない
+    if (candidate?.subject === 'authority_boundary' && e.responsibility !== 'preserved') return true
+    if (candidate?.kind === 'introduces') return false
+    return e.responsibility === 'lost'
+      || e.recordConsistency === 'contradicts_unupdated_record'
+      || (e.ceoDirectedProvenance === 'yes' && e.responsibility !== 'preserved')
+  })
 }
 
 /**

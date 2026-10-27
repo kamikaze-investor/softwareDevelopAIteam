@@ -7,9 +7,10 @@ PR title・commit message・コメント内の自己分類は根拠にしない�
 
 ## 候補ごとに答えること
 
-- `responsibility`:
+- `responsibility`（下の値の**どれか1つをそのまま**書く。別の語にしない）:
   - `preserved` — 外から見た責務・契約・遷移は変わらない（純粋な改名・移動・リファクタ）
   - `moved` — 責務は別の、特定できる場所へ移った（`newOwner` にその場所を書く）
+  - `redefined` — 同じ場所が持ち続けるが、意味・条件・上限・到達可能性が変わった（`kind` が `redefines` の候補の多く）
   - `lost` — 責務を引き継ぐ場所が無い（stage が消え、同じ役割を果たすものが diff にも base にも無い）
   - `introduced` — 既存のものに触れず、新しい責務・機構・遷移・契約を足すだけ（`kind` が `introduces` の候補）
   - `unclear` — diff と抜粋からは決められない
