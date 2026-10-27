@@ -10473,6 +10473,12 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       **検証すること（PL）**: 実 PR で (1) `Meta Review (base)` が PR head に付く (2) PR で prompt / reviewer を変えても判定に効かない
       (3) source 固定後、bot の PAT で付けた同名 status が required check を満たさない (4) bot は自分の PR を承認できない。結果を本項目に書いて done にする。
 
+      **独立レビュー（別 context の Claude。Codex は本 account で `model_not_found`）で入れた対策**: (S1) 同一 SHA・同一 tree の
+      完了した BLOCKED 判定は sticky（`reopened` を trigger から外し、再実行・同内容の push で success に戻らない。provider 失敗は
+      `providerUsed` の有無で区別し sticky にしない）/ (S2) review job は書き込み権限なし、status / comment は model を実行しない別 job が付ける /
+      (S3) fork PR は審査せず failure / pnpm・Copilot CLI の version 固定 / status の risk は enum に限定。
+      判定の意味は既存と同じで、success は「マージを止める指摘が無い」（changes_requested も success）。
+
       **残るもの**: `Typecheck & Test` は性質上 PR のコードを実行する（test script を骨抜きにする PR は Meta Review / 横断監査で拾う）。
       共有の Gemini key を並走期間中は二重に使う（0c で解消）。
 
