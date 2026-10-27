@@ -10484,6 +10484,10 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       BLOCKED も sticky / 空 diff の approved を正規の判定として扱う / action を commit SHA に固定。
       **残る（Codex 指摘・CEO の credential 操作が要る）**: bot は classic OAuth token（`repo` scope）で、workflow run を force-cancel できる。
       BLOCKED を記録される前に止めて再実行させる経路が残るので、Actions 書き込み権限の無い fine-grained token へ替える。
+      **0b の前提条件（Codex 2 回目の判断）**: bot の credential を Actions 書き込み権限の無い fine-grained token へ替えるまで、
+      `Meta Review (base)` を required check にしない（0a の並走観測だけは可）。
+      **残る（記録して受容）**: status は commit に付くため、既に success の commit を head とする新しい PR は、その PR の run が
+      status を書くまでの間それを引き継ぐ。master へ merge できるのは同じ commit = 承認済みと同じ内容の場合に限られ、別 base は failure になる。
       **残る（範囲外）**: 同じ tree を別 PR として出し直す経路。PR 本文・diff による prompt injection（`meta-review-verdict-driven-by-pr-body`）。
 
       **残るもの**: `Typecheck & Test` は性質上 PR のコードを実行する（test script を骨抜きにする PR は Meta Review / 横断監査で拾う）。

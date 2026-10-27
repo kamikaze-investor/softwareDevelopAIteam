@@ -176,23 +176,35 @@ jobs:
             // this PR with the same tree, is never replaced by success (no re-roll by reopen, rerun or
             // an identical-content push). Infra failures ('error:') are not sticky.
             if (state === 'success') {
-              const commits = await github.paginate(github.rest.pulls.listCommits, { owner, repo, pull_number: pr.number, per_page: 100 })
-              const head = await github.rest.git.getCommit({ owner, repo, commit_sha: sha })
-              // Heads that were force-pushed away are no longer in listCommits; read them from the PR timeline.
-              const forced = await github.graphql(
-                'query($o:String!,$r:String!,$n:Int!){repository(owner:$o,name:$r){pullRequest(number:$n){timelineItems(itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT],first:100){nodes{... on HeadRefForcePushedEvent{beforeCommit{oid tree{oid}}}}}}}}',
-                { o: owner, r: repo, n: pr.number },
-              )
-              const forcedSame = (forced.repository.pullRequest.timelineItems.nodes ?? [])
-                .map((e) => e?.beforeCommit).filter((c) => c && c.tree.oid === head.data.tree.sha).map((c) => c.oid)
-              const sameTree = [...new Set([sha, ...commits.filter((c) => c.commit.tree.sha === head.data.tree.sha).map((c) => c.sha), ...forcedSame])]
-              for (const s of sameTree) {
-                const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, { owner, repo, ref: s, per_page: 100 })
-                if (statuses.some((st) => st.context === CONTEXT && st.state === 'failure' && (st.description ?? '').startsWith('verdict: blocked'))) {
-                  state = 'failure'
-                  description = `verdict: blocked (sticky from ${s.slice(0, 7)}; a later run cannot clear it)`
-                  break
+              // The sticky lookup must not fail open: any error here posts a non-success.
+              try {
+                const commits = await github.paginate(github.rest.pulls.listCommits, { owner, repo, pull_number: pr.number, per_page: 100 })
+                const head = await github.rest.git.getCommit({ owner, repo, commit_sha: sha })
+                // Heads that were force-pushed away are no longer in listCommits; read every one from the PR timeline.
+                const forcedSame = []
+                let cursor = null
+                for (;;) {
+                  const page = await github.graphql(
+                    'query($o:String!,$r:String!,$n:Int!,$c:String){repository(owner:$o,name:$r){pullRequest(number:$n){timelineItems(itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT],first:100,after:$c){pageInfo{hasNextPage endCursor} nodes{... on HeadRefForcePushedEvent{beforeCommit{oid tree{oid}}}}}}}}',
+                    { o: owner, r: repo, n: pr.number, c: cursor },
+                  )
+                  const items = page.repository.pullRequest.timelineItems
+                  for (const e of items.nodes ?? []) if (e?.beforeCommit && e.beforeCommit.tree.oid === head.data.tree.sha) forcedSame.push(e.beforeCommit.oid)
+                  if (!items.pageInfo.hasNextPage) break
+                  cursor = items.pageInfo.endCursor
                 }
+                const sameTree = [...new Set([sha, ...commits.filter((c) => c.commit.tree.sha === head.data.tree.sha).map((c) => c.sha), ...forcedSame])]
+                for (const s of sameTree) {
+                  const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, { owner, repo, ref: s, per_page: 100 })
+                  if (statuses.some((st) => st.context === CONTEXT && st.state === 'failure' && (st.description ?? '').startsWith('verdict: blocked'))) {
+                    state = 'failure'
+                    description = `verdict: blocked (sticky from ${s.slice(0, 7)}; a later run cannot clear it)`
+                    break
+                  }
+                }
+              } catch (error) {
+                state = 'failure'
+                description = `error: sticky-verdict lookup failed (fail closed): ${String(error).slice(0, 60)}`
               }
             }
 

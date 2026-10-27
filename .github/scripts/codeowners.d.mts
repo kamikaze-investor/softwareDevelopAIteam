@@ -1,3 +1,7 @@
+// Types for codeowners.mjs. They live next to it, not in packages/shared, on purpose: the Code Owner
+// Approval workflow runs codeowners.mjs dependency-free from the default branch (sparse checkout of
+// .github/scripts only), and this directory is CODEOWNERS-protected so the checker cannot be weakened
+// through a non-owned dependency.
 export interface CodeownersRule {
   pattern: string
   owners: string[]

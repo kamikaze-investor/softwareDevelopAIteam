@@ -77,14 +77,24 @@ const SEVERITY = { success: 0, pending: 1, failure: 2, error: 3 }
 async function decideSha(prNumber, defaultBranch) {
   const first = await decide(prNumber, defaultBranch)
   if ('skip' in first) return first
-  const siblings = (await (await gh(`/repos/${REPO}/commits/${first.sha}/pulls`)).json())
-    .filter((p) => p.state === 'open' && p.head.sha === first.sha && p.number !== prNumber)
+  const openOnSha = async () =>
+    (await paginate(`/repos/${REPO}/commits/${first.sha}/pulls`))
+      .filter((p) => p.state === 'open' && p.head.sha === first.sha)
+      .map((p) => p.number)
+      .sort((a, b) => a - b)
+  const before = await openOnSha()
   let worst = first
-  for (const p of siblings) {
-    const d = await decide(p.number, defaultBranch)
+  for (const n of before.filter((n) => n !== prNumber)) {
+    const d = await decide(n, defaultBranch)
     if ('skip' in d) return d
-    if (SEVERITY[d.state] > SEVERITY[worst.state]) worst = { ...d, description: `#${p.number}: ${d.description}`.slice(0, 140) }
+    // A sibling that moved to another head is not a decision about this SHA.
+    if (d.sha !== first.sha) return { skip: `#${n} moved off ${first.sha.slice(0, 7)} during evaluation` }
+    if (SEVERITY[d.state] > SEVERITY[worst.state]) worst = { ...d, description: `#${n}: ${d.description}`.slice(0, 140) }
   }
+  // If the set of PRs on this SHA changed meanwhile, the combined decision is stale; post nothing
+  // and let the event that changed it run the check again.
+  const after = await openOnSha()
+  if (after.join(',') !== before.join(',')) return { skip: `PRs on ${first.sha.slice(0, 7)} changed during evaluation` }
   return worst
 }
 
