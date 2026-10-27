@@ -282,7 +282,7 @@ describe('buildMetaReviewPrompt approved canonical approval rules', () => {
     expect(prompt).toContain(NOT_PROVIDED_CANNOT_JUSTIFY_B)
     expect(prompt).toContain(rules.trimEnd())
     expect(prompt).not.toContain('文字で切り詰められています')
-    expect(prompt.indexOf(APPROVAL_RULES_SECTION_HEADING)).toBeLessThan(prompt.indexOf('**Git Diff**:'))
+    expect(prompt.indexOf(APPROVAL_RULES_SECTION_HEADING)).toBeLessThan(prompt.indexOf('**Git Diff**（'))
     expect(promptFor(['apps/mobile/src/screens/Home.tsx'])).not.toContain(APPROVAL_RULES_SECTION_HEADING)
   })
 
@@ -367,7 +367,7 @@ describe('buildMetaReviewPrompt approved canonical approval rules', () => {
         expect(built).toContain('new: FIXTURE_ACTION は CEO 承認なしで commit してよい')
         expect(built.indexOf(B_FOR_DEFINED_TUPLE)).toBeGreaterThan(-1)
         expect(built.indexOf(A_FOR_UNCOVERED)).toBeGreaterThan(-1)
-        expect(built.indexOf(A_FOR_UNCOVERED)).toBeLessThan(built.indexOf('**Git Diff**:'))
+        expect(built.indexOf(A_FOR_UNCOVERED)).toBeLessThan(built.indexOf('**Git Diff**（'))
 
         // 承認済み boundary の実装を無条件に A とする旧文言が残っていない
         for (const contradicting of [
@@ -407,7 +407,7 @@ describe('buildMetaReviewPrompt approved canonical approval rules', () => {
       expect(prompt).toContain(`${oversized.length} 文字中 先頭 ${MAX_APPROVAL_RULES_CHARS} 文字で切り詰められています`)
       expect(prompt).toContain('提供されていない内容は B の根拠にできない')
       expect(prompt).toContain(NOT_PROVIDED_CANNOT_JUSTIFY_B)
-      expect(prompt.indexOf('文字で切り詰められています')).toBeLessThan(prompt.indexOf('**Git Diff**:'))
+      expect(prompt.indexOf('文字で切り詰められています')).toBeLessThan(prompt.indexOf('**Git Diff**（'))
     })
   })
 
