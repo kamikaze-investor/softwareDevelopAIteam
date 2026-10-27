@@ -226,13 +226,19 @@ describe('parseDetection — strict', () => {
     expect(parsed.ok).toBe(true)
   })
 
+  it('material が候補の有無と食い違えば不成立（llm の予測を書き換えない）', () => {
+    expect(parseDetection(JSON.stringify({ material: false, candidates: [candidate], signalDisposition: [] }), signals))
+      .toEqual({ ok: false, reason: 'material_mismatch' })
+    expect(parseDetection(JSON.stringify({ candidates: [candidate], signalDisposition: [] }), signals))
+      .toEqual({ ok: false, reason: 'material_not_boolean' })
+  })
+
   it('未知の kind（採点に使う欄）は不成立', () => {
     expect(parseDetection(JSON.stringify({ material: true, candidates: [{ ...candidate, kind: 'tweaks' }], signalDisposition: [] }), signals))
       .toEqual({ ok: false, reason: 'invalid_candidate:kind' })
   })
 
   it.each([
-    ['material と candidates が食い違う → 候補の有無に合わせる', { material: false, candidates: [candidate], signalDisposition: [{ signalId: sid, disposition: 'supports_candidate:c1', reason: '' }] }, ['material_mismatch'], true, 1],
     ['S1 に disposition が無い → 残す', { material: true, candidates: [candidate], signalDisposition: [] }, [`signal_not_disposed:${sid}`], true, 0],
     ['存在しない candidate を指す disposition は捨てる', { material: true, candidates: [candidate], signalDisposition: [{ signalId: sid, disposition: 'supports_candidate:c9', reason: '' }] }, ['unknown_disposition:supports_candidate:c9', `signal_not_disposed:${sid}`], true, 0],
     ['正しさを判断する disposition（behavior_preserving）は捨てる', { material: false, candidates: [], signalDisposition: [{ signalId: sid, disposition: 'behavior_preserving', reason: '' }] }, ['unknown_disposition:behavior_preserving', `signal_not_disposed:${sid}`], false, 0],
@@ -265,6 +271,15 @@ describe('parseEvaluation — strict', () => {
     expect(parseEvaluation(JSON.stringify({ evaluations: [] }), candidates)).toEqual({ ok: false, reason: 'no_usable_evaluation' })
     expect(parseEvaluation(JSON.stringify({ evaluations: [evaluation, { ...evaluation, candidateId: 'c2' }] }), candidates))
       .toMatchObject({ ok: true, warnings: ['unknown_candidate:c2'] })
+  })
+
+  it('同じ候補への評価: 判定が同じなら1つにまとめ、違えば全部捨てる（順番で結果を変えない）', () => {
+    const lost = { ...evaluation, responsibility: 'lost' }
+    const preserved = { ...evaluation, responsibility: 'preserved' }
+    expect(parseEvaluation(JSON.stringify({ evaluations: [lost, lost] }), candidates)).toMatchObject({ ok: true, warnings: ['duplicate_evaluation:c1'] })
+    for (const order of [[preserved, lost], [lost, preserved]]) {
+      expect(parseEvaluation(JSON.stringify({ evaluations: order }), candidates)).toEqual({ ok: false, reason: 'no_usable_evaluation' })
+    }
   })
 
   it('評価の無い候補は unevaluated として残す', () => {
@@ -503,7 +518,7 @@ it('観測は parseWarnings に stage 付きで残す（M5 trial 2026-10-27: 1�
   const diff = fileDiff('apps/api/src/x.ts', ["-  | 'challenge_aligned'"])
   const sid = computeMaterialitySignals(diff)[0].id
   const detection = JSON.stringify({
-    material: false,
+    material: true,
     candidates: [
       { id: 'c1', kind: 'redefines', subject: 'mechanism', mechanism: 'budget', file: 'a.ts', evidence: 'e' },
       { id: 'c2', kind: 'redefines', subject: 'state_transition', mechanism: 'stage', file: 'b.ts', evidence: 'e' },
@@ -521,5 +536,5 @@ it('観測は parseWarnings に stage 付きで残す（M5 trial 2026-10-27: 1�
   )
   expect(observation.status).toBe('ok')
   expect(observation.detection?.material).toBe(true)
-  expect(observation.parseWarnings).toEqual(['detection:material_mismatch', 'evaluation:unevaluated:c2'])
+  expect(observation.parseWarnings).toEqual(['evaluation:unevaluated:c2'])
 })

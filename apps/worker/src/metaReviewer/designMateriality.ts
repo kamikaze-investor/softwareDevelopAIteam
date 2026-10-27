@@ -499,10 +499,10 @@ const oneOf = <T extends string>(values: readonly T[], v: unknown): v is T => ty
  * detection 応答の parse。
  *
  * **厳格（不成立にする）**: JSON・`candidates` / `signalDisposition` の配列・候補の採点に使う欄
- * （id・kind・subject・mechanism・file・evidence）・候補 id の重複（correctness の突き合わせが壊れる）。
+ * （id・kind・subject・mechanism・file・evidence）・候補 id の重複（correctness の突き合わせが壊れる）・
+ * `material`（llm の予測そのものなので、書き換えも補完もしない。boolean で、候補の有無と一致しなければ不成立）。
  *
  * **warning に残して続ける**（M5 trial で、副次的な出力の不備1つで観測全体を失っていたため）:
- * - `material` が候補の有無と食い違う → 候補の有無に合わせる（`material` は候補が空でないことと定義される）
  * - 1つの signal に複数の disposition（複数の候補を支える signal は正当） → すべて残す
  * - 未知の signal id・未知の disposition 値・不正な disposition → その disposition だけ捨てる
  * - S1–S3 の signal に disposition が無い → `signal_not_disposed:<id>` を残す
@@ -510,6 +510,7 @@ const oneOf = <T extends string>(values: readonly T[], v: unknown): v is T => ty
 export function parseDetection(raw: string, signals: readonly MaterialitySignal[]): ParseOutcome<DetectionResult> {
   const json = extractJsonObject(raw) as Record<string, unknown> | undefined
   if (!json || typeof json !== 'object') return { ok: false, reason: 'no_json' }
+  if (typeof json.material !== 'boolean') return { ok: false, reason: 'material_not_boolean' }
   if (!Array.isArray(json.candidates) || !Array.isArray(json.signalDisposition)) return { ok: false, reason: 'missing_arrays' }
   const warnings: string[] = []
 
@@ -529,8 +530,8 @@ export function parseDetection(raw: string, signals: readonly MaterialitySignal[
   }
   const candidateIds = new Set(candidates.map((c) => c.id))
   if (candidateIds.size !== candidates.length) return { ok: false, reason: 'duplicate_candidate_id' }
-  const material = candidates.length > 0
-  if (json.material !== material) warnings.push('material_mismatch')
+  if (json.material !== candidates.length > 0) return { ok: false, reason: 'material_mismatch' }
+  const material = json.material
 
   const known = new Set(signals.map((s) => s.id))
   const dispositions: SignalDisposition[] = []
@@ -573,8 +574,9 @@ export interface CandidateEvaluation {
  * correctness 応答の parse。
  *
  * 判定の欄（candidateId・responsibility・recordConsistency・ceoDirectedProvenance）が不正な評価、
- * 規則に反する評価（introduced を追加以外に使う・moved なのに移り先が無い）、未知の候補・2つ目以降の評価は
- * **その評価だけを捨てて warning に残す**。評価の無い候補は `unevaluated:<id>` を残す（評価が無いので
+ * 規則に反する評価（introduced を追加以外に使う・moved なのに移り先が無い）、未知の候補への評価は
+ * **その評価だけを捨てて warning に残す**。同じ候補への評価が複数あるとき、判定の欄が全部同じなら1つにまとめ、
+ * 1つでも違えばその候補の評価を**全部捨てる**（順番で狭い判定が変わらないように）。評価の無い候補は `unevaluated:<id>` を残す（評価が無いので
  * 狭い判定では「未検出」として数えられる）。1件も使える評価が無ければ不成立。
  */
 export function parseEvaluation(raw: string, candidates: readonly MaterialityCandidate[]): ParseOutcome<CandidateEvaluation[]> {
@@ -594,7 +596,6 @@ export function parseEvaluation(raw: string, candidates: readonly MaterialityCan
     if (bad) { warnings.push(`invalid_evaluation:${bad}`); continue }
     const candidate = byId.get(e.candidateId as string)
     if (!candidate) { warnings.push(`unknown_candidate:${String(e.candidateId).slice(0, 40)}`); continue }
-    if (out.some((o) => o.candidateId === candidate.id)) { warnings.push(`duplicate_evaluation:${candidate.id}`); continue }
     // introduced は追加（kind=introduces）の候補にだけ使える。消す・替える・意味を変える候補を introduced と答えた評価は
     // 狭い判定（correctnessFlags）から外れてしまうので使わない
     if (e.responsibility === 'introduced' && candidate.kind !== 'introduces') { warnings.push(`introduced_for_non_addition:${candidate.id}`); continue }
@@ -612,9 +613,20 @@ export function parseEvaluation(raw: string, candidates: readonly MaterialityCan
       naturalness: text(e.naturalness),
     })
   }
-  for (const c of candidates) if (!out.some((o) => o.candidateId === c.id)) warnings.push(`unevaluated:${c.id}`)
-  if (out.length === 0) return { ok: false, reason: 'no_usable_evaluation' }
-  return { ok: true, value: out, warnings }
+  const verdictKey = (e: CandidateEvaluation) => `${e.responsibility}|${e.recordConsistency}|${e.ceoDirectedProvenance}`
+  const kept: CandidateEvaluation[] = []
+  for (const c of candidates) {
+    const mine = out.filter((o) => o.candidateId === c.id)
+    if (mine.length === 0) { warnings.push(`unevaluated:${c.id}`); continue }
+    if (new Set(mine.map(verdictKey)).size > 1) {
+      warnings.push(`conflicting_evaluations:${c.id}`, `unevaluated:${c.id}`)
+      continue
+    }
+    if (mine.length > 1) warnings.push(`duplicate_evaluation:${c.id}`)
+    kept.push(mine[0])
+  }
+  if (kept.length === 0) return { ok: false, reason: 'no_usable_evaluation' }
+  return { ok: true, value: kept, warnings }
 }
 
 // ---------------------------------------------------------------------------
