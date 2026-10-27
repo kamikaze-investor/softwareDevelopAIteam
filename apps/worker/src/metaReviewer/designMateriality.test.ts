@@ -241,7 +241,7 @@ describe('parseDetection — strict', () => {
 
   it.each([
     ['S1 に disposition が無い → 残す', { material: true, candidates: [candidate], signalDisposition: [] }, [`signal_not_disposed:${sid}`], true, 0],
-    ['存在しない candidate を指す disposition は捨てる', { material: true, candidates: [candidate], signalDisposition: [{ signalId: sid, disposition: 'supports_candidate:c9', reason: '' }] }, ['unknown_disposition:supports_candidate_c9', `signal_not_disposed:${sid}`], true, 0],
+    ['存在しない candidate を指す disposition は捨てる', { material: true, candidates: [candidate], signalDisposition: [{ signalId: sid, disposition: 'supports_candidate:c9', reason: '' }] }, ['unknown_disposition:<non-token>', `signal_not_disposed:${sid}`], true, 0],
     ['正しさを判断する disposition（behavior_preserving）は捨てる', { material: false, candidates: [], signalDisposition: [{ signalId: sid, disposition: 'behavior_preserving', reason: '' }] }, ['unknown_disposition:behavior_preserving', `signal_not_disposed:${sid}`], false, 0],
   ])('%s', (_label, body, warnings, material, dispositions) => {
     const parsed = parseDetection(JSON.stringify(body), signals)
@@ -271,7 +271,7 @@ describe('parseEvaluation — strict', () => {
   it('使える評価が1件も無ければ不成立。未知の候補への評価は捨てて warning に残す', () => {
     expect(parseEvaluation(JSON.stringify({ evaluations: [] }), candidates)).toEqual({ ok: false, reason: 'no_usable_evaluation' })
     expect(parseEvaluation(JSON.stringify({ evaluations: [evaluation, { ...evaluation, candidateId: 'c2' }] }), candidates))
-      .toMatchObject({ ok: true, warnings: ['unknown_candidate:c2'] })
+      .toMatchObject({ ok: true, warnings: ['unknown_candidate:<non-token>'] })
   })
 
   it('同じ候補への評価: 判定が同じなら1つにまとめ、違えば全部捨てる（順番で結果を変えない）', () => {
@@ -549,6 +549,8 @@ it('redefined を受け付ける（M5 trial 2026-10-27: 再定義の候補が評
 it('warning に残す値は短い語の形だけ（model の自由文・配列は残さない）', () => {
   expect(warningToken('redefined')).toBe('redefined')
   expect(warningToken('ghp_' + 'x'.repeat(50))).toBe('<non-token>')
+  expect(warningToken('ghp_' + 'A'.repeat(36))).toBe('<non-token>')
+  expect(warningToken('abc123def456')).toBe('<non-token>')
   expect(warningToken('a, b: c')).toBe('<non-token>')
   expect(warningToken(['big', 'array'])).toBe('<non-token>')
 })

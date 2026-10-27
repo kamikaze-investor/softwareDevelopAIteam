@@ -482,9 +482,12 @@ export type ParseOutcome<T> = { ok: true; value: T; warnings: string[] } | { ok:
 
 const MAX_WARNINGS = 50
 
-/** warning に値を残すのは、短い語の形（英数字・_・-・空白、40文字以内）の string のときだけ */
+/**
+ * warning に値を残すのは、enum 語の形（小文字の英字・_・- だけ、24 文字以内）の string のときだけ。
+ * 数字・大文字を含むもの（token・hash・id の形）は残さない。enum の取り違え（`redefined` 等）の診断にはこれで足りる
+ */
 export function warningToken(v: unknown): string {
-  return typeof v === 'string' && /^[A-Za-z0-9_ -]{1,40}$/.test(v) ? v : '<non-token>'
+  return typeof v === 'string' && /^[a-z][a-z_-]{0,23}$/.test(v) ? v : '<non-token>'
 }
 
 function capWarnings(warnings: string[]): string[] {
