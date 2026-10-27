@@ -18,6 +18,38 @@ DA (1) はファイル名ではなく差分の意味で判定する。Goal / Pro
 
 DA (2) も同様に、authority 関連ファイルを触ったことではなく、差分が実際に成立させる Approval Tuple の変化で判定する。基準は「判定基準」章の「DA trigger (2) — Authority / Approval boundary の意味で判定する」節である。
 
+DA (3) の「公開範囲・公開 route」は、**AIteamOS の外の利用者・システム**（新しい外部ユーザー・地域・市場。`specs/22` §1-1）から到達・閲覧できる範囲を指す。既存の認証付き internal route の応答に項目を足すという事実だけでは DA (3) に当たらない。DA (3) について B とするのは、次をすべて差分と既存コードから確認できた場合に限る:
+- 呼び出し元が既存の credential class・既存の allowlist のままである（同じ差分で allowlist・認証・route の公開設定を変えていない）
+- 追加するデータが既存の data-use / sensitivity の範囲内である（secret・認証情報・個人データを含まない）
+- proxy・relay・log・telemetry を含め、新しい閲覧先を作らない
+- 他の DA trigger（特に (2) authority・(4) 個人データ）に当たらない
+
+次は DA (3) の A（`requiresCeoApproval: true`）である:
+- 認証なしで呼べる route、または外部の利用者・client 向けの新しい endpoint を追加する
+- 既存 route を新しい credential class・外部 client・新しい呼び出し元へ開く（allowlist への追加を含む）、または既存の認証・allowlist の確認を外す
+- 外部の audience から新しく見えるようになるデータを追加する
+
+既に外部から呼べる route でも、外部から呼べることだけでは A にしない。追加項目が新しい外部 audience・公開範囲、個人データ・データ利用方針、Product / Policy、authority を変える場合に、該当する trigger で A とする。
+差分に含まれ required CI が実行するテストが、これらの前提（例: route が既存の credential でしか呼べないこと）を実際に assert している場合は、確認できたものとして扱ってよい（テストが空振り・無関係なら確認とみなさない）。それ以外で確認できない場合は A とする（fail closed）。secret・個人データの漏えいなどの技術的欠陥は、Decision Authority の判定とは独立に `blocked` / `changes_requested` の対象である。
+
+通知（alert・escalation・LINE などの CRITICAL 通知）の変更は、通知の変更という種類だけでは A にしない。`approval_rules.md` は「承認の意味に関係しない修復（…通知のみの escalation…）は本節の対象外」とするが、これは Approval Tuple の範囲についての根拠であり、Safety boundary が不変であることの証明ではない。通知の変更を B とするのは、base canonical rule と従来の production の event の意味に対して、次がすべて不変または強化であることを差分と既存コードから確認できた場合に限る:
+- 通知の対象となる失敗の event の集合と severity の判定
+- 必要な受信者（CEO を含む）と、要求された配達の保証
+- 独立した backstop
+- gate・承認・Job intake など実行可否への効果（通知が実行可否の判定の一部なら、その判定を変えない）
+
+ある event の通知の時刻を遅らせる場合は、さらに次の両方を確認できること:
+- 遅らせる対象が正常系の誤報であり、同じ類の本当の失敗は production の経路で実際に発火する代替の経路により、有界な時間内に必要な受信者へ届く
+- 新しい時間の上限が、base branch に既にある canonical rule、または base branch に既にある CEO 承認済みの roadmap 項目に根拠を持ち、その本文がこの prompt に提供されている。差分が追加・変更した roadmap 項目・rule、PR 本文、commit message、テスト名は根拠にしない
+
+次は A（`requiresCeoApproval: true`）である:
+- 本当の失敗のある類について、通知を無くす、または上の条件を満たさずに遅らせる・有界でない待ちにする（Safety boundary の弱体化。`specs/22` §1-2）
+- base で承認された意味の上で失敗である event の類を、失敗でないと再分類する、または その severity を下げる（base の意味に照らして実装の誤報を直すことはこれに当たらないが、上の B の前提をすべて確認できる場合に限る）
+- CEO へ通知する条件そのもの（`CLAUDE.md`「Escalation Rules」・DA trigger）や必要な受信者を変える
+- 通知が gate・承認・Job intake など実行可否を決める判定の一部であり、その判定を変える
+
+確認できない場合は A とする（fail closed）。通知の修正であることを PR 本文が主張しているだけでは B にしない。
+
 AI Team OS共通行動原則は `specs/00_constitution.md` 3.14〜3.18 を正本として適用し、明示的なSafety Ruleを常に優先する。
 
 ## Review Contract
