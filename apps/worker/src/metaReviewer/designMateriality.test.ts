@@ -241,8 +241,8 @@ describe('parseDetection — strict', () => {
 
   it.each([
     ['S1 に disposition が無い → 残す', { material: true, candidates: [candidate], signalDisposition: [] }, [`signal_not_disposed:${sid}`], true, 0],
-    ['存在しない candidate を指す disposition は捨てる', { material: true, candidates: [candidate], signalDisposition: [{ signalId: sid, disposition: 'supports_candidate:c9', reason: '' }] }, ['unknown_disposition:<non-token>', `signal_not_disposed:${sid}`], true, 0],
-    ['正しさを判断する disposition（behavior_preserving）は捨てる', { material: false, candidates: [], signalDisposition: [{ signalId: sid, disposition: 'behavior_preserving', reason: '' }] }, ['unknown_disposition:behavior_preserving', `signal_not_disposed:${sid}`], false, 0],
+    ['存在しない candidate を指す disposition は捨てる', { material: true, candidates: [candidate], signalDisposition: [{ signalId: sid, disposition: 'supports_candidate:c9', reason: '' }] }, ['unknown_disposition:<other>', `signal_not_disposed:${sid}`], true, 0],
+    ['正しさを判断する disposition（behavior_preserving）は捨てる', { material: false, candidates: [], signalDisposition: [{ signalId: sid, disposition: 'behavior_preserving', reason: '' }] }, ['unknown_disposition:<other>', `signal_not_disposed:${sid}`], false, 0],
   ])('%s', (_label, body, warnings, material, dispositions) => {
     const parsed = parseDetection(JSON.stringify(body), signals)
     expect(parsed.ok).toBe(true)
@@ -271,7 +271,7 @@ describe('parseEvaluation — strict', () => {
   it('使える評価が1件も無ければ不成立。未知の候補への評価は捨てて warning に残す', () => {
     expect(parseEvaluation(JSON.stringify({ evaluations: [] }), candidates)).toEqual({ ok: false, reason: 'no_usable_evaluation' })
     expect(parseEvaluation(JSON.stringify({ evaluations: [evaluation, { ...evaluation, candidateId: 'c2' }] }), candidates))
-      .toMatchObject({ ok: true, warnings: ['unknown_candidate:<non-token>'] })
+      .toMatchObject({ ok: true, warnings: ['unknown_candidate:<other>'] })
   })
 
   it('同じ候補への評価: 判定が同じなら1つにまとめ、違えば全部捨てる（順番で結果を変えない）', () => {
@@ -387,7 +387,7 @@ describe('独立レビュー指摘（code review round 1）の回帰', () => {
       { signalId: sid, disposition: 'supports_candidate:c1', reason: '' },
       { signalId: 'ffffffffffff', disposition: 'unrelated', reason: '' },
     ] }
-    expect(parseDetection(JSON.stringify(unknown), signals)).toMatchObject({ ok: true, warnings: ['unknown_signal:ffffffffffff'] })
+    expect(parseDetection(JSON.stringify(unknown), signals)).toMatchObject({ ok: true, warnings: ['unknown_signal:<other>'] })
   })
 
   it('evaluation: moved なのに newOwner が無い評価は捨てる（唯一の評価なら不成立）', () => {
@@ -449,7 +449,7 @@ describe('M5 trial (2026-10-26) の解析失敗への対応', () => {
     const bad = { candidateId: 'c1', responsibility: 'gone', recordConsistency: 'no_record', ceoDirectedProvenance: 'no' }
     const good = { candidateId: 'c1', responsibility: 'lost', recordConsistency: 'no_record', ceoDirectedProvenance: 'no' }
     expect(parseEvaluation(JSON.stringify({ evaluations: [bad] }), cands)).toEqual({ ok: false, reason: 'no_usable_evaluation' })
-    expect(parseEvaluation(JSON.stringify({ evaluations: [bad, good] }), cands)).toMatchObject({ ok: true, warnings: ['invalid_evaluation:responsibility=gone'] })
+    expect(parseEvaluation(JSON.stringify({ evaluations: [bad, good] }), cands)).toMatchObject({ ok: true, warnings: ['invalid_evaluation:responsibility=<other>'] })
   })
 
   it('解析できなかった応答は先頭だけを rawResponseExcerpt に残す', async () => {
@@ -548,11 +548,13 @@ it('redefined を受け付ける（M5 trial 2026-10-27: 再定義の候補が評
 
 it('warning に残す値は短い語の形だけ（model の自由文・配列は残さない）', () => {
   expect(warningToken('redefined')).toBe('redefined')
-  expect(warningToken('ghp_' + 'x'.repeat(50))).toBe('<non-token>')
-  expect(warningToken('ghp_' + 'A'.repeat(36))).toBe('<non-token>')
-  expect(warningToken('abc123def456')).toBe('<non-token>')
-  expect(warningToken('a, b: c')).toBe('<non-token>')
-  expect(warningToken(['big', 'array'])).toBe('<non-token>')
+  expect(warningToken('ghp_' + 'x'.repeat(50))).toBe('<other>')
+  expect(warningToken('ghp_' + 'A'.repeat(36))).toBe('<other>')
+  expect(warningToken('abc123def456')).toBe('<other>')
+  expect(warningToken('abcdefghijklmnopqrstuvwx')).toBe('<other>')
+  expect(warningToken('changed')).toBe('changed')
+  expect(warningToken('a, b: c')).toBe('<other>')
+  expect(warningToken(['big', 'array'])).toBe('<other>')
 })
 
 it('warning は 50 件で切る', () => {

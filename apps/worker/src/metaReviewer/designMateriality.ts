@@ -483,11 +483,21 @@ export type ParseOutcome<T> = { ok: true; value: T; warnings: string[] } | { ok:
 const MAX_WARNINGS = 50
 
 /**
- * warning に値を残すのは、enum 語の形（小文字の英字・_・- だけ、24 文字以内）の string のときだけ。
- * 数字・大文字を含むもの（token・hash・id の形）は残さない。enum の取り違え（`redefined` 等）の診断にはこれで足りる
+ * warning に値を残すのは、**決まった語の一覧**にある値だけ（enum の値と、よくある取り違え）。
+ * それ以外は `<other>`。model の出力を記録へ写さない（形での判定は小文字だけの secret を通してしまう）
  */
+const WARNING_VOCABULARY = new Set([
+  'preserved', 'moved', 'redefined', 'lost', 'introduced', 'unclear',
+  'consistent', 'contradicts_unupdated_record', 'no_record', 'yes', 'no', 'unknown',
+  'removes', 'replaces', 'redefines', 'introduces',
+  'responsibility', 'mechanism', 'authority_boundary', 'state_transition', 'design_contract',
+  'unrelated', 'test_only', 'formatting_or_comment_wording',
+  'changed', 'modified', 'removed', 'added', 'new', 'replaced', 'renamed', 'deleted', 'unchanged',
+  'none', 'partial', 'true', 'false', 'null', 'undefined', 'n/a',
+])
+
 export function warningToken(v: unknown): string {
-  return typeof v === 'string' && /^[a-z][a-z_-]{0,23}$/.test(v) ? v : '<non-token>'
+  return typeof v === 'string' && WARNING_VOCABULARY.has(v) ? v : '<other>'
 }
 
 function capWarnings(warnings: string[]): string[] {
