@@ -277,7 +277,7 @@ describe('parseEvaluation — strict', () => {
   it('同じ候補への評価: 判定が同じなら1つにまとめ、違えば全部捨てる（順番で結果を変えない）', () => {
     const lost = { ...evaluation, responsibility: 'lost' }
     const preserved = { ...evaluation, responsibility: 'preserved' }
-    expect(parseEvaluation(JSON.stringify({ evaluations: [lost, lost] }), candidates)).toMatchObject({ ok: true, warnings: ['duplicate_evaluation:c1'] })
+    expect(parseEvaluation(JSON.stringify({ evaluations: [lost, lost] }), candidates)).toMatchObject({ ok: true, warnings: ['duplicate_evaluation:#0'] })
     for (const order of [[preserved, lost], [lost, preserved]]) {
       expect(parseEvaluation(JSON.stringify({ evaluations: order }), candidates)).toEqual({ ok: false, reason: 'no_usable_evaluation' })
     }
@@ -285,7 +285,7 @@ describe('parseEvaluation — strict', () => {
 
   it('評価の無い候補は unevaluated として残す', () => {
     const two = [...candidates, { ...candidates[0], id: 'c2' }]
-    expect(parseEvaluation(JSON.stringify({ evaluations: [evaluation] }), two)).toMatchObject({ ok: true, warnings: ['unevaluated:c2'] })
+    expect(parseEvaluation(JSON.stringify({ evaluations: [evaluation] }), two)).toMatchObject({ ok: true, warnings: ['unevaluated:#1'] })
   })
 })
 
@@ -511,7 +511,7 @@ it('introduced を消す・替える候補に答えた評価は使わない（�
     { candidateId: 'c1', responsibility: 'introduced', recordConsistency: 'consistent', ceoDirectedProvenance: 'no' },
     { candidateId: 'c2', responsibility: 'introduced', recordConsistency: 'no_record', ceoDirectedProvenance: 'no' },
   ] }), cands)
-  expect(parsed).toMatchObject({ ok: true, warnings: ['introduced_for_non_addition:c1', 'unevaluated:c1'] })
+  expect(parsed).toMatchObject({ ok: true, warnings: ['introduced_for_non_addition:#0', 'unevaluated:#0'] })
   expect(parsed.ok && parsed.value.map((e) => e.candidateId)).toEqual(['c2'])
 })
 
@@ -537,7 +537,7 @@ it('観測は parseWarnings に stage 付きで残す（M5 trial 2026-10-27: 1�
   )
   expect(observation.status).toBe('ok')
   expect(observation.detection?.material).toBe(true)
-  expect(observation.parseWarnings).toEqual(['evaluation:unevaluated:c2'])
+  expect(observation.parseWarnings).toEqual(['evaluation:unevaluated:#1'])
 })
 
 it('redefined を受け付ける（M5 trial 2026-10-27: 再定義の候補が評価なしになっていた）', () => {
@@ -563,4 +563,14 @@ it('warning は 50 件で切る', () => {
   const parsed = parseDetection(JSON.stringify({ material: false, candidates: [], signalDisposition: many }), signals)
   expect(parsed.ok && parsed.warnings.length).toBe(51)
   expect(parsed.ok && parsed.warnings[50]).toMatch(/^truncated:/)
+})
+
+
+it('warning に model が決めた候補 id を書かない（位置で書く）', () => {
+  const id = 'abcdefghijklmnopqrstuvwx'
+  const cands = [{ id, kind: 'removes' as const, subject: 'mechanism' as const, mechanism: 'm', file: 'f.ts', evidence: 'e' }]
+  const ev = { candidateId: id, responsibility: 'lost', recordConsistency: 'no_record', ceoDirectedProvenance: 'no' }
+  const parsed = parseEvaluation(JSON.stringify({ evaluations: [ev, ev] }), cands)
+  expect(parsed.ok && parsed.warnings).toEqual(['duplicate_evaluation:#0'])
+  expect(JSON.stringify(parsed)).not.toContain(`warnings":["duplicate_evaluation:${id}`)
 })

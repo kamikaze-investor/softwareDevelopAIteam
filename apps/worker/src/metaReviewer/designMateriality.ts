@@ -611,6 +611,8 @@ export function parseEvaluation(raw: string, candidates: readonly MaterialityCan
   const warnings: string[] = []
   const out: CandidateEvaluation[] = []
   const byId = new Map(candidates.map((c) => [c.id, c]))
+  // warning には候補の id（model が決めた文字列）ではなく位置（#0, #1 …）を書く
+  const ref = (id: string) => `#${candidates.findIndex((c) => c.id === id)}`
   // newOwner と自由記述の所見は欠けてもよい（newOwner は null、所見は空文字にする）
   const optionalText = (v: unknown) => v === undefined || v === null || typeof v === 'string'
   const text = (v: unknown) => (typeof v === 'string' ? v : '')
@@ -625,9 +627,9 @@ export function parseEvaluation(raw: string, candidates: readonly MaterialityCan
     if (!candidate) { warnings.push(`unknown_candidate:${warningToken(e.candidateId)}`); continue }
     // introduced は追加（kind=introduces）の候補にだけ使える。消す・替える・意味を変える候補を introduced と答えた評価は
     // 狭い判定（correctnessFlags）から外れてしまうので使わない
-    if (e.responsibility === 'introduced' && candidate.kind !== 'introduces') { warnings.push(`introduced_for_non_addition:${candidate.id}`); continue }
+    if (e.responsibility === 'introduced' && candidate.kind !== 'introduces') { warnings.push(`introduced_for_non_addition:${ref(candidate.id)}`); continue }
     // moved は移り先を名指しできて初めて moved である
-    if (e.responsibility === 'moved' && !isString(e.newOwner)) { warnings.push(`moved_without_owner:${candidate.id}`); continue }
+    if (e.responsibility === 'moved' && !isString(e.newOwner)) { warnings.push(`moved_without_owner:${ref(candidate.id)}`); continue }
     out.push({
       candidateId: candidate.id,
       responsibility: e.responsibility as CandidateEvaluation['responsibility'],
@@ -644,12 +646,12 @@ export function parseEvaluation(raw: string, candidates: readonly MaterialityCan
   const kept: CandidateEvaluation[] = []
   for (const c of candidates) {
     const mine = out.filter((o) => o.candidateId === c.id)
-    if (mine.length === 0) { warnings.push(`unevaluated:${c.id}`); continue }
+    if (mine.length === 0) { warnings.push(`unevaluated:${ref(c.id)}`); continue }
     if (new Set(mine.map(verdictKey)).size > 1) {
-      warnings.push(`conflicting_evaluations:${c.id}`, `unevaluated:${c.id}`)
+      warnings.push(`conflicting_evaluations:${ref(c.id)}`, `unevaluated:${ref(c.id)}`)
       continue
     }
-    if (mine.length > 1) warnings.push(`duplicate_evaluation:${c.id}`)
+    if (mine.length > 1) warnings.push(`duplicate_evaluation:${ref(c.id)}`)
     kept.push(mine[0])
   }
   if (kept.length === 0) return { ok: false, reason: 'no_usable_evaluation' }
