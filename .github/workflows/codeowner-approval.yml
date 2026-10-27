@@ -1,0 +1,68 @@
+name: Code Owner Approval
+
+# CEO 決定（2026-10-27、Option B）: CODEOWNERS 対象ファイルを変更する PR についてだけ、
+# Code Owner の承認を必須にする。通常の PR には承認を追加しない。
+#
+# なぜ Ruleset だけで足りないか（2026-10-26 実測）: master Ruleset は
+# `require_code_owner_review: true` だが `required_approving_review_count: 0` のため GitHub は
+# code-owner review を強制しない（PR #413 は review 0 件で merge できた）。count を 1 にすると
+# 通常 PR にも承認が要る（Option A、不採用）。User 所有 repository なので path 別の
+# `required_reviewers`（Team 必須）も使えない。そこで commit status `Code Owner Approval` を
+# required check にする。
+#
+# 信頼境界:
+# - `pull_request_target`: workflow 定義と checker script は base（default branch）側に固定される。
+#   PR がこのファイルや script を書き換えても、その PR の判定には効かない。
+#   PR head の checkout・依存導入・script 実行は一切しない（`gate-evidence-check.yml` と同じ方針）。
+# - review の提出は `codeowner-review-event.yml`（何もしない）を起点に `workflow_run` で再判定する。
+#   `workflow_run` も default branch の定義で動くので、PR が判定を差し替えられない。
+# - CODEOWNERS は PR の base 側を読む。PR が CODEOWNERS を書き換えて自分の要件を外すことはできない。
+# - 判定ロジックは `.github/scripts/`（CODEOWNERS 対象）にだけ置く。
+# - status は commit に付き PR には付かない。default branch 以外を base にする PR では明示的に
+#   failure を付ける（別 base・別 PR で得た success の流用を防ぐ）。PR 作成者が owner でも免除しない。
+#
+# Ruleset への登録（人が行う）: required status check `Code Owner Approval` の source を
+# **GitHub Actions に固定する**（integration_id 15368）。固定しないと write 権限の PAT で
+# `POST /statuses` を直接呼んで success を偽造できる。
+# 残るリスク（GitHub の制約）: 固定しても、同一 repository の PR が追加した workflow は
+# GitHub Actions として同名 status を書ける。workflow の追加は CODEOWNERS 対象なので本 check は
+# pending にするが、その workflow が後から success を上書きすることは防げない
+# （Meta Review も PR 側の workflow で動くため同じ前提の上にある）。
+#
+# 再判定のきっかけ: push / reopen / PR の編集（タイトル変更でもよい）/ review の提出・取り下げ。
+# review 起点の workflow を PR が壊した場合や、初回 fork contributor の承認待ちでは再判定されず
+# pending のまま止まる（fail closed）。PR タイトルを編集すれば再判定される。
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited, ready_for_review]
+  workflow_run:
+    workflows: [Code Owner Review Event]
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+
+# status は head SHA ごとに付くので、同じ SHA の判定を直列化し、新しい run を勝たせる。
+concurrency:
+  group: codeowner-approval-${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha }}
+  cancel-in-progress: true
+
+jobs:
+  decide:
+    name: Decide Code Owner Approval
+    runs-on: ubuntu-latest
+    steps:
+      # default branch の checker だけを取得する。PR head は checkout しない。
+      - name: Checkout checker (default branch only)
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: .github/scripts
+          persist-credentials: false
+
+      - name: Post Code Owner Approval status
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node .github/scripts/codeownerApprovalCheck.mjs

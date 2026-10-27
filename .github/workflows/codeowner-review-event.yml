@@ -1,0 +1,17 @@
+name: Code Owner Review Event
+
+# review の提出・取り下げを `codeowner-approval.yml` へ伝えるだけの起点。
+# `pull_request_review` は PR 側の workflow 定義で動くため、ここでは判定も書き込みも行わない
+# （token 権限なし）。判定は `workflow_run` 経由で default branch の定義が行う。
+on:
+  pull_request_review:
+    types: [submitted, dismissed]
+
+permissions: {}
+
+jobs:
+  notify:
+    name: Review event
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "review ${{ github.event.action }} on PR ${{ github.event.pull_request.number }}"

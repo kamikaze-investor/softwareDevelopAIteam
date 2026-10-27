@@ -353,6 +353,9 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Design Review runner が本番経路でのみ 120s timeout する（Root Cause 未確定）**（state: planned）
 - **Review provider が枯渇したとき、別 provider へ正式に再審査を依頼できるようにする**（state: planned）
 - **traversal / loop に termination guarantee があるかの横断監査（read-only）**（state: planned）
+- **CODEOWNERS 対象 PR にだけ Code Owner 承認を必須にする（`Code Owner Approval` required check）**（state: in_progress）
+- **Stage 0: Meta Review を base（default branch）のコードで実行し、required check の source を固定する**（state: in_progress）
+- **Meta Review が diff に無い記述（PR 説明文だけ）を根拠に BLOCKED と判定する**（state: deferred）
 - **監視責務の段階分離（Deterministic Watchdog → Lightweight Monitor → VPS PL）（state: planned）
 - **ChatGPT から AIteamOS を inspect / audit / explain できるようにする（MCP）**（state: deferred）
 - **CEO Escalation を AIteamOS Mobile Push で届ける（将来の正式第一通知チャネル）**（state: planned）
