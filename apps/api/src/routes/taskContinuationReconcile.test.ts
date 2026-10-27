@@ -424,6 +424,47 @@ describe('POST /api/task-continuations/reconcile', () => {
     }
   })
 
+  it('route の応答（受理・in-flight の両方）を Worker の parser がそのまま報告として読める（route → parser の契約）', async () => {
+    const { parseContinuationProgressReports, continuationsToAlert, OUTBOX_CONTINUATION_PENDING_ALERT_MS } =
+      await import('@ai-team/worker/src/outbox/outboxDeliveryAlert.js')
+    const app = await buildApp()
+    try {
+      const { project, sourceTask, storage } = await createRunningProjectWithTask(app)
+      const { continuation } = await seedPendingContinuation(storage, project.id, sourceTask.id)
+
+      let releaseReview: (() => void) | undefined
+      const reviewStarted = new Promise<void>((resolveStarted) => {
+        designReviewMocks.execute.mockImplementation(async (input: string) => {
+          resolveStarted()
+          await new Promise<void>((resolveHeld) => { releaseReview = resolveHeld })
+          return { ok: true, timedOut: false, stdout: stdoutForReviewInput(input) }
+        })
+      })
+
+      const accepted = await app.inject({ method: 'POST', url: '/api/task-continuations/reconcile' })
+      await reviewStarted
+      // sweep が長い Design Review で止まっている間の応答（Worker は 5 秒ごとに呼ぶ）も報告を含む。
+      const inFlight = await app.inject({ method: 'POST', url: '/api/task-continuations/reconcile' })
+
+      for (const res of [accepted, inFlight]) {
+        expect(res.statusCode).toBe(202)
+        const reports = parseContinuationProgressReports(JSON.parse(res.body))
+        // undefined なら Worker は「報告が取れない」とみなし、10 分で report outage の CRITICAL を出してしまう。
+        expect(reports).toBeDefined()
+        expect(reports).toHaveLength(1)
+        expect(reports?.[0]?.continuationId).toBe(continuation.id)
+        expect(reports?.[0]?.stuckForMs).toBeGreaterThanOrEqual(0)
+        // 作ったばかりの continuation は backstop の閾値に届かない（誤報しない）。
+        expect(reports?.[0]?.stuckForMs).toBeLessThan(OUTBOX_CONTINUATION_PENDING_ALERT_MS)
+        expect(continuationsToAlert(reports, new Set())).toEqual([])
+      }
+
+      releaseReview?.()
+    } finally {
+      await app.close()
+    }
+  })
+
   it('sweep実行中に再度呼ばれてもin-flight guardで重複起動しない', async () => {
     const app = await buildApp()
     try {

@@ -133,4 +133,22 @@ describe('outboxStore', () => {
     store.deletePending('job-pending')
     expect(store.hasPendingFor('job-pending')).toBe(false)
   })
+
+  it('oldestPendingCreatedAtMs returns the oldest pending created_at, undefined when empty or malformed', async () => {
+    const store = await loadStore()
+    expect(store.oldestPendingCreatedAtMs()).toBeUndefined()
+
+    store.recordPending('job-new', { status: 'success' })
+    store.recordPending('job-old', { status: 'success' })
+    const db = new Database(path.join(tempRoot, 'data', 'outbox.db'))
+    try {
+      db.prepare('UPDATE pending_outbox_events SET created_at = ? WHERE job_id = ?').run('2026-10-27T00:00:00.000Z', 'job-old')
+      expect(store.oldestPendingCreatedAtMs()).toBe(Date.parse('2026-10-27T00:00:00.000Z'))
+
+      db.prepare('UPDATE pending_outbox_events SET created_at = ? WHERE job_id = ?').run('0000-not-a-time', 'job-old')
+      expect(store.oldestPendingCreatedAtMs()).toBeUndefined()
+    } finally {
+      db.close()
+    }
+  })
 })
