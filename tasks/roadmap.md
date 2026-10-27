@@ -4190,8 +4190,8 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 
    (2026-10-22 roadmap integrity audit: typecheck を implement Job の検証へ入れる修正は PR #355（verificationProfile + `verify:implement`）で、2026-10-22 時点で OPEN・master d7b3ee15 に未 merge（root `package.json` に `verify:implement` が無い）。採用前に #355 の状態を確認して重複実装しない。deploy 前に Candidate がこの script を持つことも要る)
 
-<!-- roadmap:id=outbox-blocked-critical-false-alarm state=planned -->
-0. [ ] **正常な continuation 中に `Worker Outbox resend is blocked` の CRITICAL が誤発報する**
+<!-- roadmap:id=outbox-blocked-critical-false-alarm state=done -->
+0. [x] **正常な continuation 中に `Worker Outbox resend is blocked` の CRITICAL が誤発報する — 完了（2026-10-27。Tier B PR #412 / 7fcb93a6 を Production へ deploy し、Task 5ddaf485 を外部完了として取り込み済み）**
    （2026-09-11登録、**中優先度**。Production E2E test 9 で観測）。
 
    **内容**: commit 成功時に continuation が pending だと `PATCH /api/jobs/:id` は
@@ -10484,6 +10484,10 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       BLOCKED も sticky / 空 diff の approved を正規の判定として扱う / action を commit SHA に固定。
       **残る（Codex 指摘・CEO の credential 操作が要る）**: bot は classic OAuth token（`repo` scope）で、workflow run を force-cancel できる。
       BLOCKED を記録される前に止めて再実行させる経路が残るので、Actions 書き込み権限の無い fine-grained token へ替える。
+      **0a 実地確認（2026-10-27、#418 merge 後の #417）**: `Code Owner Approval` は success（CODEOWNERS 対象なし）を github-actions[bot] が付けた。
+      `Meta Review (base)` は依存導入で失敗し、fail closed（failure・"no valid Meta Review result"）で status を付けた —
+      原因は PL が固定した `pnpm@11.8.0` が Node 22.13 以上を要求し、workflow は Node 20 だったこと。既存 CI と同じ major の
+      `pnpm@12.12.1`（Node 18 以上）へ直す（workflow の変更なので CEO が branch 上で 1 行編集する）。
       **0b の前提条件（Codex 2 回目の判断）**: bot の credential を Actions 書き込み権限の無い fine-grained token へ替えるまで、
       `Meta Review (base)` を required check にしない（0a の並走観測だけは可）。
       **残る（記録して受容）**: status は commit に付くため、既に success の commit を head とする新しい PR は、その PR の run が

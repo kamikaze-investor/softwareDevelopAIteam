@@ -87,7 +87,7 @@ jobs:
           node-version: '20'
 
       - name: Install pnpm
-        run: npm install -g pnpm@11.8.0
+        run: npm install -g pnpm@12.12.1
 
       # default branch の lockfile で導入する（PR の package.json / lockfile は使わない）。
       - name: Install dependencies (default branch lockfile)
