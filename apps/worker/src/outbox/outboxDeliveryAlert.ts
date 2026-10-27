@@ -1,3 +1,5 @@
+import type { ContinuationProgressReport as SharedContinuationProgressReport } from '@ai-team/shared'
+
 /**
  * Outbox 再送が滞留したときに CRITICAL を上げるかの判定（純粋関数）。
  *
@@ -138,14 +140,11 @@ export function isContinuationPendingResponse(
 }
 
 /**
- * API が reconcile 応答で返す、running Project の pending continuation 1件分の事実
- * （`apps/api/src/state/continuationProgress.ts` `reportContinuationProgress`）。
+ * API が reconcile 応答で返す、running Project の pending continuation 1件分の事実のうち、backstop が読む欄
+ * （`apps/api/src/state/continuationProgress.ts` `reportContinuationProgress`）。API と同じ共有型から取り、
+ * 欄の名前・型がずれれば型検査で落ちるようにする。
  */
-export interface ContinuationProgressReport {
-  continuationId: string
-  /** 検証された前進が無い時間（ms）。API が永続化済みの記録から計算する。 */
-  stuckForMs: number
-}
+export type ContinuationProgressReport = Pick<SharedContinuationProgressReport, 'continuationId' | 'stuckForMs'>
 
 /**
  * reconcile 応答から continuation の報告を読む。**形が崩れていれば undefined**（報告なし）として扱い、
