@@ -675,6 +675,37 @@ code: `apps/worker/src/outbox/outboxDeliveryAlert.ts`（`OUTBOX_BLOCKED_ALERT_CY
 `OUTBOX_CONTINUATION_PENDING_ALERT_MS`・`isContinuationPendingResponse`・`continuationsToAlert`・
 `nextReportOutageState`）、`apps/worker/src/index.ts`（Outbox 再送と reconcile の報告の読み取り）。
 
+## 外部完了の取り込み — Mobile 1 画面化と承認の束縛（2026-10-27 起案・CEO code-owner review 対象）
+
+CEO 指示（2026-10-27「One-Screen Mobile External Reconciliation」）: PowerShell で API を組み立てていた外部完了の取り込みを、
+Mobile の 1 画面から行えるようにする。**新しい承認機構・Gate・status は作らず、ADMIN / Operator の権限も広げない。**
+承認は対象の Task・action・commit・根拠に束縛し、古い・期限切れ・不一致の承認では通さない（CEO 要件 3・6）。
+Mobile はワンタップ中止（2026-10-23 CEO 判断）と同じ形で、1 回の確認ダイアログの後ろで 起票 → 人の承認（human-only PATCH）→ 実行 を呼ぶ。
+確認ダイアログの「承認して完了登録」が CEO の判断そのもので、認証だけを承認として扱うものではない。
+
+**E-1 外部完了の承認は commit と根拠に束縛する**
+- 旧: `reconcile_external_completion` の承認は Task・action・期限・`approval_actor=human` だけを見た。
+  承認依頼の `targetCommit` / `targetDiffHash` は記述欄で、ある commit・根拠で下りた承認で別の commit や別の PR / CI / 受入根拠 / scope を取り込めた
+- 新: 取り込み route が Gate の前に次の両方を要求する（`checkApprovalEvidenceBinding()`。拒否は 409 `APPROVAL_EVIDENCE_MISMATCH`）:
+  - 承認依頼の `targetCommit` が、取り込む commit と同じ commit object に解決される
+  - 承認依頼の `targetDiffHash` が `reconcile_external_completion:sha256:<digest>` で、digest は実行 body（Task・sourceJob・根拠 7 項目）から server が計算し直した値と一致する。
+    digest は読み取り専用の `POST /api/tasks/:id/reconcile-external-completion/preview` が返す
+- 不明時: commit が解決できない・digest が一致しない・古い形（digest を持たない）の承認は通さない。改めてこの根拠に対する人の承認を取る
+- 根拠: 人が見て承認した内容と、実行される内容を同じにする。既に done の Task は Gate の前に断られるので、過去の取り込みには影響しない
+
+**E-2 外部完了の承認は完了と同じ transaction で使い切る**
+- 旧: 取り込みは承認を評価するだけで使い切らず、done の後も APPROVED が「生きた人の判断」として残った。根拠の audit は完了の transaction の外で書かれ、
+  その間で止まると根拠の記録の無い done ができた
+- 新: 承認の使用（`verifyAndConsumeForTaskAction()` と同じ規則）・既存 completion transition・根拠の audit を 1 transaction で行う。
+  承認を使い切れなければ（期限切れ・人の記録なし・使用済み等）何も変えずに 403 `APPROVAL_NOT_USABLE`
+- 不明時: 承認の状態・期限・決定主体が読めなければ使えない扱い
+- 根拠: 一回限りの ApprovalRequest 契約に揃える。完了と監査記録を分離しない
+
+**変えないもの**: 取り込みの入口条件（根拠の機械検証・blocked Job・Gate）、承認の決定者（ADMIN 認証の人だけ。human-only PATCH）、
+Worker / Operator の allowlist（起票・preview・取り込みのどれにも到達しない。split credential 構成での性質）、
+AI は ADMIN 認証情報を持たない（根拠は「取り込みパッケージ」として CEO に渡し、CEO の端末が API を呼ぶ）。
+API の多段手順（preview → 起票 → 承認 → 取り込み）はそのまま使える。
+
 ## Review finding の扱い — PL が統合判断してよい範囲（2026-09-15 CEO 指示）
 
 **「Reviewer が言ったから必ず変更する」ではない。** PL は事実・根拠・Design Philosophy との整合性を

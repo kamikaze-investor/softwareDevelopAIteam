@@ -1,12 +1,20 @@
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import { createSQLiteStorage } from '../storage/sqlite'
 import type { IStorage } from '../storage/interface'
-import { findBlockedJobsPreventingReconcile, verifyExternalCompletion, type ExternalCompletionEvidence } from './externalCompletion'
-import { recordResumeActor } from '../designReview/resumeActor'
+import {
+  checkApprovalEvidenceBinding,
+  externalCompletionApprovalDiffHash,
+  externalCompletionEvidenceDigest,
+  findBlockedJobsPreventingReconcile,
+  previewExternalCompletion,
+  verifyExternalCompletion,
+  type ExternalCompletionEvidence,
+} from './externalCompletion'
+import { recordApprovalActor, recordResumeActor } from '../designReview/resumeActor'
 
 /**
  * 外部完了の根拠検証。**呼び出し側の自己申告では通らない**ことを固定する。
@@ -75,6 +83,27 @@ function evidenceFor(commitSha: string, over: Partial<ExternalCompletionEvidence
     approvedScope: 'Tier B: minimal protected-file change for this task only',
     ...over,
   }
+}
+
+/** 人（ADMIN）が承認した reconcile_external_completion の承認依頼を作る。 */
+function humanApprovedReconcile(
+  storage: IStorage,
+  taskId: string,
+  over: { targetCommit?: string; targetDiffHash?: string; expiresAt?: string; actor?: 'admin' | 'worker' } = {},
+): string {
+  const request = storage.approvalRequests.create({
+    taskId, targetBranch: 'external-completion', targetCommit: over.targetCommit ?? 'n/a',
+    targetDiffHash: over.targetDiffHash ?? 'n/a', riskLevel: 'HIGH', requestedAction: 'reconcile_external_completion',
+    status: 'APPROVED', expiresAt: over.expiresAt ?? new Date(Date.now() + 3_600_000).toISOString(), invalidIf: [],
+  })
+  recordApprovalActor(storage, request.id, over.actor ?? 'admin')
+  return request.id
+}
+
+function reconcileWithHumanApproval(storage: IStorage, taskId: string, sourceJobId: string) {
+  return storage.jobs.reconcileExternalCompletion({
+    taskId, sourceJobId, approvalRequestId: humanApprovedReconcile(storage, taskId), auditDetail: '{}',
+  })
 }
 
 afterEach(() => {
@@ -188,7 +217,7 @@ describe('reconcileExternalCompletion — blocked Job が残る Task は done �
   it('refuses with TASK_HAS_BLOCKED_JOBS while an un-superseded blocked Job remains; nothing changes', () => {
     const { storage, taskId, jobId } = seedWithJob('blocked')
 
-    const result = storage.jobs.reconcileExternalCompletion({ taskId, sourceJobId: jobId })
+    const result = reconcileWithHumanApproval(storage, taskId, jobId)
 
     expect(result).toMatchObject({ ok: false, code: 'TASK_HAS_BLOCKED_JOBS' })
     if (result.ok) return
@@ -203,7 +232,7 @@ describe('reconcileExternalCompletion — blocked Job が残る Task は done �
     const { storage, taskId, jobId } = seedWithJob('blocked')
     storage.jobs.update(jobId, { failureMetadata: { quarantined: true, quarantineReason: 'unverified' } })
 
-    expect(storage.jobs.reconcileExternalCompletion({ taskId, sourceJobId: jobId }))
+    expect(reconcileWithHumanApproval(storage, taskId, jobId))
       .toMatchObject({ ok: false, code: 'TASK_HAS_BLOCKED_JOBS' })
   })
 
@@ -218,7 +247,7 @@ describe('reconcileExternalCompletion — blocked Job が残る Task は done �
     recordResumeActor(storage, { jobId: successor.id, taskId, actorClass: 'human', evidence: 'admin_credential' })
 
     expect(findBlockedJobsPreventingReconcile(storage, taskId)).toEqual([])
-    const result = storage.jobs.reconcileExternalCompletion({ taskId, sourceJobId: successor.id })
+    const result = reconcileWithHumanApproval(storage, taskId, successor.id)
     expect(result.ok).toBe(true)
     expect(storage.tasks.findById(taskId)?.status).toBe('done')
   })
@@ -229,7 +258,7 @@ describe('reconcileExternalCompletion — blocked Job が残る Task は done �
     storage.auditLog.record({ actor: 'api', operation: 'task_aborted', entityType: 'task', entityId: taskId, result: 'success' })
 
     expect(findBlockedJobsPreventingReconcile(storage, taskId)).toEqual([])
-    expect(storage.jobs.reconcileExternalCompletion({ taskId, sourceJobId: jobId }).ok).toBe(true)
+    expect(reconcileWithHumanApproval(storage, taskId, jobId).ok).toBe(true)
     expect(storage.tasks.findById(taskId)?.status).toBe('done')
   })
 
@@ -238,7 +267,7 @@ describe('reconcileExternalCompletion — blocked Job が残る Task は done �
     storage.jobs.update(jobId, { failureMetadata: { quarantined: true, quarantineReason: 'unverified' } })
     storage.auditLog.record({ actor: 'api', operation: 'task_aborted', entityType: 'task', entityId: taskId, result: 'success' })
 
-    expect(storage.jobs.reconcileExternalCompletion({ taskId, sourceJobId: jobId }))
+    expect(reconcileWithHumanApproval(storage, taskId, jobId))
       .toMatchObject({ ok: false, code: 'TASK_HAS_BLOCKED_JOBS' })
   })
 
@@ -253,16 +282,241 @@ describe('reconcileExternalCompletion — blocked Job が残る Task は done �
     } as Parameters<IStorage['jobs']['create']>[0])
     recordResumeActor(storage, { jobId: successor.id, taskId, actorClass: 'human', evidence: 'admin_credential' })
 
-    expect(storage.jobs.reconcileExternalCompletion({ taskId, sourceJobId: successor.id }))
+    expect(reconcileWithHumanApproval(storage, taskId, successor.id))
       .toMatchObject({ ok: false, code: 'TASK_HAS_BLOCKED_JOBS' })
   })
 
   it.each(['failed', 'success'] as const)('a Task whose Jobs are all terminal (%s) is reconciled as before', (status) => {
     const { storage, taskId, jobId } = seedWithJob(status)
 
-    const result = storage.jobs.reconcileExternalCompletion({ taskId, sourceJobId: jobId })
+    const result = reconcileWithHumanApproval(storage, taskId, jobId)
 
     expect(result.ok).toBe(true)
     expect(storage.tasks.findById(taskId)?.status).toBe('done')
+  })
+})
+
+describe('previewExternalCompletion — 取り込みと同じ検査を、状態を変えずに行う', () => {
+  function seedWithJob(): { storage: IStorage; taskId: string; jobId: string } {
+    const { storage, taskId } = seedTask()
+    const task = storage.tasks.findById(taskId)!
+    const job = storage.jobs.create({
+      taskId, projectId: task.projectId, agentRole: 'developer_ai', status: 'failed',
+      safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+    } as Parameters<IStorage['jobs']['create']>[0])
+    return { storage, taskId, jobId: job.id }
+  }
+
+  it('returns the server-verified files, the Stable HEAD and the approval binding digest', async () => {
+    const { repo, mergedSha } = createStableRepo()
+    const { storage, taskId, jobId } = seedWithJob()
+
+    const preview = await previewExternalCompletion(storage, taskId, jobId, evidenceFor(mergedSha), repo)
+
+    expect(preview?.eligible).toBe(true)
+    expect(preview?.problems).toEqual([])
+    expect(preview?.verification).toMatchObject({ ok: true, changedFiles: ['apps-worker-src-jobRunner.ts'], stableHead: mergedSha })
+    expect(preview?.approvalTargetDiffHash)
+      .toBe(externalCompletionApprovalDiffHash(externalCompletionEvidenceDigest(taskId, jobId, evidenceFor(mergedSha))))
+  })
+
+  it('writes nothing: Task, Jobs, approvals and audit are unchanged', async () => {
+    const { repo, mergedSha } = createStableRepo()
+    const { storage, taskId, jobId } = seedWithJob()
+    const before = JSON.stringify([
+      storage.tasks.findById(taskId), storage.jobs.findByTaskId(taskId),
+      storage.approvalRequests.findByTaskId(taskId), storage.auditLog.findByEntity('task', taskId),
+    ])
+
+    await previewExternalCompletion(storage, taskId, jobId, evidenceFor(mergedSha), repo)
+
+    expect(JSON.stringify([
+      storage.tasks.findById(taskId), storage.jobs.findByTaskId(taskId),
+      storage.approvalRequests.findByTaskId(taskId), storage.auditLog.findByEntity('task', taskId),
+    ])).toBe(before)
+  })
+
+  it('reports missing or invalid evidence, an undeployed commit and a foreign source Job as problems', async () => {
+    const { repo, unmergedSha, mergedSha } = createStableRepo()
+    const { storage, taskId } = seedWithJob()
+
+    const undeployed = await previewExternalCompletion(storage, taskId, 'no-such-job', evidenceFor(unmergedSha), repo)
+    expect(undeployed?.eligible).toBe(false)
+    expect(undeployed?.verification.ok).toBe(false)
+    expect(undeployed?.problems.join('\n')).toContain('not deployed yet')
+    expect(undeployed?.problems).toContain('Source Job not found for this Task')
+
+    const rejected = await previewExternalCompletion(
+      storage, taskId, 'no-such-job', evidenceFor(mergedSha, { independentReviewVerdict: 'changes_requested' }), repo,
+    )
+    expect(rejected?.eligible).toBe(false)
+  })
+
+  it('returns undefined for an unknown Task', async () => {
+    const { repo, mergedSha } = createStableRepo()
+    const { storage } = seedTask()
+    expect(await previewExternalCompletion(storage, 'missing', 'job', evidenceFor(mergedSha), repo)).toBeUndefined()
+  })
+
+  it('marks files owned in .github/CODEOWNERS at Stable HEAD (display only)', async () => {
+    const { repo } = createStableRepo()
+    execFileSync('git', ['checkout', '-q', '-b', 'with-owners'], { cwd: repo })
+    mkdirSync(path.join(repo, '.github'), { recursive: true })
+    mkdirSync(path.join(repo, 'apps/worker/src/guards'), { recursive: true })
+    writeFileSync(path.join(repo, '.github/CODEOWNERS'), '# owners\napps/worker/src/guards/ @ceo\nCLAUDE.md @ceo\n', 'utf-8')
+    writeFileSync(path.join(repo, 'apps/worker/src/guards/g.ts'), 'g\n', 'utf-8')
+    writeFileSync(path.join(repo, 'CLAUDE.md'), 'c\n', 'utf-8')
+    writeFileSync(path.join(repo, 'free.ts'), 'f\n', 'utf-8')
+    git(repo, ['add', '-A'])
+    git(repo, ['commit', '-m', 'owned change'])
+    const sha = git(repo, ['rev-parse', 'HEAD'])
+    const { storage, taskId, jobId } = seedWithJob()
+
+    const preview = await previewExternalCompletion(storage, taskId, jobId, evidenceFor(sha), repo)
+
+    expect(preview?.verification).toMatchObject({ ok: true, codeOwnedFiles: ['CLAUDE.md', 'apps/worker/src/guards/g.ts'] })
+  })
+})
+
+describe('externalCompletionEvidenceDigest — 根拠のどの項目が変わっても digest が変わる', () => {
+  it.each([
+    'roadmapItemId', 'commitSha', 'pullRequestUrl', 'independentReviewVerdict', 'ciResult', 'acceptanceEvidence', 'approvedScope',
+  ] as const)('%s', (key) => {
+    const base = evidenceFor('a'.repeat(40))
+    expect(externalCompletionEvidenceDigest('t', 'j', { ...base, [key]: `${base[key]}x` }))
+      .not.toBe(externalCompletionEvidenceDigest('t', 'j', base))
+  })
+
+  it('binds the Task and the source Job too, and ignores surrounding whitespace', () => {
+    const base = evidenceFor('a'.repeat(40))
+    expect(externalCompletionEvidenceDigest('t2', 'j', base)).not.toBe(externalCompletionEvidenceDigest('t', 'j', base))
+    expect(externalCompletionEvidenceDigest('t', 'j2', base)).not.toBe(externalCompletionEvidenceDigest('t', 'j', base))
+    expect(externalCompletionEvidenceDigest('t', 'j', { ...base, ciResult: ` ${base.ciResult} ` }))
+      .toBe(externalCompletionEvidenceDigest('t', 'j', base))
+  })
+})
+
+describe('reconcileExternalCompletion — 承認の使用・完了・audit は 1 transaction', () => {
+  function seedTerminal(): { storage: IStorage; taskId: string; jobId: string } {
+    const { storage, taskId } = seedTask()
+    const task = storage.tasks.findById(taskId)!
+    const job = storage.jobs.create({
+      taskId, projectId: task.projectId, agentRole: 'developer_ai', status: 'failed',
+      safeCommand: { kind: 'git_status', workingDir: '/workspace/target' },
+    } as Parameters<IStorage['jobs']['create']>[0])
+    return { storage, taskId, jobId: job.id }
+  }
+
+  it('consumes the approval and writes the evidence audit together with the completion', () => {
+    const { storage, taskId, jobId } = seedTerminal()
+    const approvalRequestId = humanApprovedReconcile(storage, taskId)
+
+    const result = storage.jobs.reconcileExternalCompletion({ taskId, sourceJobId: jobId, approvalRequestId, auditDetail: '{"pr":"x"}' })
+
+    expect(result.ok).toBe(true)
+    expect(storage.tasks.findById(taskId)?.status).toBe('done')
+    expect(storage.approvalRequests.findById(approvalRequestId)?.status).toBe('CONSUMED')
+    expect(storage.auditLog.findByEntity('task', taskId).filter((row) => row.operation === 'reconcile_external_completion'))
+      .toEqual([expect.objectContaining({ detail: '{"pr":"x"}', result: 'done' })])
+  })
+
+  it('an expired approval changes nothing (APPROVAL_NOT_USABLE)', () => {
+    const { storage, taskId, jobId } = seedTerminal()
+    const approvalRequestId = humanApprovedReconcile(storage, taskId, { expiresAt: new Date(Date.now() - 1000).toISOString() })
+
+    const result = storage.jobs.reconcileExternalCompletion({ taskId, sourceJobId: jobId, approvalRequestId, auditDetail: '{}' })
+
+    expect(result).toMatchObject({ ok: false, code: 'APPROVAL_NOT_USABLE' })
+    expect(storage.tasks.findById(taskId)?.status).toBe('pending')
+    expect(storage.taskContinuations.findByCompletedTaskId(taskId)).toBeUndefined()
+    expect(storage.auditLog.findByEntity('task', taskId).some((row) => row.operation === 'reconcile_external_completion')).toBe(false)
+  })
+
+  it('an approval decided by the Worker / AI credential is not usable and is superseded', () => {
+    const { storage, taskId, jobId } = seedTerminal()
+    const approvalRequestId = humanApprovedReconcile(storage, taskId, { actor: 'worker' })
+
+    const result = storage.jobs.reconcileExternalCompletion({ taskId, sourceJobId: jobId, approvalRequestId, auditDetail: '{}' })
+
+    expect(result).toMatchObject({ ok: false, code: 'APPROVAL_NOT_USABLE' })
+    expect(storage.tasks.findById(taskId)?.status).toBe('pending')
+    expect(storage.approvalRequests.findById(approvalRequestId)?.status).toBe('SUPERSEDED')
+  })
+
+  it('a used approval cannot complete again, and a second completion is refused (no duplicate effect)', () => {
+    const { storage, taskId, jobId } = seedTerminal()
+    const approvalRequestId = humanApprovedReconcile(storage, taskId)
+    expect(storage.jobs.reconcileExternalCompletion({ taskId, sourceJobId: jobId, approvalRequestId, auditDetail: '{}' }).ok).toBe(true)
+
+    expect(storage.jobs.reconcileExternalCompletion({ taskId, sourceJobId: jobId, approvalRequestId, auditDetail: '{}' }))
+      .toMatchObject({ ok: false, code: 'ALREADY_DONE' })
+    expect(storage.auditLog.findByEntity('task', taskId).filter((row) => row.operation === 'reconcile_external_completion')).toHaveLength(1)
+  })
+
+  it('an approval of another action is not usable and is left as it was', () => {
+    const { storage, taskId, jobId } = seedTerminal()
+    const abort = storage.approvalRequests.create({
+      taskId, targetBranch: 'manual-abort', targetCommit: taskId, targetDiffHash: 'x', riskLevel: 'HIGH',
+      requestedAction: 'abort_task', status: 'APPROVED', expiresAt: new Date(Date.now() + 3_600_000).toISOString(), invalidIf: [],
+    })
+    recordApprovalActor(storage, abort.id, 'admin')
+
+    expect(storage.jobs.reconcileExternalCompletion({ taskId, sourceJobId: jobId, approvalRequestId: abort.id, auditDetail: '{}' }))
+      .toMatchObject({ ok: false, code: 'APPROVAL_NOT_USABLE' })
+    expect(storage.approvalRequests.findById(abort.id)?.status).toBe('APPROVED')
+    expect(storage.tasks.findById(taskId)?.status).toBe('pending')
+  })
+})
+
+describe('checkApprovalEvidenceBinding — 承認はこの commit・この根拠に対するものだけ', () => {
+  function bound(repo: string, sha: string, over: { targetCommit?: string; targetDiffHash?: string } = {}) {
+    const { storage, taskId } = seedTask()
+    const evidence = evidenceFor(sha)
+    const approvalRequestId = humanApprovedReconcile(storage, taskId, {
+      targetCommit: over.targetCommit ?? sha,
+      targetDiffHash: over.targetDiffHash ?? externalCompletionApprovalDiffHash(externalCompletionEvidenceDigest(taskId, 'job-1', evidence)),
+    })
+    const verified = verifyExternalCompletion(storage, taskId, evidence, repo)
+    if (!verified.ok) throw new Error(verified.reason)
+    return { storage, taskId, evidence, approvalRequestId, commit: verified.verified.commit }
+  }
+
+  it('accepts an approval issued for this commit and this evidence digest (short SHA resolves to the same commit)', () => {
+    const { repo, mergedSha } = createStableRepo()
+    const full = bound(repo, mergedSha)
+    expect(checkApprovalEvidenceBinding(full.storage, { ...full, sourceJobId: 'job-1' }, repo)).toEqual({ ok: true })
+    const short = bound(repo, mergedSha, { targetCommit: mergedSha.slice(0, 10) })
+    expect(checkApprovalEvidenceBinding(short.storage, { ...short, sourceJobId: 'job-1' }, repo)).toEqual({ ok: true })
+  })
+
+  it('refuses when any evidence field or the source Job differs from what was approved', () => {
+    const { repo, mergedSha } = createStableRepo()
+    const fx = bound(repo, mergedSha)
+    expect(checkApprovalEvidenceBinding(fx.storage, { ...fx, sourceJobId: 'job-2' }, repo).ok).toBe(false)
+    expect(checkApprovalEvidenceBinding(
+      fx.storage, { ...fx, sourceJobId: 'job-1', evidence: { ...fx.evidence, approvedScope: 'wider' } }, repo,
+    ).ok).toBe(false)
+  })
+
+  it('refuses an approval issued for another commit', () => {
+    const { repo, mergedSha } = createStableRepo()
+    const base = git(repo, ['rev-parse', 'HEAD~1'])
+    const fx = bound(repo, mergedSha, { targetCommit: base })
+    expect(checkApprovalEvidenceBinding(fx.storage, { ...fx, sourceJobId: 'job-1' }, repo))
+      .toMatchObject({ ok: false, reason: expect.stringContaining('was issued for commit') })
+  })
+
+  it('refuses a legacy approval without the evidence digest (a fresh bound approval is required)', () => {
+    const { repo, mergedSha } = createStableRepo()
+    const fx = bound(repo, mergedSha, { targetDiffHash: 'external-tier-b' })
+    expect(checkApprovalEvidenceBinding(fx.storage, { ...fx, sourceJobId: 'job-1' }, repo))
+      .toMatchObject({ ok: false, reason: expect.stringContaining('not issued for this evidence') })
+  })
+
+  it('leaves a missing approval to the Gate (it is refused there)', () => {
+    const { repo, mergedSha } = createStableRepo()
+    const fx = bound(repo, mergedSha)
+    expect(checkApprovalEvidenceBinding(fx.storage, { ...fx, approvalRequestId: 'missing', sourceJobId: 'job-1' }, repo))
+      .toEqual({ ok: true })
   })
 })
