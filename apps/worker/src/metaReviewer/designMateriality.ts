@@ -453,7 +453,7 @@ export function buildEvaluationPrompt(instructions: string, input: EvaluationInp
 
 export const CANDIDATE_KINDS = ['removes', 'replaces', 'redefines', 'introduces'] as const
 export const CANDIDATE_SUBJECTS = ['responsibility', 'mechanism', 'authority_boundary', 'state_transition', 'design_contract'] as const
-const DISPOSITIONS = ['unrelated', 'test_only', 'formatting_or_comment_wording'] as const
+export const DISPOSITIONS = ['unrelated', 'test_only', 'formatting_or_comment_wording'] as const
 
 export interface MaterialityCandidate {
   id: string
@@ -479,6 +479,31 @@ export interface DetectionResult {
 
 /** ok でも、採点に使わない副次的な出力の不備は warnings に残す（観測全体は捨てない） */
 export type ParseOutcome<T> = { ok: true; value: T; warnings: string[] } | { ok: false; reason: string }
+
+const MAX_WARNINGS = 50
+
+/**
+ * warning に値を残すのは、**決まった語の一覧**にある値だけ（enum の値と、よくある取り違え）。
+ * それ以外は `<other>`。model の出力を記録へ写さない（形での判定は小文字だけの secret を通してしまう）
+ */
+// 正本は各 enum の配列（CANDIDATE_KINDS ほか）。ここに足すのは enum に無い「よくある取り違え」だけ
+const WARNING_NEAR_MISSES = [
+  'changed', 'modified', 'removed', 'added', 'new', 'replaced', 'renamed', 'deleted', 'unchanged',
+  'none', 'partial', 'true', 'false', 'null', 'undefined', 'n/a',
+] as const
+let warningVocabulary: Set<string> | undefined
+
+export function warningToken(v: unknown): string {
+  warningVocabulary ??= new Set([
+    ...CANDIDATE_KINDS, ...CANDIDATE_SUBJECTS, ...DISPOSITIONS,
+    ...RESPONSIBILITY, ...RECORD_CONSISTENCY, ...PROVENANCE, ...WARNING_NEAR_MISSES,
+  ])
+  return typeof v === 'string' && warningVocabulary.has(v) ? v : '<other>'
+}
+
+function capWarnings(warnings: string[]): string[] {
+  return warnings.length <= MAX_WARNINGS ? warnings : [...warnings.slice(0, MAX_WARNINGS), `truncated:${warnings.length - MAX_WARNINGS}`]
+}
 
 /** 応答本文から最後の JSON object を1つ取り出す（```json fence 内を優先） */
 function extractJsonObject(raw: string): unknown {
@@ -537,10 +562,10 @@ export function parseDetection(raw: string, signals: readonly MaterialitySignal[
   const dispositions: SignalDisposition[] = []
   for (const d of json.signalDisposition as Array<Record<string, unknown>>) {
     if (!d || !isString(d.signalId) || !isString(d.disposition)) { warnings.push('invalid_disposition'); continue }
-    if (!known.has(d.signalId)) { warnings.push(`unknown_signal:${d.signalId.slice(0, 40)}`); continue }
+    if (!known.has(d.signalId)) { warnings.push(`unknown_signal:${warningToken(d.signalId)}`); continue }
     const supports = d.disposition.match(/^supports_candidate:(.+)$/)
     if (supports ? !candidateIds.has(supports[1]) : !oneOf(DISPOSITIONS, d.disposition)) {
-      warnings.push(`unknown_disposition:${d.disposition.slice(0, 40)}`)
+      warnings.push(`unknown_disposition:${warningToken(d.disposition.replace(/^supports_candidate:/, 'supports_candidate_'))}`)
       continue
     }
     dispositions.push({ signalId: d.signalId, disposition: d.disposition, reason: typeof d.reason === 'string' ? d.reason : '' })
@@ -550,13 +575,15 @@ export function parseDetection(raw: string, signals: readonly MaterialitySignal[
     if (sig.kind !== 'behavior_test_removed' && !answered.has(sig.id)) warnings.push(`signal_not_disposed:${sig.id}`)
   }
 
-  return { ok: true, value: { material, candidates, signalDisposition: dispositions }, warnings }
+  return { ok: true, value: { material, candidates, signalDisposition: dispositions }, warnings: capWarnings(warnings) }
 }
 
 // introduced: 既存のものに触れず新しい責務・機構を足す候補（kind=introduces）。保たれる / 移る / 失われる のどれでもない
-const RESPONSIBILITY = ['preserved', 'moved', 'lost', 'introduced', 'unclear'] as const
-const RECORD_CONSISTENCY = ['consistent', 'contradicts_unupdated_record', 'no_record'] as const
-const PROVENANCE = ['yes', 'no', 'unknown'] as const
+// redefined: 同じ場所が持ち続けるが、意味・条件・上限・到達可能性が変わった（kind=redefines の多く）。M5 trial 2026-10-27 で
+// authority 境界の再定義と削除の候補が enum 外の値で答えられ、評価なしになった
+export const RESPONSIBILITY = ['preserved', 'moved', 'redefined', 'lost', 'introduced', 'unclear'] as const
+export const RECORD_CONSISTENCY = ['consistent', 'contradicts_unupdated_record', 'no_record'] as const
+export const PROVENANCE = ['yes', 'no', 'unknown'] as const
 
 export interface CandidateEvaluation {
   candidateId: string
@@ -585,6 +612,8 @@ export function parseEvaluation(raw: string, candidates: readonly MaterialityCan
   const warnings: string[] = []
   const out: CandidateEvaluation[] = []
   const byId = new Map(candidates.map((c) => [c.id, c]))
+  // warning には候補の id（model が決めた文字列）ではなく位置（#0, #1 …）を書く
+  const ref = (id: string) => `#${candidates.findIndex((c) => c.id === id)}`
   // newOwner と自由記述の所見は欠けてもよい（newOwner は null、所見は空文字にする）
   const optionalText = (v: unknown) => v === undefined || v === null || typeof v === 'string'
   const text = (v: unknown) => (typeof v === 'string' ? v : '')
@@ -593,14 +622,15 @@ export function parseEvaluation(raw: string, candidates: readonly MaterialityCan
       : !optionalText(e.newOwner) ? 'newOwner' : !oneOf(RECORD_CONSISTENCY, e.recordConsistency) ? 'recordConsistency'
       : !oneOf(PROVENANCE, e.ceoDirectedProvenance) ? 'ceoDirectedProvenance'
       : !['provenanceEvidence', 'correctness', 'simplicity', 'naturalness'].every((k) => optionalText(e[k])) ? 'text_field' : undefined
-    if (bad) { warnings.push(`invalid_evaluation:${bad}`); continue }
+    // どの値で外れたかを残す（次の調整の根拠）。model の自由文を記録へ写さないよう、短い語の形のときだけ値を残す
+    if (bad) { warnings.push(`invalid_evaluation:${bad}=${warningToken(e?.[bad])}`); continue }
     const candidate = byId.get(e.candidateId as string)
-    if (!candidate) { warnings.push(`unknown_candidate:${String(e.candidateId).slice(0, 40)}`); continue }
+    if (!candidate) { warnings.push(`unknown_candidate:${warningToken(e.candidateId)}`); continue }
     // introduced は追加（kind=introduces）の候補にだけ使える。消す・替える・意味を変える候補を introduced と答えた評価は
     // 狭い判定（correctnessFlags）から外れてしまうので使わない
-    if (e.responsibility === 'introduced' && candidate.kind !== 'introduces') { warnings.push(`introduced_for_non_addition:${candidate.id}`); continue }
+    if (e.responsibility === 'introduced' && candidate.kind !== 'introduces') { warnings.push(`introduced_for_non_addition:${ref(candidate.id)}`); continue }
     // moved は移り先を名指しできて初めて moved である
-    if (e.responsibility === 'moved' && !isString(e.newOwner)) { warnings.push(`moved_without_owner:${candidate.id}`); continue }
+    if (e.responsibility === 'moved' && !isString(e.newOwner)) { warnings.push(`moved_without_owner:${ref(candidate.id)}`); continue }
     out.push({
       candidateId: candidate.id,
       responsibility: e.responsibility as CandidateEvaluation['responsibility'],
@@ -617,16 +647,16 @@ export function parseEvaluation(raw: string, candidates: readonly MaterialityCan
   const kept: CandidateEvaluation[] = []
   for (const c of candidates) {
     const mine = out.filter((o) => o.candidateId === c.id)
-    if (mine.length === 0) { warnings.push(`unevaluated:${c.id}`); continue }
+    if (mine.length === 0) { warnings.push(`unevaluated:${ref(c.id)}`); continue }
     if (new Set(mine.map(verdictKey)).size > 1) {
-      warnings.push(`conflicting_evaluations:${c.id}`, `unevaluated:${c.id}`)
+      warnings.push(`conflicting_evaluations:${ref(c.id)}`, `unevaluated:${ref(c.id)}`)
       continue
     }
-    if (mine.length > 1) warnings.push(`duplicate_evaluation:${c.id}`)
+    if (mine.length > 1) warnings.push(`duplicate_evaluation:${ref(c.id)}`)
     kept.push(mine[0])
   }
   if (kept.length === 0) return { ok: false, reason: 'no_usable_evaluation' }
-  return { ok: true, value: kept, warnings }
+  return { ok: true, value: kept, warnings: capWarnings(warnings) }
 }
 
 // ---------------------------------------------------------------------------

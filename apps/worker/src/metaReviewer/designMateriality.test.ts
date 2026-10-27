@@ -10,6 +10,13 @@ import {
   RAW_EXCERPT_CHARS,
   signalId,
   stripStringsAndComments,
+  warningToken,
+  CANDIDATE_KINDS,
+  CANDIDATE_SUBJECTS,
+  DISPOSITIONS,
+  RESPONSIBILITY,
+  RECORD_CONSISTENCY,
+  PROVENANCE,
   type BaseRecordReader,
   type MaterialitySignal,
 } from './designMateriality.js'
@@ -240,8 +247,8 @@ describe('parseDetection — strict', () => {
 
   it.each([
     ['S1 に disposition が無い → 残す', { material: true, candidates: [candidate], signalDisposition: [] }, [`signal_not_disposed:${sid}`], true, 0],
-    ['存在しない candidate を指す disposition は捨てる', { material: true, candidates: [candidate], signalDisposition: [{ signalId: sid, disposition: 'supports_candidate:c9', reason: '' }] }, ['unknown_disposition:supports_candidate:c9', `signal_not_disposed:${sid}`], true, 0],
-    ['正しさを判断する disposition（behavior_preserving）は捨てる', { material: false, candidates: [], signalDisposition: [{ signalId: sid, disposition: 'behavior_preserving', reason: '' }] }, ['unknown_disposition:behavior_preserving', `signal_not_disposed:${sid}`], false, 0],
+    ['存在しない candidate を指す disposition は捨てる', { material: true, candidates: [candidate], signalDisposition: [{ signalId: sid, disposition: 'supports_candidate:c9', reason: '' }] }, ['unknown_disposition:<other>', `signal_not_disposed:${sid}`], true, 0],
+    ['正しさを判断する disposition（behavior_preserving）は捨てる', { material: false, candidates: [], signalDisposition: [{ signalId: sid, disposition: 'behavior_preserving', reason: '' }] }, ['unknown_disposition:<other>', `signal_not_disposed:${sid}`], false, 0],
   ])('%s', (_label, body, warnings, material, dispositions) => {
     const parsed = parseDetection(JSON.stringify(body), signals)
     expect(parsed.ok).toBe(true)
@@ -270,13 +277,13 @@ describe('parseEvaluation — strict', () => {
   it('使える評価が1件も無ければ不成立。未知の候補への評価は捨てて warning に残す', () => {
     expect(parseEvaluation(JSON.stringify({ evaluations: [] }), candidates)).toEqual({ ok: false, reason: 'no_usable_evaluation' })
     expect(parseEvaluation(JSON.stringify({ evaluations: [evaluation, { ...evaluation, candidateId: 'c2' }] }), candidates))
-      .toMatchObject({ ok: true, warnings: ['unknown_candidate:c2'] })
+      .toMatchObject({ ok: true, warnings: ['unknown_candidate:<other>'] })
   })
 
   it('同じ候補への評価: 判定が同じなら1つにまとめ、違えば全部捨てる（順番で結果を変えない）', () => {
     const lost = { ...evaluation, responsibility: 'lost' }
     const preserved = { ...evaluation, responsibility: 'preserved' }
-    expect(parseEvaluation(JSON.stringify({ evaluations: [lost, lost] }), candidates)).toMatchObject({ ok: true, warnings: ['duplicate_evaluation:c1'] })
+    expect(parseEvaluation(JSON.stringify({ evaluations: [lost, lost] }), candidates)).toMatchObject({ ok: true, warnings: ['duplicate_evaluation:#0'] })
     for (const order of [[preserved, lost], [lost, preserved]]) {
       expect(parseEvaluation(JSON.stringify({ evaluations: order }), candidates)).toEqual({ ok: false, reason: 'no_usable_evaluation' })
     }
@@ -284,7 +291,7 @@ describe('parseEvaluation — strict', () => {
 
   it('評価の無い候補は unevaluated として残す', () => {
     const two = [...candidates, { ...candidates[0], id: 'c2' }]
-    expect(parseEvaluation(JSON.stringify({ evaluations: [evaluation] }), two)).toMatchObject({ ok: true, warnings: ['unevaluated:c2'] })
+    expect(parseEvaluation(JSON.stringify({ evaluations: [evaluation] }), two)).toMatchObject({ ok: true, warnings: ['unevaluated:#1'] })
   })
 })
 
@@ -386,7 +393,7 @@ describe('独立レビュー指摘（code review round 1）の回帰', () => {
       { signalId: sid, disposition: 'supports_candidate:c1', reason: '' },
       { signalId: 'ffffffffffff', disposition: 'unrelated', reason: '' },
     ] }
-    expect(parseDetection(JSON.stringify(unknown), signals)).toMatchObject({ ok: true, warnings: ['unknown_signal:ffffffffffff'] })
+    expect(parseDetection(JSON.stringify(unknown), signals)).toMatchObject({ ok: true, warnings: ['unknown_signal:<other>'] })
   })
 
   it('evaluation: moved なのに newOwner が無い評価は捨てる（唯一の評価なら不成立）', () => {
@@ -448,7 +455,7 @@ describe('M5 trial (2026-10-26) の解析失敗への対応', () => {
     const bad = { candidateId: 'c1', responsibility: 'gone', recordConsistency: 'no_record', ceoDirectedProvenance: 'no' }
     const good = { candidateId: 'c1', responsibility: 'lost', recordConsistency: 'no_record', ceoDirectedProvenance: 'no' }
     expect(parseEvaluation(JSON.stringify({ evaluations: [bad] }), cands)).toEqual({ ok: false, reason: 'no_usable_evaluation' })
-    expect(parseEvaluation(JSON.stringify({ evaluations: [bad, good] }), cands)).toMatchObject({ ok: true, warnings: ['invalid_evaluation:responsibility'] })
+    expect(parseEvaluation(JSON.stringify({ evaluations: [bad, good] }), cands)).toMatchObject({ ok: true, warnings: ['invalid_evaluation:responsibility=<other>'] })
   })
 
   it('解析できなかった応答は先頭だけを rawResponseExcerpt に残す', async () => {
@@ -510,7 +517,7 @@ it('introduced を消す・替える候補に答えた評価は使わない（�
     { candidateId: 'c1', responsibility: 'introduced', recordConsistency: 'consistent', ceoDirectedProvenance: 'no' },
     { candidateId: 'c2', responsibility: 'introduced', recordConsistency: 'no_record', ceoDirectedProvenance: 'no' },
   ] }), cands)
-  expect(parsed).toMatchObject({ ok: true, warnings: ['introduced_for_non_addition:c1', 'unevaluated:c1'] })
+  expect(parsed).toMatchObject({ ok: true, warnings: ['introduced_for_non_addition:#0', 'unevaluated:#0'] })
   expect(parsed.ok && parsed.value.map((e) => e.candidateId)).toEqual(['c2'])
 })
 
@@ -536,5 +543,46 @@ it('観測は parseWarnings に stage 付きで残す（M5 trial 2026-10-27: 1�
   )
   expect(observation.status).toBe('ok')
   expect(observation.detection?.material).toBe(true)
-  expect(observation.parseWarnings).toEqual(['evaluation:unevaluated:c2'])
+  expect(observation.parseWarnings).toEqual(['evaluation:unevaluated:#1'])
+})
+
+it('redefined を受け付ける（M5 trial 2026-10-27: 再定義の候補が評価なしになっていた）', () => {
+  const cands = [{ id: 'c2', kind: 'redefines' as const, subject: 'authority_boundary' as const, mechanism: 'approval path', file: 'f.ts', evidence: 'e' }]
+  const parsed = parseEvaluation(JSON.stringify({ evaluations: [{ candidateId: 'c2', responsibility: 'redefined', recordConsistency: 'contradicts_unupdated_record', ceoDirectedProvenance: 'yes' }] }), cands)
+  expect(parsed.ok && parsed.value[0].responsibility).toBe('redefined')
+})
+
+it('warning に残す値は短い語の形だけ（model の自由文・配列は残さない）', () => {
+  expect(warningToken('redefined')).toBe('redefined')
+  expect(warningToken('ghp_' + 'x'.repeat(50))).toBe('<other>')
+  expect(warningToken('ghp_' + 'A'.repeat(36))).toBe('<other>')
+  expect(warningToken('abc123def456')).toBe('<other>')
+  expect(warningToken('abcdefghijklmnopqrstuvwx')).toBe('<other>')
+  expect(warningToken('changed')).toBe('changed')
+  expect(warningToken('a, b: c')).toBe('<other>')
+  expect(warningToken(['big', 'array'])).toBe('<other>')
+})
+
+it('warning は 50 件で切る', () => {
+  const signals = computeMaterialitySignals(fileDiff('apps/api/src/x.ts', ["-  | 'challenge_aligned'"]))
+  const many = Array.from({ length: 80 }, (_, i) => ({ signalId: `unknown${i}`, disposition: 'unrelated', reason: '' }))
+  const parsed = parseDetection(JSON.stringify({ material: false, candidates: [], signalDisposition: many }), signals)
+  expect(parsed.ok && parsed.warnings.length).toBe(51)
+  expect(parsed.ok && parsed.warnings[50]).toMatch(/^truncated:/)
+})
+
+
+it('warning に model が決めた候補 id を書かない（位置で書く）', () => {
+  const id = 'abcdefghijklmnopqrstuvwx'
+  const cands = [{ id, kind: 'removes' as const, subject: 'mechanism' as const, mechanism: 'm', file: 'f.ts', evidence: 'e' }]
+  const ev = { candidateId: id, responsibility: 'lost', recordConsistency: 'no_record', ceoDirectedProvenance: 'no' }
+  const parsed = parseEvaluation(JSON.stringify({ evaluations: [ev, ev] }), cands)
+  expect(parsed.ok && parsed.warnings).toEqual(['duplicate_evaluation:#0'])
+  expect(JSON.stringify(parsed)).not.toContain(`warnings":["duplicate_evaluation:${id}`)
+})
+
+it('warning の語彙は enum の正本から作られる（enum に値を足せば warning にもそのまま出る）', () => {
+  for (const v of [...CANDIDATE_KINDS, ...CANDIDATE_SUBJECTS, ...DISPOSITIONS, ...RESPONSIBILITY, ...RECORD_CONSISTENCY, ...PROVENANCE]) {
+    expect(warningToken(v)).toBe(v)
+  }
 })
