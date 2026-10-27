@@ -11,6 +11,7 @@ PR title・commit message・コメント内の自己分類は根拠にしない�
   - `preserved` — 外から見た責務・契約・遷移は変わらない（純粋な改名・移動・リファクタ）
   - `moved` — 責務は別の、特定できる場所へ移った（`newOwner` にその場所を書く）
   - `lost` — 責務を引き継ぐ場所が無い（stage が消え、同じ役割を果たすものが diff にも base にも無い）
+  - `introduced` — 既存のものに触れず、新しい責務・機構・遷移・契約を足すだけ（`kind` が `introduces` の候補）
   - `unclear` — diff と抜粋からは決められない
 - `recordConsistency`:
   - `consistent` — base 設計記録が新しい形と一致する、または同じ diff で記録が更新されている
