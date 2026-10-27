@@ -18,7 +18,7 @@
  * 既存の PL（`DEFAULT_STALL_HINT_MS` の停滞閾値・notify-only・重複抑止）が決める。復旧操作はしない。
  */
 
-import type { Project, TaskContinuation } from '@ai-team/shared'
+import type { ContinuationProgressReport, Project, TaskContinuation } from '@ai-team/shared'
 import { buildInitialImplementAiCliPrompt, initialWorkflowStepKey } from '../ctoAi/initialImplementWorkflow'
 import { DESIGN_REVIEW_RUNNER_SIGKILL_GRACE_MS, DESIGN_REVIEW_RUNNER_TIMEOUT_MS } from '../designReview/designReviewCoordinator'
 import { designReviewRetryNotBeforeMs } from '../designReview/retryCooldown'
@@ -156,15 +156,6 @@ export function evaluateContinuationProgress(
   return { taskId: task.id, stuckForMs: stuckSince(lastActivityMs), detail: facts.join('; ') }
 }
 
-/** Worker の reconcile 応答に載せる、running Project の pending continuation 1件分の事実。 */
-export interface ContinuationProgressReport {
-  continuationId: string
-  projectId: string
-  taskId: string | undefined
-  /** 検証された前進が無い時間（ms）。 */
-  stuckForMs: number
-}
-
 /**
  * running Project の pending continuation について「前進が無い時間」を返す（読み取りのみ）。
  *
@@ -189,7 +180,12 @@ export function reportContinuationProgress(storage: IStorage, nowMs: number): Co
       } catch {
         stuckForMs = Math.max(0, nowMs - (parseMs(continuation.createdAt, nowMs) ?? 0))
       }
-      reports.push({ continuationId: continuation.id, projectId: project.id, taskId, stuckForMs })
+      reports.push({
+        continuationId: continuation.id,
+        projectId: project.id,
+        ...(taskId !== undefined ? { taskId } : {}),
+        stuckForMs,
+      })
     }
   }
   return reports
