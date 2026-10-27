@@ -88,6 +88,7 @@ export type {
   CriticModelSelection,
 } from './independentRemediationPolicy'
 export * from './aiCliTimeout'
+export * from './roleModelRegistry'
 export * from './roadmapTaskIdentity'
 export * from './taskOccupancy'
 export * from './approvalLiveness'
