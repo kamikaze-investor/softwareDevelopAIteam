@@ -654,7 +654,7 @@ boolean のもの。以下「確認済みの continuation pending 503」。1つ�
    約 **5 分**無い continuation を診断し、合法的な自律復旧を試みる
 4. 独立した Worker の backstop: 確認済みの continuation pending 503 だけが続く滞留が、壁時計で
    **10 分**（滞留した最初の cycle の開始から正の差分だけを積み上げた時間と、滞留中の最古の Outbox event を
-   durable に記録した時刻からの時間の、大きいほう。Worker の再起動では戻らない。判定は再送 batch の後なので、
+   durable に記録した時刻からの時間の、大きいほう。Worker の再起動では戻らない。durable な記録時刻が読めない間は、想定内の待ちとは扱わず本当の失敗として 1. の 3 cycle で数える。判定は再送 batch の後なので、
    上限は 10 分 + 最後の batch 1回分）に達したら CRITICAL を上げる。API が「検証された前進が無い」と報告する時間が
    10 分に達した continuation と、その報告そのものが 10 分取れない状態にも、それぞれ1回 CRITICAL を上げる
 5. 既にある、より早い通知の条件に当たる重大な失敗を、10 分まで意図して遅らせない

@@ -204,3 +204,11 @@ describe('独立レビュー指摘への回帰（CEO 決定 2026-10-27 の範囲
     expect(alerts).toBe(1)
   })
 })
+
+describe('独立レビュー round 2 の回帰', () => {
+  it('負の stuckForMs・空白だけの continuationId を含む報告は全体を捨てる（報告なし扱い）', () => {
+    expect(parseContinuationProgressReports({ continuations: [{ continuationId: 'c1', stuckForMs: -1 }] })).toBeUndefined()
+    expect(parseContinuationProgressReports({ continuations: [{ continuationId: '   ', stuckForMs: 0 }] })).toBeUndefined()
+    expect(parseContinuationProgressReports({ continuations: [{ continuationId: 'c1', stuckForMs: 0 }] })).toEqual([{ continuationId: 'c1', stuckForMs: 0 }])
+  })
+})

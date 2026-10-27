@@ -157,8 +157,9 @@ export function parseContinuationProgressReports(body: unknown): ContinuationPro
   const reports: ContinuationProgressReport[] = []
   for (const entry of value) {
     const row = entry as { continuationId?: unknown; stuckForMs?: unknown } | null
-    if (typeof row?.continuationId !== 'string' || row.continuationId === ''
-      || typeof row.stuckForMs !== 'number' || !Number.isFinite(row.stuckForMs)) return undefined
+    // 負の時間・空白だけの id は API の契約外。報告ありとして扱うと outage の時計が戻り、通知も出ないので捨てる。
+    if (typeof row?.continuationId !== 'string' || row.continuationId.trim() === ''
+      || typeof row.stuckForMs !== 'number' || !Number.isFinite(row.stuckForMs) || row.stuckForMs < 0) return undefined
     reports.push({ continuationId: row.continuationId, stuckForMs: row.stuckForMs })
   }
   return reports

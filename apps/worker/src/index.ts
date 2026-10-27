@@ -538,7 +538,7 @@ export interface PatchJobResult {
    */
   refusedCode?: typeof JOB_CLAIM_REFUSED_CODE
   /**
-   * 最後の応答が「受理済み・continuation pending」の 503 だった（`isContinuationPendingResponse`）。
+   * retry の**すべての試行**が「受理済み・continuation pending」の 503 だった（`isContinuationPendingResponse`）。
    * event は Outbox に保持されたまま再送される。滞留通知の閾値を分けるためだけに使う。
    */
   continuationPending?: boolean
@@ -1219,15 +1219,20 @@ export async function pollJobs(): Promise<never> {
         }
 
         const pendingRemains = outboxHasPending()
+        // 10 分の時計の durable な下限。pending が残るのに読めない（例外・不正な時刻）なら、再起動で時計が戻りうるので
+        // 想定内の待ちとは扱わず本当の失敗として 3 cycle で数える（fail closed。独立レビュー指摘）。
         let durableEpisodeStartedAtMs: number | undefined
-        try {
-          durableEpisodeStartedAtMs = pendingRemains ? outboxStore.oldestPendingCreatedAtMs() : undefined
-        } catch {
-          durableEpisodeStartedAtMs = undefined // 読めなければ in-memory の経過時間だけで判定する
+        if (pendingRemains) {
+          try {
+            durableEpisodeStartedAtMs = outboxStore.oldestPendingCreatedAtMs()
+          } catch {
+            durableEpisodeStartedAtMs = undefined
+          }
         }
+        const durableClockAvailable = !pendingRemains || durableEpisodeStartedAtMs !== undefined
         const alertDecision = nextOutboxAlertState(outboxAlert, {
           pendingRemains,
-          onlyContinuationPending: !outboxReadFailed && resendCount > 0 && onlyContinuationPending,
+          onlyContinuationPending: !outboxReadFailed && durableClockAvailable && resendCount > 0 && onlyContinuationPending,
         }, { cycleStartedAtMs, nowMs: Date.now(), durableEpisodeStartedAtMs })
         outboxAlert = alertDecision.state
         if (alertDecision.shouldAlert) await notifyOutboxDeliveryBlocked()

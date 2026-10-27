@@ -117,6 +117,8 @@ beforeEach(() => {
   outboxMocks.recordPending.mockReset()
   outboxMocks.deletePending.mockReset()
   outboxMocks.oldestPendingCreatedAtMs.mockReset()
+  // 既定は「いま記録された」event（durable な時計が読めて、まだ経過していない）。
+  outboxMocks.oldestPendingCreatedAtMs.mockImplementation(() => Date.now())
   outboxMocks.resendPending.mockReset()
   outboxMocks.hasPending.mockReset()
   outboxMocks.hasPendingFor.mockReset()
@@ -1833,6 +1835,31 @@ describe('Outbox 滞留通知 — continuation pending の 503 は想定内（ou
 
     expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(1)
     expect(notifierMocks.sendAlert).toHaveBeenCalledWith(expect.objectContaining({ severity: 'critical' }))
+  })
+
+  it.each([
+    ['例外', () => { throw new Error('SQLITE_BUSY') }],
+    ['不正な時刻', () => undefined],
+  ])('durable な記録時刻が読めない（%s）間は、continuation pending の 503 でも 3 cycle で CRITICAL（fail closed）', async (_label, unreadable) => {
+    {
+      vi.useFakeTimers()
+      vi.stubGlobal('fetch', fetchMock)
+      fetchMock.mockImplementation(async (url: string | URL | Request) => (
+        String(url).includes('/api/jobs/job-1') ? continuation503('e1') : new Response(JSON.stringify([]), { status: 200 })
+      ))
+      outboxMocks.hasPending.mockReturnValue(true)
+      outboxMocks.oldestPendingCreatedAtMs.mockImplementation(unreadable)
+      outboxMocks.resendPending.mockImplementation(async (patchFn: (id: string, p: unknown) => Promise<boolean>) => {
+        await patchFn('job-1', { status: 'success', eventId: 'e1', payloadHash: 'h' })
+      })
+
+      void pollJobs()
+      await flushPollCycle()
+      await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST * 3)
+      await Promise.resolve()
+
+      expect(notifierMocks.sendAlert).toHaveBeenCalledWith(expect.objectContaining({ severity: 'critical' }))
+    }
   })
 
   it('本当の配送失敗（eventId の無い 503）は従来どおり 3 cycle で CRITICAL', async () => {
