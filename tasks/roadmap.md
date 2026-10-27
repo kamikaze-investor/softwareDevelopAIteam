@@ -10484,6 +10484,10 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       BLOCKED も sticky / 空 diff の approved を正規の判定として扱う / action を commit SHA に固定。
       **残る（Codex 指摘・CEO の credential 操作が要る）**: bot は classic OAuth token（`repo` scope）で、workflow run を force-cancel できる。
       BLOCKED を記録される前に止めて再実行させる経路が残るので、Actions 書き込み権限の無い fine-grained token へ替える。
+      **0a 実地確認（2026-10-27、#418 merge 後の #417）**: `Code Owner Approval` は success（CODEOWNERS 対象なし）を github-actions[bot] が付けた。
+      `Meta Review (base)` は依存導入で失敗し、fail closed（failure・"no valid Meta Review result"）で status を付けた —
+      原因は PL が固定した `pnpm@11.8.0` が Node 22.13 以上を要求し、workflow は Node 20 だったこと。既存 CI と同じ major の
+      `pnpm@12.12.1`（Node 18 以上）へ直す（workflow の変更なので CEO が branch 上で 1 行編集する）。
       **0b の前提条件（Codex 2 回目の判断）**: bot の credential を Actions 書き込み権限の無い fine-grained token へ替えるまで、
       `Meta Review (base)` を required check にしない（0a の並走観測だけは可）。
       **残る（記録して受容）**: status は commit に付くため、既に success の commit を head とする新しい PR は、その PR の run が
