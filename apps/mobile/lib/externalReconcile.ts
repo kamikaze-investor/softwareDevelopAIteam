@@ -203,7 +203,8 @@ export function reconcileEvidenceLines(pkg: ReconcilePackage, preview: Reconcile
         : '（確認できませんでした）',
     },
     { label: 'PR', source: 'claimed', value: pkg.evidence.pullRequestUrl },
-    { label: 'Independent Review', source: verified ? 'verified' : 'problem', value: pkg.evidence.independentReviewVerdict },
+    // API が見るのは申告が 'approved' であることだけで、レビュー結果そのものは照合していない（AI の申告）。
+    { label: 'Independent Review', source: 'claimed', value: pkg.evidence.independentReviewVerdict },
     { label: 'CI', source: 'claimed', value: pkg.evidence.ciResult },
     { label: '受入根拠', source: 'claimed', value: pkg.evidence.acceptanceEvidence },
     { label: '許可された範囲', source: 'claimed', value: pkg.evidence.approvedScope },
@@ -521,6 +522,10 @@ export async function runOneScreenReconcile(
       return { message: RECONCILE_STALE_MESSAGE, ok: false, stage }
     }
     if (approval.kind === 'none') {
+      // 起票の直前に読み直した一覧で照合する。読み直しと起票の間に別の承認待ちが作られた場合だけは、API の
+      // `replaceActiveAndCreate()` がそれも置き換える（起票 API に期待集合の CAS は無い）。置き換えは SUPERSEDED +
+      // audit で残り、置き換えられた判断は実行されない側に倒れる（fail-closed）。既知の残余として受け入れている
+      // （CAS を足すには共有の起票 API の契約を変える必要がある。PR 本文の「残余」を参照）。
       const disclosed = new Set(confirmation.replaced)
       if (approvalRequestsReplacedByCreate(state, approval).some((id) => !disclosed.has(id))) {
         return { message: RECONCILE_STALE_MESSAGE, ok: false, stage }

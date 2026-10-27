@@ -418,6 +418,8 @@ describe('screen content', () => {
     const lines = reconcileEvidenceLines(pkg, preview({ problems: ['Source Job not found for this Task'] }))
     expect(lines.find((line) => line.label === 'commit')?.source).toBe('verified')
     expect(lines.find((line) => line.label === 'CI')?.source).toBe('claimed')
+    // 申告文字列が approved であることしか API は確かめていないので、検証済みとは表示しない
+    expect(lines.find((line) => line.label === 'Independent Review')?.source).toBe('claimed')
     expect(lines.find((line) => line.label === 'Code Owner 対象（保護範囲）')?.value).toBe('CLAUDE.md')
     expect(lines.some((line) => line.source === 'problem' && line.value.includes('Source Job'))).toBe(true)
   })
