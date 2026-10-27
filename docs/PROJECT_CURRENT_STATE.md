@@ -246,6 +246,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **`done` Task の滞留 blocked Job が workspace 所有権を握り続ける**
 - **M3 最終 Production E2E（新規 Project・Generator 生成の 2 Task）**
 - **期限切れ `WAITING_FOR_USER` Approval が blocked git_commit Job の resume を永久に塞ぐ**
+- **正常な continuation 中に `Worker Outbox resend is blocked` の CRITICAL が誤発報する
 - **review の structured output が `"rule": null` で strict schema 違反になり fail-closed する**
 - **Task ContinuationのGET依存解消（高優先度）
 - 2種類の承認の役割整理とMobile導線設計
@@ -312,7 +313,6 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **M1-b: どの Task にも帰属できない dirty workspace（orphan dirty）を復旧する手段が無い**（state: planned）
 - **fallback workspace ownership は content identity を証明しない（CEO受容済みの既知制約）**（state: deferred）
 - **implement Job が受入条件を機械的に検証せず、条件を満たさない成果物が `success` になる**（state: planned）
-- **正常な continuation 中に `Worker Outbox resend is blocked` の CRITICAL が誤発報する**（state: planned）
 - **continuation reconcile の非blocking指摘2件（Independent Review NON-BLOCKING）**（state: deferred）
 - **Codex sandboxをdeprecated Landlockに依存しない経路へ移行する**（2026-09-07登録、（state: planned）
 - **OpenCode repo-aware feasibility reviewer（保留）**（2026-09-07登録。Step 2 provider（state: deferred）
