@@ -480,6 +480,17 @@ export interface DetectionResult {
 /** ok でも、採点に使わない副次的な出力の不備は warnings に残す（観測全体は捨てない） */
 export type ParseOutcome<T> = { ok: true; value: T; warnings: string[] } | { ok: false; reason: string }
 
+const MAX_WARNINGS = 50
+
+/** warning に値を残すのは、短い語の形（英数字・_・-・空白、40文字以内）の string のときだけ */
+export function warningToken(v: unknown): string {
+  return typeof v === 'string' && /^[A-Za-z0-9_ -]{1,40}$/.test(v) ? v : '<non-token>'
+}
+
+function capWarnings(warnings: string[]): string[] {
+  return warnings.length <= MAX_WARNINGS ? warnings : [...warnings.slice(0, MAX_WARNINGS), `truncated:${warnings.length - MAX_WARNINGS}`]
+}
+
 /** 応答本文から最後の JSON object を1つ取り出す（```json fence 内を優先） */
 function extractJsonObject(raw: string): unknown {
   const fenced = [...raw.matchAll(/```(?:json)?\s*([\s\S]*?)```/g)].map((m) => m[1]).reverse()
@@ -537,10 +548,10 @@ export function parseDetection(raw: string, signals: readonly MaterialitySignal[
   const dispositions: SignalDisposition[] = []
   for (const d of json.signalDisposition as Array<Record<string, unknown>>) {
     if (!d || !isString(d.signalId) || !isString(d.disposition)) { warnings.push('invalid_disposition'); continue }
-    if (!known.has(d.signalId)) { warnings.push(`unknown_signal:${d.signalId.slice(0, 40)}`); continue }
+    if (!known.has(d.signalId)) { warnings.push(`unknown_signal:${warningToken(d.signalId)}`); continue }
     const supports = d.disposition.match(/^supports_candidate:(.+)$/)
     if (supports ? !candidateIds.has(supports[1]) : !oneOf(DISPOSITIONS, d.disposition)) {
-      warnings.push(`unknown_disposition:${d.disposition.slice(0, 40)}`)
+      warnings.push(`unknown_disposition:${warningToken(d.disposition.replace(/^supports_candidate:/, 'supports_candidate_'))}`)
       continue
     }
     dispositions.push({ signalId: d.signalId, disposition: d.disposition, reason: typeof d.reason === 'string' ? d.reason : '' })
@@ -550,7 +561,7 @@ export function parseDetection(raw: string, signals: readonly MaterialitySignal[
     if (sig.kind !== 'behavior_test_removed' && !answered.has(sig.id)) warnings.push(`signal_not_disposed:${sig.id}`)
   }
 
-  return { ok: true, value: { material, candidates, signalDisposition: dispositions }, warnings }
+  return { ok: true, value: { material, candidates, signalDisposition: dispositions }, warnings: capWarnings(warnings) }
 }
 
 // introduced: 既存のものに触れず新しい責務・機構を足す候補（kind=introduces）。保たれる / 移る / 失われる のどれでもない
@@ -595,10 +606,10 @@ export function parseEvaluation(raw: string, candidates: readonly MaterialityCan
       : !optionalText(e.newOwner) ? 'newOwner' : !oneOf(RECORD_CONSISTENCY, e.recordConsistency) ? 'recordConsistency'
       : !oneOf(PROVENANCE, e.ceoDirectedProvenance) ? 'ceoDirectedProvenance'
       : !['provenanceEvidence', 'correctness', 'simplicity', 'naturalness'].every((k) => optionalText(e[k])) ? 'text_field' : undefined
-    // どの値で外れたかを残す（次の調整の根拠。値は短く切る）
-    if (bad) { warnings.push(`invalid_evaluation:${bad}=${String(e?.[bad] ?? '').slice(0, 40)}`); continue }
+    // どの値で外れたかを残す（次の調整の根拠）。model の自由文を記録へ写さないよう、短い語の形のときだけ値を残す
+    if (bad) { warnings.push(`invalid_evaluation:${bad}=${warningToken(e?.[bad])}`); continue }
     const candidate = byId.get(e.candidateId as string)
-    if (!candidate) { warnings.push(`unknown_candidate:${String(e.candidateId).slice(0, 40)}`); continue }
+    if (!candidate) { warnings.push(`unknown_candidate:${warningToken(e.candidateId)}`); continue }
     // introduced は追加（kind=introduces）の候補にだけ使える。消す・替える・意味を変える候補を introduced と答えた評価は
     // 狭い判定（correctnessFlags）から外れてしまうので使わない
     if (e.responsibility === 'introduced' && candidate.kind !== 'introduces') { warnings.push(`introduced_for_non_addition:${candidate.id}`); continue }
@@ -629,7 +640,7 @@ export function parseEvaluation(raw: string, candidates: readonly MaterialityCan
     kept.push(mine[0])
   }
   if (kept.length === 0) return { ok: false, reason: 'no_usable_evaluation' }
-  return { ok: true, value: kept, warnings }
+  return { ok: true, value: kept, warnings: capWarnings(warnings) }
 }
 
 // ---------------------------------------------------------------------------

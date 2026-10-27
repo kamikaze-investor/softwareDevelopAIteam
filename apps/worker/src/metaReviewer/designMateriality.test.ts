@@ -10,6 +10,7 @@ import {
   RAW_EXCERPT_CHARS,
   signalId,
   stripStringsAndComments,
+  warningToken,
   type BaseRecordReader,
   type MaterialitySignal,
 } from './designMateriality.js'
@@ -240,7 +241,7 @@ describe('parseDetection — strict', () => {
 
   it.each([
     ['S1 に disposition が無い → 残す', { material: true, candidates: [candidate], signalDisposition: [] }, [`signal_not_disposed:${sid}`], true, 0],
-    ['存在しない candidate を指す disposition は捨てる', { material: true, candidates: [candidate], signalDisposition: [{ signalId: sid, disposition: 'supports_candidate:c9', reason: '' }] }, ['unknown_disposition:supports_candidate:c9', `signal_not_disposed:${sid}`], true, 0],
+    ['存在しない candidate を指す disposition は捨てる', { material: true, candidates: [candidate], signalDisposition: [{ signalId: sid, disposition: 'supports_candidate:c9', reason: '' }] }, ['unknown_disposition:supports_candidate_c9', `signal_not_disposed:${sid}`], true, 0],
     ['正しさを判断する disposition（behavior_preserving）は捨てる', { material: false, candidates: [], signalDisposition: [{ signalId: sid, disposition: 'behavior_preserving', reason: '' }] }, ['unknown_disposition:behavior_preserving', `signal_not_disposed:${sid}`], false, 0],
   ])('%s', (_label, body, warnings, material, dispositions) => {
     const parsed = parseDetection(JSON.stringify(body), signals)
@@ -543,4 +544,19 @@ it('redefined を受け付ける（M5 trial 2026-10-27: 再定義の候補が評
   const cands = [{ id: 'c2', kind: 'redefines' as const, subject: 'authority_boundary' as const, mechanism: 'approval path', file: 'f.ts', evidence: 'e' }]
   const parsed = parseEvaluation(JSON.stringify({ evaluations: [{ candidateId: 'c2', responsibility: 'redefined', recordConsistency: 'contradicts_unupdated_record', ceoDirectedProvenance: 'yes' }] }), cands)
   expect(parsed.ok && parsed.value[0].responsibility).toBe('redefined')
+})
+
+it('warning に残す値は短い語の形だけ（model の自由文・配列は残さない）', () => {
+  expect(warningToken('redefined')).toBe('redefined')
+  expect(warningToken('ghp_' + 'x'.repeat(50))).toBe('<non-token>')
+  expect(warningToken('a, b: c')).toBe('<non-token>')
+  expect(warningToken(['big', 'array'])).toBe('<non-token>')
+})
+
+it('warning は 50 件で切る', () => {
+  const signals = computeMaterialitySignals(fileDiff('apps/api/src/x.ts', ["-  | 'challenge_aligned'"]))
+  const many = Array.from({ length: 80 }, (_, i) => ({ signalId: `unknown${i}`, disposition: 'unrelated', reason: '' }))
+  const parsed = parseDetection(JSON.stringify({ material: false, candidates: [], signalDisposition: many }), signals)
+  expect(parsed.ok && parsed.warnings.length).toBe(51)
+  expect(parsed.ok && parsed.warnings[50]).toMatch(/^truncated:/)
 })
