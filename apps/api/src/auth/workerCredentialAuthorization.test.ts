@@ -389,6 +389,36 @@ describe('Worker↔API authority separation — WORKER credential: Default Deny'
     })
   })
 
+  // 外部成果の取り込み（Mobile の 1 画面取り込み）。AI は起票・確認・実行のどれにも到達しない。
+  it.each([
+    ['POST', '/api/approval-requests'],
+    ['POST', '/api/tasks/some-task/reconcile-external-completion/preview'],
+    ['POST', '/api/tasks/some-task/reconcile-external-completion'],
+  ] as const)('external completion: %s %s は403', async (method, url) => {
+    await withApp(async (app) => {
+      const res = await app.inject({ method, url, headers: workerAuthHeader(), payload: {} })
+      expect(res.statusCode).toBe(403)
+    })
+  })
+
+  it('ADMIN は取り込みの preview へ到達する（認証は通過し、Task が無いので 404）', async () => {
+    await withApp(async (app) => {
+      const res = await app.inject({
+        method: 'POST',
+        url: '/api/tasks/some-task/reconcile-external-completion/preview',
+        headers: adminAuthHeader(),
+        payload: {
+          sourceJobId: 'job',
+          evidence: {
+            roadmapItemId: 'r', commitSha: 'a'.repeat(40), pullRequestUrl: 'u', independentReviewVerdict: 'approved',
+            ciResult: 'c', acceptanceEvidence: 'a', approvedScope: 's',
+          },
+        },
+      })
+      expect(res.statusCode).toBe(404)
+    })
+  })
+
   it('Knowledge Graph delete（DELETE /api/kg/nodes/:id）は403', async () => {
     await withApp(async (app) => {
       const res = await app.inject({

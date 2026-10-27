@@ -17,8 +17,11 @@ import {
 import { buildResumeAiCliPrompt } from '../implementPrompt'
 import { authorizePlAction, PlActionBlockedError } from '../pl/actionGate'
 import {
+  APPROVAL_EVIDENCE_MISMATCH,
   blockedJobsReconcileRefusalReason,
+  checkApprovalEvidenceBinding,
   findBlockedJobsPreventingReconcile,
+  previewExternalCompletion,
   TASK_HAS_BLOCKED_JOBS,
   verifyExternalCompletion,
 } from '../reconcile/externalCompletion'
@@ -202,6 +205,9 @@ const ReconcileExternalCompletionBody = z.object({
     approvedScope: z.string().trim().min(1),
   }).strict(),
 }).strict()
+
+/** 取り込み前の確認（読むだけ）。取り込みと同じ根拠の形で、承認の id は持たない。 */
+const PreviewExternalCompletionBody = ReconcileExternalCompletionBody.omit({ approvalRequestId: true })
 
 const AbortTaskBody = z.object({
   approvalRequestId: z.string().min(1),
@@ -681,6 +687,33 @@ export async function taskRoutes(
   })
 
   /**
+   * POST /:id/reconcile-external-completion/preview
+   *
+   * 取り込みの**前に** CEO が根拠を確かめるための読み取り（Mobile の 1 画面取り込み）。
+   * 取り込みと同じ検査（`verifyExternalCompletion`・blocked Job）を行い、server が git で確かめた
+   * 変更ファイルと、承認依頼の `targetDiffHash` に載せる根拠の digest を返す。
+   *
+   * **状態を何も変えない。** 承認を評価も消費もしない。Task も Job も audit も書かない。
+   * 実行時には取り込み route がすべてをもう一度確かめるので、ここでの結果は authorization ではない。
+   * 根拠を URL に載せないため GET ではなく POST にしている。
+   *
+   * 到達できるのは ADMIN だけである —— Worker / Operator の allowlist に無い（default deny）。
+   * これは split credential 構成（Production は 2026-09-22 から）での性質で、legacy 単一 token や
+   * 認証なしのローカル構成では取り込み route と同じく誰でも到達する（どちらも human-only route ではない）。
+   */
+  app.post<{ Params: { id: string } }>('/:id/reconcile-external-completion/preview', async (req, reply) => {
+    const parsed = PreviewExternalCompletionBody.safeParse(req.body)
+    if (!parsed.success) {
+      return reply.status(400).send({ error: 'Validation failed', details: parsed.error.format() })
+    }
+    const preview = await previewExternalCompletion(storage, req.params.id, parsed.data.sourceJobId, parsed.data.evidence)
+    if (!preview) {
+      return reply.status(404).send({ error: 'Task not found' })
+    }
+    return reply.send(preview)
+  })
+
+  /**
    * POST /:id/reconcile-external-completion
    *
    * Candidate 以外（Tier B 外部実装）で正式に完了した成果を Task completion へ戻す。
@@ -689,8 +722,11 @@ export async function taskRoutes(
    * 与えない。既に canonical master へ入り production へ出ている成果を、既存の completion
    * transition で Task state へ反映するだけである（CEO 指示・2026-09-15）。
    *
-   * 順序は **根拠の機械検証 → Mandatory Gate → 既存 completion transition**。
-   * 呼び出し側の自己申告だけでは done にならない。
+   * 順序は **根拠の機械検証 → 承認と根拠の束縛 → Mandatory Gate → 承認の使用・既存 completion transition・
+   * audit（1 transaction）**。呼び出し側の自己申告だけでは done にならない。
+   *
+   * 承認は **この commit・この根拠に対して下されたもの**でなければ使えない（`checkApprovalEvidenceBinding`）。
+   * 承認依頼の `targetDiffHash` には preview が返す digest を載せる。
    */
   app.post<{ Params: { id: string } }>('/:id/reconcile-external-completion', async (req, reply) => {
     const parsed = ReconcileExternalCompletionBody.safeParse(req.body)
@@ -719,6 +755,18 @@ export async function taskRoutes(
       })
     }
 
+    // 承認と根拠の束縛。Gate は Task・action・期限・人の記録を見るが commit / 根拠は見ないので、ここで確かめる。
+    const binding = checkApprovalEvidenceBinding(storage, {
+      approvalRequestId: parsed.data.approvalRequestId,
+      taskId: task.id,
+      sourceJobId: parsed.data.sourceJobId,
+      evidence: parsed.data.evidence,
+      commit: verification.verified.commit,
+    })
+    if (!binding.ok) {
+      return reply.status(409).send({ code: APPROVAL_EVIDENCE_MISMATCH, error: binding.reason })
+    }
+
     // 2) Mandatory Gate。**Task completion を起こす正式操作なので必ず通す。**
     //    充足の根拠は seam が DB の実レコードで検証する（Gate 名の文字列では通らない）。
     try {
@@ -734,26 +782,13 @@ export async function taskRoutes(
       throw error
     }
 
-    // 3) 既存 completion transition。新しい完了経路は作っていない。
+    // 3) 承認の使用・既存 completion transition・根拠の audit を 1 transaction で行う。新しい完了経路は作っていない。
+    //    audit には機械照合できなかった項目も含めてそのまま載せる。
     const reconciled = storage.jobs.reconcileExternalCompletion({
       taskId: task.id,
       sourceJobId: parsed.data.sourceJobId,
-    })
-    if (!reconciled.ok) {
-      if (reconciled.code === 'TASK_HAS_BLOCKED_JOBS') {
-        return reply.status(409).send({ code: reconciled.code, error: reconciled.reason })
-      }
-      return reply.status(reconciled.code === 'ALREADY_DONE' ? 409 : 400).send({ error: reconciled.reason })
-    }
-
-    // 4) 根拠を残す。機械照合できなかった項目も含めてそのまま監査へ載せる。
-    storage.auditLog.record({
-      actor: 'api',
-      operation: 'reconcile_external_completion',
-      entityType: 'task',
-      entityId: task.id,
-      result: 'done',
-      detail: JSON.stringify({
+      approvalRequestId: parsed.data.approvalRequestId,
+      auditDetail: JSON.stringify({
         ...parsed.data.evidence,
         sourceJobId: parsed.data.sourceJobId,
         approvalRequestId: parsed.data.approvalRequestId,
@@ -761,6 +796,15 @@ export async function taskRoutes(
         verifiedAgainstStableHead: verification.verified.stableHead,
       }).slice(0, 4000),
     })
+    if (!reconciled.ok) {
+      if (reconciled.code === 'TASK_HAS_BLOCKED_JOBS') {
+        return reply.status(409).send({ code: reconciled.code, error: reconciled.reason })
+      }
+      if (reconciled.code === 'APPROVAL_NOT_USABLE') {
+        return reply.status(403).send({ code: reconciled.code, error: reconciled.reason })
+      }
+      return reply.status(reconciled.code === 'ALREADY_DONE' ? 409 : 400).send({ error: reconciled.reason })
+    }
 
     return reply.send({ task: reconciled.task, continuation: reconciled.continuation })
   })
