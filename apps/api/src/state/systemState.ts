@@ -22,6 +22,7 @@ import { summarizeAdoptionFailure } from '../pl/adoptionFailure'
 import { latestHumanRecoveryId } from '../humanRecovery/recoveryAudit'
 import { readJobsSupersededByHumanResume, withApprovalActorFacts } from '../designReview/resumeActor'
 import { designReviewRetryNotBeforeMs } from '../designReview/retryCooldown'
+import { evaluateContinuationProgress } from './continuationProgress'
 import { isTechnicalRecoveryTargetExhausted } from '../pl/technicalResumePolicy'
 import type { IStorage } from '../storage/interface'
 import { gateTechnicalStopCodeOfJob, isLiveApprovedApproval, isLiveTaskScopedDecision, isLiveWaitingApproval } from '@ai-team/shared'
@@ -451,8 +452,15 @@ export function buildSystemState(
       tasks.find((task) => task.status === 'in_progress' || task.status === 'blocked') ??
       tasks.find((task) => occupiesProject(task))
 
-    const continuationsPending = storage.taskContinuations.findPendingByProjectId(project.id).length
+    const pendingContinuations = storage.taskContinuations.findPendingByProjectId(project.id)
+    const continuationsPending = pendingContinuations.length
     continuationsPendingTotal += continuationsPending
+    // pending continuation の次 Task。この Task の「Job が無い」は continuation 側で前進を検証して扱う
+    // （下の `continuation_pending`）。汎用の `task_ready_without_job` は Task の作成時刻から数え、
+    // Design Review が実際に走っていても鳴るので、continuation の対象には出さない。
+    const continuationTargetIds = new Set(
+      pendingContinuations.flatMap((continuation) => (continuation.nextTaskId !== undefined ? [continuation.nextTaskId] : [])),
+    )
 
     const waitingForProject = tasks.filter(
       // attention の `approval_waiting` と同じ意味で数える（期限切れ WAITING は誰も待っていない）。
@@ -745,7 +753,7 @@ export function buildSystemState(
         })
       }
 
-      if (project.status === 'running' && isReadyTaskWithoutJob(task, jobs)) {
+      if (project.status === 'running' && isReadyTaskWithoutJob(task, jobs) && !continuationTargetIds.has(task.id)) {
         attention.push({
           kind: 'task_ready_without_job',
           projectId: project.id,
@@ -806,12 +814,18 @@ export function buildSystemState(
       }
     }
 
-    if (continuationsPending > 0) {
+    // continuation 1件につき1件。`stuckForMs` は「検証された前進が無い時間」（`evaluateContinuationProgress`）で、
+    // 前進中・Project が running でない間は 0。通知の要否は PL の既存の停滞閾値が決める。
+    for (const continuation of pendingContinuations) {
+      const progress = evaluateContinuationProgress(storage, continuation, project, nowMs)
       attention.push({
         kind: 'continuation_pending',
         projectId: project.id,
         projectName: project.name,
-        detail: `${continuationsPending} task continuation(s) still pending`,
+        ...(progress.taskId !== undefined ? { taskId: progress.taskId } : {}),
+        referenceId: continuation.id,
+        detail: progress.detail,
+        stuckForMs: progress.stuckForMs,
       })
     }
 

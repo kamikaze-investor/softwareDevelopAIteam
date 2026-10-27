@@ -7,6 +7,7 @@ import {
   emptyUsage,
   classifyApiError,
   correctnessFlags,
+  DETECTOR_MAX_OUTPUT_TOKENS,
   promptVersion,
   PROVIDER_REQUEST_TIMEOUT_MS,
   yieldToWorkflow,
@@ -217,6 +218,25 @@ describe('correctnessFlags（狭い予測）', () => {
     ['記録と食い違う', 'redefines', { responsibility: 'moved', newOwner: 'x', recordConsistency: 'contradicts_unupdated_record' }, true],
     ['CEO 指示で preserved 以外', 'replaces', { responsibility: 'unclear', ceoDirectedProvenance: 'yes' }, true],
     ['preserved（改名）', 'replaces', { responsibility: 'preserved' }, false],
+    ['redefined で記録と食い違う', 'redefines', { responsibility: 'redefined', recordConsistency: 'contradicts_unupdated_record' }, true],
+    ['redefined で記録と整合・CEO 指示なし', 'redefines', { responsibility: 'redefined' }, false],
+    ['redefined で CEO 指示の設計', 'redefines', { responsibility: 'redefined', ceoDirectedProvenance: 'yes' }, true],
+  ])('%s → %s', (_label, kind, over, expected) => {
+    expect(correctnessFlags(obs(kind, over))).toBe(expected)
+  })
+
+  it.each([
+    ['Authority 境界の再定義（記録と整合・CEO 指示なし）も数える', 'redefines', { responsibility: 'redefined' }, true],
+    ['Authority 境界の追加も数える', 'introduces', { responsibility: 'introduced' }, true],
+    ['保たれた Authority 境界は数えない', 'replaces', { responsibility: 'preserved' }, false],
+  ])('authority_boundary: %s', (_label, kind, over, expected) => {
+    const o = obs(kind, over)
+    if (o.detection) o.detection.candidates[0].subject = 'authority_boundary'
+    expect(correctnessFlags(o)).toBe(expected)
+  })
+
+  it.each([
+    ['既定の評価（preserved・consistent・CEO 指示なし）は数えない', 'removes', {}, false],
     ['追加だけ', 'introduces', { responsibility: 'lost' }, false],
   ])('%s → %s', (_label, kind, over, expected) => {
     expect(correctnessFlags(obs(kind, over))).toBe(expected)
@@ -289,4 +309,8 @@ describe('yieldToWorkflow（共有 key の譲り合い。safety gate ではな�
 
 it('client 側の request timeout は、最小間隔と足しても既定の観測待機上限より短い', () => {
   expect(20_000 + PROVIDER_REQUEST_TIMEOUT_MS).toBeLessThan(OBSERVATION_TIMEOUT_MS)
+})
+
+it('detector の出力上限は thinking を含めても JSON が切れない大きさ（live の 8192 より大きい）', () => {
+  expect(DETECTOR_MAX_OUTPUT_TOKENS).toBeGreaterThan(8192)
 })

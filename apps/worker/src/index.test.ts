@@ -9,6 +9,7 @@ const outboxMocks = vi.hoisted(() => ({
   resendPending: vi.fn(),
   hasPending: vi.fn(),
   hasPendingFor: vi.fn(),
+  oldestPendingCreatedAtMs: vi.fn(),
 }))
 
 const jobStateMocks = vi.hoisted(() => ({
@@ -57,6 +58,8 @@ vi.mock('./jobStateManager.js', async (importOriginal) => {
 import {
   patchJobWithRetry,
   pollJobs,
+  reconcileSupervisedRuns,
+  reconcileTaskContinuations,
   persistJobResult,
   processQueuedWork,
   reportAbortCleanupObservations,
@@ -113,6 +116,9 @@ beforeEach(() => {
   fetchMock.mockReset()
   outboxMocks.recordPending.mockReset()
   outboxMocks.deletePending.mockReset()
+  outboxMocks.oldestPendingCreatedAtMs.mockReset()
+  // 既定は「いま記録された」event（durable な時計が読めて、まだ経過していない）。
+  outboxMocks.oldestPendingCreatedAtMs.mockImplementation(() => Date.now())
   outboxMocks.resendPending.mockReset()
   outboxMocks.hasPending.mockReset()
   outboxMocks.hasPendingFor.mockReset()
@@ -1735,5 +1741,430 @@ describe('P1 Phase 2: containment 失敗時の quarantine（B3）', () => {
       executeJob: vi.fn().mockRejectedValue(new Error('unrelated bug')),
       now: () => NOW,
     })).rejects.toThrow('unrelated bug')
+  })
+})
+
+describe('Outbox 滞留通知 — continuation pending の 503 は想定内（outbox-blocked-critical-false-alarm）', () => {
+  const continuation503 = (eventId: string): Response => new Response(
+    JSON.stringify({ id: 'job-1', status: 'success', outbox: { eventId, deduplicated: false } }),
+    { status: 503 },
+  )
+
+  it('送った eventId を返す 503 は continuationPending として返す（retry は従来どおり）', async () => {
+    fetchMock.mockImplementation(async () => continuation503('e1'))
+
+    const result = await retryingPatchJob()('job-1', { status: 'success', eventId: 'e1', payloadHash: 'h' } as never)
+
+    expect(result).toEqual({ ok: false, continuationPending: true })
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+  })
+
+  it('試行の1回でも本当の失敗（network・一般の 503・401）が混じれば、後が continuation pending でも continuationPending にしない', async () => {
+    const firstAttempts: Array<() => Promise<Response>> = [
+      async () => { throw new Error('ECONNREFUSED') },
+      async () => new Response(JSON.stringify({ error: 'Service Unavailable' }), { status: 503 }),
+      async () => new Response('', { status: 401 }),
+    ]
+    for (const first of firstAttempts) {
+      fetchMock.mockReset()
+      fetchMock
+        .mockImplementationOnce(first)
+        .mockImplementation(async () => continuation503('e1'))
+
+      const result = await retryingPatchJob()('job-1', { status: 'success', eventId: 'e1', payloadHash: 'h' } as never)
+
+      expect(result).toEqual({ ok: false })
+    }
+  })
+
+  it('eventId が一致しても別の Job id の 503 は continuationPending にしない', async () => {
+    fetchMock.mockImplementation(async () => new Response(
+      JSON.stringify({ id: 'job-other', status: 'success', outbox: { eventId: 'e1', deduplicated: false } }),
+      { status: 503 },
+    ))
+
+    const result = await retryingPatchJob()('job-1', { status: 'success', eventId: 'e1', payloadHash: 'h' } as never)
+
+    expect(result).toEqual({ ok: false })
+  })
+
+  it('eventId を伴わない 503（proxy・障害）は continuationPending にしない', async () => {
+    fetchMock.mockImplementation(async () => new Response(JSON.stringify({ error: 'Service Unavailable' }), { status: 503 }))
+
+    const result = await retryingPatchJob()('job-1', { status: 'success', eventId: 'e1', payloadHash: 'h' } as never)
+
+    expect(result).toEqual({ ok: false })
+  })
+
+  it('再送がすべて continuation pending の 503 なら、正常な continuation の長さ（7 cycle）では CRITICAL を出さない', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockImplementation(async (url: string | URL | Request) => (
+      String(url).includes('/api/jobs/job-1') ? continuation503('e1') : new Response(JSON.stringify([]), { status: 200 })
+    ))
+    outboxMocks.hasPending.mockReturnValue(true)
+    outboxMocks.resendPending.mockImplementation(async (patchFn: (id: string, p: unknown) => Promise<boolean>) => {
+      await patchFn('job-1', { status: 'success', eventId: 'e1', payloadHash: 'h' })
+    })
+
+    void pollJobs()
+    await flushPollCycle()
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST * 7)
+    await Promise.resolve()
+
+    expect(notifierMocks.sendAlert).not.toHaveBeenCalled()
+    // 従来の閾値（3 cycle）を十分に超えて滞留しても鳴らない（retry の backoff も fake timer を消費する）。
+    expect(outboxMocks.resendPending.mock.calls.length).toBeGreaterThan(3)
+  })
+
+  it('Worker の再起動後でも、durable な Outbox の記録時刻から 10 分を超えていれば最初の cycle で CRITICAL（時計が戻らない）', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockImplementation(async (url: string | URL | Request) => (
+      String(url).includes('/api/jobs/job-1') ? continuation503('e1') : new Response(JSON.stringify([]), { status: 200 })
+    ))
+    outboxMocks.hasPending.mockReturnValue(true)
+    outboxMocks.oldestPendingCreatedAtMs.mockReturnValue(Date.now() - 11 * 60 * 1000)
+    outboxMocks.resendPending.mockImplementation(async (patchFn: (id: string, p: unknown) => Promise<boolean>) => {
+      await patchFn('job-1', { status: 'success', eventId: 'e1', payloadHash: 'h' })
+    })
+
+    void pollJobs()
+    await vi.advanceTimersByTimeAsync(2_000) // 1 cycle の PATCH retry の backoff（計 1.5 秒）だけ進める
+    await Promise.resolve()
+
+    expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(1)
+    expect(notifierMocks.sendAlert).toHaveBeenCalledWith(expect.objectContaining({ severity: 'critical' }))
+  })
+
+  it.each([
+    ['例外', () => { throw new Error('SQLITE_BUSY') }],
+    ['不正な時刻', () => undefined],
+    ['未来の時刻（壁時計の巻き戻し後）', () => Date.now() + 60 * 60 * 1000],
+  ])('durable な記録時刻が読めない（%s）間は、continuation pending の 503 でも 3 cycle で CRITICAL（fail closed）', async (_label, unreadable) => {
+    {
+      vi.useFakeTimers()
+      vi.stubGlobal('fetch', fetchMock)
+      fetchMock.mockImplementation(async (url: string | URL | Request) => (
+        String(url).includes('/api/jobs/job-1') ? continuation503('e1') : new Response(JSON.stringify([]), { status: 200 })
+      ))
+      outboxMocks.hasPending.mockReturnValue(true)
+      outboxMocks.oldestPendingCreatedAtMs.mockImplementation(unreadable)
+      outboxMocks.resendPending.mockImplementation(async (patchFn: (id: string, p: unknown) => Promise<boolean>) => {
+        await patchFn('job-1', { status: 'success', eventId: 'e1', payloadHash: 'h' })
+      })
+
+      void pollJobs()
+      await flushPollCycle()
+      await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST * 3)
+      await Promise.resolve()
+
+      expect(notifierMocks.sendAlert).toHaveBeenCalledWith(expect.objectContaining({ severity: 'critical' }))
+    }
+  })
+
+  it('本当の配送失敗（eventId の無い 503）は従来どおり 3 cycle で CRITICAL', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockImplementation(async (url: string | URL | Request) => (
+      String(url).includes('/api/jobs/job-1')
+        ? new Response(JSON.stringify({ error: 'down' }), { status: 503 })
+        : new Response(JSON.stringify([]), { status: 200 })
+    ))
+    outboxMocks.hasPending.mockReturnValue(true)
+    outboxMocks.resendPending.mockImplementation(async (patchFn: (id: string, p: unknown) => Promise<boolean>) => {
+      await patchFn('job-1', { status: 'success', eventId: 'e1', payloadHash: 'h' })
+    })
+
+    void pollJobs()
+    await flushPollCycle()
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST * 3)
+    await Promise.resolve()
+
+    expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(1)
+    expect(notifierMocks.sendAlert).toHaveBeenCalledWith(
+      expect.objectContaining({ severity: 'critical', title: 'Worker Outbox resend is blocked' }),
+    )
+  })
+})
+
+describe('Outbox 滞留通知 — 本当の失敗を抑止しない（Tier B 独立レビュー観点）', () => {
+  const resendTwo = (): void => {
+    outboxMocks.resendPending.mockImplementation(async (patchFn: (id: string, p: unknown) => Promise<boolean>) => {
+      await patchFn('job-1', { status: 'success', eventId: 'e1', payloadHash: 'h1' })
+      await patchFn('job-2', { status: 'success', eventId: 'e2', payloadHash: 'h2' })
+    })
+  }
+
+  async function runCycles(cycles: number): Promise<void> {
+    void pollJobs()
+    await flushPollCycle()
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST * cycles)
+    await Promise.resolve()
+  }
+
+  it('本文が JSON でない 503 は本当の失敗として 3 cycle で CRITICAL', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockImplementation(async (url: string | URL | Request) => (
+      String(url).includes('/api/jobs/job-1')
+        ? new Response('<html>503 Service Unavailable</html>', { status: 503 })
+        : new Response(JSON.stringify([]), { status: 200 })
+    ))
+    outboxMocks.hasPending.mockReturnValue(true)
+    outboxMocks.resendPending.mockImplementation(async (patchFn: (id: string, p: unknown) => Promise<boolean>) => {
+      await patchFn('job-1', { status: 'success', eventId: 'e1', payloadHash: 'h' })
+    })
+
+    await runCycles(3)
+
+    expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(1)
+  })
+
+  it('同じ cycle に continuation pending と本当の失敗が混じれば、従来どおり 3 cycle で CRITICAL', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const target = String(url)
+      if (target.includes('/api/jobs/job-1')) {
+        return new Response(JSON.stringify({ id: 'job-1', outbox: { eventId: 'e1', deduplicated: false } }), { status: 503 })
+      }
+      if (target.includes('/api/jobs/job-2')) return new Response(JSON.stringify({ error: 'down' }), { status: 500 })
+      return new Response(JSON.stringify([]), { status: 200 })
+    })
+    outboxMocks.hasPending.mockReturnValue(true)
+    resendTwo()
+
+    // 1 cycle に PATCH が2本（各3回 retry + backoff）あるので、時間ではなく完了した再送 cycle 数で確かめる。
+    // 再送の呼び出しが N+1 回目に入った時点で N cycle 分の判定は済んでいる。
+    void pollJobs()
+    await flushPollCycle()
+    const advanceUntilResendCalls = async (calls: number): Promise<void> => {
+      for (let i = 0; i < 40 && outboxMocks.resendPending.mock.calls.length < calls; i += 1) {
+        await vi.advanceTimersByTimeAsync(500)
+      }
+    }
+    await advanceUntilResendCalls(3)
+    expect(outboxMocks.resendPending.mock.calls.length).toBe(3)
+    expect(notifierMocks.sendAlert).not.toHaveBeenCalled()
+    await advanceUntilResendCalls(4)
+    expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(1)
+  })
+
+  it('別の Job の eventId を返す 503 は continuation pending とみなさない（eventId は完全一致）', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockImplementation(async (url: string | URL | Request) => (
+      String(url).includes('/api/jobs/job-1')
+        ? new Response(JSON.stringify({ id: 'job-1', outbox: { eventId: 'e1-other', deduplicated: false } }), { status: 503 })
+        : new Response(JSON.stringify([]), { status: 200 })
+    ))
+    outboxMocks.hasPending.mockReturnValue(true)
+    outboxMocks.resendPending.mockImplementation(async (patchFn: (id: string, p: unknown) => Promise<boolean>) => {
+      await patchFn('job-1', { status: 'success', eventId: 'e1', payloadHash: 'h' })
+    })
+
+    await runCycles(3)
+
+    expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(1)
+  })
+
+  it('再送の例外（resendPending 自体の失敗）は本当の失敗として 3 cycle で CRITICAL', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockResolvedValue(new Response(JSON.stringify([]), { status: 200 }))
+    outboxMocks.hasPending.mockReturnValue(true)
+    outboxMocks.resendPending.mockRejectedValue(new Error('outbox db locked'))
+
+    await runCycles(3)
+
+    expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(1)
+  })
+})
+
+describe('Outbox 滞留通知 — continuation が恒久的に壊れていても壁時計で必ず鳴る', () => {
+  it('continuation pending の 503 だけが 10 分を超えて続けば CRITICAL を1回出す', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', fetchMock)
+    // reconcile は有効な報告（停滞なし）を返す: Outbox 側の backstop だけを見る。
+    fetchMock.mockImplementation(async (url: string | URL | Request) => {
+      const target = String(url)
+      if (target.includes('/api/jobs/job-1')) {
+        return new Response(JSON.stringify({ id: 'job-1', outbox: { eventId: 'e1', deduplicated: false } }), { status: 503 })
+      }
+      if (target.includes('/api/task-continuations/reconcile')) {
+        return new Response(JSON.stringify({ accepted: true, continuations: [] }), { status: 202 })
+      }
+      return new Response(JSON.stringify([]), { status: 200 })
+    })
+    outboxMocks.hasPending.mockReturnValue(true)
+    outboxMocks.resendPending.mockImplementation(async (patchFn: (id: string, p: unknown) => Promise<boolean>) => {
+      await patchFn('job-1', { status: 'success', eventId: 'e1', payloadHash: 'h' })
+    })
+
+    void pollJobs()
+    await flushPollCycle()
+    await vi.advanceTimersByTimeAsync(9 * 60 * 1000)
+    expect(notifierMocks.sendAlert).not.toHaveBeenCalled()
+
+    await vi.advanceTimersByTimeAsync(2 * 60 * 1000)
+    expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(1)
+    expect(notifierMocks.sendAlert).toHaveBeenCalledWith(
+      expect.objectContaining({ severity: 'critical', title: 'Worker Outbox resend is blocked' }),
+    )
+  })
+})
+
+describe('poll cycle 先頭の reconcile 呼び出しに期限がある（応答の無い API で loop 全体を止めない）', () => {
+  it.each([
+    ['task continuation', reconcileTaskContinuations, '/api/task-continuations/reconcile'],
+    ['supervised run', reconcileSupervisedRuns, '/api/supervised-runs/reconcile'],
+  ] as const)('%s reconcile の fetch は AbortSignal を持つ', async (_label, reconcile, path) => {
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockResolvedValue(new Response(null, { status: 202 }))
+
+    await reconcile()
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.stringContaining(path),
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    )
+  })
+
+  it('期限切れ（abort）は warn して例外を外へ出さない（次の処理へ進む）', async () => {
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockRejectedValue(new DOMException('The operation was aborted due to timeout', 'TimeoutError'))
+
+    await expect(reconcileTaskContinuations()).resolves.toBeUndefined()
+    await expect(reconcileSupervisedRuns()).resolves.toBeUndefined()
+  })
+})
+
+describe('continuation の独立した backstop — API の「前進なし」報告で1回だけ CRITICAL', () => {
+  function reconcileReport(stuckForMs: number): Response {
+    return new Response(JSON.stringify({ accepted: true, continuations: [{ continuationId: 'c1', projectId: 'p', stuckForMs }] }), { status: 202 })
+  }
+
+  it('前進なしが 10 分以上の continuation は、何 cycle 続いても1回だけ通知する（Outbox が空でも鳴る）', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockImplementation(async (url: string | URL | Request) => (
+      String(url).includes('/api/task-continuations/reconcile')
+        ? reconcileReport(11 * 60 * 1000)
+        : new Response(JSON.stringify([]), { status: 200 })
+    ))
+    outboxMocks.hasPending.mockReturnValue(false)
+
+    void pollJobs()
+    await flushPollCycle()
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST * 3)
+
+    const stalled = notifierMocks.sendAlert.mock.calls
+      .filter(([payload]) => (payload as { title?: string }).title === 'Task continuation has made no verified progress')
+    expect(stalled).toHaveLength(1)
+    expect(stalled[0]?.[0]).toMatchObject({ severity: 'critical', sourceType: 'task_continuation', sourceId: 'c1' })
+  })
+
+  it('前進なしが 10 分未満なら通知しない', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockImplementation(async (url: string | URL | Request) => (
+      String(url).includes('/api/task-continuations/reconcile')
+        ? reconcileReport(9 * 60 * 1000)
+        : new Response(JSON.stringify([]), { status: 200 })
+    ))
+    outboxMocks.hasPending.mockReturnValue(false)
+
+    void pollJobs()
+    await flushPollCycle()
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST * 3)
+
+    expect(notifierMocks.sendAlert).not.toHaveBeenCalled()
+  })
+})
+
+describe('continuation の報告が取れない状態 — 取れないこと自体を 10 分で1回通知する', () => {
+  it('reconcile が報告を返さない状態が 10 分続けば CRITICAL を1回出す（Outbox が空でも）', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockImplementation(async () => new Response(JSON.stringify([]), { status: 200 }))
+    outboxMocks.hasPending.mockReturnValue(false)
+
+    void pollJobs()
+    await flushPollCycle()
+    await vi.advanceTimersByTimeAsync(9 * 60 * 1000)
+    const titles = (): string[] => notifierMocks.sendAlert.mock.calls.map(([payload]) => (payload as { title?: string }).title ?? '')
+    expect(titles()).not.toContain('Task continuation progress cannot be verified')
+
+    await vi.advanceTimersByTimeAsync(2 * 60 * 1000)
+    await vi.advanceTimersByTimeAsync(2 * 60 * 1000)
+    expect(titles().filter((title) => title === 'Task continuation progress cannot be verified')).toHaveLength(1)
+  })
+})
+
+describe('Outbox が読めない状態も本当の配送失敗として 3 cycle で CRITICAL', () => {
+  it('hasPending() が毎回 throw しても、汎用 catch に吸われず CRITICAL を1回出す', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockImplementation(async (url: string | URL | Request) => (
+      String(url).includes('/api/task-continuations/reconcile')
+        ? new Response(JSON.stringify({ accepted: true, continuations: [] }), { status: 202 })
+        : new Response(JSON.stringify([]), { status: 200 })
+    ))
+    outboxMocks.hasPending.mockImplementation(() => { throw new Error('SQLITE_BUSY: database is locked') })
+    outboxMocks.resendPending.mockRejectedValue(new Error('SQLITE_BUSY: database is locked'))
+
+    void pollJobs()
+    await flushPollCycle()
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST * 4)
+
+    const blocked = notifierMocks.sendAlert.mock.calls
+      .filter(([payload]) => (payload as { title?: string }).title === 'Worker Outbox resend is blocked')
+    expect(blocked).toHaveLength(1)
+  })
+})
+
+describe('round 4: poll cycle の待ちに期限・停滞 episode ごとの通知', () => {
+  it('queued Job の取得（GET）にも AbortSignal の期限が付く', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockImplementation(async (url: string | URL | Request) => (
+      String(url).includes('/api/task-continuations/reconcile')
+        ? new Response(JSON.stringify({ accepted: true, continuations: [] }), { status: 202 })
+        : new Response(JSON.stringify([]), { status: 200 })
+    ))
+    outboxMocks.hasPending.mockReturnValue(false)
+
+    void pollJobs()
+    await flushPollCycle()
+
+    const gets = fetchMock.mock.calls.filter(([, init]) => (init as RequestInit | undefined)?.method === undefined)
+    expect(gets.length).toBeGreaterThan(0)
+    for (const [, init] of gets) expect((init as RequestInit).signal).toBeInstanceOf(AbortSignal)
+  })
+
+  it('同じ continuation が前進して閾値を下回った後に再び停滞したら、もう1回通知する', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', fetchMock)
+    let stuckForMs = 11 * 60 * 1000
+    fetchMock.mockImplementation(async (url: string | URL | Request) => (
+      String(url).includes('/api/task-continuations/reconcile')
+        ? new Response(JSON.stringify({ accepted: true, continuations: [{ continuationId: 'c1', stuckForMs }] }), { status: 202 })
+        : new Response(JSON.stringify([]), { status: 200 })
+    ))
+    outboxMocks.hasPending.mockReturnValue(false)
+    const stalledAlerts = (): number => notifierMocks.sendAlert.mock.calls
+      .filter(([payload]) => (payload as { title?: string }).title === 'Task continuation has made no verified progress').length
+
+    void pollJobs()
+    await flushPollCycle()
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST * 2)
+    expect(stalledAlerts()).toBe(1)
+
+    stuckForMs = 0
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST * 2)
+    stuckForMs = 12 * 60 * 1000
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST * 2)
+    expect(stalledAlerts()).toBe(2)
   })
 })

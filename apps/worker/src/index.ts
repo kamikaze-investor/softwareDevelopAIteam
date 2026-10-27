@@ -48,11 +48,30 @@ import { buildApiAuthHeaders } from './utils/apiAuth.js'
 import { startWatchdog } from './watchdog/watchdog.js'
 import { sendAlert } from './notifier/notifier.js'
 import * as outboxStore from './outbox/outboxStore.js'
+import {
+  continuationsToAlert,
+  initialOutboxAlertState,
+  initialReportOutageState,
+  nextReportOutageState,
+  isContinuationPendingResponse,
+  nextOutboxAlertState,
+  parseContinuationProgressReports,
+  type ContinuationProgressReport,
+} from './outbox/outboxDeliveryAlert.js'
 
 const API_BASE = process.env.API_BASE_URL ?? 'http://localhost:3000'
 const POLL_INTERVAL_MS = readPollInterval()
 const PATCH_TIMEOUT_MS = 5_000
 const PATCH_BACKOFF_MS = [500, 1_000] as const
+/**
+ * poll cycle が待つ API 呼び出し（reconcile・queued Job の取得・abort cleanup の報告）の期限。
+ *
+ * **期限が無いと、応答が返らない API 1回で poll loop 全体が止まる**: Outbox の再送も、本当の配送失敗の
+ * 3 cycle CRITICAL も、continuation の backstop も実行されなくなる（終了保証監査 2026-10-16 の推奨・
+ * 独立レビュー指摘）。どの呼び出しも即答する種類なので PATCH と同じ期限で足りる。期限切れは各呼び出しの
+ * 既存の失敗扱い（warn・null・retryable）に入り、次の cycle で再び呼ばれる。
+ */
+const POLL_REQUEST_TIMEOUT_MS = PATCH_TIMEOUT_MS
 const TECHNICAL_PERSISTENCE_FAILURE =
   'Job status persistence failed after bounded retries due to a technical communication failure.'
 
@@ -518,6 +537,11 @@ export interface PatchJobResult {
    * 応答が失われた場合とは違い、Job は API 側で queued のまま確定している。
    */
   refusedCode?: typeof JOB_CLAIM_REFUSED_CODE
+  /**
+   * retry の**すべての試行**が「受理済み・continuation pending」の 503 だった（`isContinuationPendingResponse`）。
+   * event は Outbox に保持されたまま再送される。滞留通知の閾値を分けるためだけに使う。
+   */
+  continuationPending?: boolean
 }
 
 /**
@@ -541,8 +565,14 @@ export async function patchJobWithRetry(
   const sleepImpl = options.sleepImpl ?? sleep
   const backoffMs = options.backoffMs ?? PATCH_BACKOFF_MS
   const requestBody = JSON.stringify(payload)
+  const sentEventId = (payload as { eventId?: unknown }).eventId
+  // **すべての試行**が continuation pending の 503 だったときだけ continuationPending とする。1回でも別の失敗
+  // （network・timeout・別の非 2xx・形の合わない 503）が混じれば本当の失敗（独立レビュー指摘: 最後の試行だけで
+  // 分類すると、本当の失敗の後に一致する 503 が続くたびに 3 cycle の CRITICAL が 10 分まで遅れた）。
+  let everyAttemptContinuationPending = true
 
   for (let attempt = 0; attempt < 3; attempt += 1) {
+    let attemptContinuationPending = false
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? PATCH_TIMEOUT_MS)
     try {
@@ -581,18 +611,34 @@ export async function patchJobWithRetry(
         }
         if (code === JOB_CLAIM_REFUSED_CODE) return { ok: false, refusedCode: JOB_CLAIM_REFUSED_CODE }
       }
+      // continuation pending の 503 は従来どおり retry する（挙動は変えない）。分類だけを残す。
+      if (response.status === 503) {
+        let body: unknown
+        try {
+          body = await response.json()
+        } catch {
+          body = undefined
+        }
+        attemptContinuationPending = isContinuationPendingResponse(
+          503,
+          body,
+          typeof sentEventId === 'string' ? sentEventId : undefined,
+          jobId,
+        )
+      }
     } catch {
       // A network error and an AbortController timeout are both retryable here.
     } finally {
       clearTimeout(timeout)
     }
+    if (!attemptContinuationPending) everyAttemptContinuationPending = false
 
     if (attempt < 2) {
       await sleepImpl(backoffMs[attempt])
     }
   }
 
-  return { ok: false }
+  return everyAttemptContinuationPending ? { ok: false, continuationPending: true } : { ok: false }
 }
 
 /** 既存のテストダブルが素の boolean を返すのを壊さないため、両方を受け付ける。 */
@@ -799,6 +845,7 @@ async function reconcileAfterPatchFailure(
 async function fetchJson<T>(path: string): Promise<T | null> {
   const res = await fetch(`${API_BASE}${path}`, {
     headers: buildApiAuthHeaders(),
+    signal: AbortSignal.timeout(POLL_REQUEST_TIMEOUT_MS),
   })
 
   if (!res.ok) return null
@@ -1038,17 +1085,29 @@ async function confirmRunningTransition(
  * （待つと Outbox 再送と queued Job 取得へ到達できなくなる）。
  * 回収件数のログは API 側が出す。ここでは retry も gate 判定もしない。
  */
-export async function reconcileTaskContinuations(): Promise<void> {
+/**
+ * Task continuation の reconcile を起動し、API が返す「前進が無い時間」の報告を返す。
+ * 報告が無い・形が崩れている・失敗した場合は undefined（Outbox 側の backstop に任せる）。
+ */
+export async function reconcileTaskContinuations(): Promise<ContinuationProgressReport[] | undefined> {
   try {
     const response = await fetch(`${API_BASE}/api/task-continuations/reconcile`, {
       method: 'POST',
       headers: buildApiAuthHeaders(),
+      signal: AbortSignal.timeout(POLL_REQUEST_TIMEOUT_MS),
     })
     if (!response.ok) {
       console.warn(`[Worker] task continuation reconcile failed: HTTP ${response.status}`)
+      return undefined
+    }
+    try {
+      return parseContinuationProgressReports(await response.json())
+    } catch {
+      return undefined
     }
   } catch (err: unknown) {
     console.warn(`[Worker] task continuation reconcile error: ${formatUnknownError(err)}`)
+    return undefined
   }
 }
 
@@ -1057,6 +1116,7 @@ export async function reconcileSupervisedRuns(): Promise<void> {
     const response = await fetch(`${API_BASE}/api/supervised-runs/reconcile`, {
       method: 'POST',
       headers: buildApiAuthHeaders(),
+      signal: AbortSignal.timeout(POLL_REQUEST_TIMEOUT_MS),
     })
     if (!response.ok) {
       console.warn(`[Worker] supervised run reconcile failed: HTTP ${response.status}`)
@@ -1069,8 +1129,12 @@ export async function reconcileSupervisedRuns(): Promise<void> {
 export async function pollJobs(): Promise<never> {
   // pendingが連続して残ったpoll cycle数。起動直後もこの1ループに合流するため、
   // startup専用の別ループは持たない（start()は本関数を即座に呼ぶだけ）。
-  let pendingOutboxStreak = 0
-  let pendingOutboxAlertSent = false
+  // 滞留通知の判定は `outbox/outboxDeliveryAlert.ts` の純粋関数に置く（continuation pending の 503 は想定内）。
+  let outboxAlert = initialOutboxAlertState()
+  // API の報告に基づく continuation の backstop で通知済みの continuation（1件につき1回）。
+  const alertedContinuations = new Set<string>()
+  // continuation の報告が取れない状態の継続（取れない間は上の backstop が働かないので、それ自体を通知する）。
+  let reportOutage = initialReportOutageState()
 
   while (true) {
     try {
@@ -1091,32 +1155,91 @@ export async function pollJobs(): Promise<never> {
       // else 側に置くと、Outbox に配送できない event が1件でも残っている間 continuation が
       // 一切進まなくなる。Job intake を止める理由（workspace 競合）は continuation 回収には
       // 当てはまらない（実際に次 Job を作るかどうかは API 側の既存 gate が決める）。
-      await reconcileTaskContinuations()
+      const reconcileStartedAtMs = Date.now()
+      const continuationReports = await reconcileTaskContinuations()
+      const outage = nextReportOutageState(reportOutage, continuationReports !== undefined, {
+        cycleStartedAtMs: reconcileStartedAtMs,
+        nowMs: Date.now(),
+      })
+      reportOutage = outage.state
+      if (outage.shouldAlert) await notifyContinuationReportUnavailable()
+      // **独立した backstop**（CEO 決定 2026-10-27）。診断と復旧の一次の担い手は API / PL で、前進が無いまま
+      // 5 分を超えると `continuation_pending` として扱う。ここは PL loop・escalation の配達・Outbox の滞留に
+      // 依存せず、API が永続化済みの記録から計算した「前進が無い時間」だけを見る。重複通知は許容する。
+      for (const continuationId of continuationsToAlert(continuationReports, alertedContinuations)) {
+        alertedContinuations.add(continuationId)
+        await notifyContinuationStalled(continuationId)
+      }
+      if (continuationReports !== undefined) {
+        // 通知済みの印は**停滞の episode ごと**に持つ。報告から消えた（settle した）continuation と、
+        // 前進が戻って閾値を下回った continuation は忘れる。同じ continuation が再び停滞したら、また1回鳴る
+        // （独立レビュー指摘）。集合も有界に保たれる。
+        const stillStalled = new Set(continuationReports
+          .filter((report) => continuationsToAlert([report], new Set()).length > 0)
+          .map((report) => report.continuationId))
+        for (const continuationId of alertedContinuations) {
+          if (!stillStalled.has(continuationId)) alertedContinuations.delete(continuationId)
+        }
+      }
 
-      if (outboxStore.hasPending()) {
+      // **Outbox が読めないことも本当の配送失敗として扱う（fail-closed）。** 読めない（SQLite の lock・破損・I/O）
+      // まま下の汎用 catch へ抜けると、滞留の判定が一度も進まず CRITICAL が永久に出ない（独立レビュー指摘）。
+      // 読めない間は「pending が残っている」とみなして queued Job を取らない（従来も例外でこの cycle を飛ばしていた）。
+      let outboxReadFailed = false
+      const outboxHasPending = (): boolean => {
+        try {
+          return outboxStore.hasPending()
+        } catch (err: unknown) {
+          outboxReadFailed = true
+          console.error(`[Worker] Outbox読み取りエラー: ${formatUnknownError(err)}。配送できていないものとして扱います`)
+          return true
+        }
+      }
+
+      if (outboxHasPending()) {
         console.warn('[Worker] Pending Outbox events remain; skipping queued Job fetch for this poll cycle.')
         // 稼働中も未送信結果を再送する。新しいscheduler/watchdog/retry frameworkは追加せず、
         // 既存のpoll cycleに相乗りする。
         // 1 pollにつき1 resend batch。失敗時はpendingを保持し、tight loopせず次pollで再試行する。
+        // この cycle の再送がすべて「受理済み・continuation pending」の 503 だったかを数える。
+        // 1件も再送しなかった・例外になった・別の失敗が混じった場合は本当の失敗として扱う。
+        let resendCount = 0
+        let onlyContinuationPending = true
+        const cycleStartedAtMs = Date.now()
         try {
-          await outboxStore.resendPending(async (jobId, payload) => (await patchJobWithRetry(jobId, payload)).ok)
+          await outboxStore.resendPending(async (jobId, payload) => {
+            const result = await patchJobWithRetry(jobId, payload)
+            resendCount += 1
+            if (!result.ok && result.continuationPending !== true) onlyContinuationPending = false
+            return result.ok
+          })
         } catch (err: unknown) {
+          onlyContinuationPending = false
           console.error(`[Worker] Outbox再送エラー: ${formatUnknownError(err)}。次のpollで再試行します`)
         }
 
-        if (outboxStore.hasPending()) {
-          pendingOutboxStreak += 1
-          if (pendingOutboxStreak >= 3 && !pendingOutboxAlertSent) {
-            pendingOutboxAlertSent = true
-            await notifyOutboxDeliveryBlocked()
+        const pendingRemains = outboxHasPending()
+        // 10 分の時計の durable な下限。pending が残るのに読めない（例外・不正な時刻・未来の時刻）なら、再起動で時計が戻りうるので
+        // 想定内の待ちとは扱わず本当の失敗として 3 cycle で数える（fail closed。独立レビュー指摘）。
+        let durableEpisodeStartedAtMs: number | undefined
+        if (pendingRemains) {
+          try {
+            durableEpisodeStartedAtMs = outboxStore.oldestPendingCreatedAtMs()
+          } catch {
+            durableEpisodeStartedAtMs = undefined
           }
-        } else {
-          pendingOutboxStreak = 0
-          pendingOutboxAlertSent = false
         }
+        // 未来の時刻（壁時計の巻き戻し後）は経過 0 にしかならず時計の下限にならないので、読めないものと同じに扱う。
+        const durableClockAvailable = !pendingRemains
+          || (durableEpisodeStartedAtMs !== undefined && durableEpisodeStartedAtMs <= Date.now())
+        const alertDecision = nextOutboxAlertState(outboxAlert, {
+          pendingRemains,
+          onlyContinuationPending: !outboxReadFailed && durableClockAvailable && resendCount > 0 && onlyContinuationPending,
+        }, { cycleStartedAtMs, nowMs: Date.now(), durableEpisodeStartedAtMs })
+        outboxAlert = alertDecision.state
+        if (alertDecision.shouldAlert) await notifyOutboxDeliveryBlocked()
       } else {
-        pendingOutboxStreak = 0
-        pendingOutboxAlertSent = false
+        outboxAlert = initialOutboxAlertState()
         // **abort_task の cleanup 要求を先に処理する。**
         // 対象 Job は所有権を保持しているので、どのみち `fetchQueuedJob()` は何も返さない。
         // 先に観測を報告して所有権を解放できるようにしておく。
@@ -1272,6 +1395,7 @@ async function submitAbortCleanupResult(jobId: string, body: string): Promise<Ab
         method: 'POST',
         headers: { ...buildApiAuthHeaders(), 'Content-Type': 'application/json' },
         body,
+        signal: AbortSignal.timeout(POLL_REQUEST_TIMEOUT_MS),
       },
     )
   } catch (err: unknown) {
@@ -1613,6 +1737,7 @@ async function reportAbortCleanupRefusal(
       // 拒否もどの generation のものかを名指す。API は carrier の現在の marker と一致しない（遅れて届いた
       // 古い generation の）拒否を GENERATION_MISMATCH で捨て、新しい generation を退役させない。
       body: JSON.stringify({ refusalCode, cleanupGeneration: technicalCleanupGenerationOf(carrier) }),
+      signal: AbortSignal.timeout(POLL_REQUEST_TIMEOUT_MS),
     })
   } catch (err: unknown) {
     // refusal の delivery 失敗は黙らせない。request marker は残るので次 poll でも再試行される。
@@ -1633,6 +1758,44 @@ async function notifyOutboxDeliveryBlocked(): Promise<void> {
       body: 'Pending Worker Outbox events could not be delivered after repeated retry cycles. New Job intake is paused until delivery succeeds; Worker startup and the watchdog are unaffected.',
       sourceType: 'job_persistence',
       sourceId: 'worker_outbox',
+    })
+  } catch (err: unknown) {
+    console.error(`[Worker] CRITICAL通知エラー: ${formatUnknownError(err)}`)
+  }
+}
+
+/**
+ * continuation が検証された前進なしに停滞していることの独立した通知（backstop）。
+ * API / PL の診断が届いていない・働いていない場合に、本当の停滞を無音にしないためのもの。
+ */
+async function notifyContinuationStalled(continuationId: string): Promise<void> {
+  try {
+    await sendAlert({
+      severity: 'critical',
+      title: 'Task continuation has made no verified progress',
+      body: 'A pending task continuation has shown no verified Design Review or Job progress for at least 10 minutes. '
+        + 'The PL diagnosis may not have run or may not have reached anyone; check the continuation_pending attention.',
+      sourceType: 'task_continuation',
+      sourceId: continuationId,
+    })
+  } catch (err: unknown) {
+    console.error(`[Worker] CRITICAL通知エラー: ${formatUnknownError(err)}`)
+  }
+}
+
+/**
+ * continuation の「前進なし」報告が 10 分以上取れていないことの通知。報告が取れない間は continuation の
+ * backstop が働かないので、PL も働いていなければ本当の停滞が無音になる。それを防ぐための通知。
+ */
+async function notifyContinuationReportUnavailable(): Promise<void> {
+  try {
+    await sendAlert({
+      severity: 'critical',
+      title: 'Task continuation progress cannot be verified',
+      body: 'The Worker has not received a usable continuation progress report from the API for at least 10 minutes. '
+        + 'A stalled continuation may go unnoticed until reports resume.',
+      sourceType: 'task_continuation',
+      sourceId: 'continuation_progress_report',
     })
   } catch (err: unknown) {
     console.error(`[Worker] CRITICAL通知エラー: ${formatUnknownError(err)}`)

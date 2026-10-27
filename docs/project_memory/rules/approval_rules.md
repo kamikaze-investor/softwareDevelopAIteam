@@ -634,6 +634,47 @@ Meta Review が「コードが本節どおりか」を照合するための索�
 | 9 章 | L09-1・L11-3・L09-2・L10-1・L10-2・L12-2・L13-3・L11-4・L11-6・L04-2 | 承認決定 route、storage `approveAndResumeJob()`（期限が読めなければ状態を変えず `EXPIRED`）、`consumeForJob()` ほか |
 | 対象外 | L03・L05・L08・L11-7 | — |
 
+## Worker Outbox 滞留の CRITICAL 通知時期 — continuation pending の 503（2026-10-27 CEO 決定）
+
+**検知の速さと誤報の量の trade-off を CEO が決めたもの。** 対象は下の1つの event の類だけであり、
+他の CRITICAL 通知の条件・時期・受信者は変えない。
+
+**対象の event の類**: Worker の `PATCH /api/jobs/:id` 再送に対する 503 のうち、本文が API の continuation pending
+応答の形（`apps/api/src/routes/jobs.ts` の continuation pending 分岐: Job 本体に `outbox: { eventId, deduplicated }`）で、
+`outbox.eventId` が**送った event の eventId と一致し**、`id` が**送り先の Job id と一致し**、`outbox.deduplicated` が
+boolean のもの。以下「確認済みの continuation pending 503」。1つでも欠ける 503 は対象外（本当の失敗）。
+1回の再送の retry の**すべての試行**がこれに当たる場合だけ、その再送を continuation pending と数える。
+
+**時期**:
+1. 本当の配送失敗（API 不達・認証失敗・確認済みの continuation pending 503 以外の非 2xx（eventId の無い 503 を含む）・
+   再送の例外・再送が1件も行われなかった cycle）が、その滞留の中で1回でもあれば、従来どおり滞留の
+   **3 cycle** で CRITICAL を上げる（滞留の途中で起きた場合も、その滞留の始まりから数える）
+2. 確認済みの continuation pending 503 は、次の操作が pending であることだけを理由に、直ちに配送失敗として扱わない
+3. 前進の検証と一次の対処は API / PL が担う: 検証された前進（次 Task の Design Review / Job の実際の遷移）が
+   約 **5 分**無い continuation を診断し、合法的な自律復旧を試みる
+4. 独立した Worker の backstop: 確認済みの continuation pending 503 だけが続く滞留が、壁時計で
+   **10 分**（滞留した最初の cycle の開始から正の差分だけを積み上げた時間と、滞留中の最古の Outbox event を
+   durable に記録した時刻からの時間の、大きいほう。Worker の再起動では戻らない。durable な記録時刻が読めない（未来の時刻を含む）間は、想定内の待ちとは扱わず本当の失敗として 1. の 3 cycle で数える。判定は再送 batch の後なので、
+   上限は 10 分 + 最後の batch 1回分）に達したら CRITICAL を上げる。API が「検証された前進が無い」と報告する時間が
+   10 分に達した continuation と、その報告そのものが 10 分取れない状態にも、それぞれ1回 CRITICAL を上げる
+5. 既にある、より早い通知の条件に当たる重大な失敗を、10 分まで意図して遅らせない
+
+**変えないもの**: event は捨てない（Outbox の保持・再送・Job intake の停止は変えない）。retry は有界のまま、
+判定できないものは本当の失敗として扱う（fail closed）。Approval の束縛と効果、既存の Safety boundary は変えない。
+
+**既知の制約**: 「報告が取れない」状態の 10 分は Worker の memory だけで数えるため、Worker の再起動で数え直す
+（3 cycle の数え方と同じ性質。continuation ごとの報告の時間は API が永続化済みの記録から計算するので戻らない）。
+
+**backstop の扱い**: Worker の backstop は API / PL と重複して通知してよい。PL の健全性監視が入っても自動では
+外さない。外すには、同等以上の検知が稼働し独立に検証された証拠と、CEO の判断が要る。
+
+**この決定が許さないもの**: 上の類以外の CRITICAL の遅延・削除、独立した失敗検知の削除、時間の延長
+（10 分・5 分・3 cycle の変更は CEO の判断）。
+
+code: `apps/worker/src/outbox/outboxDeliveryAlert.ts`（`OUTBOX_BLOCKED_ALERT_CYCLES`・
+`OUTBOX_CONTINUATION_PENDING_ALERT_MS`・`isContinuationPendingResponse`・`continuationsToAlert`・
+`nextReportOutageState`）、`apps/worker/src/index.ts`（Outbox 再送と reconcile の報告の読み取り）。
+
 ## Review finding の扱い — PL が統合判断してよい範囲（2026-09-15 CEO 指示）
 
 **「Reviewer が言ったから必ず変更する」ではない。** PL は事実・根拠・Design Philosophy との整合性を

@@ -181,6 +181,9 @@ const ACTIONABLE_ATTENTION_KINDS: readonly AttentionItem['kind'][] = [
   'job_blocked',
   'design_review_idle',
   'design_review_failed',
+  // 次 Task の初回 workflow が**検証された前進なしに**停滞している continuation（`stuckForMs` は
+  // `evaluateContinuationProgress()` の「前進が無い時間」）。**通知だけ**する（下の NOTIFY_ONLY 参照）。
+  'continuation_pending',
   // executor はまだ無い。PL は Diagnose して操作を提案するが、復旧操作（resume / retry）は
   // workspace を書き換えるため Gate の根拠が要り、そこで止まる。技術的な試行上限は自動実行を
   // bounded に止めるが、それだけを理由に CEO decision へ変換しない。
@@ -211,6 +214,9 @@ const ATTENTION_PRIORITY: readonly AttentionItem['kind'][] = [
   'job_blocked',
   'design_review_idle',
   'design_review_failed',
+  // continuation の停滞は、同じ Task の design_review_idle（同一 run の rekick）/ design_review_failed の
+  // 既存の復旧より**後**に見る。既存の復旧が動いている間は、その復旧が先に扱う。
+  'continuation_pending',
   // executor はまだ無い。PL は Diagnose して操作を提案するが、復旧操作（resume / retry）は
   // workspace を書き換えるため Gate の根拠が要り、そこで止まる。試行上限に達すると CEO へ Escalation
   // される。**それが今の正しい振る舞い**である（止まったことを人へ確実に伝える）。
@@ -423,6 +429,10 @@ const NOTIFY_ONLY_ATTENTION_KINDS: readonly AttentionItem['kind'][] = [
   'workspace_held_by_stalled_owner',
   // claim されない queued Job。PL には Worker の再起動も所有権の観測もできない。
   'job_queued_long',
+  // 検証された前進なしに停滞した continuation。PL に新しい復旧操作は与えない（再起動・再試行・状態の
+  // 書き換えをしない）。前進の事実（canonical review・settlement・依存）を載せた通知を1回だけ届ける。
+  // 同一 run の rekick・失敗 run の復旧は既存の design_review_idle / design_review_failed が先に扱う。
+  'continuation_pending',
 ]
 
 /**
@@ -451,7 +461,9 @@ function targetKeyOf(item: AttentionItem): string {
  * 他の種類は従来どおり即座に対象とする（停滞の定義がすでに種類側に入っているため）。
  */
 function hasStalledLongEnough(item: AttentionItem): boolean {
-  if (item.kind !== 'task_ready_without_job') return true
+  // continuation_pending の stuckForMs は「検証された前進が無い時間」（前進中・pause 中は 0）。
+  // 同じ既存の停滞閾値（5分）を使い、新しい閾値の概念を増やさない。
+  if (item.kind !== 'task_ready_without_job' && item.kind !== 'continuation_pending') return true
   return (item.stuckForMs ?? 0) >= READY_TASK_STALL_THRESHOLD_MS
 }
 
