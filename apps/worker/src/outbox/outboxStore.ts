@@ -86,6 +86,14 @@ export async function resendPending(
   }
 }
 
+/** 最古の pending event を記録した時刻（ms）。無い・読めない形なら undefined。 */
+export function oldestPendingCreatedAtMs(): number | undefined {
+  const row = getDb().prepare('SELECT MIN(created_at) AS oldest FROM pending_outbox_events').get() as { oldest: string | null } | undefined
+  if (row?.oldest == null) return undefined
+  const ms = Date.parse(row.oldest)
+  return Number.isFinite(ms) ? ms : undefined
+}
+
 export function hasPending(): boolean {
   const row = getDb().prepare('SELECT 1 FROM pending_outbox_events LIMIT 1').get()
   return row !== undefined

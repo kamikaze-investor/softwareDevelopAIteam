@@ -77,6 +77,12 @@ export interface OutboxResendCycle {
 export interface OutboxCycleTiming {
   cycleStartedAtMs: number
   nowMs: number
+  /**
+   * 滞留している最古の Outbox event を記録した時刻（ms。durable な Outbox の `created_at`）。
+   * Worker の再起動で失われる in-memory の経過時間の下限として使う（独立レビュー指摘: 再起動のたびに
+   * 10 分の時計が戻り、通知が無期限に遅れうる）。読めない・未来の時刻なら使わない。
+   */
+  durableEpisodeStartedAtMs?: number
 }
 
 export function nextOutboxAlertState(
@@ -88,9 +94,14 @@ export function nextOutboxAlertState(
 
   // 滞留の最初の cycle は batch の開始から数える。以後は前回の判定時刻から。
   const previousMs = state.lastEvaluatedAtMs ?? timing.cycleStartedAtMs
+  const accumulatedMs = state.elapsedMs + Math.max(0, timing.nowMs - previousMs)
+  // durable な記録時刻からの経過は再起動で戻らない。大きいほうを取る（通知を早めるだけで、遅らせない）。
+  const durableMs = timing.durableEpisodeStartedAtMs !== undefined && Number.isFinite(timing.durableEpisodeStartedAtMs)
+    ? Math.max(0, timing.nowMs - timing.durableEpisodeStartedAtMs)
+    : 0
   const next: OutboxAlertState = {
     streak: state.streak + 1,
-    elapsedMs: state.elapsedMs + Math.max(0, timing.nowMs - previousMs),
+    elapsedMs: Math.max(accumulatedMs, durableMs),
     lastEvaluatedAtMs: timing.nowMs,
     sawGenuineFailure: state.sawGenuineFailure || !cycle.onlyContinuationPending,
     alertSent: state.alertSent,
@@ -105,14 +116,25 @@ export function nextOutboxAlertState(
 /**
  * `PATCH /api/jobs/:id` の 503 が「受理済み・continuation pending」か。
  *
- * API はこの場合だけ、永続化した Job に `outbox: { eventId }` を付けて 503 を返す
- * （`apps/api/src/routes/jobs.ts` の continuation pending 分岐）。**送った eventId と一致する**ことを
- * 要求するので、proxy や障害が返す 503 は該当しない（本当の失敗として扱われる）。
+ * API はこの場合だけ、永続化した Job に `outbox: { eventId, deduplicated }` を付けて 503 を返す
+ * （`apps/api/src/routes/jobs.ts` の continuation pending 分岐。本文は Job そのもの）。次の**すべて**を要求する:
+ * - **送った eventId と一致する** `outbox.eventId`
+ * - **送った先の Job id と一致する** `id`（request 本文には Job id が無いので、本文を写し返す層では作れない）
+ * - boolean の `outbox.deduplicated`（API の Outbox 応答の形）
+ * 1つでも欠ければ proxy や障害の 503 として、本当の失敗として扱う（fail closed）。
  */
-export function isContinuationPendingResponse(status: number, body: unknown, sentEventId: string | undefined): boolean {
+export function isContinuationPendingResponse(
+  status: number,
+  body: unknown,
+  sentEventId: string | undefined,
+  jobId: string,
+): boolean {
   if (status !== 503 || sentEventId === undefined) return false
-  const outbox = (body as { outbox?: { eventId?: unknown } } | null | undefined)?.outbox
-  return typeof outbox?.eventId === 'string' && outbox.eventId === sentEventId
+  const job = body as { id?: unknown; outbox?: { eventId?: unknown; deduplicated?: unknown } } | null | undefined
+  return job?.id === jobId
+    && typeof job.outbox?.eventId === 'string'
+    && job.outbox.eventId === sentEventId
+    && typeof job.outbox.deduplicated === 'boolean'
 }
 
 /**

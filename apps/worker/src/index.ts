@@ -566,10 +566,13 @@ export async function patchJobWithRetry(
   const backoffMs = options.backoffMs ?? PATCH_BACKOFF_MS
   const requestBody = JSON.stringify(payload)
   const sentEventId = (payload as { eventId?: unknown }).eventId
-  let lastContinuationPending = false
+  // **すべての試行**が continuation pending の 503 だったときだけ continuationPending とする。1回でも別の失敗
+  // （network・timeout・別の非 2xx・形の合わない 503）が混じれば本当の失敗（独立レビュー指摘: 最後の試行だけで
+  // 分類すると、本当の失敗の後に一致する 503 が続くたびに 3 cycle の CRITICAL が 10 分まで遅れた）。
+  let everyAttemptContinuationPending = true
 
   for (let attempt = 0; attempt < 3; attempt += 1) {
-    lastContinuationPending = false
+    let attemptContinuationPending = false
     const controller = new AbortController()
     const timeout = setTimeout(() => controller.abort(), options.timeoutMs ?? PATCH_TIMEOUT_MS)
     try {
@@ -616,10 +619,11 @@ export async function patchJobWithRetry(
         } catch {
           body = undefined
         }
-        lastContinuationPending = isContinuationPendingResponse(
+        attemptContinuationPending = isContinuationPendingResponse(
           503,
           body,
           typeof sentEventId === 'string' ? sentEventId : undefined,
+          jobId,
         )
       }
     } catch {
@@ -627,13 +631,14 @@ export async function patchJobWithRetry(
     } finally {
       clearTimeout(timeout)
     }
+    if (!attemptContinuationPending) everyAttemptContinuationPending = false
 
     if (attempt < 2) {
       await sleepImpl(backoffMs[attempt])
     }
   }
 
-  return lastContinuationPending ? { ok: false, continuationPending: true } : { ok: false }
+  return everyAttemptContinuationPending ? { ok: false, continuationPending: true } : { ok: false }
 }
 
 /** 既存のテストダブルが素の boolean を返すのを壊さないため、両方を受け付ける。 */
@@ -1214,10 +1219,16 @@ export async function pollJobs(): Promise<never> {
         }
 
         const pendingRemains = outboxHasPending()
+        let durableEpisodeStartedAtMs: number | undefined
+        try {
+          durableEpisodeStartedAtMs = pendingRemains ? outboxStore.oldestPendingCreatedAtMs() : undefined
+        } catch {
+          durableEpisodeStartedAtMs = undefined // 読めなければ in-memory の経過時間だけで判定する
+        }
         const alertDecision = nextOutboxAlertState(outboxAlert, {
           pendingRemains,
           onlyContinuationPending: !outboxReadFailed && resendCount > 0 && onlyContinuationPending,
-        }, { cycleStartedAtMs, nowMs: Date.now() })
+        }, { cycleStartedAtMs, nowMs: Date.now(), durableEpisodeStartedAtMs })
         outboxAlert = alertDecision.state
         if (alertDecision.shouldAlert) await notifyOutboxDeliveryBlocked()
       } else {

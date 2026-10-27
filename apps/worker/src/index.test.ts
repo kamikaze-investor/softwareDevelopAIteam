@@ -9,6 +9,7 @@ const outboxMocks = vi.hoisted(() => ({
   resendPending: vi.fn(),
   hasPending: vi.fn(),
   hasPendingFor: vi.fn(),
+  oldestPendingCreatedAtMs: vi.fn(),
 }))
 
 const jobStateMocks = vi.hoisted(() => ({
@@ -115,6 +116,7 @@ beforeEach(() => {
   fetchMock.mockReset()
   outboxMocks.recordPending.mockReset()
   outboxMocks.deletePending.mockReset()
+  outboxMocks.oldestPendingCreatedAtMs.mockReset()
   outboxMocks.resendPending.mockReset()
   outboxMocks.hasPending.mockReset()
   outboxMocks.hasPendingFor.mockReset()
@@ -1755,6 +1757,35 @@ describe('Outbox 滞留通知 — continuation pending の 503 は想定内（ou
     expect(fetchMock).toHaveBeenCalledTimes(3)
   })
 
+  it('試行の1回でも本当の失敗（network・一般の 503・401）が混じれば、後が continuation pending でも continuationPending にしない', async () => {
+    const firstAttempts: Array<() => Promise<Response>> = [
+      async () => { throw new Error('ECONNREFUSED') },
+      async () => new Response(JSON.stringify({ error: 'Service Unavailable' }), { status: 503 }),
+      async () => new Response('', { status: 401 }),
+    ]
+    for (const first of firstAttempts) {
+      fetchMock.mockReset()
+      fetchMock
+        .mockImplementationOnce(first)
+        .mockImplementation(async () => continuation503('e1'))
+
+      const result = await retryingPatchJob()('job-1', { status: 'success', eventId: 'e1', payloadHash: 'h' } as never)
+
+      expect(result).toEqual({ ok: false })
+    }
+  })
+
+  it('eventId が一致しても別の Job id の 503 は continuationPending にしない', async () => {
+    fetchMock.mockImplementation(async () => new Response(
+      JSON.stringify({ id: 'job-other', status: 'success', outbox: { eventId: 'e1', deduplicated: false } }),
+      { status: 503 },
+    ))
+
+    const result = await retryingPatchJob()('job-1', { status: 'success', eventId: 'e1', payloadHash: 'h' } as never)
+
+    expect(result).toEqual({ ok: false })
+  })
+
   it('eventId を伴わない 503（proxy・障害）は continuationPending にしない', async () => {
     fetchMock.mockImplementation(async () => new Response(JSON.stringify({ error: 'Service Unavailable' }), { status: 503 }))
 
@@ -1782,6 +1813,26 @@ describe('Outbox 滞留通知 — continuation pending の 503 は想定内（ou
     expect(notifierMocks.sendAlert).not.toHaveBeenCalled()
     // 従来の閾値（3 cycle）を十分に超えて滞留しても鳴らない（retry の backoff も fake timer を消費する）。
     expect(outboxMocks.resendPending.mock.calls.length).toBeGreaterThan(3)
+  })
+
+  it('Worker の再起動後でも、durable な Outbox の記録時刻から 10 分を超えていれば最初の cycle で CRITICAL（時計が戻らない）', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockImplementation(async (url: string | URL | Request) => (
+      String(url).includes('/api/jobs/job-1') ? continuation503('e1') : new Response(JSON.stringify([]), { status: 200 })
+    ))
+    outboxMocks.hasPending.mockReturnValue(true)
+    outboxMocks.oldestPendingCreatedAtMs.mockReturnValue(Date.now() - 11 * 60 * 1000)
+    outboxMocks.resendPending.mockImplementation(async (patchFn: (id: string, p: unknown) => Promise<boolean>) => {
+      await patchFn('job-1', { status: 'success', eventId: 'e1', payloadHash: 'h' })
+    })
+
+    void pollJobs()
+    await vi.advanceTimersByTimeAsync(2_000) // 1 cycle の PATCH retry の backoff（計 1.5 秒）だけ進める
+    await Promise.resolve()
+
+    expect(notifierMocks.sendAlert).toHaveBeenCalledTimes(1)
+    expect(notifierMocks.sendAlert).toHaveBeenCalledWith(expect.objectContaining({ severity: 'critical' }))
   })
 
   it('本当の配送失敗（eventId の無い 503）は従来どおり 3 cycle で CRITICAL', async () => {

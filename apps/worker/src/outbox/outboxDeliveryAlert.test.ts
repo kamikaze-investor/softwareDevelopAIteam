@@ -104,15 +104,15 @@ describe('nextOutboxAlertState', () => {
 
 describe('isContinuationPendingResponse', () => {
   it('送った eventId を返す 503 だけが continuation pending', () => {
-    expect(isContinuationPendingResponse(503, { id: 'j', outbox: { eventId: 'e1', deduplicated: false } }, 'e1')).toBe(true)
+    expect(isContinuationPendingResponse(503, { id: 'j', outbox: { eventId: 'e1', deduplicated: false } }, 'e1', 'j')).toBe(true)
   })
 
   it('別の eventId・eventId なし・503 以外・本文なし・送信 eventId なしは continuation pending ではない', () => {
-    expect(isContinuationPendingResponse(503, { outbox: { eventId: 'other' } }, 'e1')).toBe(false)
-    expect(isContinuationPendingResponse(503, { error: 'Service Unavailable' }, 'e1')).toBe(false)
-    expect(isContinuationPendingResponse(500, { outbox: { eventId: 'e1' } }, 'e1')).toBe(false)
-    expect(isContinuationPendingResponse(503, undefined, 'e1')).toBe(false)
-    expect(isContinuationPendingResponse(503, { outbox: { eventId: 'e1' } }, undefined)).toBe(false)
+    expect(isContinuationPendingResponse(503, { outbox: { eventId: 'other' } }, 'e1', 'j')).toBe(false)
+    expect(isContinuationPendingResponse(503, { error: 'Service Unavailable' }, 'e1', 'j')).toBe(false)
+    expect(isContinuationPendingResponse(500, { outbox: { eventId: 'e1' } }, 'e1', 'j')).toBe(false)
+    expect(isContinuationPendingResponse(503, undefined, 'e1', 'j')).toBe(false)
+    expect(isContinuationPendingResponse(503, { outbox: { eventId: 'e1' } }, undefined, 'j')).toBe(false)
   })
 })
 
@@ -163,5 +163,44 @@ describe('continuation の報告が取れない状態の継続', () => {
     step(true)
     for (let i = 0; i < 120; i += 1) step(false)
     expect(alerts).toBe(2)
+  })
+})
+
+describe('独立レビュー指摘への回帰（CEO 決定 2026-10-27 の範囲を超えない）', () => {
+  it('eventId が一致しても、Job id が違う・無い・deduplicated が無い 503 は continuation pending ではない（写し返しで作れない）', () => {
+    expect(isContinuationPendingResponse(503, { id: 'other', outbox: { eventId: 'e1', deduplicated: false } }, 'e1', 'j')).toBe(false)
+    expect(isContinuationPendingResponse(503, { outbox: { eventId: 'e1', deduplicated: false } }, 'e1', 'j')).toBe(false)
+    expect(isContinuationPendingResponse(503, { id: 'j', outbox: { eventId: 'e1' } }, 'e1', 'j')).toBe(false)
+    // request 本文（status・eventId・payloadHash）をそのまま写し返す層の 503
+    expect(isContinuationPendingResponse(503, { status: 'success', eventId: 'e1', payloadHash: 'h' }, 'e1', 'j')).toBe(false)
+  })
+
+  it('Worker の再起動で in-memory の経過時間が戻っても、durable な記録時刻から 10 分経っていれば最初の cycle で通知する', () => {
+    const nowMs = 5_000_000
+    const result = nextOutboxAlertState(
+      initialOutboxAlertState(),
+      { pendingRemains: true, onlyContinuationPending: true },
+      { cycleStartedAtMs: nowMs - 5_000, nowMs, durableEpisodeStartedAtMs: nowMs - OUTBOX_CONTINUATION_PENDING_ALERT_MS },
+    )
+    expect(result.shouldAlert).toBe(true)
+  })
+
+  it('durable な記録時刻が未来・数値でない場合は使わず、in-memory の経過時間だけで判定する（通知を遅らせる方向には使わない）', () => {
+    const nowMs = 5_000_000
+    for (const durableEpisodeStartedAtMs of [nowMs + 60_000, Number.NaN]) {
+      const result = nextOutboxAlertState(
+        initialOutboxAlertState(),
+        { pendingRemains: true, onlyContinuationPending: true },
+        { cycleStartedAtMs: nowMs - 5_000, nowMs, durableEpisodeStartedAtMs },
+      )
+      expect(result.shouldAlert).toBe(false)
+      expect(result.state.elapsedMs).toBe(5_000)
+    }
+  })
+
+  it('本当の失敗を含む滞留は、durable な記録時刻に関係なく 3 cycle で通知する（10 分まで遅らせない）', () => {
+    const genuine = { pendingRemains: true, onlyContinuationPending: false }
+    const { alerts } = run([genuine, genuine, genuine])
+    expect(alerts).toBe(1)
   })
 })
