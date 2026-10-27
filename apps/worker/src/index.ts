@@ -63,6 +63,15 @@ const API_BASE = process.env.API_BASE_URL ?? 'http://localhost:3000'
 const POLL_INTERVAL_MS = readPollInterval()
 const PATCH_TIMEOUT_MS = 5_000
 const PATCH_BACKOFF_MS = [500, 1_000] as const
+/**
+ * poll cycle が待つ API 呼び出し（reconcile・queued Job の取得・abort cleanup の報告）の期限。
+ *
+ * **期限が無いと、応答が返らない API 1回で poll loop 全体が止まる**: Outbox の再送も、本当の配送失敗の
+ * 3 cycle CRITICAL も、continuation の backstop も実行されなくなる（終了保証監査 2026-10-16 の推奨・
+ * 独立レビュー指摘）。どの呼び出しも即答する種類なので PATCH と同じ期限で足りる。期限切れは各呼び出しの
+ * 既存の失敗扱い（warn・null・retryable）に入り、次の cycle で再び呼ばれる。
+ */
+const POLL_REQUEST_TIMEOUT_MS = PATCH_TIMEOUT_MS
 const TECHNICAL_PERSISTENCE_FAILURE =
   'Job status persistence failed after bounded retries due to a technical communication failure.'
 
@@ -831,6 +840,7 @@ async function reconcileAfterPatchFailure(
 async function fetchJson<T>(path: string): Promise<T | null> {
   const res = await fetch(`${API_BASE}${path}`, {
     headers: buildApiAuthHeaders(),
+    signal: AbortSignal.timeout(POLL_REQUEST_TIMEOUT_MS),
   })
 
   if (!res.ok) return null
@@ -1071,16 +1081,6 @@ async function confirmRunningTransition(
  * 回収件数のログは API 側が出す。ここでは retry も gate 判定もしない。
  */
 /**
- * poll cycle の先頭で待つ reconcile 呼び出しの期限。
- *
- * どちらの endpoint も sweep を起動して即座に 202 を返すので、PATCH と同じ期限で足りる。
- * **期限が無いと、応答が返らない API 1回で poll loop 全体が止まる**: Outbox の再送も、本当の配送失敗の
- * 3 cycle CRITICAL も、continuation 待ちの backstop も実行されなくなる（終了保証監査 2026-10-16 の推奨）。
- * 期限切れは既存の catch で warn して次の処理へ進む（失敗しても次の cycle で再び呼ばれる）。
- */
-const RECONCILE_TIMEOUT_MS = PATCH_TIMEOUT_MS
-
-/**
  * Task continuation の reconcile を起動し、API が返す「前進が無い時間」の報告を返す。
  * 報告が無い・形が崩れている・失敗した場合は undefined（Outbox 側の backstop に任せる）。
  */
@@ -1089,7 +1089,7 @@ export async function reconcileTaskContinuations(): Promise<ContinuationProgress
     const response = await fetch(`${API_BASE}/api/task-continuations/reconcile`, {
       method: 'POST',
       headers: buildApiAuthHeaders(),
-      signal: AbortSignal.timeout(RECONCILE_TIMEOUT_MS),
+      signal: AbortSignal.timeout(POLL_REQUEST_TIMEOUT_MS),
     })
     if (!response.ok) {
       console.warn(`[Worker] task continuation reconcile failed: HTTP ${response.status}`)
@@ -1111,7 +1111,7 @@ export async function reconcileSupervisedRuns(): Promise<void> {
     const response = await fetch(`${API_BASE}/api/supervised-runs/reconcile`, {
       method: 'POST',
       headers: buildApiAuthHeaders(),
-      signal: AbortSignal.timeout(RECONCILE_TIMEOUT_MS),
+      signal: AbortSignal.timeout(POLL_REQUEST_TIMEOUT_MS),
     })
     if (!response.ok) {
       console.warn(`[Worker] supervised run reconcile failed: HTTP ${response.status}`)
@@ -1166,10 +1166,14 @@ export async function pollJobs(): Promise<never> {
         await notifyContinuationStalled(continuationId)
       }
       if (continuationReports !== undefined) {
-        // 報告から消えた（settle した）continuation は忘れる（集合を有界に保つ）。
-        const reported = new Set(continuationReports.map((report) => report.continuationId))
+        // 通知済みの印は**停滞の episode ごと**に持つ。報告から消えた（settle した）continuation と、
+        // 前進が戻って閾値を下回った continuation は忘れる。同じ continuation が再び停滞したら、また1回鳴る
+        // （独立レビュー指摘）。集合も有界に保たれる。
+        const stillStalled = new Set(continuationReports
+          .filter((report) => continuationsToAlert([report], new Set()).length > 0)
+          .map((report) => report.continuationId))
         for (const continuationId of alertedContinuations) {
-          if (!reported.has(continuationId)) alertedContinuations.delete(continuationId)
+          if (!stillStalled.has(continuationId)) alertedContinuations.delete(continuationId)
         }
       }
 
@@ -1373,6 +1377,7 @@ async function submitAbortCleanupResult(jobId: string, body: string): Promise<Ab
         method: 'POST',
         headers: { ...buildApiAuthHeaders(), 'Content-Type': 'application/json' },
         body,
+        signal: AbortSignal.timeout(POLL_REQUEST_TIMEOUT_MS),
       },
     )
   } catch (err: unknown) {
@@ -1714,6 +1719,7 @@ async function reportAbortCleanupRefusal(
       // 拒否もどの generation のものかを名指す。API は carrier の現在の marker と一致しない（遅れて届いた
       // 古い generation の）拒否を GENERATION_MISMATCH で捨て、新しい generation を退役させない。
       body: JSON.stringify({ refusalCode, cleanupGeneration: technicalCleanupGenerationOf(carrier) }),
+      signal: AbortSignal.timeout(POLL_REQUEST_TIMEOUT_MS),
     })
   } catch (err: unknown) {
     // refusal の delivery 失敗は黙らせない。request marker は残るので次 poll でも再試行される。

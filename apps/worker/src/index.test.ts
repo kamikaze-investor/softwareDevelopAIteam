@@ -2044,3 +2044,48 @@ describe('Outbox が読めない状態も本当の配送失敗として 3 cycle 
     expect(blocked).toHaveLength(1)
   })
 })
+
+describe('round 4: poll cycle の待ちに期限・停滞 episode ごとの通知', () => {
+  it('queued Job の取得（GET）にも AbortSignal の期限が付く', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', fetchMock)
+    fetchMock.mockImplementation(async (url: string | URL | Request) => (
+      String(url).includes('/api/task-continuations/reconcile')
+        ? new Response(JSON.stringify({ accepted: true, continuations: [] }), { status: 202 })
+        : new Response(JSON.stringify([]), { status: 200 })
+    ))
+    outboxMocks.hasPending.mockReturnValue(false)
+
+    void pollJobs()
+    await flushPollCycle()
+
+    const gets = fetchMock.mock.calls.filter(([, init]) => (init as RequestInit | undefined)?.method === undefined)
+    expect(gets.length).toBeGreaterThan(0)
+    for (const [, init] of gets) expect((init as RequestInit).signal).toBeInstanceOf(AbortSignal)
+  })
+
+  it('同じ continuation が前進して閾値を下回った後に再び停滞したら、もう1回通知する', async () => {
+    vi.useFakeTimers()
+    vi.stubGlobal('fetch', fetchMock)
+    let stuckForMs = 11 * 60 * 1000
+    fetchMock.mockImplementation(async (url: string | URL | Request) => (
+      String(url).includes('/api/task-continuations/reconcile')
+        ? new Response(JSON.stringify({ accepted: true, continuations: [{ continuationId: 'c1', stuckForMs }] }), { status: 202 })
+        : new Response(JSON.stringify([]), { status: 200 })
+    ))
+    outboxMocks.hasPending.mockReturnValue(false)
+    const stalledAlerts = (): number => notifierMocks.sendAlert.mock.calls
+      .filter(([payload]) => (payload as { title?: string }).title === 'Task continuation has made no verified progress').length
+
+    void pollJobs()
+    await flushPollCycle()
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST * 2)
+    expect(stalledAlerts()).toBe(1)
+
+    stuckForMs = 0
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST * 2)
+    stuckForMs = 12 * 60 * 1000
+    await vi.advanceTimersByTimeAsync(POLL_INTERVAL_FOR_TEST * 2)
+    expect(stalledAlerts()).toBe(2)
+  })
+})
