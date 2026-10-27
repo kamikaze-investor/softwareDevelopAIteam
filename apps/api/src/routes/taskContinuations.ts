@@ -1,3 +1,4 @@
+import { reportContinuationProgress } from '../state/continuationProgress'
 import type { FastifyInstance } from 'fastify'
 import { getStorage } from '../storage'
 import { reconcileTaskContinuations } from '../ctoAi/taskContinuation'
@@ -36,8 +37,18 @@ export async function taskContinuationRoutes(app: FastifyInstance): Promise<void
 
   // POST /api/task-continuations/reconcile
   app.post('/task-continuations/reconcile', async (_req, reply) => {
+    // Worker の独立した backstop のために、running Project の pending continuation の「前進が無い時間」を
+    // 応答に載せる（読み取りのみ・sweep の前に計算）。計算に失敗しても route は壊さず、欄を出さない
+    // （Worker は報告が無いとき Outbox 側の backstop に頼る）。
+    let continuations: ReturnType<typeof reportContinuationProgress> | undefined
+    try {
+      continuations = reportContinuationProgress(storage, Date.now())
+    } catch (err: unknown) {
+      app.log.error({ err }, '[taskContinuations] could not report continuation progress')
+    }
+    const report = continuations !== undefined ? { continuations } : {}
     if (sweepInFlight) {
-      return reply.status(202).send({ accepted: false, reason: 'sweep already in flight' })
+      return reply.status(202).send({ accepted: false, reason: 'sweep already in flight', ...report })
     }
     sweepInFlight = true
 
@@ -110,6 +121,6 @@ export async function taskContinuationRoutes(app: FastifyInstance): Promise<void
         sweepInFlight = false
       })
 
-    return reply.status(202).send({ accepted: true })
+    return reply.status(202).send({ accepted: true, ...report })
   })
 }
