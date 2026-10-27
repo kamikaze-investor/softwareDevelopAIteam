@@ -1,0 +1,225 @@
+name: Meta Review (base)
+
+# Stage 0（CEO 承認 2026-10-27）: Meta Review を **base（default branch）のコード**で実行する。
+#
+# なぜ: `meta-review.yml` は `pull_request` で動くため、PR 自身の autoReview.ts・runner・依存
+# （PR の lockfile で `pnpm install`）・prompt・checklist が、その PR の審査を行う。PR は自分を審査する
+# reviewer を書き換えられる。ここでは workflow 定義・reviewer のコード・依存・prompt・checklist を
+# すべて default branch 側に固定し、PR からは **diff（git object）だけ**を読む。
+#
+# 信頼境界:
+# - `pull_request_target`: workflow 定義は base 側。PR head の checkout・依存導入・script 実行はしない。
+#   PR の commit は `git fetch` で object として取り込むだけで、作業ツリーへ展開しない。
+# - prompt / checklist / CODEOWNERS / canonical 文書は default branch の作業ツリーと `git show <base>` から読む
+#   （autoReview.ts・runner.ts の既存仕様）。PR がそれらを書き換えても自分の審査には効かない。
+# - **review job は書き込み権限を持たない**（`contents: read` と Copilot fallback 用の `copilot-requests: write` だけ）。
+#   PR の diff を読む LLM CLI に status / comment を書ける token を渡さない。投稿は model を実行しない `post` job が行う。
+# - 判定は commit status `Meta Review (base)` として PR head に付ける。required check にするときは
+#   source を GitHub Actions に固定する（bot の PAT は workflow を追加できず、source 固定で PAT からの
+#   status 偽造も防げる）。
+# - **判定の re-roll を許さない**: 完了した審査が BLOCKED を返した内容（同じ commit、または同じ tree の別 commit）に
+#   後から success を付けない（`reopened` でも再審査しない）。infra 失敗（`error:`）は再実行で上書きできる。
+# - fork からの PR は審査しない（secret 付きで誰でも起動できるため）。status は failure（fail closed）。
+#
+# 段階:
+# - 0a（このファイル）: 既存 `meta-review.yml` と並走させる。PR comment は見出し「Meta Review (base)」で区別する。
+# - 0b（CEO・Ruleset）: required check を `Meta Reviewer AI (Gemini)` から `Meta Review (base)` へ置き換え、
+#   すべての required check の source を GitHub Actions に固定する。
+# - 0c: `meta-review.yml` を削除する（このファイルは変更不要）。
+#
+# 判定の意味は既存と同じ: approved / changes_requested → success、blocked・結果なし → failure。
+# success は「マージを止める指摘が無い」の意味であり、approved と同義ではない。
+on:
+  pull_request_target:
+    branches: [master, main]
+    types: [opened, synchronize]
+
+permissions: {}
+
+concurrency:
+  group: meta-review-base-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    name: Meta Review (base-run)
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      contents: read
+      copilot-requests: write  # Gemini 枯渇時の Copilot CLI フォールバック（既存と同じ）
+    outputs:
+      outcome: ${{ steps.meta-review.outcome }}
+      result: ${{ steps.export.outputs.result }}
+    steps:
+      # default branch のコードだけを作業ツリーに置く。
+      - name: Checkout reviewer (default branch)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      # PR の commit を object としてだけ取り込む（checkout しない）。diff は BASE_SHA...HEAD_SHA で取る。
+      - name: Fetch PR commits as objects only
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "+refs/pull/${PR_NUMBER}/head:refs/remotes/pull/head"
+          git cat-file -e "${HEAD_SHA}^{commit}"
+          git cat-file -e "${BASE_SHA}^{commit}"
+
+      - name: Prepare workspace paths
+        run: |
+          sudo mkdir -p /workspace
+          if [ ! -e /workspace/control ]; then
+            sudo ln -s "$GITHUB_WORKSPACE" /workspace/control
+          fi
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install pnpm
+        run: npm install -g pnpm@11.8.0
+
+      # default branch の lockfile で導入する（PR の package.json / lockfile は使わない）。
+      - name: Install dependencies (default branch lockfile)
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Copilot CLI
+        continue-on-error: true
+        run: npm install -g @github/copilot@1.0.96
+
+      - name: Run Meta Review (base code)
+        id: meta-review
+        run: pnpm --filter @ai-team/worker exec tsx src/metaReviewer/autoReview.ts
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GITHUB_TOKEN: ${{ github.token }}   # この job の token は status / comment を書けない
+          BASE_SHA:  ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA:  ${{ github.event.pull_request.head.sha }}
+          PR_TITLE:  ${{ github.event.pull_request.title }}
+          PR_BODY:   ${{ github.event.pull_request.body }}
+          TASK_ID:   "pr-${{ github.event.pull_request.number }}"
+          META_REVIEW_RESULT_PATH: ${{ github.workspace }}/meta-review-result.json
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.5-flash' }}
+
+      - name: Export result
+        id: export
+        if: always()
+        run: |
+          if [ -f meta-review-result.json ]; then
+            echo "result=$(base64 -w0 meta-review-result.json)" >> "$GITHUB_OUTPUT"
+          fi
+
+  post:
+    name: Post Meta Review (base)
+    needs: review
+    if: always()
+    runs-on: ubuntu-latest
+    permissions:
+      statuses: write
+      pull-requests: write
+    steps:
+      # model を実行しない。review job の出力を検証して status と comment を付けるだけ。
+      - name: Post status and comment
+        uses: actions/github-script@v7
+        env:
+          OUTCOME: ${{ needs.review.outputs.outcome }}
+          RESULT_B64: ${{ needs.review.outputs.result }}
+          IS_FORK: ${{ github.event.pull_request.head.repo.full_name != github.repository }}
+        with:
+          script: |
+            const { owner, repo } = context.repo
+            const pr = context.payload.pull_request
+            const sha = pr.head.sha
+            const CONTEXT = 'Meta Review (base)'
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`
+            const RISK = new Set(['low', 'medium', 'high', 'critical'])
+            const STATUS = new Set(['approved', 'changes_requested', 'blocked'])
+
+            let result = null
+            if (process.env.RESULT_B64) {
+              try { result = JSON.parse(Buffer.from(process.env.RESULT_B64, 'base64').toString('utf8')) } catch {}
+            }
+            const verdictValid = result && STATUS.has(result.status)
+            // A provider failure is written as status 'blocked' WITHOUT providerUsed (autoReview.ts);
+            // every real verdict (including the fail-closed CODEOWNERS block) carries providerUsed.
+            // Only real verdicts may become sticky; provider failures are infra errors a rerun may clear.
+            const realVerdict = verdictValid && typeof result.providerUsed === 'string'
+            const completed = realVerdict && (process.env.OUTCOME === 'success' || result.status === 'blocked')
+
+            let state
+            let description
+            if (process.env.IS_FORK === 'true') {
+              state = 'failure'; description = 'error: fork PR is not reviewed by the base-run Meta Review'
+            } else if (!completed) {
+              state = 'failure'
+              description = verdictValid ? 'error: review step or provider failed (fail closed; a rerun may clear it)' : 'error: no valid Meta Review result (fail closed)'
+            } else {
+              const risk = RISK.has(result.riskLevel) ? result.riskLevel : 'unknown'
+              const ceo = result.requiresCeoApproval === true ? ' / CEO' : ''
+              state = result.status === 'blocked' ? 'failure' : 'success'
+              description = `verdict: ${result.status} / risk ${risk}${ceo}`
+            }
+
+            // Sticky BLOCKED: a completed BLOCKED verdict on this commit, or on an earlier commit of
+            // this PR with the same tree, is never replaced by success (no re-roll by reopen, rerun or
+            // an identical-content push). Infra failures ('error:') are not sticky.
+            if (state === 'success') {
+              const commits = await github.paginate(github.rest.pulls.listCommits, { owner, repo, pull_number: pr.number, per_page: 100 })
+              const head = await github.rest.git.getCommit({ owner, repo, commit_sha: sha })
+              const sameTree = [...new Set([sha, ...commits.filter((c) => c.commit.tree.sha === head.data.tree.sha).map((c) => c.sha)])]
+              for (const s of sameTree) {
+                const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, { owner, repo, ref: s, per_page: 100 })
+                if (statuses.some((st) => st.context === CONTEXT && st.state === 'failure' && (st.description ?? '').startsWith('verdict: blocked'))) {
+                  state = 'failure'
+                  description = `verdict: blocked (sticky from ${s.slice(0, 7)}; a later run cannot clear it)`
+                  break
+                }
+              }
+            }
+
+            await github.rest.repos.createCommitStatus({ owner, repo, sha, state, context: CONTEXT, description: description.slice(0, 140), target_url: runUrl })
+            core.info(`${CONTEXT}: ${state} — ${description}`)
+
+            if (!verdictValid) return
+            const emoji = { approved: '✅', changes_requested: '⚠️', blocked: '🚫' }[result.status] ?? '❓'
+            const findings = Array.isArray(result.findings) && result.findings.length > 0
+              ? ['', '### 検出事項', ...result.findings.map((f) => {
+                  const lines = [`- **[${f.severity}]** ${f.message}`]
+                  if (f.suggestion) lines.push(`  > 💡 ${f.suggestion}`)
+                  return lines.join('\n')
+                })].join('\n')
+              : '\n*検出事項なし*'
+            const ceoNote = result.requiresCeoApproval
+              ? result.status === 'blocked'
+                ? '\n\n> 🔴 **CEO判断が必要です。** Meta Review は BLOCKED のため、この状態ではマージできません。'
+                : '\n\n> 🟡 **CEOのCode Owner承認が必要です。** Human Decision Authority の確認はGitHub Reviewで行います。'
+              : ''
+            const reviewedBy = result.providerUsed === 'copilot'
+              ? 'GitHub Copilot CLI — Gemini quota exhausted fallback'
+              : 'Gemini (Meta Reviewer AI)'
+            const body = [
+              `## ${emoji} Meta Review (base) — ${result.status.toUpperCase()}`,
+              '',
+              '| 項目 | 内容 |',
+              '|---|---|',
+              `| 判定 | **${result.status}** |`,
+              `| リスク | ${RISK.has(result.riskLevel) ? result.riskLevel : 'unknown'} |`,
+              `| status | ${state}${state === 'failure' && result.status !== 'blocked' ? '（sticky / error）' : ''} |`,
+              '',
+              '### サマリー',
+              result.summary,
+              findings,
+              ceoNote,
+              '',
+              '---',
+              `*Reviewed by ${reviewedBy} on the default-branch reviewer — [ログを確認](${runUrl})*`,
+            ].join('\n')
+            await github.rest.issues.createComment({ owner, repo, issue_number: pr.number, body })
