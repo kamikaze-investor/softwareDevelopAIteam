@@ -1840,6 +1840,7 @@ describe('Outbox 滞留通知 — continuation pending の 503 は想定内（ou
   it.each([
     ['例外', () => { throw new Error('SQLITE_BUSY') }],
     ['不正な時刻', () => undefined],
+    ['未来の時刻（壁時計の巻き戻し後）', () => Date.now() + 60 * 60 * 1000],
   ])('durable な記録時刻が読めない（%s）間は、continuation pending の 503 でも 3 cycle で CRITICAL（fail closed）', async (_label, unreadable) => {
     {
       vi.useFakeTimers()

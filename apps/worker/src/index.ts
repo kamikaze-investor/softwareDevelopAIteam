@@ -1219,7 +1219,7 @@ export async function pollJobs(): Promise<never> {
         }
 
         const pendingRemains = outboxHasPending()
-        // 10 分の時計の durable な下限。pending が残るのに読めない（例外・不正な時刻）なら、再起動で時計が戻りうるので
+        // 10 分の時計の durable な下限。pending が残るのに読めない（例外・不正な時刻・未来の時刻）なら、再起動で時計が戻りうるので
         // 想定内の待ちとは扱わず本当の失敗として 3 cycle で数える（fail closed。独立レビュー指摘）。
         let durableEpisodeStartedAtMs: number | undefined
         if (pendingRemains) {
@@ -1229,7 +1229,9 @@ export async function pollJobs(): Promise<never> {
             durableEpisodeStartedAtMs = undefined
           }
         }
-        const durableClockAvailable = !pendingRemains || durableEpisodeStartedAtMs !== undefined
+        // 未来の時刻（壁時計の巻き戻し後）は経過 0 にしかならず時計の下限にならないので、読めないものと同じに扱う。
+        const durableClockAvailable = !pendingRemains
+          || (durableEpisodeStartedAtMs !== undefined && durableEpisodeStartedAtMs <= Date.now())
         const alertDecision = nextOutboxAlertState(outboxAlert, {
           pendingRemains,
           onlyContinuationPending: !outboxReadFailed && durableClockAvailable && resendCount > 0 && onlyContinuationPending,
