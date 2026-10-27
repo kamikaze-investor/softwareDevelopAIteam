@@ -448,7 +448,7 @@ describe('M5 trial (2026-10-26) の解析失敗への対応', () => {
     const bad = { candidateId: 'c1', responsibility: 'gone', recordConsistency: 'no_record', ceoDirectedProvenance: 'no' }
     const good = { candidateId: 'c1', responsibility: 'lost', recordConsistency: 'no_record', ceoDirectedProvenance: 'no' }
     expect(parseEvaluation(JSON.stringify({ evaluations: [bad] }), cands)).toEqual({ ok: false, reason: 'no_usable_evaluation' })
-    expect(parseEvaluation(JSON.stringify({ evaluations: [bad, good] }), cands)).toMatchObject({ ok: true, warnings: ['invalid_evaluation:responsibility'] })
+    expect(parseEvaluation(JSON.stringify({ evaluations: [bad, good] }), cands)).toMatchObject({ ok: true, warnings: ['invalid_evaluation:responsibility=gone'] })
   })
 
   it('解析できなかった応答は先頭だけを rawResponseExcerpt に残す', async () => {
@@ -537,4 +537,10 @@ it('観測は parseWarnings に stage 付きで残す（M5 trial 2026-10-27: 1�
   expect(observation.status).toBe('ok')
   expect(observation.detection?.material).toBe(true)
   expect(observation.parseWarnings).toEqual(['evaluation:unevaluated:c2'])
+})
+
+it('redefined を受け付ける（M5 trial 2026-10-27: 再定義の候補が評価なしになっていた）', () => {
+  const cands = [{ id: 'c2', kind: 'redefines' as const, subject: 'authority_boundary' as const, mechanism: 'approval path', file: 'f.ts', evidence: 'e' }]
+  const parsed = parseEvaluation(JSON.stringify({ evaluations: [{ candidateId: 'c2', responsibility: 'redefined', recordConsistency: 'contradicts_unupdated_record', ceoDirectedProvenance: 'yes' }] }), cands)
+  expect(parsed.ok && parsed.value[0].responsibility).toBe('redefined')
 })

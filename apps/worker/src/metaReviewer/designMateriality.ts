@@ -554,7 +554,9 @@ export function parseDetection(raw: string, signals: readonly MaterialitySignal[
 }
 
 // introduced: 既存のものに触れず新しい責務・機構を足す候補（kind=introduces）。保たれる / 移る / 失われる のどれでもない
-const RESPONSIBILITY = ['preserved', 'moved', 'lost', 'introduced', 'unclear'] as const
+// redefined: 同じ場所が持ち続けるが、意味・条件・上限・到達可能性が変わった（kind=redefines の多く）。M5 trial 2026-10-27 で
+// authority 境界の再定義と削除の候補が enum 外の値で答えられ、評価なしになった
+const RESPONSIBILITY = ['preserved', 'moved', 'redefined', 'lost', 'introduced', 'unclear'] as const
 const RECORD_CONSISTENCY = ['consistent', 'contradicts_unupdated_record', 'no_record'] as const
 const PROVENANCE = ['yes', 'no', 'unknown'] as const
 
@@ -593,7 +595,8 @@ export function parseEvaluation(raw: string, candidates: readonly MaterialityCan
       : !optionalText(e.newOwner) ? 'newOwner' : !oneOf(RECORD_CONSISTENCY, e.recordConsistency) ? 'recordConsistency'
       : !oneOf(PROVENANCE, e.ceoDirectedProvenance) ? 'ceoDirectedProvenance'
       : !['provenanceEvidence', 'correctness', 'simplicity', 'naturalness'].every((k) => optionalText(e[k])) ? 'text_field' : undefined
-    if (bad) { warnings.push(`invalid_evaluation:${bad}`); continue }
+    // どの値で外れたかを残す（次の調整の根拠。値は短く切る）
+    if (bad) { warnings.push(`invalid_evaluation:${bad}=${String(e?.[bad] ?? '').slice(0, 40)}`); continue }
     const candidate = byId.get(e.candidateId as string)
     if (!candidate) { warnings.push(`unknown_candidate:${String(e.candidateId).slice(0, 40)}`); continue }
     // introduced は追加（kind=introduces）の候補にだけ使える。消す・替える・意味を変える候補を introduced と答えた評価は

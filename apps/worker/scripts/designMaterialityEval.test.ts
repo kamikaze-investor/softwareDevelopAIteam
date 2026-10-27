@@ -218,6 +218,9 @@ describe('correctnessFlags（狭い予測）', () => {
     ['記録と食い違う', 'redefines', { responsibility: 'moved', newOwner: 'x', recordConsistency: 'contradicts_unupdated_record' }, true],
     ['CEO 指示で preserved 以外', 'replaces', { responsibility: 'unclear', ceoDirectedProvenance: 'yes' }, true],
     ['preserved（改名）', 'replaces', { responsibility: 'preserved' }, false],
+    ['redefined で記録と食い違う', 'redefines', { responsibility: 'redefined', recordConsistency: 'contradicts_unupdated_record' }, true],
+    ['redefined で記録と整合・CEO 指示なし', 'redefines', { responsibility: 'redefined' }, false],
+    ['redefined で CEO 指示の設計', 'redefines', { responsibility: 'redefined', ceoDirectedProvenance: 'yes' }, true],
     ['追加だけ', 'introduces', { responsibility: 'lost' }, false],
   ])('%s → %s', (_label, kind, over, expected) => {
     expect(correctnessFlags(obs(kind, over))).toBe(expected)
