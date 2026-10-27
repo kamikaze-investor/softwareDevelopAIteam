@@ -4190,8 +4190,8 @@ CEOレビューで以下3点を各項目の設計へ反映する（詳細は各�
 
    (2026-10-22 roadmap integrity audit: typecheck を implement Job の検証へ入れる修正は PR #355（verificationProfile + `verify:implement`）で、2026-10-22 時点で OPEN・master d7b3ee15 に未 merge（root `package.json` に `verify:implement` が無い）。採用前に #355 の状態を確認して重複実装しない。deploy 前に Candidate がこの script を持つことも要る)
 
-<!-- roadmap:id=outbox-blocked-critical-false-alarm state=planned -->
-0. [ ] **正常な continuation 中に `Worker Outbox resend is blocked` の CRITICAL が誤発報する**
+<!-- roadmap:id=outbox-blocked-critical-false-alarm state=done -->
+0. [x] **正常な continuation 中に `Worker Outbox resend is blocked` の CRITICAL が誤発報する — 完了（2026-10-27。Tier B PR #412 / 7fcb93a6 を Production へ deploy し、Task 5ddaf485 を外部完了として取り込み済み）**
    （2026-09-11登録、**中優先度**。Production E2E test 9 で観測）。
 
    **内容**: commit 成功時に continuation が pending だと `PATCH /api/jobs/:id` は
