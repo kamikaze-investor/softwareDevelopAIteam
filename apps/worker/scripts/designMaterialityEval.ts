@@ -884,6 +884,14 @@ async function main(): Promise<void> {
         // 実測の token 数（API が返した usageMetadata）。費用はこの合計に単価を掛けて報告側で出す
         usage: records.reduce((u, r) => { if (r.usage) addUsage(u, r.usage); return u }, emptyUsage()),
       },
+      // 捨てずに続けた副次的な出力の不備の内訳（`detection:signal_not_disposed` 等。id 部分は落として数える）
+      parseWarnings: records.reduce<Record<string, number>>((acc, r) => {
+        for (const w of r.observation.parseWarnings ?? []) {
+          const key = w.split(':').slice(0, 2).join(':')
+          acc[key] = (acc[key] ?? 0) + 1
+        }
+        return acc
+      }, {}),
       historical: scoreFrame(frame, labels, records),
       repeatability: {
         positives: scoreRepeatability(KNOWN_POSITIVES.map((p) => ({ itemId: p.sha, target: p.target, expectCandidate: true })), records.filter((r) => r.kind === 'positive'), REPEATS),
