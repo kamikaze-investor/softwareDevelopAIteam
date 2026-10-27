@@ -314,3 +314,11 @@ it('client 側の request timeout は、最小間隔と足しても既定の観�
 it('detector の出力上限は thinking を含めても JSON が切れない大きさ（live の 8192 より大きい）', () => {
   expect(DETECTOR_MAX_OUTPUT_TOKENS).toBeGreaterThan(8192)
 })
+
+it.each([
+  ["codex: You've hit your usage limit. Try again later", 'quota'],
+  ['claude: Not logged in · Please run /login', 'auth'],
+  ["codex: The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account.", 'auth'],
+])('CLI provider の停止対象エラー: %s → %s', (message, errorClass) => {
+  expect(classifyApiError(message).errorClass).toBe(errorClass)
+})
