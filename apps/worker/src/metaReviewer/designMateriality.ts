@@ -453,7 +453,7 @@ export function buildEvaluationPrompt(instructions: string, input: EvaluationInp
 
 export const CANDIDATE_KINDS = ['removes', 'replaces', 'redefines', 'introduces'] as const
 export const CANDIDATE_SUBJECTS = ['responsibility', 'mechanism', 'authority_boundary', 'state_transition', 'design_contract'] as const
-const DISPOSITIONS = ['unrelated', 'test_only', 'formatting_or_comment_wording'] as const
+export const DISPOSITIONS = ['unrelated', 'test_only', 'formatting_or_comment_wording'] as const
 
 export interface MaterialityCandidate {
   id: string
@@ -486,18 +486,19 @@ const MAX_WARNINGS = 50
  * warning に値を残すのは、**決まった語の一覧**にある値だけ（enum の値と、よくある取り違え）。
  * それ以外は `<other>`。model の出力を記録へ写さない（形での判定は小文字だけの secret を通してしまう）
  */
-const WARNING_VOCABULARY = new Set([
-  'preserved', 'moved', 'redefined', 'lost', 'introduced', 'unclear',
-  'consistent', 'contradicts_unupdated_record', 'no_record', 'yes', 'no', 'unknown',
-  'removes', 'replaces', 'redefines', 'introduces',
-  'responsibility', 'mechanism', 'authority_boundary', 'state_transition', 'design_contract',
-  'unrelated', 'test_only', 'formatting_or_comment_wording',
+// 正本は各 enum の配列（CANDIDATE_KINDS ほか）。ここに足すのは enum に無い「よくある取り違え」だけ
+const WARNING_NEAR_MISSES = [
   'changed', 'modified', 'removed', 'added', 'new', 'replaced', 'renamed', 'deleted', 'unchanged',
   'none', 'partial', 'true', 'false', 'null', 'undefined', 'n/a',
-])
+] as const
+let warningVocabulary: Set<string> | undefined
 
 export function warningToken(v: unknown): string {
-  return typeof v === 'string' && WARNING_VOCABULARY.has(v) ? v : '<other>'
+  warningVocabulary ??= new Set([
+    ...CANDIDATE_KINDS, ...CANDIDATE_SUBJECTS, ...DISPOSITIONS,
+    ...RESPONSIBILITY, ...RECORD_CONSISTENCY, ...PROVENANCE, ...WARNING_NEAR_MISSES,
+  ])
+  return typeof v === 'string' && warningVocabulary.has(v) ? v : '<other>'
 }
 
 function capWarnings(warnings: string[]): string[] {
@@ -580,9 +581,9 @@ export function parseDetection(raw: string, signals: readonly MaterialitySignal[
 // introduced: 既存のものに触れず新しい責務・機構を足す候補（kind=introduces）。保たれる / 移る / 失われる のどれでもない
 // redefined: 同じ場所が持ち続けるが、意味・条件・上限・到達可能性が変わった（kind=redefines の多く）。M5 trial 2026-10-27 で
 // authority 境界の再定義と削除の候補が enum 外の値で答えられ、評価なしになった
-const RESPONSIBILITY = ['preserved', 'moved', 'redefined', 'lost', 'introduced', 'unclear'] as const
-const RECORD_CONSISTENCY = ['consistent', 'contradicts_unupdated_record', 'no_record'] as const
-const PROVENANCE = ['yes', 'no', 'unknown'] as const
+export const RESPONSIBILITY = ['preserved', 'moved', 'redefined', 'lost', 'introduced', 'unclear'] as const
+export const RECORD_CONSISTENCY = ['consistent', 'contradicts_unupdated_record', 'no_record'] as const
+export const PROVENANCE = ['yes', 'no', 'unknown'] as const
 
 export interface CandidateEvaluation {
   candidateId: string

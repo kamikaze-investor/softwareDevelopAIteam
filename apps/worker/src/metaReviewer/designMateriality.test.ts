@@ -11,6 +11,12 @@ import {
   signalId,
   stripStringsAndComments,
   warningToken,
+  CANDIDATE_KINDS,
+  CANDIDATE_SUBJECTS,
+  DISPOSITIONS,
+  RESPONSIBILITY,
+  RECORD_CONSISTENCY,
+  PROVENANCE,
   type BaseRecordReader,
   type MaterialitySignal,
 } from './designMateriality.js'
@@ -573,4 +579,10 @@ it('warning に model が決めた候補 id を書かない（位置で書く）
   const parsed = parseEvaluation(JSON.stringify({ evaluations: [ev, ev] }), cands)
   expect(parsed.ok && parsed.warnings).toEqual(['duplicate_evaluation:#0'])
   expect(JSON.stringify(parsed)).not.toContain(`warnings":["duplicate_evaluation:${id}`)
+})
+
+it('warning の語彙は enum の正本から作られる（enum に値を足せば warning にもそのまま出る）', () => {
+  for (const v of [...CANDIDATE_KINDS, ...CANDIDATE_SUBJECTS, ...DISPOSITIONS, ...RESPONSIBILITY, ...RECORD_CONSISTENCY, ...PROVENANCE]) {
+    expect(warningToken(v)).toBe(v)
+  }
 })
