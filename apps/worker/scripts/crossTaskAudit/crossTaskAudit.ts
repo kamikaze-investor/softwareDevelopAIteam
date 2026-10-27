@@ -13,7 +13,10 @@
 // - syntax idioms (startsWith / split / latest row): docs/meta_reviewer/checklists/semantic_integrity.md
 //   (it calls them "clues, not evidence"); the Challenger is pointed there instead.
 // - removed / introduced contract members per diff: apps/worker/src/metaReviewer/designMateriality.ts (#406).
-// - the authority surface: .github/CODEOWNERS (the 2026-10-08 canonical DA surface), read, not copied.
+// - the authority surface: .github/CODEOWNERS (the 2026-10-08 canonical DA surface), read, not copied;
+//   its pattern semantics live in .github/scripts/codeowners.mjs (the Code Owner Approval checker).
+
+import { matchesCodeownersPattern } from '../../../../.github/scripts/codeowners.mjs'
 
 export const AUDIT_RECORD_PATH_PATTERN = /^docs\/project_memory\/decisions\/cross_task_audit_[^/]+\.md$/
 
@@ -249,33 +252,14 @@ export function collectAddedFacts(lines: readonly AddedLine[], existedAtBase: (l
 // Authority surface (read from CODEOWNERS, never copied)
 // ---------------------------------------------------------------------------
 
-export function parseCodeownersPatterns(codeowners: string): string[] {
-  return codeowners
-    .split(/\r?\n/)
-    .map((l) => l.trim())
-    .filter((l) => l && !l.startsWith('#'))
-    .map((l) => l.split(/\s+/)[0]!)
-}
+// CODEOWNERS pattern semantics have one owner: the Code Owner Approval checker's module, which
+// CODEOWNERS itself protects. This audit only re-exports it.
+export { matchesCodeownersPattern, parseCodeownersPatterns } from '../../../../.github/scripts/codeowners.mjs'
 
 /**
- * GitHub CODEOWNERS semantics: a pattern with no slash except a trailing one (`AGENTS.md`,
- * `sandbox/`) matches at any depth; a leading slash or an inner slash anchors it at the root;
- * a trailing slash or a plain path also covers everything below it.
+ * Any matching pattern counts (conservative for an upgrade-only signal; the approval check uses
+ * GitHub's last-match-wins `ownersFor()` instead).
  */
-export function matchesCodeownersPattern(file: string, pattern: string): boolean {
-  const anchored = pattern.startsWith('/') || pattern.replace(/\/$/, '').includes('/')
-  const body = pattern.replace(/^\//, '').replace(/\/$/, '')
-  const glob = body
-    .replace(/[.+^${}()|[\]\\]/g, '\\$&')
-    .replace(/^\*\*\//, '\u0001')
-    .replace(/\*\*/g, '\u0000')
-    .replace(/\*/g, '[^/]*')
-    .replace(/\?/g, '[^/]')
-    .replace(/\u0001/, '(?:.*/)?')
-    .replace(/\u0000/g, '.*')
-  return new RegExp(`${anchored ? '^' : '(?:^|/)'}${glob}(?:$|/)`).test(file)
-}
-
 export function isAuthoritySurface(file: string, patterns: readonly string[]): boolean {
   return patterns.some((p) => matchesCodeownersPattern(file, p))
 }

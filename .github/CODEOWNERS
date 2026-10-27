@@ -13,6 +13,8 @@
 # ワークフロー（Meta Reviewer の審査を回避するコードの追加を防ぐ）
 .github/workflows/ @kamikaze-investor
 .github/CODEOWNERS @kamikaze-investor
+# Code Owner Approval check のロジック（2026-10-27 CEO 決定 Option B）。ここを弱める変更自体が code-owner 承認を要する
+.github/scripts/ @kamikaze-investor
 
 # セキュリティ機構
 apps/worker/src/guards/ @kamikaze-investor

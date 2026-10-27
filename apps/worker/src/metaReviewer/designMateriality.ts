@@ -453,7 +453,7 @@ export function buildEvaluationPrompt(instructions: string, input: EvaluationInp
 
 export const CANDIDATE_KINDS = ['removes', 'replaces', 'redefines', 'introduces'] as const
 export const CANDIDATE_SUBJECTS = ['responsibility', 'mechanism', 'authority_boundary', 'state_transition', 'design_contract'] as const
-const DISPOSITIONS = ['unrelated', 'test_only', 'formatting_or_comment_wording'] as const
+export const DISPOSITIONS = ['unrelated', 'test_only', 'formatting_or_comment_wording'] as const
 
 export interface MaterialityCandidate {
   id: string
@@ -477,7 +477,33 @@ export interface DetectionResult {
   signalDisposition: SignalDisposition[]
 }
 
-export type ParseOutcome<T> = { ok: true; value: T } | { ok: false; reason: string }
+/** ok でも、採点に使わない副次的な出力の不備は warnings に残す（観測全体は捨てない） */
+export type ParseOutcome<T> = { ok: true; value: T; warnings: string[] } | { ok: false; reason: string }
+
+const MAX_WARNINGS = 50
+
+/**
+ * warning に値を残すのは、**決まった語の一覧**にある値だけ（enum の値と、よくある取り違え）。
+ * それ以外は `<other>`。model の出力を記録へ写さない（形での判定は小文字だけの secret を通してしまう）
+ */
+// 正本は各 enum の配列（CANDIDATE_KINDS ほか）。ここに足すのは enum に無い「よくある取り違え」だけ
+const WARNING_NEAR_MISSES = [
+  'changed', 'modified', 'removed', 'added', 'new', 'replaced', 'renamed', 'deleted', 'unchanged',
+  'none', 'partial', 'true', 'false', 'null', 'undefined', 'n/a',
+] as const
+let warningVocabulary: Set<string> | undefined
+
+export function warningToken(v: unknown): string {
+  warningVocabulary ??= new Set([
+    ...CANDIDATE_KINDS, ...CANDIDATE_SUBJECTS, ...DISPOSITIONS,
+    ...RESPONSIBILITY, ...RECORD_CONSISTENCY, ...PROVENANCE, ...WARNING_NEAR_MISSES,
+  ])
+  return typeof v === 'string' && warningVocabulary.has(v) ? v : '<other>'
+}
+
+function capWarnings(warnings: string[]): string[] {
+  return warnings.length <= MAX_WARNINGS ? warnings : [...warnings.slice(0, MAX_WARNINGS), `truncated:${warnings.length - MAX_WARNINGS}`]
+}
 
 /** 応答本文から最後の JSON object を1つ取り出す（```json fence 内を優先） */
 function extractJsonObject(raw: string): unknown {
@@ -495,16 +521,23 @@ const isString = (v: unknown): v is string => typeof v === 'string' && v.trim().
 const oneOf = <T extends string>(values: readonly T[], v: unknown): v is T => typeof v === 'string' && (values as readonly string[]).includes(v)
 
 /**
- * detection 応答の strict parse。
- * - `material` は `candidates` が空でないことと一致しなければならない
- * - S1–S3 の signal は必ず1つの disposition を持たなければならない（S4 は任意）
- * - `supports_candidate:<id>` は実在する candidate を指さなければならない
+ * detection 応答の parse。
+ *
+ * **厳格（不成立にする）**: JSON・`candidates` / `signalDisposition` の配列・候補の採点に使う欄
+ * （id・kind・subject・mechanism・file・evidence）・候補 id の重複（correctness の突き合わせが壊れる）・
+ * `material`（llm の予測そのものなので、書き換えも補完もしない。boolean で、候補の有無と一致しなければ不成立）。
+ *
+ * **warning に残して続ける**（M5 trial で、副次的な出力の不備1つで観測全体を失っていたため）:
+ * - 1つの signal に複数の disposition（複数の候補を支える signal は正当） → すべて残す
+ * - 未知の signal id・未知の disposition 値・不正な disposition → その disposition だけ捨てる
+ * - S1–S3 の signal に disposition が無い → `signal_not_disposed:<id>` を残す
  */
 export function parseDetection(raw: string, signals: readonly MaterialitySignal[]): ParseOutcome<DetectionResult> {
   const json = extractJsonObject(raw) as Record<string, unknown> | undefined
   if (!json || typeof json !== 'object') return { ok: false, reason: 'no_json' }
   if (typeof json.material !== 'boolean') return { ok: false, reason: 'material_not_boolean' }
   if (!Array.isArray(json.candidates) || !Array.isArray(json.signalDisposition)) return { ok: false, reason: 'missing_arrays' }
+  const warnings: string[] = []
 
   const candidates: MaterialityCandidate[] = []
   for (const raw of json.candidates as Array<Record<string, unknown>>) {
@@ -520,34 +553,37 @@ export function parseDetection(raw: string, signals: readonly MaterialitySignal[
     if (bad) return { ok: false, reason: `invalid_candidate:${bad}` }
     candidates.push({ id: c.id as string, kind: c.kind as MaterialityCandidate['kind'], subject: c.subject as MaterialityCandidate['subject'], mechanism: c.mechanism as string, file: c.file as string, evidence: c.evidence as string })
   }
-  if (json.material !== candidates.length > 0) return { ok: false, reason: 'material_mismatch' }
   const candidateIds = new Set(candidates.map((c) => c.id))
   if (candidateIds.size !== candidates.length) return { ok: false, reason: 'duplicate_candidate_id' }
+  if (json.material !== candidates.length > 0) return { ok: false, reason: 'material_mismatch' }
+  const material = json.material
 
+  const known = new Set(signals.map((s) => s.id))
   const dispositions: SignalDisposition[] = []
   for (const d of json.signalDisposition as Array<Record<string, unknown>>) {
-    if (!d || !isString(d.signalId) || !isString(d.disposition) || typeof d.reason !== 'string') {
-      return { ok: false, reason: 'invalid_disposition' }
-    }
+    if (!d || !isString(d.signalId) || !isString(d.disposition)) { warnings.push('invalid_disposition'); continue }
+    if (!known.has(d.signalId)) { warnings.push(`unknown_signal:${warningToken(d.signalId)}`); continue }
     const supports = d.disposition.match(/^supports_candidate:(.+)$/)
     if (supports ? !candidateIds.has(supports[1]) : !oneOf(DISPOSITIONS, d.disposition)) {
-      return { ok: false, reason: 'unknown_disposition' }
+      warnings.push(`unknown_disposition:${warningToken(d.disposition.replace(/^supports_candidate:/, 'supports_candidate_'))}`)
+      continue
     }
-    dispositions.push({ signalId: d.signalId, disposition: d.disposition, reason: d.reason })
+    dispositions.push({ signalId: d.signalId, disposition: d.disposition, reason: typeof d.reason === 'string' ? d.reason : '' })
   }
   const answered = new Set(dispositions.map((d) => d.signalId))
-  if (answered.size !== dispositions.length) return { ok: false, reason: 'duplicate_disposition' }
-  const known = new Set(signals.map((s) => s.id))
-  if (dispositions.some((d) => !known.has(d.signalId))) return { ok: false, reason: 'unknown_signal' }
-  const required = signals.filter((s) => s.kind !== 'behavior_test_removed')
-  if (required.some((s) => !answered.has(s.id))) return { ok: false, reason: 'signal_not_disposed' }
+  for (const sig of signals) {
+    if (sig.kind !== 'behavior_test_removed' && !answered.has(sig.id)) warnings.push(`signal_not_disposed:${sig.id}`)
+  }
 
-  return { ok: true, value: { material: json.material, candidates, signalDisposition: dispositions } }
+  return { ok: true, value: { material, candidates, signalDisposition: dispositions }, warnings: capWarnings(warnings) }
 }
 
-const RESPONSIBILITY = ['preserved', 'moved', 'lost', 'unclear'] as const
-const RECORD_CONSISTENCY = ['consistent', 'contradicts_unupdated_record', 'no_record'] as const
-const PROVENANCE = ['yes', 'no', 'unknown'] as const
+// introduced: 既存のものに触れず新しい責務・機構を足す候補（kind=introduces）。保たれる / 移る / 失われる のどれでもない
+// redefined: 同じ場所が持ち続けるが、意味・条件・上限・到達可能性が変わった（kind=redefines の多く）。M5 trial 2026-10-27 で
+// authority 境界の再定義と削除の候補が enum 外の値で答えられ、評価なしになった
+export const RESPONSIBILITY = ['preserved', 'moved', 'redefined', 'lost', 'introduced', 'unclear'] as const
+export const RECORD_CONSISTENCY = ['consistent', 'contradicts_unupdated_record', 'no_record'] as const
+export const PROVENANCE = ['yes', 'no', 'unknown'] as const
 
 export interface CandidateEvaluation {
   candidateId: string
@@ -561,25 +597,42 @@ export interface CandidateEvaluation {
   naturalness: string
 }
 
-/** correctness 応答の strict parse。全 candidate にちょうど1つの評価が要る。 */
+/**
+ * correctness 応答の parse。
+ *
+ * 判定の欄（candidateId・responsibility・recordConsistency・ceoDirectedProvenance）が不正な評価、
+ * 規則に反する評価（introduced を追加以外に使う・moved なのに移り先が無い）、未知の候補への評価は
+ * **その評価だけを捨てて warning に残す**。同じ候補への評価が複数あるとき、判定の欄が全部同じなら1つにまとめ、
+ * 1つでも違えばその候補の評価を**全部捨てる**（順番で狭い判定が変わらないように）。評価の無い候補は `unevaluated:<id>` を残す（評価が無いので
+ * 狭い判定では「未検出」として数えられる）。1件も使える評価が無ければ不成立。
+ */
 export function parseEvaluation(raw: string, candidates: readonly MaterialityCandidate[]): ParseOutcome<CandidateEvaluation[]> {
   const json = extractJsonObject(raw) as Record<string, unknown> | undefined
   if (!json || !Array.isArray(json.evaluations)) return { ok: false, reason: 'no_evaluations' }
+  const warnings: string[] = []
   const out: CandidateEvaluation[] = []
-  // 判定の欄（candidateId・responsibility・recordConsistency・ceoDirectedProvenance）は厳格。
+  const byId = new Map(candidates.map((c) => [c.id, c]))
+  // warning には候補の id（model が決めた文字列）ではなく位置（#0, #1 …）を書く
+  const ref = (id: string) => `#${candidates.findIndex((c) => c.id === id)}`
   // newOwner と自由記述の所見は欠けてもよい（newOwner は null、所見は空文字にする）
   const optionalText = (v: unknown) => v === undefined || v === null || typeof v === 'string'
+  const text = (v: unknown) => (typeof v === 'string' ? v : '')
   for (const e of json.evaluations as Array<Record<string, unknown>>) {
     const bad = !e ? 'evaluation' : !isString(e.candidateId) ? 'candidateId' : !oneOf(RESPONSIBILITY, e.responsibility) ? 'responsibility'
       : !optionalText(e.newOwner) ? 'newOwner' : !oneOf(RECORD_CONSISTENCY, e.recordConsistency) ? 'recordConsistency'
       : !oneOf(PROVENANCE, e.ceoDirectedProvenance) ? 'ceoDirectedProvenance'
       : !['provenanceEvidence', 'correctness', 'simplicity', 'naturalness'].every((k) => optionalText(e[k])) ? 'text_field' : undefined
-    if (bad) return { ok: false, reason: `invalid_evaluation:${bad}` }
+    // どの値で外れたかを残す（次の調整の根拠）。model の自由文を記録へ写さないよう、短い語の形のときだけ値を残す
+    if (bad) { warnings.push(`invalid_evaluation:${bad}=${warningToken(e?.[bad])}`); continue }
+    const candidate = byId.get(e.candidateId as string)
+    if (!candidate) { warnings.push(`unknown_candidate:${warningToken(e.candidateId)}`); continue }
+    // introduced は追加（kind=introduces）の候補にだけ使える。消す・替える・意味を変える候補を introduced と答えた評価は
+    // 狭い判定（correctnessFlags）から外れてしまうので使わない
+    if (e.responsibility === 'introduced' && candidate.kind !== 'introduces') { warnings.push(`introduced_for_non_addition:${ref(candidate.id)}`); continue }
     // moved は移り先を名指しできて初めて moved である
-    if (e.responsibility === 'moved' && !isString(e.newOwner)) return { ok: false, reason: 'moved_without_owner' }
-    const text = (v: unknown) => (typeof v === 'string' ? v : '')
+    if (e.responsibility === 'moved' && !isString(e.newOwner)) { warnings.push(`moved_without_owner:${ref(candidate.id)}`); continue }
     out.push({
-      candidateId: e.candidateId as string,
+      candidateId: candidate.id,
       responsibility: e.responsibility as CandidateEvaluation['responsibility'],
       newOwner: isString(e.newOwner) ? e.newOwner : null,
       recordConsistency: e.recordConsistency as CandidateEvaluation['recordConsistency'],
@@ -590,11 +643,20 @@ export function parseEvaluation(raw: string, candidates: readonly MaterialityCan
       naturalness: text(e.naturalness),
     })
   }
-  const ids = out.map((e) => e.candidateId)
-  if (new Set(ids).size !== ids.length || candidates.some((c) => !ids.includes(c.id)) || ids.some((id) => !candidates.some((c) => c.id === id))) {
-    return { ok: false, reason: 'evaluation_candidate_mismatch' }
+  const verdictKey = (e: CandidateEvaluation) => `${e.responsibility}|${e.recordConsistency}|${e.ceoDirectedProvenance}`
+  const kept: CandidateEvaluation[] = []
+  for (const c of candidates) {
+    const mine = out.filter((o) => o.candidateId === c.id)
+    if (mine.length === 0) { warnings.push(`unevaluated:${ref(c.id)}`); continue }
+    if (new Set(mine.map(verdictKey)).size > 1) {
+      warnings.push(`conflicting_evaluations:${ref(c.id)}`, `unevaluated:${ref(c.id)}`)
+      continue
+    }
+    if (mine.length > 1) warnings.push(`duplicate_evaluation:${ref(c.id)}`)
+    kept.push(mine[0])
   }
-  return { ok: true, value: out }
+  if (kept.length === 0) return { ok: false, reason: 'no_usable_evaluation' }
+  return { ok: true, value: kept, warnings: capWarnings(warnings) }
 }
 
 // ---------------------------------------------------------------------------
@@ -624,6 +686,8 @@ export interface MaterialityObservation {
   evaluations?: CandidateEvaluation[]
   /** 応答を解析できなかったときだけ、その応答の先頭（RAW_EXCERPT_CHARS まで）を残す。原因を後から確かめるため */
   rawResponseExcerpt?: { stage: 'detection' | 'evaluation'; text: string }
+  /** 捨てずに続けた副次的な出力の不備（`detection:<warning>` / `evaluation:<warning>`） */
+  parseWarnings?: string[]
 }
 
 export const RAW_EXCERPT_CHARS = 3_000
@@ -678,18 +742,21 @@ export async function observeDesignMateriality(
     if (typeof detectionRaw !== 'string') return { ...observation, reason: 'provider_error' }
     const detection = parseDetection(detectionRaw, signals)
     if (!detection.ok) return { ...observation, reason: `parse:${detection.reason}`, rawResponseExcerpt: { stage: 'detection', text: detectionRaw.slice(0, RAW_EXCERPT_CHARS) } }
-    if (detection.value.candidates.length === 0) return { ...observation, status: 'ok', detection: detection.value, evaluations: [] }
+    const detectionWarnings = detection.warnings.map((w) => `detection:${w}`)
+    const warned = detectionWarnings.length > 0 ? { parseWarnings: detectionWarnings } : {}
+    if (detection.value.candidates.length === 0) return { ...observation, ...warned, status: 'ok', detection: detection.value, evaluations: [] }
 
     const evaluationPrompt = buildEvaluationPrompt(input.evaluationInstructions, {
       diff: input.diff, candidates: detection.value.candidates, signals, excerpts,
     })
-    const withDetection = { ...observation, detection: detection.value, evaluationPromptHash: sha256(evaluationPrompt) }
+    const withDetection = { ...observation, ...warned, detection: detection.value, evaluationPromptHash: sha256(evaluationPrompt) }
     const evaluationRaw = await withTimeout(provider(evaluationPrompt).then((r) => r, (e: unknown) => ({ error: e })), timeoutMs)
     if (evaluationRaw === TIMEOUT) return { ...withDetection, reason: 'evaluation_timeout' }
     if (typeof evaluationRaw !== 'string') return { ...withDetection, reason: 'evaluation_provider_error' }
     const evaluations = parseEvaluation(evaluationRaw, detection.value.candidates)
     if (!evaluations.ok) return { ...withDetection, reason: `evaluation_parse:${evaluations.reason}`, rawResponseExcerpt: { stage: 'evaluation', text: evaluationRaw.slice(0, RAW_EXCERPT_CHARS) } }
-    return { ...withDetection, status: 'ok', evaluations: evaluations.value }
+    const allWarnings = [...detectionWarnings, ...evaluations.warnings.map((w) => `evaluation:${w}`)]
+    return { ...withDetection, ...(allWarnings.length > 0 ? { parseWarnings: allWarnings } : {}), status: 'ok', evaluations: evaluations.value }
   } catch {
     return { ...base(), reason: 'internal_error' }
   }

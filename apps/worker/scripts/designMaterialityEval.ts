@@ -330,9 +330,14 @@ export function addUsage(into: TokenUsage, add: TokenUsage): void {
 /**
  * CI Meta Review の `callGeminiForReview`（geminiClient.ts）と **同じ設定**で呼び、token 使用量も返す。
  * geminiClient は本文だけを返し usage を捨てるため、費用の実測にはここで SDK を直接呼ぶ。
- * 設定（REST API・temperature 0.1・maxOutputTokens 8192・responseMimeType なし）を変えるときは両方を揃える。
+ * 設定（REST API・temperature 0.1・responseMimeType なし）は geminiClient と揃える。**maxOutputTokens だけは違う**:
+ * gemini-2.5 系は thinking も出力上限に数えるため、8192 では thinking で上限に達し JSON が途中で切れた
+ * （M5 trial 40302787189: 出力 8187 token のうち本文 327）。detector は live の Meta Review ではないので、自前の上限を持つ
  * API key は環境変数 GEMINI_API_KEY からだけ読み、記録にもログにも出さない。
  */
+/** detector の出力上限（thinking を含む）。live Meta Review の 8192 とは別 */
+export const DETECTOR_MAX_OUTPUT_TOKENS = 24_576
+
 export async function callGeminiWithUsage(
   prompt: string,
   model: string,
@@ -343,7 +348,7 @@ export async function callGeminiWithUsage(
   const { GoogleGenerativeAI } = await import('@google/generative-ai')
   const client = new GoogleGenerativeAI(apiKey).getGenerativeModel({
     model,
-    generationConfig: { temperature: 0.1, maxOutputTokens: 8192 },
+    generationConfig: { temperature: 0.1, maxOutputTokens: DETECTOR_MAX_OUTPUT_TOKENS },
   })
   // client 側の timeout で request を打ち切る（observeDesignMateriality の待機上限より短くし、待つのをやめた request が残らないようにする）
   const result = await client.generateContent(prompt, opts.timeoutMs === undefined ? undefined : { timeout: opts.timeoutMs })
@@ -559,17 +564,22 @@ const PREDICTORS: Record<string, Predictor> = {
 }
 
 /**
- * correctness が「記録された責務が失われる・記録と食い違う・CEO 指示の設計を保たない」と判定した候補があるか。
- * 追加（introduces）だけの候補は数えない。評価が得られていない run は false（未検出として数える）。
+ * correctness が「記録された責務が失われる・記録と食い違う・CEO 指示の設計を保たない」と判定した候補、
+ * または保たれていない Authority 境界の候補（追加を含む）があるか。それ以外の追加（introduces）の候補は数えない。
+ * 評価が得られていない run は false（未検出として数える）。
  */
 export function correctnessFlags(o: MaterialityObservation): boolean {
   if (o.status !== 'ok') return false
-  const kindOf = new Map((o.detection?.candidates ?? []).map((c) => [c.id, c.kind]))
-  return (o.evaluations ?? []).some((e) => kindOf.get(e.candidateId) !== 'introduces' && (
-    e.responsibility === 'lost'
-    || e.recordConsistency === 'contradicts_unupdated_record'
-    || (e.ceoDirectedProvenance === 'yes' && e.responsibility !== 'preserved')
-  ))
+  const byId = new Map((o.detection?.candidates ?? []).map((c) => [c.id, c]))
+  return (o.evaluations ?? []).some((e) => {
+    const candidate = byId.get(e.candidateId)
+    // 狭い正解は Authority 境界の変更を（追加も含めて）必ず数える（rubric-narrow.md）。保たれているなら変更ではない
+    if (candidate?.subject === 'authority_boundary' && e.responsibility !== 'preserved') return true
+    if (candidate?.kind === 'introduces') return false
+    return e.responsibility === 'lost'
+      || e.recordConsistency === 'contradicts_unupdated_record'
+      || (e.ceoDirectedProvenance === 'yes' && e.responsibility !== 'preserved')
+  })
 }
 
 /**
@@ -879,6 +889,14 @@ async function main(): Promise<void> {
         // 実測の token 数（API が返した usageMetadata）。費用はこの合計に単価を掛けて報告側で出す
         usage: records.reduce((u, r) => { if (r.usage) addUsage(u, r.usage); return u }, emptyUsage()),
       },
+      // 捨てずに続けた副次的な出力の不備の内訳（`detection:signal_not_disposed` 等。id 部分は落として数える）
+      parseWarnings: records.reduce<Record<string, number>>((acc, r) => {
+        for (const w of r.observation.parseWarnings ?? []) {
+          const key = w.split(':').slice(0, 2).join(':')
+          acc[key] = (acc[key] ?? 0) + 1
+        }
+        return acc
+      }, {}),
       historical: scoreFrame(frame, labels, records),
       repeatability: {
         positives: scoreRepeatability(KNOWN_POSITIVES.map((p) => ({ itemId: p.sha, target: p.target, expectCandidate: true })), records.filter((r) => r.kind === 'positive'), REPEATS),

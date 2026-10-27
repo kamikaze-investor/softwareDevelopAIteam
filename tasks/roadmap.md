@@ -10431,6 +10431,108 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
 
       **やらないこと**: parser 以外の detection・評価ロジックの変更。adoption parser の変更（#409 の範囲判断を維持）。
 
+<!-- roadmap:id=codeowner-approval-required-check state=in_progress -->
+0. [~] **CODEOWNERS 対象 PR にだけ Code Owner 承認を必須にする（`Code Owner Approval` required check）** —
+      2026-10-27登録（CEO 決定 2026-10-27 Option B）。実装は本項目の PR。**残りは Ruleset への required check 追加（人が行う Mechanical Operation）と実 PR での検証。**
+
+      **確認された事実（2026-10-26 実測）**: master Ruleset（id 17202177、bypass actor 無し）は `require_code_owner_review: true` だが
+      `required_approving_review_count: 0` で、GitHub は code-owner review を強制しない。PR #413（CODEOWNERS 対象の `AGENTS.md` を変更）は
+      **review 0 件の時点で `mergeStateStatus=CLEAN`** になり、CEO が承認した後も `reviewDecision` は空のままだった
+      （CEO は GitHub 上で承認してから merge された。承認が無いまま merge された PR は観測されていない）。
+      2026-10-08 決定（`.github/CODEOWNERS` 冒頭・`autoReview.ts`）は Meta Review の `requiresCeoApproval` をこの review に委ねており、
+      **委ねた先が強制されていなかった**。
+
+      **入れたもの**: `.github/workflows/codeowner-approval.yml`（`pull_request_target` + `workflow_run`。default branch の
+      `.github/scripts/codeownerApprovalCheck.mjs` だけを実行し PR code を実行しない）、`codeowner-review-event.yml`（review 提出の起点、権限なし）、
+      判定 `.github/scripts/codeowners.mjs`（GitHub の last-match-wins、rename は旧 path も対象、承認は head SHA に限る、PR 作成者が owner でも免除しない、default branch 以外の base は failure、team / e-mail owner は fail closed、
+      CODEOWNERS は base 側を読む）、`.github/scripts/` を CODEOWNERS 対象に追加。通常 PR は承認なしで success（runner の実行を待つだけ）。
+      CODEOWNERS の pattern 意味論の owner はここ1つ（`crossTaskAudit` は re-export するだけ）。
+
+      **残る手順**:
+      0. **CEO（人）**: bot の token は `workflow` scope を持たない（意図的）ので、2 つの workflow ファイルは CEO が本項目の PR の branch へ
+         GitHub web UI で追加し、その head を承認する（PR 作成者は bot なので CEO は承認できる。`require_last_push_approval` は false）。
+         **今後 workflow を変える PR も同じ形にする**: bot が PR を作り、CEO が workflow を branch へ push して承認する。
+         CEO 自身が作成した PR は、作成者免除が無いので CODEOWNERS 対象を含むと pending のまま merge できない
+      1. **CEO（人）**: Settings → Rules → `master` → Require status checks に `Code Owner Approval` を追加し、**source を GitHub Actions に固定する**
+         （integration_id 15368。固定しないと write 権限の PAT で `POST /statuses` を直接呼んで success を偽造できる）。AI credential は Ruleset を変更できない。
+         **既存の required check 2 本（`Typecheck & Test`・`Meta Reviewer AI (Gemini)`）も同じく source を GitHub Actions に固定する**
+         （2026-10-27 実測: どちらも integration_id 未指定で、bot の `repo` scope PAT で success を偽造できる状態。本項目とは独立に今すでに開いている穴）
+      2. **PL**: 実 PR で検証する（CODEOWNERS 対象外の PR = 即 success / 対象 PR = 承認まで pending → 承認で success）。結果を本項目に書いて done にする。
+         既存の open PR は status を持たないので、push / reopen / タイトル編集のどれかで一度再判定させる（作成者が CEO の古い PR は、
+         CODEOWNERS 対象を含むなら pending のままになる。作成者免除を外したため。GitHub は作成者自身の承認を認めない）
+
+      **残るリスク（GitHub の制約）**: source を GitHub Actions に固定しても、同一 repository の PR が追加した workflow は GitHub Actions として
+      同名 status を書ける。workflow の追加は CODEOWNERS 対象なので本 check は pending にするが、その workflow による後からの上書きは防げない
+      （Meta Review も PR 側の workflow で動くので同じ前提）。review 起点 workflow を PR が壊した場合は再判定されず pending で止まる（fail closed。タイトル編集で再判定）。
+
+      **独立レビュー（別 context の Claude。Codex は本 account で `model_not_found`）**: must-fix 3 件を修正 —
+      作成者免除の悪用（CEO 作成の古い open PR 13 件へ bot が push できた）/ 別 base・別 PR の success 流用 / PAT による status 直接偽造（source 固定で対処）。
+      あわせて評価中の head 移動・同一 SHA の直列化・`dir/*` の照合を修正。
+
+      **やらないこと**: `required_approving_review_count` の変更（Option A・通常 PR に承認を追加する）。新しい Approval 経路。
+
+<!-- roadmap:id=meta-review-base-run state=in_progress -->
+0. [~] **Stage 0: Meta Review を base（default branch）のコードで実行し、required check の source を固定する** —
+      2026-10-27登録（CEO 決定 2026-10-27「Stage 0 approved」）。CEO 承認権限の縮小・Safety 境界の緩和・Goal / Design Philosophy の変更は含まない。
+
+      **確認された事実**: `meta-review.yml` は `pull_request` で動き、PR の lockfile で `pnpm install` し、PR 自身の
+      autoReview.ts・runner・prompt・checklist（と `GEMINI_API_KEY`）で、その PR を審査する。PR は自分を審査する reviewer を書き換えられる。
+      また既存 required check 2 本（`Typecheck & Test`・`Meta Reviewer AI (Gemini)`）は source（integration_id）未固定で、
+      bot の `repo` scope PAT から `POST /statuses` で success を偽造できる（2026-10-27 実測）。
+
+      **方式（既存 Meta Review の改善。新しい Review 工程・Gate は足さない）**: `.github/workflows/meta-review-base.yml`
+      （`pull_request_target`。default branch の reviewer コード・lockfile・prompt・checklist を使い、PR の commit は
+      `git fetch` で object として取り込むだけ。結果を commit status `Meta Review (base)` として PR head に付け、PR comment も投稿）。
+      bot の token は `workflow` scope を持たないので、bot 作成の PR は status を偽造する workflow を追加できない。
+
+      **段階（1 PR で切り替えると、その PR 自身に required check が付かず merge できなくなるため）**:
+      - 0a: `meta-review-base.yml` を追加し既存と並走（`codeowner-approval-required-check` と同じ PR。CEO が workflow を追加）
+      - 0b（CEO・Ruleset）: 実 PR 2〜3 件で `Meta Review (base)` が付き判定が妥当なことを PL が確認した後、
+        required check `Meta Reviewer AI (Gemini)` を `Meta Review (base)` に置き換え、`Typecheck & Test`・`Code Owner Approval`・
+        `Meta Review (base)` の source をすべて GitHub Actions に固定する
+      - 0c（CEO）: `meta-review.yml` を削除する（workflow の削除も `workflow` scope が要る）
+
+      **検証すること（PL）**: 実 PR で (1) `Meta Review (base)` が PR head に付く (2) PR で prompt / reviewer を変えても判定に効かない
+      (3) source 固定後、bot の PAT で付けた同名 status が required check を満たさない (4) bot は自分の PR を承認できない。結果を本項目に書いて done にする。
+
+      **独立レビュー（別 context の Claude。Codex は本 account で `model_not_found`）で入れた対策**: (S1) 同一 SHA・同一 tree の
+      完了した BLOCKED 判定は sticky（`reopened` を trigger から外し、再実行・同内容の push で success に戻らない。provider 失敗は
+      `providerUsed` の有無で区別し sticky にしない）/ (S2) review job は書き込み権限なし、status / comment は model を実行しない別 job が付ける /
+      (S3) fork PR は審査せず failure / pnpm・Copilot CLI の version 固定 / status の risk は enum に限定。
+      判定の意味は既存と同じで、success は「マージを止める指摘が無い」（changes_requested も success）。
+
+      **Codex 独立レビュー（gpt-5.6-sol、2026-10-27）で入れた対策**: 同じ commit を head とする全 open PR が通らない限り
+      `Code Owner Approval` を success にしない / fork PR は failure / 評価中の base 移動も検出 / force-push で外された同じ tree の旧 head の
+      BLOCKED も sticky / 空 diff の approved を正規の判定として扱う / action を commit SHA に固定。
+      **残る（Codex 指摘・CEO の credential 操作が要る）**: bot は classic OAuth token（`repo` scope）で、workflow run を force-cancel できる。
+      BLOCKED を記録される前に止めて再実行させる経路が残るので、Actions 書き込み権限の無い fine-grained token へ替える。
+      **0b の前提条件（Codex 2 回目の判断）**: bot の credential を Actions 書き込み権限の無い fine-grained token へ替えるまで、
+      `Meta Review (base)` を required check にしない（0a の並走観測だけは可）。
+      **残る（記録して受容）**: status は commit に付くため、既に success の commit を head とする新しい PR は、その PR の run が
+      status を書くまでの間それを引き継ぐ。master へ merge できるのは同じ commit = 承認済みと同じ内容の場合に限られ、別 base は failure になる。
+      **残る（範囲外）**: 同じ tree を別 PR として出し直す経路。PR 本文・diff による prompt injection（`meta-review-verdict-driven-by-pr-body`）。
+
+      **残るもの**: `Typecheck & Test` は性質上 PR のコードを実行する（test script を骨抜きにする PR は Meta Review / 横断監査で拾う）。
+      共有の Gemini key を並走期間中は二重に使う（0c で解消）。
+
+<!-- roadmap:id=meta-review-verdict-driven-by-pr-body state=deferred -->
+0. [ ] **Meta Review が diff に無い記述（PR 説明文だけ）を根拠に BLOCKED と判定する** —
+      2026-10-27登録（CEO 指示: 別の品質課題として記録。PR 説明文を書き換えて判定を通す行為は行わない）。
+
+      **実測（PR #417・head `50586b4b`）**: `codeowner-review-not-enforced-by-ruleset` の roadmap 記述を diff から外した後の run が、
+      その記述と `required_approving_review_count` を引用して BLOCKED（DA 7）を返した。`git diff origin/master...HEAD` に該当語は **0 件**で、
+      PR 説明文の「Moved out of this PR」節にだけ存在した。2026-10-23 の実測（PR 説明文の編集 + close/reopen で同一 SHA の判定が
+      BLOCKED → APPROVED に 7 回反転）と合わせ、**PR 説明文は untrusted と表示されていても判定を両方向に動かす**。
+
+      **なぜ問題か**: 判定が diff ではなく説明文で決まると、(a) 説明文の編集で判定を通せる（review-shopping）、
+      (b) 正直に経緯を書いた説明文が false BLOCKED を生む。どちらも Meta Review を独立した checkpoint として使えなくする。
+
+      **着手時に決めること**: 2026-10-07 の canonical principle delivery 監査（`principle-registry-coverage-and-threshold-review` の追加 scope）は
+      PR body を「上限付きの untrusted task-intent context」として渡すと決めている。外すか、finding の evidence を diff 内の行に限る
+      （diff 外だけを根拠にした finding を判定から外す）かを設計で決める。
+
+      **関連（重複実装しない）**: `independent-review-verdict-instability`（deferred、同じ Meta Review 経路の判定揺れ。一緒に扱う）。
+
 <!-- roadmap:id=monitoring-tiering-watchdog-monitor-pl state=planned -->
 3. [ ] **監視責務の段階分離（Deterministic Watchdog → Lightweight Monitor → VPS PL）— VPS PL 完成後の最適化** — 2026-09-14登録。
       **【着手条件（CEO 指示・2026-09-14）: `vps-pl-execution-loop` の最小実装と VPS 上の実運用 E2E が
