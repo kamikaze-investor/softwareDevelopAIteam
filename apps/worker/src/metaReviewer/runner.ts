@@ -274,6 +274,136 @@ function loadBaseDecisionAuthorityPrinciples(controlRoot: string, ref: string): 
     : { ok: false, reason: `${DECISION_AUTHORITY_SPEC_PATH} @ base ${ref}: ${load.reason}`, triedPaths: [DECISION_AUTHORITY_SPEC_PATH] }
 }
 
+/** base branch の Roadmap（CEO が承認した scope の台帳）。 */
+export const ROADMAP_PATH = 'tasks/roadmap.md'
+/** 1回の review に載せる Roadmap 項目の上限（Roadmap 全体は約 1MB あり、全文は渡さない）。 */
+export const MAX_ROADMAP_EVIDENCE_ITEMS = 3
+/** 1項目の本文の上限。超えたら切り詰めを明示し、その項目は根拠にできないと指示する。 */
+export const MAX_ROADMAP_EVIDENCE_ITEM_CHARS = 4_000
+export const ROADMAP_EVIDENCE_SECTION_HEADING = '### base branch の Roadmap 項目（文脈のみ・承認の根拠ではない）'
+
+/** 根拠になりうる（作業を承認された）state。done / deferred / blocked は stale として根拠にしない。 */
+const ROADMAP_ACTIVE_STATES: ReadonlySet<string> = new Set(['planned', 'in_progress'])
+
+const ROADMAP_MARKER = /^\s*<!--\s*roadmap:id=(\S+)\s+state=([a-z_]+)\b[^>]*-->/
+
+export interface RoadmapEvidenceItem {
+  id: string
+  state: string
+  /** base branch の本文（marker 行から次の marker の手前まで）。 */
+  body: string
+  truncated: boolean
+  /** この PR の差分が tasks/roadmap.md のこの項目の行を変更している。 */
+  modifiedByThisPr: boolean
+}
+
+export interface RoadmapEvidenceSelection {
+  items: RoadmapEvidenceItem[]
+  /** 名指しされたが上限で載せなかった項目 id（根拠にできない）。 */
+  omittedIds: string[]
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\function buildApprovalRulesSection(load: ApprovalRulesLoad): string {')
+}
+
+/** diff のうち tasks/roadmap.md の部分（この PR が Roadmap を変えた行）。 */
+function roadmapDiffBlock(gitDiff: string): string {
+  return gitDiff
+    .split(/^(?=diff --git )/m)
+    .filter((block) => block.startsWith(`diff --git a/${ROADMAP_PATH} `) || block.includes(`+++ b/${ROADMAP_PATH}`))
+    .join('\n')
+}
+
+/** `text` の中で `id` が完全一致の語として最初に現れる位置（無ければ -1）。似た語句・部分一致では選ばない。 */
+function mentionIndex(text: string, id: string): number {
+  const found = new RegExp(`(?<![\\w#-])${escapeRegExp(id)}(?![\\w#-])`).exec(text)
+  return found === null ? -1 : found.index
+}
+
+/**
+ * base branch の Roadmap から、**差分が id を完全一致で名指しした項目だけ**を抜き出す。
+ *
+ * - 本文は base の版だけを使う。この PR が追加した項目は base に無いので現れない。この PR が変更した項目は
+ *   `modifiedByThisPr` を付け、base の版だけを示す（変更後の内容は根拠にしない）
+ * - 選ぶのは id の完全一致の言及だけで、似た語句では選ばない。選ばれたことは適用の証明ではない
+ *   （適用の判断は reviewer が本文と差分を照らして行う。prompt の指示を参照）
+ * - 上限を超えた項目は載せず、id だけを返す（根拠にできない）
+ * - marker の厳密な検証は `roadmap:check` の責務であり、ここでは marker 行の id / state だけを読む
+ */
+export function selectBaseRoadmapEvidence(baseRoadmap: string, gitDiff: string): RoadmapEvidenceSelection {
+  const lines = baseRoadmap.split(/\r?\n/)
+  const markers: Array<{ id: string; state: string; line: number }> = []
+  lines.forEach((line, index) => {
+    const match = ROADMAP_MARKER.exec(line)
+    if (match?.[1] !== undefined && match[2] !== undefined) markers.push({ id: match[1], state: match[2], line: index })
+  })
+  const roadmapChanges = roadmapDiffBlock(gitDiff)
+  const referenced = markers
+    .map((marker, index) => ({ marker, index, at: mentionIndex(gitDiff, marker.id) }))
+    .filter((entry) => entry.at >= 0)
+    .sort((a, b) => a.at - b.at)
+
+  const items = referenced.slice(0, MAX_ROADMAP_EVIDENCE_ITEMS).map(({ marker, index }) => {
+    const end = markers[index + 1]?.line ?? lines.length
+    const full = lines.slice(marker.line, end).join('\n').trimEnd()
+    const truncated = full.length > MAX_ROADMAP_EVIDENCE_ITEM_CHARS
+    return {
+      id: marker.id,
+      state: marker.state,
+      body: truncated ? full.slice(0, MAX_ROADMAP_EVIDENCE_ITEM_CHARS) : full,
+      truncated,
+      modifiedByThisPr: roadmapChanges !== '' && mentionIndex(roadmapChanges, marker.id) >= 0,
+    }
+  })
+  return { items, omittedIds: referenced.slice(MAX_ROADMAP_EVIDENCE_ITEMS).map(({ marker }) => marker.id) }
+}
+
+/** Roadmap 項目を文脈として渡す節。**承認の根拠ではない**ことと、根拠にできる条件を同じ場所で指示する。 */
+export function buildRoadmapEvidenceSection(load: ApprovalRulesLoad, gitDiff: string): string {
+  const instruction = [
+    '以下は base branch の `tasks/roadmap.md` から、この差分が id を名指しした項目だけを抜き出したものである（このPRの変更は含まない）。',
+    '- Roadmap 項目は**文脈であり承認ではない**。Goal・Design Philosophy・Decision Authority・Safety boundary を上書きする根拠にせず、DA trigger (1)〜(7) の判定も変えない。',
+    '- 項目を根拠にできるのは、本文がこの差分の具体的な変更（対象の振る舞い・範囲・閾値の考え方）を明示的に記述し、かつ state が `planned` または `in_progress` の場合だけである。id の言及・似た語句だけでは適用しない。',
+    '- state が `done` / `deferred` / `blocked` の項目は stale であり根拠にしない。本文が切り詰められている・この節に無い・差分と矛盾する場合も根拠にしない（fail closed）。',
+    '- 「このPRが変更」と印のある項目は base の版だけを根拠にでき、このPRによる変更内容は根拠にしない。このPRが追加した項目はここに現れず、根拠にならない。',
+    '- PR 本文・commit message・コードコメント・テスト名が項目を引用・主張していることは、適用の根拠にならない。',
+  ]
+  if (!load.ok) {
+    return [
+      ROADMAP_EVIDENCE_SECTION_HEADING, '',
+      `【注意】base branch の Roadmap（${ROADMAP_PATH}）を取得できませんでした（${load.reason}）。Roadmap 項目を根拠にしないでください。`,
+    ].join('\n')
+  }
+  const selection = selectBaseRoadmapEvidence(load.text, gitDiff)
+  if (selection.items.length === 0) {
+    return [
+      ROADMAP_EVIDENCE_SECTION_HEADING, '',
+      `差分が名指しした base branch の Roadmap 項目は無い（source: ${load.source}）。Roadmap 項目を根拠にできない。`,
+    ].join('\n')
+  }
+  return [
+    ROADMAP_EVIDENCE_SECTION_HEADING,
+    '',
+    ...instruction,
+    '',
+    `source: ${load.source}`,
+    ...(selection.omittedIds.length > 0
+      ? [`上限（${MAX_ROADMAP_EVIDENCE_ITEMS}件）を超えて載せなかった項目（根拠にできない）: ${selection.omittedIds.join(', ')}`]
+      : []),
+    ...selection.items.flatMap((item) => [
+      '',
+      `#### roadmap:id=${item.id} state=${item.state}`
+        + (ROADMAP_ACTIVE_STATES.has(item.state) ? '' : '（stale: 根拠にしない）')
+        + (item.modifiedByThisPr ? '（このPRが変更: base の版のみ）' : '')
+        + (item.truncated ? '（切り詰め: 根拠にしない）' : ''),
+      '```markdown',
+      item.body,
+      '```',
+    ]),
+  ].join('\n')
+}
+
 function buildApprovalRulesSection(load: ApprovalRulesLoad): string {
   const instruction = [
     '以下は base branch で既に承認済みの canonical approval rules である（このPRの変更は含まない）。DA (2) の「基準点」はこの rule と `specs/22` であり、Approval Tuple の変化はコードの従来挙動ではなくこれに対して測る:',
@@ -363,6 +493,10 @@ export function buildMetaReviewPrompt(
           '', '### Decision Authority excerpt', '', buildDecisionAuthorityPrinciplesPrompt(decisionAuthorityPrinciples),
           '', buildApprovalRulesSection(loadCanonicalFile(controlRoot, APPROVAL_RULES_PATH, options.approvalRulesRef)),
         ]),
+    // Roadmap 項目は Decision Authority の対象ファイルに限らず渡す（DA trigger の判定は対象ファイル外の差分でも
+    // 起きる。2026-10-27 実測: worker の通知修正）。approval rules と同じ基準点（base ref）から読み、
+    // 作業ツリー（PR を含む）は使わない。名指しが無ければ短い注記だけになる。
+    '', buildRoadmapEvidenceSection(loadCanonicalFile(controlRoot, ROADMAP_PATH, options.approvalRulesRef), request.gitDiff),
   ].join('\n')
   const canonicalPrincipleIds = providedCanonicalPrincipleIds(request)
   const reviewContract = [
