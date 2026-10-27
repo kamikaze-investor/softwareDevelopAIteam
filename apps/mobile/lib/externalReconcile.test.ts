@@ -106,7 +106,7 @@ function deps(over: Partial<ReconcileDeps> = {}): ReconcileDeps & { calls: strin
   }
 }
 
-const confirmation = { pkg, preview: preview(), replaced: [] as string[] }
+const confirmation = { approval: { kind: 'none' } as const, pkg, preview: preview(), replaced: [] as string[] }
 
 beforeEach(() => {
   apiFetchMock.mockReset()
@@ -239,7 +239,7 @@ describe('runOneScreenReconcile — create → human approve → execute', () =>
     const d = deps({
       loadState: vi.fn(async () => freshState({ approvalRequests: [request('w1')], humanTaskDecisions: [decision('w1', 'waiting')] })),
     })
-    expect((await runOneScreenReconcile(confirmation, d)).ok).toBe(true)
+    expect((await runOneScreenReconcile({ ...confirmation, approval: { approvalRequestId: 'w1', kind: 'waiting' } }, d)).ok).toBe(true)
     expect(d.createRequest).not.toHaveBeenCalled()
     expect(d.approveRequest).toHaveBeenCalledWith('w1')
     expect(d.execute).toHaveBeenCalledWith(pkg, 'w1')
@@ -251,7 +251,7 @@ describe('runOneScreenReconcile — create → human approve → execute', () =>
         approvalRequests: [request('p1', { status: 'APPROVED' })], humanTaskDecisions: [decision('p1', 'approved')],
       })),
     })
-    expect((await runOneScreenReconcile(confirmation, d)).ok).toBe(true)
+    expect((await runOneScreenReconcile({ ...confirmation, approval: { approvalRequestId: 'p1', kind: 'approved' } }, d)).ok).toBe(true)
     expect(d.createRequest).not.toHaveBeenCalled()
     expect(d.approveRequest).not.toHaveBeenCalled()
     expect(d.execute).toHaveBeenCalledWith(pkg, 'p1')
@@ -276,6 +276,23 @@ describe('runOneScreenReconcile — create → human approve → execute', () =>
     await runOneScreenReconcile({ ...confirmation, replaced: ['p1（reconcile_external_completion）'] }, d)
     expect(d.createRequest).toHaveBeenCalledTimes(1)
     expect(d.execute).toHaveBeenCalledWith(pkg, 'new-1')
+  })
+
+  it('stops when the request shown in the confirmation was rejected / expired meanwhile (no silent re-issue)', async () => {
+    const d = deps({ loadState: vi.fn(async () => freshState({ approvalRequests: [request('w1', { status: 'REJECTED' })] })) })
+    const result = await runOneScreenReconcile({ ...confirmation, approval: { approvalRequestId: 'w1', kind: 'waiting' } }, d)
+    expect(result).toMatchObject({ message: RECONCILE_STALE_MESSAGE, ok: false, stage: 'check' })
+    expect(d.createRequest).not.toHaveBeenCalled()
+    expect(d.approveRequest).not.toHaveBeenCalled()
+    expect(d.execute).not.toHaveBeenCalled()
+  })
+
+  it('stops when a different bound request appeared after the confirmation was built', async () => {
+    const d = deps({
+      loadState: vi.fn(async () => freshState({ approvalRequests: [request('w9')], humanTaskDecisions: [decision('w9', 'waiting')] })),
+    })
+    expect(await runOneScreenReconcile(confirmation, d)).toMatchObject({ ok: false, stage: 'check' })
+    expect(d.approveRequest).not.toHaveBeenCalled()
   })
 
   it('does not execute when the human approval was refused (expired / non-ADMIN credential)', async () => {

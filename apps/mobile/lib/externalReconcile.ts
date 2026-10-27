@@ -495,11 +495,12 @@ export type ReconcileRunResult =
  *
  * - **既に done なら何もしない**（成功として返す。前回の実行が通信断の後ろで成立していた場合）
  * - 同じ commit・digest の承認があれば再利用する（承認済みなら実行だけ・承認待ちなら承認して実行）。もう 1 件作らない
- * - 確認時に示さなかった依頼を置き換えることになるなら起票せずに止める
+ * - **確認ダイアログを作った時と承認の状況が違えば止める**（使う依頼が変わった・却下された・期限切れになった等。
+ *   黙って起票し直すと、CEO が見ていない承認で実行することになる）。確認時に示さなかった依頼を置き換えることになる場合も止める
  * - 実行が拒否・不明に終わったら Task を読み直し、done なら成功（二重には登録されない）として返す
  */
 export async function runOneScreenReconcile(
-  confirmation: Pick<ReconcileConfirmation, 'pkg' | 'preview' | 'replaced'>,
+  confirmation: Pick<ReconcileConfirmation, 'pkg' | 'preview' | 'approval' | 'replaced'>,
   deps: Omit<ReconcileDeps, 'preview'>,
 ): Promise<ReconcileRunResult> {
   const { pkg, preview } = confirmation
@@ -516,6 +517,9 @@ export async function runOneScreenReconcile(
     const approval = reconcileApprovalState(
       state.humanTaskDecisions, state.approvalRequests, pkg.evidence.commitSha, preview.approvalTargetDiffHash,
     )
+    if (!sameApprovalState(approval, confirmation.approval)) {
+      return { message: RECONCILE_STALE_MESSAGE, ok: false, stage }
+    }
     if (approval.kind === 'none') {
       const disclosed = new Set(confirmation.replaced)
       if (approvalRequestsReplacedByCreate(state, approval).some((id) => !disclosed.has(id))) {
@@ -565,10 +569,15 @@ export async function runOneScreenReconcile(
   }
 }
 
+function sameApprovalState(a: ReconcileApprovalState, b: ReconcileApprovalState): boolean {
+  if (a.kind === 'none' || b.kind === 'none') return a.kind === b.kind
+  return a.kind === b.kind && a.approvalRequestId === b.approvalRequestId
+}
+
 /** 二重送信を防ぐ runner（描画の反映前の 2 回押し対策。`createOneTapAbortRunner` と同じ）。 */
 export function createOneScreenReconcileRunner(deps: Omit<ReconcileDeps, 'preview'>): {
   isRunning: () => boolean
-  run: (confirmation: Pick<ReconcileConfirmation, 'pkg' | 'preview' | 'replaced'>) => Promise<ReconcileRunResult | null>
+  run: (confirmation: Pick<ReconcileConfirmation, 'pkg' | 'preview' | 'approval' | 'replaced'>) => Promise<ReconcileRunResult | null>
 } {
   let running = false
   return {
