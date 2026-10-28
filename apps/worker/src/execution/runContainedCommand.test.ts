@@ -9,6 +9,7 @@
 
 import { existsSync, readFileSync, rmdirSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
+import ts from 'typescript'
 import { afterAll, describe, expect, it } from 'vitest'
 import {
   buildCgroupName,
@@ -145,22 +146,39 @@ describe('isOutputOverflowAfterSafeCleanup', () => {
     expect(sourcePath).toBeDefined()
     const source = readFileSync(sourcePath!, 'utf-8')
 
-    // 結果として output_overflow を作る箇所は1つだけ
-    expect(source.match(/outcome: 'output_overflow'/g)).toHaveLength(1)
-    const overflowIndex = source.indexOf("outcome: 'output_overflow'")
-    const guard = 'if (isContainmentSafe(cleanup.outcome)) {'
-    const guardIndex = source.lastIndexOf(guard, overflowIndex)
-    expect(guardIndex).toBeGreaterThan(0)
-    // guard の `{` から output_overflow までを走査し、その if ブロックが一度も閉じない（深さが 0 にならない）こと。
-    // `} else {` や別ブロックへ移されると、ここで深さ 0 を通るので落ちる。
-    let depth = 1
-    let closedBeforeOverflow = false
-    for (const ch of source.slice(guardIndex + guard.length, overflowIndex)) {
-      if (ch === '{') depth += 1
-      if (ch === '}') depth -= 1
-      if (depth === 0) closedBeforeOverflow = true
+    // 文字列やコメント内の括弧に惑わされないよう、構文木で確かめる。
+    const sourceFile = ts.createSourceFile(sourcePath!, source, ts.ScriptTarget.Latest, true)
+    const overflowAssignments: ts.PropertyAssignment[] = []
+    const visit = (node: ts.Node): void => {
+      if (
+        ts.isPropertyAssignment(node)
+        && node.name.getText(sourceFile) === 'outcome'
+        && ts.isStringLiteral(node.initializer)
+        && node.initializer.text === 'output_overflow'
+      ) {
+        overflowAssignments.push(node)
+      }
+      ts.forEachChild(node, visit)
     }
-    expect(closedBeforeOverflow).toBe(false)
+    visit(sourceFile)
+
+    // 結果として output_overflow を作る箇所は1つだけ
+    expect(overflowAssignments).toHaveLength(1)
+
+    // その箇所の祖先に「`isContainmentSafe(cleanup.outcome)` の if の then 側」がある
+    let insideSafeCleanup = false
+    let child: ts.Node = overflowAssignments[0]!
+    for (let parent = child.parent; parent !== undefined; child = parent, parent = parent.parent) {
+      if (
+        ts.isIfStatement(parent)
+        && parent.thenStatement === child
+        && parent.expression.getText(sourceFile).replace(/\s+/g, '') === 'isContainmentSafe(cleanup.outcome)'
+      ) {
+        insideSafeCleanup = true
+        break
+      }
+    }
+    expect(insideSafeCleanup).toBe(true)
   })
 })
 
