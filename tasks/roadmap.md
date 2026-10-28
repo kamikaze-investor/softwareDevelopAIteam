@@ -10409,6 +10409,28 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       **再評価（`observation-closes-loop`）**: 3 回目の監査記録に「仕組みの評価」節を置き、
       発火回数・finding の採用率（false positive）・escaped・コストから、継続 / 発火条件の変更 / 集計 script の要否 / 廃止を決める。
 
+<!-- roadmap:id=materiality-parser-greedy-json-reintroduced state=planned -->
+0. [ ] **#409 が除いた「最初の `{` から最後の `}`」JSON 抽出が、#406 の materiality parser で再導入され M5 の recall を黙って下げる** —
+      2026-10-26登録（Cross-Task Drift Audit `cross_task_audit_2026_10_26b.md` の `xta-97567fd-01`・`02`。PL が実行で再現済み）。
+
+      **確認された事実**:
+      - `apps/worker/src/metaReviewer/designMateriality.ts` の `extractJsonObject()` は最後の fence（言語不問）を取り、
+        `indexOf('{')`〜`lastIndexOf('}')` を `JSON.parse` する。正しい detection JSON の後ろに `}` が1つ付くと
+        `parseDetection()` は `no_json` を返す（2026-10-26 PL 実行で再現。#409 の commit message にある Production 応答形と同じ）
+      - parse 失敗は `unavailable` になり、M5 評価（`designMaterialityEval.ts`）では「検出しなかった」として数えられる
+      - 同じ意味（model 応答から JSON object を1つ取り出す）の owner は `packages/shared/src/firstJsonObject.ts` の
+        `parseFirstJsonObject()`（#409）。worker は既に `@ai-team/shared` に依存している
+      - 同じ class が `apps/api/src/pl/operatorRequestStep.ts`（2026-09-28 から）にも残る。adoption parser は #409 が意図的に範囲外にした
+
+      **方向**: `extractJsonObject()` を `parseFirstJsonObject()` への委譲にする（fence 選択の差は委譲側の仕様に合わせ、
+      M5 の既存 label・結果との比較可能性を記録する）。`operatorRequestStep.ts` も同じ owner へ寄せる。
+      **M5 評価を進めている作業と同じファイルなので、その作業の owner が着手するのが自然**（並行編集しない）。
+
+      **Acceptance Criteria**: 末尾に余分な `}` / 散文中の `{}` が付いた正しい応答が parse できる（テストで固定。修正前に失敗を確認）/
+      JSON 抽出の実装が shared の1つだけになる / M5 の結果に parse 修正前後の差を記録する。
+
+      **やらないこと**: parser 以外の detection・評価ロジックの変更。adoption parser の変更（#409 の範囲判断を維持）。
+
 <!-- roadmap:id=codeowner-approval-required-check state=in_progress -->
 0. [~] **CODEOWNERS 対象 PR にだけ Code Owner 承認を必須にする（`Code Owner Approval` required check）** —
       2026-10-27登録（CEO 決定 2026-10-27 Option B）。実装は本項目の PR。**残りは Ruleset への required check 追加（人が行う Mechanical Operation）と実 PR での検証。**

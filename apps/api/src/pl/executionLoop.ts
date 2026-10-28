@@ -48,12 +48,14 @@
 
 import {
   DESIGN_REVIEW_MAX_ATTEMPTS,
+  DESIGN_REVIEW_RUNNER_SIGKILL_GRACE_MS,
+  DESIGN_REVIEW_RUNNER_TIMEOUT_MS,
   buildDefaultCoordinatorDeps,
   type CoordinatorDeps,
   type ExecuteDesignReviewResult,
 } from '../designReview/designReviewCoordinator'
 import { executeQueuedRun, toExecuteDesignReviewResult } from '../designReview/queuedRunDispatch'
-import { designReviewRetryNotBeforeMs } from '../designReview/retryCooldown'
+import { DESIGN_REVIEW_RETRY_COOLDOWNS_MS, designReviewRetryNotBeforeMs } from '../designReview/retryCooldown'
 import { resolveReviewedImplementation } from '../designReview/repairFlow'
 import {
   CHEAP_AI_PROPOSER_ID,
@@ -490,24 +492,25 @@ function isActionableNow(storage: IStorage, item: AttentionItem, resumeInstructi
   )
 }
 
-/** retry cooldown を待つ間、PL が診断を回さない attention kind（どちらも resume で同じ run を再実行する）。 */
+/** retry cooldown または linked run の完了を待つ attention kind。 */
 const WAITS_FOR_DESIGN_REVIEW_RETRY_KINDS: readonly AttentionItem['kind'][] = ['job_blocked', 'job_failed']
 
 /**
- * その Task の直近 Design Review run が、判定の出なかった attempt の後の retry cooldown 中なら
- * 明ける時刻（ISO）。そうでなければ undefined。
+ * その Task の直近 Design Review run が retry cooldown 中、または attention Job と保存済み
+ * lineage で結び付いた queued / running run なら、待機期限（ISO）。そうでなければ undefined。
  *
  * cooldown 中は `claim()` が拒むので、resume しても同じ run は動かず pending になるだけである。
  * そこへ毎 tick provider 診断を払わない（lifecycle repair C3-c）。**待つだけで、試行も Escalation も
  * 記録しない。** 判定は `claim()` と同じ壁時計で行う（「いま claim できるか」と同じ問い）。
- * cooldown が明ければ undefined になり、従来の選択（`design_review_idle` の rekick を含む）へ戻るので、
- * 配線済みの executor を先取りしない。
+ * linked run の待機は既存の retry cooldown・attempt 数・runner timeout だけから上限を作る。
+ * 上限を過ぎた場合や running の開始時刻を信用できない場合は fail-open し、従来の
+ * triage / escalation へ戻る。待機中は cooldown と同じく何も記録しない。
  *
  * **待たせるのは、その Job の復旧がこの run に依存すると記録から証明できるときだけ**
  * （`isRetryRunLinkedToAttentionJob()`）。証明できなければ従来どおり actionable のまま残す
  * （同じ Task の無関係な Job の停止を、最大 30 分黙らせない。独立レビュー指摘・C3-c）。
  */
-function designReviewRetryWaitUntil(
+export function designReviewRetryWaitUntil(
   storage: IStorage,
   item: AttentionItem,
   resumeInstruction: string | undefined,
@@ -515,11 +518,32 @@ function designReviewRetryWaitUntil(
   if (item.taskId === undefined || !WAITS_FOR_DESIGN_REVIEW_RETRY_KINDS.includes(item.kind)) return undefined
   const run = storage.designReviewRuns.findLatestByTaskId(item.taskId)
   if (run === undefined) return undefined
+  if (!isRetryRunLinkedToAttentionJob(storage, run, item, resumeInstruction)) return undefined
+
+  const now = Date.now()
+  // 既存の cooldown 待機。**linked run の上限を過ぎていてもこちらは従来どおり効かせる**
+  // （rekick が遅れて上限より後に cooldown が明けるとき、上限で打ち切ると claim できない run へ
+  // 毎 tick 診断を払う。独立レビュー A1）。
   const notBeforeMs = designReviewRetryNotBeforeMs(run)
-  if (notBeforeMs === undefined || Date.now() >= notBeforeMs) return undefined
-  return isRetryRunLinkedToAttentionJob(storage, run, item, resumeInstruction)
-    ? new Date(notBeforeMs).toISOString()
-    : undefined
+  const cooldownUntilMs = notBeforeMs !== undefined && now < notBeforeMs ? notBeforeMs : undefined
+
+  let inFlightUntilMs: number | undefined
+  if (run.status === 'queued' || run.status === 'running') {
+    const createdAtMs = Date.parse(run.createdAt)
+    const waitBoundMs = createdAtMs
+      + DESIGN_REVIEW_RETRY_COOLDOWNS_MS.reduce((sum, cooldownMs) => sum + cooldownMs, 0)
+      + DESIGN_REVIEW_MAX_ATTEMPTS
+        * (DESIGN_REVIEW_RUNNER_TIMEOUT_MS + DESIGN_REVIEW_RUNNER_SIGKILL_GRACE_MS)
+    const startedAtMs = run.startedAt === undefined ? Number.NaN : Date.parse(run.startedAt)
+    const trustworthyStart = run.status === 'queued'
+      || (Number.isFinite(startedAtMs) && startedAtMs <= now)
+    if (Number.isFinite(createdAtMs) && now <= waitBoundMs && trustworthyStart) {
+      inFlightUntilMs = waitBoundMs
+    }
+  }
+
+  const untilMs = Math.max(cooldownUntilMs ?? Number.NEGATIVE_INFINITY, inFlightUntilMs ?? Number.NEGATIVE_INFINITY)
+  return Number.isFinite(untilMs) ? new Date(untilMs).toISOString() : undefined
 }
 
 /**
@@ -977,7 +1001,7 @@ async function actOnOperatorTarget(
         : hasExhaustedTargetTechnicalRecovery(storage, item)
           ? 'technical recovery budget exhausted; the PL will not resume this target'
           : designReviewRetryWaitUntil(storage, item, deps.resumeInstruction) !== undefined
-            ? `the Design Review retry is cooling down until ${designReviewRetryWaitUntil(storage, item, deps.resumeInstruction)}; the PL will look at it automatically`
+            ? `the linked Design Review run is cooling down or still in flight (waiting until ${designReviewRetryWaitUntil(storage, item, deps.resumeInstruction)}); the PL will look at it automatically`
             : 'not stalled long enough yet; the PL will look at it automatically'
     return { attempted: false, status: 'not_eligible', reason }
   }
@@ -1331,7 +1355,7 @@ function collectSystemEvidence(
 }
 
 /** 止まっている Job の「なぜ止まったか」。PL はこれを読んで判断する。 */
-function describeStuckJob(storage: IStorage, jobId: string): unknown {
+export function describeStuckJob(storage: IStorage, jobId: string): unknown {
   const job = storage.jobs.findById(jobId)
   if (!job) return { jobId, note: 'job not found' }
   return {
@@ -1345,7 +1369,23 @@ function describeStuckJob(storage: IStorage, jobId: string): unknown {
     guardResult: job.guardResult,
     // **allowedPaths では解決できない違反**。空なら scope の問題、非空なら protected の問題。
     protectedViolations: protectedViolations(job.guardResult?.fileViolations),
-    failureMetadata: job.failureMetadata,
+    // SafeCommand の出力抜粋は未信頼データで、修正 prompt の untrusted block 専用である。
+    // PL の診断材料には出所（source / withheld）だけを渡し、本文は載せない。
+    failureMetadata: job.failureMetadata === undefined
+      ? undefined
+      : {
+          ...job.failureMetadata,
+          ...(job.failureMetadata.safeCommandEvidence !== undefined
+            ? {
+                safeCommandEvidence: {
+                  source: job.failureMetadata.safeCommandEvidence.source,
+                  ...(job.failureMetadata.safeCommandEvidence.withheld !== undefined
+                    ? { withheld: job.failureMetadata.safeCommandEvidence.withheld }
+                    : {}),
+                },
+              }
+            : {}),
+        },
     stderrTail: tailText(job.stderr, 300),
   }
 }

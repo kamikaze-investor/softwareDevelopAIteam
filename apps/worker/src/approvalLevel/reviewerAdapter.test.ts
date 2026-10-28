@@ -20,6 +20,7 @@ import { callGeminiWithFallback } from '../metaReviewer/geminiRouter.js'
 import { TARGET_ROOT } from '../utils/pathUtils.js'
 import {
   buildReviewPrompt,
+  buildRepositoryContextSection,
   ClaudeReviewerAdapter,
   extractClaudeCliResultText,
   CodexReviewerAdapter,
@@ -370,17 +371,17 @@ describe('buildReviewPrompt repository context', () => {
     expect(prompt).toContain('NORMAL_FILE_CONTENT')
   })
 
-  it('1ファイルの上限を超える内容は切り詰め、その旨を明示する', () => {
+  it('省略時は既存の1ファイル上限を変えず、その上限で切り詰める', () => {
     writeRepoFile('src/large.ts', 'a'.repeat(REPOSITORY_CONTEXT_MAX_FILE_CHARS + 100))
 
-    const prompt = buildReviewPrompt(makeRequest({ targetFiles: ['src/large.ts'] }), [], repoRoot)
+    const prompt = buildRepositoryContextSection(['src/large.ts'], repoRoot)
 
     expect(prompt).toContain('a'.repeat(REPOSITORY_CONTEXT_MAX_FILE_CHARS))
     expect(prompt).not.toContain('a'.repeat(REPOSITORY_CONTEXT_MAX_FILE_CHARS + 1))
     expect(prompt).toContain(`先頭${REPOSITORY_CONTEXT_MAX_FILE_CHARS}文字のみ`)
   })
 
-  it('全体上限に達した後のファイルは省略し、その旨を明示する', () => {
+  it('省略時は既存の全体上限を変えず、到達後のファイルを省略する', () => {
     const fileCount = Math.ceil(REPOSITORY_CONTEXT_MAX_TOTAL_CHARS / REPOSITORY_CONTEXT_MAX_FILE_CHARS)
     const files = Array.from({ length: fileCount }, (_, i) => `src/f${i}.ts`)
     for (const file of files) writeRepoFile(file, 'b'.repeat(REPOSITORY_CONTEXT_MAX_FILE_CHARS))

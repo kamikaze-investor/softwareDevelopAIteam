@@ -26,9 +26,11 @@ import type {
   Task,
 } from '@ai-team/shared'
 import {
+  SAFE_COMMAND_FAILED_FAILURE_KIND,
   SAFE_COMMAND_TIMEOUT_FAILURE_KIND,
   aiCliTimeoutMs,
   findGateTechnicalStopCode,
+  isPromptSafe,
   runRiskReview,
 } from '@ai-team/shared'
 import { z } from 'zod'
@@ -366,11 +368,12 @@ export interface JobRunResult {
   completedAt: string
   providerFailureKind?: AiCliResult['providerFailureKind']
   /**
-   * SafeCommand が kind 別の実行予算で containment に kill されたときだけ立つ。
+   * SafeCommand が timeout または通常の非0終了で失敗したときに立つ。
    * 既存 `failureMetadata.kind` へ保存される（新しい保存欄は作らない）。
    * provider failure は SafeCommand 実行前に return するので両者は同時に立たない。
    */
-  safeCommandFailureKind?: typeof SAFE_COMMAND_TIMEOUT_FAILURE_KIND
+  safeCommandFailureKind?: typeof SAFE_COMMAND_TIMEOUT_FAILURE_KIND | typeof SAFE_COMMAND_FAILED_FAILURE_KIND
+  safeCommandEvidence?: JobFailureMetadata['safeCommandEvidence']
   refusal?: JobFailureMetadata['refusal']
   workspaceState?: 'unchanged' | 'changed' | 'unknown'
   /** 子プロセスと Job 固有 cleanup が終わった時点の value-free workspace fingerprint。 */
@@ -414,8 +417,7 @@ export interface JobRunResult {
    * safetyVerifier結果（Step R4-B・観察モード）。
    * targetProjectRiskScanResult.highestSeverity が medium/high の場合のみ呼び出す
    * （postReviewer/Gemini Step Reviewと同じ既存シグナルを流用。新しい分類器は作らない）。
-   * 12項目中、TYPECHECK/RELATED_TESTS/FULL_TESTSの3項目は実行結果を渡していないため
-   * 常にfail-closed（overallPassed:falseの主要因になり得る。危険検出とは限らない）。
+   * typecheck / test は扱わない（workflow の Implement Job は SafeCommand の verify:implement が実行し、失敗なら Job が failed）。
    * 呼び出し自体に失敗しても（想定外入力・実装バグ等）Jobは止めず、undefinedのまま。
    */
   safetyVerificationResult?: SafetyVerificationResult
@@ -1178,14 +1180,12 @@ export async function runJob(
 
   // ── safetyVerifier接続（Step R4-B・観察モード・非停止） ─────────────────────────
   // safetyVerifier は postReviewer と異なり medium/high のみで実行する（意図的）。
-  // 理由: (1) TYPECHECK/RELATED_TESTS/FULL_TESTS の3チェックが未接続のため fail-closed
-  //   であり、any severity で実行しても overallPassed は常に false（構造的問題）;
-  //   (2) target_project の下位tier 相当のリスクシグナルは既に targetProjectRiskScanResult
+  // 理由: target_project の下位tier 相当のリスクシグナルは既に targetProjectRiskScanResult
   //   がカバーしているため、SAFETY_VERIFICATION_RESULT は commit gate から不要とされた
   //   （commitGate.ts getRequiredArtifacts 注釈参照）。
   //   観察モードとして medium/high でのみ計測・ログを蓄積する。
-  // 12項目中TYPECHECK/RELATED_TESTS/FULL_TESTSの3項目は実行結果を渡していないためfail-closed。
-  // これは危険検出ではなく未接続項目によるものであり、blockingFailuresで区別できるようにする。
+  // typecheck / test はこの verifier では扱わない。この位置は SafeCommand 実行より前で結果が無く、
+  // workflow の Implement Job では SafeCommand（verify:implement）が検証し、失敗すれば Job は failed になる（#355）。
   let safetyVerificationResult: SafetyVerificationResult | undefined
   if (isRiskSeverityMediumOrHigh) {
     try {
@@ -1311,6 +1311,8 @@ export async function runJob(
   let createdCommitHash: string | undefined
   // SafeCommand が kind 別の実行予算で containment に kill されたか（構造化して API へ渡す）。
   let safeCommandTimedOut = false
+  let safeCommandFailed = false
+  let safeCommandExitedWithoutCode = false
 
   if (!job.dryRun) {
     // アトミックジョブの場合は実行前コミットハッシュを記録
@@ -1342,6 +1344,7 @@ export async function runJob(
         stderr = contained.stderr
       } else {
         exitCode = contained.exitCode ?? 1
+        safeCommandExitedWithoutCode = contained.exitCode === null || contained.exitCode === undefined
         safeCommandTimedOut = contained.timedOut
         stderr = contained.stderr || (contained.timedOut
           ? `command timed out after ${timeoutMs}ms (${job.safeCommand.kind} budget) and was terminated by containment`
@@ -1355,6 +1358,19 @@ export async function runJob(
       exitCode = typeof failure.status === 'number' ? failure.status : 1
       stdout = outputToString(failure.stdout)
       stderr = outputToString(failure.stderr) || formatUnknownError(err)
+    }
+
+    safeCommandFailed = !safeCommandTimedOut && exitCode !== 0
+    if (safeCommandFailed) {
+      // コマンド出力は信頼済みの `[jobRunner]` 行へ混ぜない。ここに置けば、
+      // 後段の Guard / containment / ログ保存失敗の注記が必要に応じて先頭を上書きできる。
+      // signal 等で終了コードが無い場合は、代入した 1 を「exited 1」と書かない（独立レビュー B4）。
+      stderr = withLeadingNote(
+        stderr,
+        safeCommandExitedWithoutCode
+          ? `SafeCommand kind=${job.safeCommand.kind} terminated without an exit code`
+          : `SafeCommand kind=${job.safeCommand.kind} exited ${exitCode}`,
+      )
     }
 
     // アトミックジョブの場合は実行後コミットハッシュを記録
@@ -1472,6 +1488,14 @@ export async function runJob(
     stderr = withLeadingNote(stderr, note)
   }
 
+  const safeCommandEvidence = safeCommandFailed
+    ? buildSafeCommandFailureEvidence({
+        kind: job.safeCommand.kind,
+        stdoutPath,
+        aiCliUsed: Boolean(job.aiCliProvider && job.aiCliMode),
+      })
+    : undefined
+
   // アトミックジョブの RollbackInfo を自動生成
   let rollbackInfo: RollbackInfo | undefined
   if (isAtomic && beforeCommitHash && exitCode === 0) {
@@ -1522,8 +1546,49 @@ export async function runJob(
       preChangedPaths: [...preManifest.paths],
     },
     reviewResult: structuredReviewResult,
-    ...(safeCommandTimedOut ? { safeCommandFailureKind: SAFE_COMMAND_TIMEOUT_FAILURE_KIND } : {}),
+    ...(safeCommandTimedOut
+      ? { safeCommandFailureKind: SAFE_COMMAND_TIMEOUT_FAILURE_KIND }
+      : safeCommandFailed ? { safeCommandFailureKind: SAFE_COMMAND_FAILED_FAILURE_KIND } : {}),
+    ...(safeCommandEvidence !== undefined ? { safeCommandEvidence } : {}),
   }
+}
+
+const SAFE_COMMAND_FAILURE_EVIDENCE_MAX_CHARS = 3_000
+const SAFE_COMMAND_FAILURE_EVIDENCE_MIN_TAIL_CHARS = 1_500
+
+/**
+ * 修正 prompt へ渡す未信頼出力を、要約が末尾の直接原因を押し出さない形で有界化する。
+ * `readSafeCommandEvidence()` が分離を証明できない場合は本文を一切運ばない。
+ */
+function buildSafeCommandFailureEvidence(input: {
+  kind: string
+  stdoutPath?: string
+  aiCliUsed: boolean
+}): NonNullable<JobFailureMetadata['safeCommandEvidence']> {
+  const evidence = readSafeCommandEvidence(input)
+  if (!evidence.separated) {
+    return { source: evidence.source, withheld: 'unavailable' }
+  }
+
+  const summary = evidence.summaryLines.join('\n')
+  const reservedTail = Math.min(evidence.excerpt.length, SAFE_COMMAND_FAILURE_EVIDENCE_MIN_TAIL_CHARS)
+  const separatorLength = summary.length > 0 && evidence.excerpt.length > 0 ? 1 : 0
+  const summaryBudget = Math.max(
+    0,
+    SAFE_COMMAND_FAILURE_EVIDENCE_MAX_CHARS - reservedTail - separatorLength,
+  )
+  const boundedSummary = summary.slice(0, summaryBudget)
+  const tailBudget = SAFE_COMMAND_FAILURE_EVIDENCE_MAX_CHARS
+    - boundedSummary.length
+    - (boundedSummary.length > 0 && evidence.excerpt.length > 0 ? 1 : 0)
+  const tail = evidence.excerpt.slice(-tailBudget)
+  const excerpt = [boundedSummary, tail].filter((part) => part.length > 0).join('\n')
+
+  // 切り詰め前の本文も検査する。末尾切り出しが secret の形を途中で割ると、切った後だけの
+  // 検査では一致しなくなる（独立レビュー B3）。
+  return isPromptSafe(excerpt) && isPromptSafe(`${summary}\n${evidence.excerpt}`)
+    ? { source: evidence.source, excerpt }
+    : { source: evidence.source, withheld: 'secret_scan' }
 }
 
 /**

@@ -1,5 +1,8 @@
 import { closeSync, fstatSync, lstatSync, mkdirSync, openSync, readSync, realpathSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
+import type { SafeCommandEvidenceSource } from '@ai-team/shared'
+
+export type { SafeCommandEvidenceSource } from '@ai-team/shared'
 
 /**
  * DB / API / Mobile を軽く保つためのプレビュー上限。**検証証跡の上限ではない。**
@@ -95,8 +98,6 @@ export function safeCommandSectionHeader(kind: string): string {
  * - `unseparable`: 全文は読めたが SafeCommand の出力を分離できない
  * - `unavailable`: ログを読めない
  */
-export type SafeCommandEvidenceSource = 'safe_command_log' | 'full_log' | 'unseparable' | 'unavailable'
-
 export interface SafeCommandEvidence {
   source: SafeCommandEvidenceSource
   /**

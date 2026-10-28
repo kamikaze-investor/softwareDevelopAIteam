@@ -70,16 +70,32 @@ export type JobRefusalMetadata = JobRefusalFacts & (
  * - `safe_command_timeout`: AI CLI の後の SafeCommand（test / build / typecheck 等）が
  *   kind 別の実行予算で containment に kill された（2026-10-23 implement stall）。
  *   実装を直しても予算は変わらない技術停止なので、stderr の解析ではなくこの値で判定する。
+ * - `safe_command_failed`: 実行済みの SafeCommand が timeout 以外の非0で終了した。
+ *   コマンド出力そのものは未信頼なので、この kind には含めない。
  */
 export const SAFE_COMMAND_TIMEOUT_FAILURE_KIND = 'safe_command_timeout' as const
+export const SAFE_COMMAND_FAILED_FAILURE_KIND = 'safe_command_failed' as const
 
 export type JobTimeoutFailureKind = 'provider_timeout' | typeof SAFE_COMMAND_TIMEOUT_FAILURE_KIND
+
+export type SafeCommandEvidenceSource = 'safe_command_log' | 'full_log' | 'unseparable' | 'unavailable'
+
+export interface SafeCommandFailureEvidence {
+  source: SafeCommandEvidenceSource
+  excerpt?: string
+  withheld?: 'secret_scan' | 'unavailable'
+}
 
 export interface JobFailureMetadata {
   /** 構造化された失敗種別。timeout 系の値は `JobTimeoutFailureKind`。 */
   kind?: string
   workspaceState?: 'unchanged' | 'changed' | 'unknown'
   refusal?: JobRefusalMetadata
+  /**
+   * 未信頼のコマンド出力。修正 prompt 内の untrusted block 専用で、
+   * Worker が長さを制限し secret scan を通したものだけを保持する。
+   */
+  safeCommandEvidence?: SafeCommandFailureEvidence
   /**
    * PR-C: クラッシュ復旧時にこの Job が quarantine されたか。
    * uptime: 復旧処理が workspace を「クリーン」と確認できず、

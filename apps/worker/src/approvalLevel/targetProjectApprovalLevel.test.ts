@@ -39,7 +39,7 @@ function makePassingSafetyVerificationResult(
     jobId: 'job-1',
     taskId: 'task-1',
     overallPassed: true,
-    checks: [makeSafetyCheck('TYPECHECK', true)],
+    checks: [makeSafetyCheck('UNEXPECTED_FILES', true)],
     blockingFailures: [],
     verifiedAt: '2026-08-25T00:00:00.000Z',
     ...overrides,
