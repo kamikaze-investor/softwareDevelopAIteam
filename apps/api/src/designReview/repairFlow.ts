@@ -328,6 +328,7 @@ export async function runRepairFlow(
       changedFiles: failedJob.changedFiles,
       failureKind: failedJob.failureMetadata?.kind,
       workspaceState: failedJob.failureMetadata?.workspaceState,
+      safeCommandEvidence: failedJob.failureMetadata?.safeCommandEvidence,
     },
     review: review
       ? { status: review.status, summary: review.summary, findings: review.findings }
@@ -1344,6 +1345,7 @@ export function prepareRepairFlow(storage: IStorage, input: RepairFlowInput): Re
       changedFiles: failedJob.changedFiles,
       failureKind: failedJob.failureMetadata?.kind,
       workspaceState: failedJob.failureMetadata?.workspaceState,
+      safeCommandEvidence: failedJob.failureMetadata?.safeCommandEvidence,
     },
     review: review
       ? { status: review.status, summary: review.summary, findings: review.findings }

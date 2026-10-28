@@ -187,6 +187,11 @@ const UpdateJobBody = z.object({
     kind: z.string().optional(),
     workspaceState: z.enum(['unchanged', 'changed', 'unknown']).optional(),
     refusal: RefusalMetadataSchema.optional(),
+    safeCommandEvidence: z.object({
+      source: z.enum(['safe_command_log', 'full_log', 'unseparable', 'unavailable']),
+      excerpt: z.string().max(3_000).optional(),
+      withheld: z.enum(['secret_scan', 'unavailable']).optional(),
+    }).strict().optional(),
     // PR-C: quarantine は failure_metadata に載る。ここを strict に絞ったままだと
     // Worker が正当に送る quarantine payload を API が 400 で弾き、
     // 「所有権を保持したまま quarantine する」経路が本番で成立しない。
@@ -259,6 +264,11 @@ const FailIfRunningJobBody = z.object({
     kind: z.string().optional(),
     workspaceState: z.enum(['unchanged', 'changed', 'unknown']).optional(),
     refusal: RefusalMetadataSchema.optional(),
+    safeCommandEvidence: z.object({
+      source: z.enum(['safe_command_log', 'full_log', 'unseparable', 'unavailable']),
+      excerpt: z.string().max(3_000).optional(),
+      withheld: z.enum(['secret_scan', 'unavailable']).optional(),
+    }).strict().optional(),
     // PR-C: quarantine は failure_metadata に載る。ここを strict に絞ったままだと
     // Worker が正当に送る quarantine payload を API が 400 で弾き、
     // 「所有権を保持したまま quarantine する」経路が本番で成立しない。
