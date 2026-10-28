@@ -28,6 +28,8 @@ export async function createContainedCommandMock(): Promise<Record<string, unkno
   return {
     ContainmentInfrastructureError: TestContainmentInfrastructureError,
     isContainmentInfrastructureError: (err: unknown) => err instanceof TestContainmentInfrastructureError,
+    isOutputOverflowAfterSafeCleanup: (err: unknown) =>
+      err instanceof TestContainmentInfrastructureError && err.result?.outcome === 'output_overflow',
     isContainmentAvailable: () => true,
     runContainedOrThrow: (options: RunContainedCommandOptions) =>
       containedOverride !== undefined
@@ -42,9 +44,13 @@ export async function createContainedCommandMock(): Promise<Record<string, unkno
  * このクラスを投げること（実モジュールのクラスでは mock 側の判定に一致しない）。
  */
 export class TestContainmentInfrastructureError extends Error {
-  constructor(message: string) {
+  /** 実クラスの `result` 相当。出力超過など、結果の中身で分岐する経路を検証するときに渡す */
+  readonly result?: Partial<ContainedResult>
+
+  constructor(message: string, result?: Partial<ContainedResult>) {
     super(message)
     this.name = 'ContainmentInfrastructureError'
+    this.result = result
   }
 }
 

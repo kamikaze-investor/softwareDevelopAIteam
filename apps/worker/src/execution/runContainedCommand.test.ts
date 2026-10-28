@@ -18,6 +18,10 @@ import {
   runContainedCommand,
   runContainedOrThrow,
   isContainmentInfrastructureError,
+  isOutputOverflowAfterSafeCleanup,
+  ContainmentInfrastructureError,
+  type ContainedResult,
+  type ContainmentOutcome,
   removeCgroupWithRetry,
   CLEANUP_RETRY_DELAYS_MS,
   DEFAULT_DRAIN_MS,
@@ -86,6 +90,68 @@ describe('isContainmentSafe', () => {
     ] as const) {
       expect(isContainmentSafe(outcome)).toBe(false)
     }
+  })
+})
+
+/**
+ * 出力超過だが後始末は成功した失敗だけを見分ける（2026-10-28 Job 71538c24）。
+ * jobRunner は SafeCommand でこれを quarantine にせず通常失敗として扱うので、
+ * 後始末が失敗した結果まで true にすると、静止を証明できていない workspace を解放してしまう。
+ */
+describe('isOutputOverflowAfterSafeCleanup', () => {
+  function failure(outcome: ContainmentOutcome): ContainmentInfrastructureError {
+    const result: ContainedResult = {
+      outcome,
+      exitCode: null,
+      signal: null,
+      stdout: 'partial',
+      stderr: '',
+      timedOut: false,
+      killedDescendants: true,
+      drainMs: 1,
+    }
+    return new ContainmentInfrastructureError(result)
+  }
+
+  it('output_overflow の containment 失敗だけを true にする', () => {
+    expect(isOutputOverflowAfterSafeCleanup(failure('output_overflow'))).toBe(true)
+  })
+
+  it('後始末が失敗した結果・その他の containment 失敗は false にする（quarantine を維持）', () => {
+    for (const outcome of [
+      'drain_timeout',
+      'cleanup_failed',
+      'spawn_failed',
+      'placement_failed',
+      'kill_failed',
+      'events_failed',
+      'unavailable',
+    ] as const) {
+      expect(isOutputOverflowAfterSafeCleanup(failure(outcome))).toBe(false)
+    }
+  })
+
+  it('containment 失敗でない例外は false にする', () => {
+    expect(isOutputOverflowAfterSafeCleanup(new Error('containment failed: output_overflow'))).toBe(false)
+    expect(isOutputOverflowAfterSafeCleanup(undefined)).toBe(false)
+  })
+
+  it('output_overflow は後始末が安全だった分岐の内側でだけ返る（ソース不変条件）', () => {
+    const candidates = [
+      path.join(process.cwd(), 'src/execution/runContainedCommand.ts'),
+      path.join(process.cwd(), 'apps/worker/src/execution/runContainedCommand.ts'),
+    ]
+    const sourcePath = candidates.find((candidate) => existsSync(candidate))
+    expect(sourcePath).toBeDefined()
+    const source = readFileSync(sourcePath!, 'utf-8')
+
+    // 結果として output_overflow を作る箇所は1つだけ
+    expect(source.match(/outcome: 'output_overflow'/g)).toHaveLength(1)
+    const guardIndex = source.lastIndexOf('if (isContainmentSafe(cleanup.outcome)) {', source.indexOf("outcome: 'output_overflow'"))
+    expect(guardIndex).toBeGreaterThan(0)
+    // guard から output_overflow までの間で、その if ブロック（関数直下・2 スペース字下げ）が閉じていない
+    const between = source.slice(guardIndex, source.indexOf("outcome: 'output_overflow'"))
+    expect(between).not.toMatch(/\n {2}\}\n/)
   })
 })
 
@@ -309,6 +375,10 @@ describeLinux('runContainedCommand — 実 cgroup（Linux のみ）', () => {
     expect(result.outcome).toBe('output_overflow')
     expect(isContainmentSafe(result.outcome)).toBe(false)
     expect(Buffer.byteLength(result.stdout, 'utf-8')).toBeLessThanOrEqual(1024)
+    // 後始末は完了している（cgroup は削除済み）。jobRunner が通常失敗へ回せるのはこのため
+    expect(result.cgroupPath).toBeDefined()
+    expect(existsSync(result.cgroupPath!)).toBe(false)
+    expect(isOutputOverflowAfterSafeCleanup(new ContainmentInfrastructureError(result))).toBe(true)
   })
 
   it('abort されたら containment kill される', async () => {
