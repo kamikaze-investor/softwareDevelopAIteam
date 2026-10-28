@@ -7,6 +7,7 @@ import {
   emptyUsage,
   classifyApiError,
   codexArgs,
+  cliEnv,
   CLI_ARG_PATTERN,
   correctnessFlags,
   DETECTOR_MAX_OUTPUT_TOKENS,
@@ -341,4 +342,9 @@ it.each(['gpt-5.6-sol', 'claude-sonnet-5-5', 'medium'])('CLI に渡す値とし�
 
 it.each(['--dangerously-bypass-approvals-and-sandbox', 'x" -c sandbox_mode=danger-full-access', 'a b', ''])('CLI に渡す値として %s を拒む', (v) => {
   expect(CLI_ARG_PATTERN.test(v)).toBe(false)
+})
+
+it('CLI の子 process には allowlist の環境変数だけを渡し、他の credential を継がせない', () => {
+  const env = cliEnv({ PATH: '/bin', USERPROFILE: 'C:/u', GEMINI_API_KEY: 'k', GITHUB_TOKEN: 't', OPENAI_API_KEY: 'o', ANTHROPIC_API_KEY: 'a' })
+  expect(env).toEqual({ PATH: '/bin', USERPROFILE: 'C:/u' })
 })

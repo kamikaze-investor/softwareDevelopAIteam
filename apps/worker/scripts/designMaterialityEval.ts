@@ -424,10 +424,21 @@ export const CLI_REQUEST_TIMEOUT_MS = 300_000
 /** 比較のため、どの provider にも同じ prompt 本文を stdin で渡す。CLI は空の作業ディレクトリで動かし、repo を読ませない */
 export interface CliCallResult { text: string; usage: TokenUsage; toolUses: number; costUsd: number | null }
 
+/**
+ * CLI に渡す環境変数。OS・login の解決に要るものだけにし、GEMINI_API_KEY・GITHUB_TOKEN など
+ * 他の credential を子 process へ継がせない
+ */
+export const CLI_ENV_ALLOWLIST = ['PATH', 'Path', 'PATHEXT', 'SystemRoot', 'SYSTEMROOT', 'WINDIR', 'ComSpec', 'TEMP', 'TMP', 'TMPDIR',
+  'HOME', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'APPDATA', 'LOCALAPPDATA', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'LANG', 'LC_ALL'] as const
+
+export function cliEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return Object.fromEntries(CLI_ENV_ALLOWLIST.flatMap((k) => source[k] === undefined ? [] : [[k, source[k]]]))
+}
+
 function runCli(command: string, args: string[], prompt: string, timeoutMs: number): Promise<{ stdout: string; code: number | null }> {
   return new Promise((resolve, reject) => {
     const cwd = mkdtempSync(path.join(tmpdir(), 'materiality-cli-'))
-    const child = spawn(command, args, { cwd, stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true })
+    const child = spawn(command, args, { cwd, env: cliEnv(), stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true })
     let stdout = ''
     const timer = setTimeout(() => { child.kill(); reject(new Error(`timeout after ${timeoutMs} ms`)) }, timeoutMs)
     child.stdout.on('data', (d) => { stdout += d })
@@ -463,12 +474,13 @@ export const CLI_ARG_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
 /** Codex CLI（既存の ChatGPT login）。実行ファイルは npm の global install に固定する */
 export async function callCodexWithUsage(prompt: string, model: string, effort: string, timeoutMs = CLI_REQUEST_TIMEOUT_MS): Promise<CliCallResult> {
   const codexJs = path.join(process.env.APPDATA ?? '', 'npm/node_modules/@openai/codex/bin/codex.js')
-  const { stdout } = await runCli(process.execPath, [codexJs, ...codexArgs(model, effort)], prompt, timeoutMs)
+  const { stdout, code } = await runCli(process.execPath, [codexJs, ...codexArgs(model, effort)], prompt, timeoutMs)
   const events = stdout.split('\n').flatMap((l) => { try { return [JSON.parse(l)] } catch { return [] } })
-  const failed = events.find((e) => e.type === 'turn.failed' || e.type === 'error')
-  if (failed) throw new Error(`codex: ${JSON.stringify(failed).slice(0, 300)}`)
   const toolUses = events.filter((e) => e.item && e.item.type !== 'agent_message' && e.item.type !== 'error' && e.item.type !== 'reasoning').length
   if (toolUses > 0) throw new Error(`codex: ${CLI_TOOL_USE_REFUSED} (${toolUses} items)`)
+  const failed = events.find((e) => e.type === 'turn.failed' || e.type === 'error')
+  if (failed) throw new Error(`codex: ${JSON.stringify(failed).slice(0, 300)}`)
+  if (code !== 0) throw new Error(`codex exited with code ${code}`)
   const text = [...events].reverse().find((e) => e.item?.type === 'agent_message')?.item?.text
   if (typeof text !== 'string' || text.length === 0) throw new Error('codex returned no agent message')
   const u = [...events].reverse().find((e) => e.type === 'turn.completed')?.usage ?? {}
@@ -486,13 +498,14 @@ export async function callCodexWithUsage(prompt: string, model: string, effort: 
 export async function callClaudeWithUsage(prompt: string, model: string, timeoutMs = CLI_REQUEST_TIMEOUT_MS): Promise<CliCallResult> {
   const exe = process.env.CLAUDE_CLI
   if (!exe) throw new Error('CLAUDE_CLI is not configured')
-  const { stdout } = await runCli(exe, ['-p', '--output-format', 'json', '--model', model, '--tools', '', '--no-session-persistence',
+  const { stdout, code } = await runCli(exe, ['-p', '--output-format', 'json', '--model', model, '--tools', '', '--no-session-persistence',
     '--strict-mcp-config', '--disable-slash-commands', '--system-prompt', 'Follow the user instructions exactly. Answer only from the text you are given.'], prompt, timeoutMs)
   let j: Record<string, any>
   try { j = JSON.parse(stdout) } catch { throw new Error(`claude returned non-JSON output (${stdout.length} chars)`) }
-  if (j.is_error || typeof j.result !== 'string') throw new Error(`claude: ${String(j.result ?? j.terminal_reason ?? 'error').slice(0, 200)}`)
   const denials = j.permission_denials?.length ?? 0
   if (denials > 0) throw new Error(`claude: ${CLI_TOOL_USE_REFUSED} (${denials} denials)`)
+  if (j.is_error || typeof j.result !== 'string') throw new Error(`claude: ${String(j.result ?? j.terminal_reason ?? 'error').slice(0, 200)}`)
+  if (code !== 0) throw new Error(`claude exited with code ${code}`)
   const u = j.usage ?? {}
   const input = Number(u.input_tokens ?? 0) + Number(u.cache_read_input_tokens ?? 0) + Number(u.cache_creation_input_tokens ?? 0)
   const output = Number(u.output_tokens ?? 0)
