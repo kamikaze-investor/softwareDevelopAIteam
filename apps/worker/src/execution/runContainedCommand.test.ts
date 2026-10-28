@@ -147,38 +147,50 @@ describe('isOutputOverflowAfterSafeCleanup', () => {
     const source = readFileSync(sourcePath!, 'utf-8')
 
     // 文字列やコメント内の括弧に惑わされないよう、構文木で確かめる。
+    // 'output_overflow' という値の出現をすべて分類する。型の union と `===` の比較（読むだけ）以外は
+    // 「値を作る箇所」とみなす（別名の const や別の return へ移すと、ここで2件以上になる）。
     const sourceFile = ts.createSourceFile(sourcePath!, source, ts.ScriptTarget.Latest, true)
-    const overflowAssignments: ts.PropertyAssignment[] = []
+    const producers: ts.StringLiteral[] = []
     const visit = (node: ts.Node): void => {
-      if (
-        ts.isPropertyAssignment(node)
-        && node.name.getText(sourceFile) === 'outcome'
-        && ts.isStringLiteral(node.initializer)
-        && node.initializer.text === 'output_overflow'
-      ) {
-        overflowAssignments.push(node)
+      if (ts.isStringLiteral(node) && node.text === 'output_overflow') {
+        const isTypeLiteral = ts.isLiteralTypeNode(node.parent)
+        const isComparison = ts.isBinaryExpression(node.parent)
+          && node.parent.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken
+        if (!isTypeLiteral && !isComparison) producers.push(node)
       }
       ts.forEachChild(node, visit)
     }
     visit(sourceFile)
+    expect(producers).toHaveLength(1)
 
-    // 結果として output_overflow を作る箇所は1つだけ
-    expect(overflowAssignments).toHaveLength(1)
+    // その1件は `return { ..., outcome: 'output_overflow', ... }` の形で直接返される
+    const literal = producers[0]!
+    const assignment = literal.parent
+    expect(ts.isPropertyAssignment(assignment) && assignment.name.getText(sourceFile) === 'outcome').toBe(true)
+    const objectLiteral = assignment.parent
+    expect(ts.isObjectLiteralExpression(objectLiteral)).toBe(true)
+    const returnStatement = objectLiteral.parent
+    expect(ts.isReturnStatement(returnStatement)).toBe(true)
 
-    // その箇所の祖先に「`isContainmentSafe(cleanup.outcome)` の if の then 側」がある
-    let insideSafeCleanup = false
-    let child: ts.Node = overflowAssignments[0]!
+    // その return の祖先に「`isContainmentSafe(cleanup.outcome)` の if の then 側」があり、
+    // その if は runInsideCgroup()（runContainedCommand の本体）の直下にある（別の if の else 側に入れ子にされていない）
+    let guardIf: ts.IfStatement | undefined
+    let child: ts.Node = returnStatement
     for (let parent = child.parent; parent !== undefined; child = parent, parent = parent.parent) {
       if (
         ts.isIfStatement(parent)
         && parent.thenStatement === child
         && parent.expression.getText(sourceFile).replace(/\s+/g, '') === 'isContainmentSafe(cleanup.outcome)'
       ) {
-        insideSafeCleanup = true
+        guardIf = parent
         break
       }
     }
-    expect(insideSafeCleanup).toBe(true)
+    expect(guardIf).toBeDefined()
+    const functionBody = guardIf!.parent
+    expect(ts.isBlock(functionBody)).toBe(true)
+    const fn = functionBody.parent
+    expect(ts.isFunctionDeclaration(fn) && fn.name?.text === 'runInsideCgroup').toBe(true)
   })
 })
 

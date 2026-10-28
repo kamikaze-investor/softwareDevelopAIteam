@@ -171,7 +171,7 @@ export function isContainmentInfrastructureError(err: unknown): err is Containme
 /**
  * 出力上限を超えたが、後始末（cgroup.kill → populated 0 → rmdir）は成功した失敗か。
  *
- * `output_overflow` は `runContainedCommand()` 末尾の `isContainmentSafe(cleanup.outcome)` の内側でだけ
+ * `output_overflow` は `runInsideCgroup()`（`runContainedCommand()` の本体）末尾の `isContainmentSafe(cleanup.outcome)` の内側でだけ
  * 返るため、timeout の `killed` と同じ静止の証拠を持つ。後始末が失敗した場合はその失敗
  * （`drain_timeout` 等）が結果になり、ここは false になる。この不変条件を変えるときはこの関数も直すこと。
  *
