@@ -441,14 +441,34 @@ function runCli(command: string, args: string[], prompt: string, timeoutMs: numb
   })
 }
 
-/** Codex CLI（既存の ChatGPT login）。read-only sandbox・ephemeral。tool（command）の使用回数を数えて残す */
+/**
+ * prompt には repo の diff（信頼できない入力）が入る。read-only sandbox は shell の書き込みしか止めず、
+ * 読み取り・MCP app・plugin・browser・computer use は残るので、user config を読まず tool 系 feature を切る。
+ * それでも tool を使った応答は捨てて run を止める（下の CLI_TOOL_USE_REFUSED）
+ */
+export const CODEX_DISABLED_FEATURES = ['shell_tool', 'apps', 'plugins', 'browser_use', 'browser_use_external', 'computer_use', 'in_app_browser', 'multi_agent', 'image_generation', 'goals'] as const
+
+export function codexArgs(model: string, effort: string): string[] {
+  return ['exec', '--ignore-user-config', '--ignore-rules', '--sandbox', 'read-only', '--skip-git-repo-check', '--ephemeral',
+    ...CODEX_DISABLED_FEATURES.flatMap((f) => ['--disable', f]),
+    '-m', model, '-c', `model_reasoning_effort=${effort}`, '--json', '-']
+}
+
+/** tool を使った CLI 応答は比較条件を満たさず、信頼できない入力に動かされた可能性もあるので捨てる */
+export const CLI_TOOL_USE_REFUSED = 'tool use refused'
+
+/** CLI に渡す model・effort は operator 指定でも英数字と . _ - だけ（argv・-c 値への混入を防ぐ） */
+export const CLI_ARG_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
+
+/** Codex CLI（既存の ChatGPT login）。実行ファイルは npm の global install に固定する */
 export async function callCodexWithUsage(prompt: string, model: string, effort: string, timeoutMs = CLI_REQUEST_TIMEOUT_MS): Promise<CliCallResult> {
-  const codexJs = process.env.CODEX_JS ?? path.join(process.env.APPDATA ?? '', 'npm/node_modules/@openai/codex/bin/codex.js')
-  const { stdout } = await runCli(process.execPath, [codexJs, 'exec', '--sandbox', 'read-only', '--skip-git-repo-check', '--ephemeral',
-    '-m', model, '-c', `model_reasoning_effort=${effort}`, '--json', '-'], prompt, timeoutMs)
+  const codexJs = path.join(process.env.APPDATA ?? '', 'npm/node_modules/@openai/codex/bin/codex.js')
+  const { stdout } = await runCli(process.execPath, [codexJs, ...codexArgs(model, effort)], prompt, timeoutMs)
   const events = stdout.split('\n').flatMap((l) => { try { return [JSON.parse(l)] } catch { return [] } })
   const failed = events.find((e) => e.type === 'turn.failed' || e.type === 'error')
   if (failed) throw new Error(`codex: ${JSON.stringify(failed).slice(0, 300)}`)
+  const toolUses = events.filter((e) => e.item && e.item.type !== 'agent_message' && e.item.type !== 'error' && e.item.type !== 'reasoning').length
+  if (toolUses > 0) throw new Error(`codex: ${CLI_TOOL_USE_REFUSED} (${toolUses} items)`)
   const text = [...events].reverse().find((e) => e.item?.type === 'agent_message')?.item?.text
   if (typeof text !== 'string' || text.length === 0) throw new Error('codex returned no agent message')
   const u = [...events].reverse().find((e) => e.type === 'turn.completed')?.usage ?? {}
@@ -457,7 +477,7 @@ export async function callCodexWithUsage(prompt: string, model: string, effort: 
   return {
     text,
     usage: { calls: 1, promptTokens: input, candidatesTokens: Number(u.output_tokens ?? 0), totalTokens: input + output },
-    toolUses: events.filter((e) => e.item && e.item.type !== 'agent_message' && e.item.type !== 'error' && e.item.type !== 'reasoning').length,
+    toolUses,
     costUsd: null,
   }
 }
@@ -467,17 +487,19 @@ export async function callClaudeWithUsage(prompt: string, model: string, timeout
   const exe = process.env.CLAUDE_CLI
   if (!exe) throw new Error('CLAUDE_CLI is not configured')
   const { stdout } = await runCli(exe, ['-p', '--output-format', 'json', '--model', model, '--tools', '', '--no-session-persistence',
-    '--strict-mcp-config', '--system-prompt', 'Follow the user instructions exactly. Answer only from the text you are given.'], prompt, timeoutMs)
+    '--strict-mcp-config', '--disable-slash-commands', '--system-prompt', 'Follow the user instructions exactly. Answer only from the text you are given.'], prompt, timeoutMs)
   let j: Record<string, any>
   try { j = JSON.parse(stdout) } catch { throw new Error(`claude returned non-JSON output (${stdout.length} chars)`) }
   if (j.is_error || typeof j.result !== 'string') throw new Error(`claude: ${String(j.result ?? j.terminal_reason ?? 'error').slice(0, 200)}`)
+  const denials = j.permission_denials?.length ?? 0
+  if (denials > 0) throw new Error(`claude: ${CLI_TOOL_USE_REFUSED} (${denials} denials)`)
   const u = j.usage ?? {}
   const input = Number(u.input_tokens ?? 0) + Number(u.cache_read_input_tokens ?? 0) + Number(u.cache_creation_input_tokens ?? 0)
   const output = Number(u.output_tokens ?? 0)
   return {
     text: j.result,
     usage: { calls: 1, promptTokens: input, candidatesTokens: output, totalTokens: input + output },
-    toolUses: (j.permission_denials?.length ?? 0),
+    toolUses: denials,
     costUsd: typeof j.total_cost_usd === 'number' ? j.total_cost_usd : null,
   }
 }
@@ -489,7 +511,7 @@ export function promptVersion(instructions: { detection: string; evaluation: str
   return { detection: h(instructions.detection), evaluation: h(instructions.evaluation) }
 }
 
-export type ApiErrorClass = 'quota' | 'auth' | 'transient' | 'other'
+export type ApiErrorClass = 'quota' | 'auth' | 'policy' | 'transient' | 'other'
 
 export interface ApiErrorRecord {
   stage: 'detection' | 'evaluation'
@@ -508,6 +530,7 @@ export function classifyApiError(message: string): { errorClass: ApiErrorClass; 
   const httpStatus = status === undefined ? null : Number(status)
   if (httpStatus === 429 || httpStatus === 402 || /RESOURCE_EXHAUSTED|quota|billing|credit|usage limit|rate limit/i.test(message)) return { errorClass: 'quota', httpStatus }
   if (httpStatus === 401 || httpStatus === 403 || /API key|PERMISSION_DENIED|UNAUTHENTICATED|GEMINI_API_KEY|not logged in|CLAUDE_CLI is not configured|not supported when using Codex/i.test(message)) return { errorClass: 'auth', httpStatus }
+  if (message.includes(CLI_TOOL_USE_REFUSED)) return { errorClass: 'policy', httpStatus }
   if ((httpStatus !== null && httpStatus >= 500) || /timeout|ECONNRESET|ETIMEDOUT|fetch failed|network/i.test(message)) return { errorClass: 'transient', httpStatus }
   return { errorClass: 'other', httpStatus }
 }
@@ -818,6 +841,11 @@ async function main(): Promise<void> {
     const providerKind = (a.provider ?? 'gemini') as ProviderKind
     if (!['gemini', 'codex', 'claude'].includes(providerKind)) throw new Error(`unknown provider: ${providerKind}`)
     const effort = a.effort ?? 'medium'
+    if (providerKind !== 'gemini') {
+      for (const v of [effort, a.model].filter((x): x is string => x !== undefined)) {
+        if (!CLI_ARG_PATTERN.test(v)) throw new Error(`invalid --model/--effort value: ${JSON.stringify(v.slice(0, 64))}`)
+      }
+    }
     const model = providerKind === 'gemini'
       ? process.env.GEMINI_MODEL?.trim() || 'gemini-2.5-flash'
       : `${providerKind}:${a.model ?? (providerKind === 'codex' ? 'gpt-5.6-sol' : 'claude-sonnet-5-5')}${providerKind === 'codex' ? `@${effort}` : ''}`
@@ -895,7 +923,7 @@ async function main(): Promise<void> {
           const message = sanitizeMessage(err instanceof Error ? err.message : String(err))
           const classified = classifyApiError(message)
           ctx.apiErrors.push({ stage, ...classified, message })
-          if (classified.errorClass === 'quota' || classified.errorClass === 'auth') stopReason = `${classified.errorClass} error at ${stage}`
+          if (classified.errorClass === 'quota' || classified.errorClass === 'auth' || classified.errorClass === 'policy') stopReason = `${classified.errorClass} error at ${stage}`
           throw err
         }
       })()
