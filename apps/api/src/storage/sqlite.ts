@@ -2741,12 +2741,29 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           return { ok: false, code: 'TASK_HAS_BLOCKED_JOBS', reason: blockedJobsReconcileRefusalReason(blocked) }
         }
 
+        // **承認は完了と同じ transaction で使い切る**（一回限りの ApprovalRequest 契約）。以前は route の Gate が
+        // 評価するだけで使い切らず、done になった後も APPROVED が「生きた人の判断」として残り、
+        // 完了と audit の間で止まると根拠の記録の無い done ができた（Mobile 1 画面取り込み・Codex review）。
+        const consumed = verifyAndConsumeTaskApproval(task.id, input.approvalRequestId, 'reconcile_external_completion')
+        if (!consumed.ok) {
+          return { ok: false, code: 'APPROVAL_NOT_USABLE', reason: consumed.reason }
+        }
+
         // **Candidate commit と同じ遷移を共有する。** ここに別の完了ロジックは無い。
         const continuation = completeTaskAndCreateContinuation(task, source.id)
         const updated = tasks.findById(task.id)
         if (!updated) {
-          return { ok: false, code: 'STORAGE_ERROR', reason: 'Task disappeared during completion' }
+          throw new Error('Task disappeared during completion')
         }
+
+        auditLog.record({
+          actor: 'api',
+          operation: 'reconcile_external_completion',
+          entityType: 'task',
+          entityId: task.id,
+          result: 'done',
+          detail: input.auditDetail,
+        })
 
         return { ok: true, task: updated, continuation }
       })

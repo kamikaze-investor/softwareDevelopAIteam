@@ -35,6 +35,7 @@ import {
   View,
 } from 'react-native'
 
+import { ExternalReconcileSection } from '../../components/ExternalReconcileSection'
 import { apiFetch } from '../../lib/api'
 import type { DerivedQaEvidence } from '../../lib/taskWorkflow'
 import { submitStoredReviewRecovery } from '../../lib/storedReviewRecovery'
@@ -1828,6 +1829,7 @@ export default function TaskDetailScreen(): ReactElement {
             progress={abortProgress}
             task={data.task}
           />
+          <ExternalReconcileSection onFinished={loadTaskDetail} task={data.task} />
           <JobHistorySection jobs={data.jobs} />
           <ApprovalHistorySection
             approvalRequests={data.approvalRequests}

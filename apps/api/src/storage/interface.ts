@@ -150,7 +150,14 @@ export type ReconcileExternalCompletionResult =
   | { ok: true; task: Task; continuation: TaskContinuation }
   | {
       ok: false
-      code: 'TASK_NOT_FOUND' | 'JOB_NOT_FOUND' | 'ALREADY_DONE' | 'TASK_HAS_BLOCKED_JOBS' | 'STORAGE_ERROR'
+      code:
+        | 'TASK_NOT_FOUND'
+        | 'JOB_NOT_FOUND'
+        | 'ALREADY_DONE'
+        | 'TASK_HAS_BLOCKED_JOBS'
+        /** 承認を使い切れなかった（期限切れ・人の記録なし・既に使用済み等）。何も変えていない。 */
+        | 'APPROVAL_NOT_USABLE'
+        | 'STORAGE_ERROR'
       reason: string
     }
 export type PersistProviderTimeoutFailureResult =
@@ -627,6 +634,13 @@ export interface IJobStorage {
     taskId: string
     /** continuation の出所として記録する既存 Job。外部完了なので新規 Job は作らない。 */
     sourceJobId: string
+    /**
+     * この取り込みを許可した `reconcile_external_completion` の承認。**完了と同じ transaction で使い切る**
+     * （`verifyAndConsumeForTaskAction` と同じ規則。使い切れなければ何も変えない）。
+     */
+    approvalRequestId: string
+    /** `reconcile_external_completion` audit 行の detail。完了と同じ transaction で書く。 */
+    auditDetail: string
   }): ReconcileExternalCompletionResult
   persistProviderTimeoutFailure(input: {
     jobId: string
