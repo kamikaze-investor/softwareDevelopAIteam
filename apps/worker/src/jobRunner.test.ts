@@ -4677,7 +4677,7 @@ describe('safetyVerifier接続（Step R4-B・観察モード）', () => {
     const result = await runJob(createJob(), createPolicy())
 
     expect(result.safetyVerificationResult).toBeDefined()
-    expect(result.safetyVerificationResult?.checks).toHaveLength(12)
+    expect(result.safetyVerificationResult?.checks).toHaveLength(9)
     expect(result.status).toBe('success')
   })
 
@@ -4689,13 +4689,55 @@ describe('safetyVerifier接続（Step R4-B・観察モード）', () => {
 
     const result = await runJob(createJob(), createPolicy())
 
-    // typecheck/test実行結果を渡していないため、TYPECHECK/RELATED_TESTS/FULL_TESTSがfail-closedになり
-    // overallPassedはfalseになる想定（危険検出ではなく未接続項目による）。それでもJobは止めない。
+    // この mock では Post-Review が無いので PURPOSE_DIFF_ALIGNMENT が fail-closed で失敗する（残した項目の本来の意味）。
+    // それでも観察モードなので Job は止めない。
     expect(result.safetyVerificationResult?.overallPassed).toBe(false)
-    expect(result.safetyVerificationResult?.blockingFailures).toEqual(
-      expect.arrayContaining(['TYPECHECK', 'RELATED_TESTS', 'FULL_TESTS']),
-    )
+    expect(result.safetyVerificationResult?.blockingFailures).toEqual(['PURPOSE_DIFF_ALIGNMENT'])
     expect(result.status).toBe('success')
+  })
+
+  it('typecheck / test の結果が無いことでは失敗を報告しない（実行前に走るため、それらの項目を持たない）', async () => {
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return '.env\n'
+      return gitFallback(args)
+    })
+
+    const result = await runJob(createJob(), createPolicy())
+
+    const ids = result.safetyVerificationResult?.checks.map(check => check.id) as string[]
+    for (const removed of ['TYPECHECK', 'RELATED_TESTS', 'FULL_TESTS']) {
+      expect(ids).not.toContain(removed)
+      expect(result.safetyVerificationResult?.blockingFailures as string[]).not.toContain(removed)
+    }
+  })
+
+  it('typecheck / test の実際の失敗は SafeCommand が検出し、Job は failed になる', async () => {
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+      if (Array.isArray(args) && args.includes('--name-only')) return '.env\n'
+      return gitFallback(args)
+    })
+    resolveCommandMock.mockReturnValue({ argv: ['pnpm', 'run', 'verify:implement'], description: 'pnpm run verify:implement' })
+    setContainedCommandOverride(async (options) => {
+      if (options.attemptId.startsWith('safe-command-')) {
+        return {
+          outcome: 'clean', signal: null, killedDescendants: false, drainMs: 0,
+          exitCode: 1, stdout: '', stderr: 'error TS2322: Type string is not assignable to type number', timedOut: false,
+        }
+      }
+      return forwardToExecFileSync(execFileSyncMock as unknown as ExecFileSyncLike, options)
+    })
+    try {
+      const result = await runJob(
+        createJob({ safeCommand: { kind: 'test', workingDir: '/workspace/target' } }),
+        createPolicy(),
+      )
+
+      expect(result.status).toBe('failed')
+      expect(result.exitCode).toBe(1)
+      expect(result.safetyVerificationResult).toBeDefined()
+    } finally {
+      clearContainedCommandOverride()
+    }
   })
 
   it('Risk Scan severity: low/none → safetyVerificationResultは呼ばれずundefinedのまま', async () => {

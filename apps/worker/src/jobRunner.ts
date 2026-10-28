@@ -414,8 +414,7 @@ export interface JobRunResult {
    * safetyVerifier結果（Step R4-B・観察モード）。
    * targetProjectRiskScanResult.highestSeverity が medium/high の場合のみ呼び出す
    * （postReviewer/Gemini Step Reviewと同じ既存シグナルを流用。新しい分類器は作らない）。
-   * 12項目中、TYPECHECK/RELATED_TESTS/FULL_TESTSの3項目は実行結果を渡していないため
-   * 常にfail-closed（overallPassed:falseの主要因になり得る。危険検出とは限らない）。
+   * typecheck / test は扱わない（workflow の Implement Job は SafeCommand の verify:implement が実行し、失敗なら Job が failed）。
    * 呼び出し自体に失敗しても（想定外入力・実装バグ等）Jobは止めず、undefinedのまま。
    */
   safetyVerificationResult?: SafetyVerificationResult
@@ -1178,14 +1177,12 @@ export async function runJob(
 
   // ── safetyVerifier接続（Step R4-B・観察モード・非停止） ─────────────────────────
   // safetyVerifier は postReviewer と異なり medium/high のみで実行する（意図的）。
-  // 理由: (1) TYPECHECK/RELATED_TESTS/FULL_TESTS の3チェックが未接続のため fail-closed
-  //   であり、any severity で実行しても overallPassed は常に false（構造的問題）;
-  //   (2) target_project の下位tier 相当のリスクシグナルは既に targetProjectRiskScanResult
+  // 理由: target_project の下位tier 相当のリスクシグナルは既に targetProjectRiskScanResult
   //   がカバーしているため、SAFETY_VERIFICATION_RESULT は commit gate から不要とされた
   //   （commitGate.ts getRequiredArtifacts 注釈参照）。
   //   観察モードとして medium/high でのみ計測・ログを蓄積する。
-  // 12項目中TYPECHECK/RELATED_TESTS/FULL_TESTSの3項目は実行結果を渡していないためfail-closed。
-  // これは危険検出ではなく未接続項目によるものであり、blockingFailuresで区別できるようにする。
+  // typecheck / test はこの verifier では扱わない。この位置は SafeCommand 実行より前で結果が無く、
+  // workflow の Implement Job では SafeCommand（verify:implement）が検証し、失敗すれば Job は failed になる（#355）。
   let safetyVerificationResult: SafetyVerificationResult | undefined
   if (isRiskSeverityMediumOrHigh) {
     try {
