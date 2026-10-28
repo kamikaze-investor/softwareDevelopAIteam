@@ -147,11 +147,20 @@ describe('isOutputOverflowAfterSafeCleanup', () => {
 
     // 結果として output_overflow を作る箇所は1つだけ
     expect(source.match(/outcome: 'output_overflow'/g)).toHaveLength(1)
-    const guardIndex = source.lastIndexOf('if (isContainmentSafe(cleanup.outcome)) {', source.indexOf("outcome: 'output_overflow'"))
+    const overflowIndex = source.indexOf("outcome: 'output_overflow'")
+    const guard = 'if (isContainmentSafe(cleanup.outcome)) {'
+    const guardIndex = source.lastIndexOf(guard, overflowIndex)
     expect(guardIndex).toBeGreaterThan(0)
-    // guard から output_overflow までの間で、その if ブロック（関数直下・2 スペース字下げ）が閉じていない
-    const between = source.slice(guardIndex, source.indexOf("outcome: 'output_overflow'"))
-    expect(between).not.toMatch(/\n {2}\}\n/)
+    // guard の `{` から output_overflow までを走査し、その if ブロックが一度も閉じない（深さが 0 にならない）こと。
+    // `} else {` や別ブロックへ移されると、ここで深さ 0 を通るので落ちる。
+    let depth = 1
+    let closedBeforeOverflow = false
+    for (const ch of source.slice(guardIndex + guard.length, overflowIndex)) {
+      if (ch === '{') depth += 1
+      if (ch === '}') depth -= 1
+      if (depth === 0) closedBeforeOverflow = true
+    }
+    expect(closedBeforeOverflow).toBe(false)
   })
 })
 
