@@ -6031,18 +6031,21 @@ export function createSQLiteStorage(dbPath: string): IStorage {
           createdAt: now(),
           repairSourceJobId: data.repairSourceJobId,
           resumeSourceJobId: data.resumeSourceJobId,
+          reviewProvider: data.reviewProvider,
+          reviewModel: data.reviewModel,
         }
         try {
           db.prepare(`
             INSERT INTO design_review_runs
               (id, review_kind, subject_id, task_id, design_text, design_text_hash, task_title, changed_files, status,
                attempt_count, claim_token, result_json, error, created_at, started_at, completed_at,
-               repair_source_job_id, resume_source_job_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL, ?, ?)
+               repair_source_job_id, resume_source_job_id, review_provider, review_model)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, NULL, NULL, ?, ?, ?, ?)
           `).run(
             run.id, run.reviewKind, run.subjectId, run.taskId ?? null, run.designText, run.designTextHash, run.taskTitle,
             JSON.stringify(run.changedFiles), run.status, run.attemptCount, run.createdAt,
             run.repairSourceJobId ?? null, run.resumeSourceJobId ?? null,
+            run.reviewProvider ?? null, run.reviewModel ?? null,
           )
         } catch (err) {
           // partial unique index (ux_design_review_runs_subject_active) 違反は「別経路が先に
@@ -7396,6 +7399,8 @@ function deserializeDesignReviewRun(row: any): DesignReviewRun {
     completedAt: row.completed_at ?? undefined,
     repairSourceJobId: row.repair_source_job_id ?? undefined,
     resumeSourceJobId: row.resume_source_job_id ?? undefined,
+    reviewProvider: row.review_provider ?? undefined,
+    reviewModel: row.review_model ?? undefined,
   }
 }
 
@@ -7419,7 +7424,13 @@ function deserializeDesignReviewRun(row: any): DesignReviewRun {
  */
 function reuseActiveRun(
   existingRow: any,
-  requested: { repairSourceJobId?: string; designTextHash: string; changedFiles: readonly string[] },
+  requested: {
+    repairSourceJobId?: string
+    designTextHash: string
+    changedFiles: readonly string[]
+    reviewProvider?: string
+    reviewModel?: string
+  },
 ): DesignReviewRun {
   const existing = deserializeDesignReviewRun(existingRow)
   if (existing.repairSourceJobId !== requested.repairSourceJobId) {
@@ -7439,6 +7450,16 @@ function reuseActiveRun(
   if (existing.designTextHash !== requested.designTextHash || !sameFiles) {
     throw new DesignReviewRunContentionError(
       'design review run identity mismatch: an active run for this subject reviews a different design'
+      + ` (runId=${existing.id})`,
+      existing.id,
+    )
+  }
+  // **審査する provider も同一性の一部である。** 既定連鎖の run を「別 provider での再審査」として
+  // 返すと（逆向きも同じ）、実際には誰が審査したのかが run から読めなくなる。
+  if (existing.reviewProvider !== requested.reviewProvider || existing.reviewModel !== requested.reviewModel) {
+    throw new DesignReviewRunContentionError(
+      'design review run provider mismatch: an active run for this subject is bound to provider='
+      + `${existing.reviewProvider ?? 'default'} but ${requested.reviewProvider ?? 'default'} was requested`
       + ` (runId=${existing.id})`,
       existing.id,
     )
@@ -7951,17 +7972,21 @@ function runDesignReviewSubjectMigration(db: Database.Database): void {
         repair_source_job_id TEXT,
         -- resume provenance（C3-c）。理由は repair_source_job_id と同じ。legacy 行は NULL。
         resume_source_job_id TEXT,
+        -- 別 provider 再審査の指定。理由は repair_source_job_id と同じ。legacy 行は NULL。
+        review_provider TEXT,
+        review_model TEXT,
         FOREIGN KEY (task_id) REFERENCES tasks(id)
       );
 
       INSERT INTO design_review_runs_new
         (id, review_kind, subject_id, task_id, design_text, design_text_hash, task_title,
          changed_files, status, attempt_count, claim_token, result_json, error, created_at,
-         started_at, completed_at, repair_source_job_id, resume_source_job_id)
+         started_at, completed_at, repair_source_job_id, resume_source_job_id,
+         review_provider, review_model)
       SELECT
         id, 'task', task_id, task_id, design_text, design_text_hash, task_title,
         changed_files, status, attempt_count, claim_token, result_json, error, created_at,
-        started_at, completed_at, NULL, NULL
+        started_at, completed_at, NULL, NULL, NULL, NULL
       FROM design_review_runs;
 
       DROP TABLE design_review_runs;

@@ -283,6 +283,17 @@ describe('resolvePlActionPolicy — 実在する復旧操作が語彙から漏�
     expect(decision.requiredGates).toEqual([])
   })
 
+  it('枯渇後の別 provider 再審査は語彙にあり、up-front Gate を要さず、provider 切替や BLOCK override とは別物', () => {
+    // rekick_design_review が 3/3 を拒否した先の経路。表に無いと fail-closed で forbidden になる。
+    const decision = resolvePlActionPolicy({ kind: 'rereview_design_with_alternate_provider' })
+
+    expect(decision.disposition).toBe('no_gate_required')
+    expect(decision.requiredGates).toEqual([])
+    // provider 構成そのものの変更と Gate 結果の上書きは従来どおり。
+    expect(resolvePlActionPolicy({ kind: 'switch_provider' }).disposition).toBe('forbidden')
+    expect(resolvePlActionPolicy({ kind: 'override_gate_block' }).disposition).toBe('forbidden')
+  })
+
   it('無 Gate なのは再kickだけで、workspace を書き換える復旧へは波及していない', () => {
     // 「下流が Gate されているから無 Gate でよい」を一般化しないための境界テスト。
     for (const kind of ['retry_job', 'resume_task', 'delegate_implementation'] as const) {

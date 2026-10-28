@@ -1048,6 +1048,14 @@ export interface DesignReviewRun {
    * `repairSourceJobId` とは別の事実であり、流用しない。active run の再利用時は最初の値が残る。
    */
   resumeSourceJobId?: string
+  /**
+   * **この run を審査させる provider / model の指定。** 別 provider での正式再審査
+   * （`designReview/alternateProviderReview.ts`）が起票した run でだけ入り、それ以外は undefined
+   * （= runner 既定の provider 連鎖）。run の同一性の一部であり、startup recovery 後の再kickでも
+   * 同じ指定で実行される。値は Registry から選ばれたもので、PL / runner の申告ではない。
+   */
+  reviewProvider?: string
+  reviewModel?: string
 }
 
 /** claim結果。claimできなかった場合は run=undefined。 */

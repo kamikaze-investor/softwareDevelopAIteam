@@ -77,6 +77,7 @@ export const PL_ACTION_KINDS = [
   'abort_task',
   'rollback_commit',
   'rekick_design_review',
+  'rereview_design_with_alternate_provider',
   'fail_stuck_job',
 
   // ── 開発の進行 ──
@@ -337,6 +338,28 @@ const ACTION_GATE_TABLE: Record<PlActionKind, ActionRule> = {
     reason:
       'a re-kicked design review changes no workspace, is bounded by DESIGN_REVIEW_MAX_ATTEMPTS, ' +
       'and its verdict is recomputed by the API before any evidence is registered',
+  },
+  /**
+   * attempt を使い切って終端した Design Review の後に、**新しい正式 Review run** を別 provider で作る。
+   * `rekick_design_review` が 3/3 を正しく拒否した先の、唯一の非 Escalation 経路である。
+   *
+   * **up-front の Gate を課さない理由は `rekick_design_review` と同じ**（workspace を変更しない /
+   * 判定は `recomputeDecision()` が再計算し ALIGNED のときだけ evidence が登録される）に加え、
+   * CEO 判断（2026-09-15）の不変条件を実装側（`apps/api/src/designReview/alternateProviderReview.ts`）が
+   * 強制するからである:
+   *   1. Review を skip しない（必ず新しい run を作って実行する）
+   *   2. 既存 BLOCK を override しない（同じ設計に否定判定がある Task では作らない）
+   *   3. attempt を使い切った run を再利用しない
+   *   4. provider は Registry から、生成担当と vendor 分離できるものだけを選ぶ
+   *   5. 回数は `ALTERNATE_PROVIDER_REVIEW_MAX_RUNS` まで。尽きたら CEO Escalation
+   *
+   * **provider を PL が指定することはできない。** 指定できると `switch_provider`（CEO 承認）の迂回になる。
+   */
+  rereview_design_with_alternate_provider: {
+    gates: [],
+    reason:
+      'a new review run changes no workspace, uses a registry-selected vendor-separated provider, is bounded, '
+      + 'and its verdict is recomputed by the API before any evidence is registered',
   },
   /**
    * 停止した running Job の強制終端（`PATCH /api/jobs/:id/fail-if-running`）。
