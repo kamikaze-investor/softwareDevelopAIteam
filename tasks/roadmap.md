@@ -10443,6 +10443,52 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
 
       **やらないこと**: parser 以外の detection・評価ロジックの変更。adoption parser の変更（#409 の範囲判断を維持）。
 
+<!-- roadmap:id=external-completion-approval-binding-not-codeowned state=planned -->
+0. [ ] **external completion reconcile の「承認が何に効くか」の束縛 predicate が CODEOWNERS に無く、Code Owner 承認なしで弱められる** —
+      2026-10-28登録（Cross-Task Drift Audit `cross_task_audit_2026_10_28.md` の `xta-112a7a5-01`。PL が実行で再現済み。
+      DA 候補として機械で格上げされ、PL が specs/22 1-3 により technical と処分）。
+
+      **確認された事実**:
+      - #425 が承認を commit + 根拠に束縛した `checkApprovalEvidenceBinding()`（`apps/api/src/reconcile/externalCompletion.ts`）と、
+        その呼び出し（`apps/api/src/routes/tasks.ts` の reconcile route）は、どの CODEOWNERS 規則にも当たらない。
+        Gate（`actionGate.ts`、CODEOWNERS 対象）は commit / 根拠を見ないので、束縛はこの predicate だけが持つ
+      - base の CODEOWNERS・review 0 件で `evaluateCodeOwnerApproval()`（`.github/scripts/codeowners.mjs`）を呼ぶと、
+        `externalCompletion.ts`・`routes/tasks.ts`・`storage/sqlite.ts`・`apps/mobile/components/ExternalReconcileSection.tsx` の
+        どれを変えても `success: no CODEOWNERS-owned file changed`（2026-10-28 PL 実行）
+      - git_commit 側で同じ意味の正本 `apps/api/src/gitCommitEvidence.ts` は CODEOWNERS 57 行に載っており、同じ呼び方で `pending` になる。
+        CODEOWNERS 28〜34 行の規則（authority / cage を定義・実装する正本だけを載せる。2026-10-08 CEO 決定）は、#418 より前からある
+
+      **方向（着手時に反証する）**: 束縛の predicate を、git_commit 側と同じく**正本 1 ファイル**に置いて CODEOWNERS に載せる
+      （`externalCompletion.ts` 全体を載せるか、束縛だけを専用ファイルへ切り出すかは、変更頻度と diff で決める）。
+      route が束縛を呼ばなくなる変更をどう検出するか（route を載せる / 契約 test で固定する）も、着手時に決める。
+      **`routes/tasks.ts`・`sqlite.ts` を丸ごと載せない**（変更頻度が高く、code-owner review の選別力が下がる。CODEOWNERS 31〜32 行の規則）。
+
+      **Acceptance Criteria**: 束縛 predicate を変える PR が `Code Owner Approval` で `pending` になる（`evaluateCodeOwnerApproval()` の
+      テストで固定する。修正前に `success` になることを確認する）/ 束縛を外す route 変更が test で失敗する /
+      CODEOWNERS に載せる理由を 28〜34 行の規則の言葉で 1 行書く。
+
+      **やらないこと**: 束縛の意味（commit + 根拠 digest）の変更。CODEOWNERS 規則そのものの変更。Ruleset の変更。
+
+<!-- roadmap:id=cross-task-audit-trigger-revision state=planned -->
+0. [ ] **Cross-Task Audit の 3 回目評価で決めた発火条件の変更と、`--base` 指定の可視化** —
+      2026-10-28登録（`cross_task_audit_2026_10_28.md` 5 章の判断 2・3・5。`cross-task-drift-audit` の `observation-closes-loop`）。
+
+      **確認された事実（3 回分の記録）**:
+      - authority surface の重複は 2/12 → 5/6 → 11/15 変更で成立し、選別力がほとんど無い
+      - 引用ベースの fix chain は、2 回目で誤検知 1・見逃し 2。3 回目の 3 件はどれも不具合修正ではなかった。同じ塊は churn が毎回拾っている
+      - `cli.ts` は `--base` が明示されると chain head を使わず、警告を出さない。2026-10-28 の due check は `--base e3677f93` で実行され、
+        12 変更（10/27 deploy を含む）が window から抜けかけた。ずれは次回の chain 検証（genesis 2 つ）で fail closed するまで見えない
+
+      **方向**: `evaluateDue()` から authority surface 条件を外す（packet の節は残す）。引用ベースの fix chain を
+      「同じファイルを window 内の 3 変更以上が触った」に置き換える。`due` / `packet` の出力に、`--base` が chain head と違うときの
+      chain head と抜ける変更の数を出す（止めない）。設計記録 `cross_task_drift_audit_design.md` の 4 章・7 章を更新し、
+      repository 外の authority 状態（Ruleset・branch protection）が範囲外であることを明記する。
+
+      **Acceptance Criteria**: 3 回分の window で新しい `evaluateDue()` を再実行し、発火したか / 理由が何かを記録する
+      （3 回とも発火する想定。しなければ理由を書く）/ `--base` のずれが出力に出ることを test で固定する / 設計記録が新条件と一致する。
+
+      **やらないこと**: 集計 script。新しい Gate・外部 API 読み取り。Challenger の問いの変更。
+
 <!-- roadmap:id=codeowner-approval-required-check state=in_progress -->
 0. [~] **CODEOWNERS 対象 PR にだけ Code Owner 承認を必須にする（`Code Owner Approval` required check）** —
       2026-10-27登録（CEO 決定 2026-10-27 Option B）。実装は本項目の PR。**残りは Ruleset への required check 追加（人が行う Mechanical Operation）と実 PR での検証。**
