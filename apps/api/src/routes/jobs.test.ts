@@ -324,6 +324,56 @@ beforeEach(() => {
 })
 
 describe('Job API', () => {
+  it('accepts and round-trips failureMetadata.safeCommandEvidence', async () => {
+    await withApp(async (app) => {
+      const project = await createProject(app, { status: 'running' })
+      const task = await createTask(app, project.id, { status: 'in_progress' })
+      const { getStorage } = await import('../storage/index.js')
+      const storage = getStorage()
+      const job = storage.jobs.create({
+        taskId: task.id,
+        projectId: project.id,
+        agentRole: 'developer_ai',
+        status: 'running',
+        safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      } as Parameters<typeof storage.jobs.create>[0])
+      const safeCommandEvidence = {
+        source: 'safe_command_log' as const,
+        excerpt: 'src/a.ts(3,1): error TS2322: Type mismatch',
+      }
+
+      const response = await app.inject({
+        method: 'PATCH',
+        url: `/api/jobs/${job.id}`,
+        payload: withOutbox({
+          status: 'failed',
+          exitCode: 2,
+          failureMetadata: { kind: 'safe_command_failed', safeCommandEvidence },
+        }, 'safe-command-evidence-result'),
+      })
+
+      expect(response.statusCode).toBe(200)
+      expect(storage.jobs.findById(job.id)?.failureMetadata?.safeCommandEvidence).toEqual(safeCommandEvidence)
+    })
+  })
+
+  it('rejects a SafeCommand evidence excerpt over 3000 characters', async () => {
+    await withApp(async (app) => {
+      const response = await app.inject({
+        method: 'PATCH',
+        url: '/api/jobs/missing',
+        payload: {
+          failureMetadata: {
+            kind: 'safe_command_failed',
+            safeCommandEvidence: { source: 'safe_command_log', excerpt: 'x'.repeat(3_001) },
+          },
+        },
+      })
+
+      expect(response.statusCode).toBe(400)
+    })
+  })
+
   it('rejects value-bearing Technical Abort refusal text at the HTTP boundary', async () => {
     await withApp(async (app) => {
       const response = await app.inject({

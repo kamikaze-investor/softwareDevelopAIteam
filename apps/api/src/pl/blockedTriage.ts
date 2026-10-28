@@ -1131,6 +1131,17 @@ export function triageBlocked(storage: IStorage, item: AttentionItem): BlockedDi
   // ── 9. 特定できなかった。**推測で retry しない** ───────────────────────
   return {
     ...result,
+    evidence: facts.job === undefined
+      ? result.evidence
+      : [
+          ...(facts.job.exitCode !== undefined
+            ? [{ fact: 'job.exitCode', id: facts.job.id, value: String(facts.job.exitCode) }]
+            : []),
+          ...(facts.job.failureMetadata?.kind !== undefined
+            ? [{ fact: 'job.failureMetadata.kind', id: facts.job.id, value: facts.job.failureMetadata.kind }]
+            : []),
+          { fact: 'job.safeCommand.kind', id: facts.job.id, value: facts.job.safeCommand.kind },
+        ],
     summary: '機械的事実から原因を特定できなかった。証拠不足のまま状態を変える操作は行わない。',
   }
 }

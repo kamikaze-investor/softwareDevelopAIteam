@@ -12,6 +12,8 @@ import {
   buildPlResumeAiCliPrompt,
   countPlTechnicalResumes,
   countPriorAttempts,
+  describeStuckJob,
+  designReviewRetryWaitUntil,
   extractProposedKind,
   isRecoveryTargetResolved,
   resetPlLoopInFlightForTest,
@@ -32,6 +34,12 @@ import { computeDesignTextHash } from '../designReviewEvidencePolicy'
 import { prepareRepairFlow } from '../designReview/repairFlow'
 import type { JobRefusalMetadata } from '@ai-team/shared'
 import { advanceWallClock, passDesignReviewRetryCooldown } from '../designReview/retryCooldownTestClock'
+import {
+  DESIGN_REVIEW_MAX_ATTEMPTS,
+  DESIGN_REVIEW_RUNNER_SIGKILL_GRACE_MS,
+  DESIGN_REVIEW_RUNNER_TIMEOUT_MS,
+} from '../designReview/designReviewCoordinator'
+import { DESIGN_REVIEW_RETRY_COOLDOWNS_MS } from '../designReview/retryCooldown'
 
 /**
  * ここで固定しているのは「PL が自分の権限で動かない」ことと「操作したら必ず確かめる」ことである。
@@ -2314,6 +2322,167 @@ describe('runPlTick — 採用したのに動き出さない Task を黙って�
   })
 })
 
+describe('linked Design Review run の待機', () => {
+  const WAIT_BOUND_MS = DESIGN_REVIEW_RETRY_COOLDOWNS_MS.reduce((sum, ms) => sum + ms, 0)
+    + DESIGN_REVIEW_MAX_ATTEMPTS
+      * (DESIGN_REVIEW_RUNNER_TIMEOUT_MS + DESIGN_REVIEW_RUNNER_SIGKILL_GRACE_MS)
+
+  function failedJob(storage: IStorage, taskId: string, projectId: string): string {
+    const job = storage.jobs.create({
+      taskId,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'failed',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      failureMetadata: { kind: 'safe_command_failed' },
+    } as Parameters<IStorage['jobs']['create']>[0])
+    storage.tasks.update(taskId, { status: 'blocked' })
+    return job.id
+  }
+
+  function repairRun(storage: IStorage, taskId: string, sourceJobId: string) {
+    return storage.designReviewRuns.create({
+      taskId,
+      taskTitle: 'repair review',
+      designText: 'repair design',
+      designTextHash: 'repair-hash',
+      changedFiles: ['src/a.ts'],
+      repairSourceJobId: sourceJobId,
+    })
+  }
+
+  function attentionFor(storage: IStorage, jobId: string) {
+    const item = buildSystemState(storage).attention.find((candidate) => candidate.jobId === jobId)
+    if (!item) throw new Error(`attention not found for ${jobId}`)
+    return item
+  }
+
+  it('linked running repair run の間は escalation せず待つ', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-28T00:00:00.000Z'))
+    const { storage, taskId, projectId } = seed()
+    const jobId = failedJob(storage, taskId, projectId)
+    const run = repairRun(storage, taskId, jobId)
+    expect(storage.designReviewRuns.claim(run.id, DESIGN_REVIEW_MAX_ATTEMPTS).claimToken).toBeDefined()
+    const escalations: string[] = []
+
+    const result = await runPlTick(storage, deps({
+      escalate: async (payload) => { escalations.push(payload.title); return DELIVERED },
+    }))
+
+    expect(result.status).toBe('idle')
+    expect(escalations).toEqual([])
+    expect(countPriorAttempts(storage, `job_failed:${jobId}`)).toBe(0)
+  })
+
+  it('unlinked run は Job を待たせない', () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-28T00:00:00.000Z'))
+    const { storage, taskId, projectId } = seed()
+    const jobId = failedJob(storage, taskId, projectId)
+    const run = repairRun(storage, taskId, 'another-job')
+    storage.designReviewRuns.claim(run.id, DESIGN_REVIEW_MAX_ATTEMPTS)
+
+    expect(designReviewRetryWaitUntil(storage, attentionFor(storage, jobId), undefined)).toBeUndefined()
+  })
+
+  it('linked run でも既存定数から導いた上限を過ぎたら待たない', () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-28T00:00:00.000Z'))
+    const { storage, taskId, projectId } = seed()
+    const jobId = failedJob(storage, taskId, projectId)
+    const run = repairRun(storage, taskId, jobId)
+    storage.designReviewRuns.claim(run.id, DESIGN_REVIEW_MAX_ATTEMPTS)
+    vi.setSystemTime(new Date(Date.parse(run.createdAt) + WAIT_BOUND_MS + 1))
+
+    expect(designReviewRetryWaitUntil(storage, attentionFor(storage, jobId), undefined)).toBeUndefined()
+  })
+
+  it('running run の startedAt が無い場合は fail-open する', () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-28T00:00:00.000Z'))
+    const { storage, taskId, projectId } = seed()
+    const jobId = failedJob(storage, taskId, projectId)
+    const run = repairRun(storage, taskId, jobId)
+    vi.spyOn(storage.designReviewRuns, 'findLatestByTaskId').mockReturnValue({
+      ...run,
+      status: 'running',
+      startedAt: undefined,
+    })
+
+    expect(designReviewRetryWaitUntil(storage, attentionFor(storage, jobId), undefined)).toBeUndefined()
+  })
+
+  it('queued linked run は startedAt 無しでも上限まで待つ', () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-28T00:00:00.000Z'))
+    const { storage, taskId, projectId } = seed()
+    const jobId = failedJob(storage, taskId, projectId)
+    const run = repairRun(storage, taskId, jobId)
+
+    expect(designReviewRetryWaitUntil(storage, attentionFor(storage, jobId), undefined))
+      .toBe(new Date(Date.parse(run.createdAt) + WAIT_BOUND_MS).toISOString())
+  })
+
+  it('linked run の上限を過ぎても、遅れて始まった retry cooldown 中は従来どおり待つ（独立レビュー A1）', () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-28T00:00:00.000Z'))
+    const { storage, taskId, projectId } = seed()
+    const jobId = failedJob(storage, taskId, projectId)
+    const run = repairRun(storage, taskId, jobId)
+    const createdAtMs = Date.parse(run.createdAt)
+    // rekick が遅れ、2回目の attempt が上限の直前に終わって cooldown が上限より後まで続く形。
+    const lastAttemptEndedAt = new Date(createdAtMs + WAIT_BOUND_MS - 60_000).toISOString()
+    const notBeforeMs = Date.parse(lastAttemptEndedAt) + DESIGN_REVIEW_RETRY_COOLDOWNS_MS[1]!
+    vi.spyOn(storage.designReviewRuns, 'findLatestByTaskId').mockReturnValue({
+      ...run,
+      status: 'queued',
+      attemptCount: 2,
+      startedAt: undefined,
+      completedAt: lastAttemptEndedAt,
+    })
+    vi.setSystemTime(new Date(createdAtMs + WAIT_BOUND_MS + 1))
+
+    expect(designReviewRetryWaitUntil(storage, attentionFor(storage, jobId), undefined))
+      .toBe(new Date(notBeforeMs).toISOString())
+  })
+
+  it('running run の startedAt が未来なら fail-open する', () => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    vi.setSystemTime(new Date('2026-10-28T00:00:00.000Z'))
+    const { storage, taskId, projectId } = seed()
+    const jobId = failedJob(storage, taskId, projectId)
+    const run = repairRun(storage, taskId, jobId)
+    vi.spyOn(storage.designReviewRuns, 'findLatestByTaskId').mockReturnValue({
+      ...run,
+      status: 'running',
+      startedAt: new Date(Date.now() + 60_000).toISOString(),
+    })
+
+    expect(designReviewRetryWaitUntil(storage, attentionFor(storage, jobId), undefined)).toBeUndefined()
+  })
+
+  it('PL の診断材料には SafeCommand 出力の本文を載せず、出所だけを渡す', () => {
+    const { storage, taskId, projectId } = seed()
+    const job = storage.jobs.create({
+      taskId,
+      projectId,
+      agentRole: 'developer_ai',
+      status: 'failed',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target' },
+      failureMetadata: {
+        kind: 'safe_command_failed',
+        safeCommandEvidence: { source: 'safe_command_log', excerpt: 'error TS2352: untrusted output' },
+      },
+    } as Parameters<IStorage['jobs']['create']>[0])
+
+    const described = JSON.stringify(describeStuckJob(storage, job.id))
+    expect(described).not.toContain('untrusted output')
+    expect(described).toContain('"safeCommandEvidence":{"source":"safe_command_log"}')
+    expect(described).toContain('"kind":"safe_command_failed"')
+  })
+})
+
 describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を選ぶ', () => {
   function blockedCommitJob(storage: IStorage, taskId: string, projectId: string): string {
     const job = storage.jobs.create({
@@ -2776,14 +2945,27 @@ describe('runPlTick — job_blocked は Diagnose して sanctioned な復旧を�
 
     passDesignReviewRetryCooldown()
     resetPlLoopInFlightForTest()
-    const resumed = await runPlTick(storage, deps({
-      diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: 'technical recovery', riskLevel: 'LOW' }),
+    const reviewResumed = await runPlTick(storage, deps({
+      // linked queued run は source Job 側では待機する。Design Review 自身の idle attention を
+      // cooldown 後の同じ壁時計で見せ、既存 rekick executor が進めることを固定する。
+      now: () => new Date().toISOString(),
+      diagnose: async () => JSON.stringify({ actionKind: 'rekick_design_review', rationale: 'queued review is ready', riskLevel: 'LOW' }),
+      rekickDesignReview: undefined,
       coordinatorDeps: alignedCoordinatorDeps,
     }))
 
-    expect(resumed.status).toBe('acted')
+    expect(reviewResumed.status).toBe('acted')
     // 新しい run を引き直さず、同じ queued run が判定まで進んだ。
     expect(storage.designReviewRuns.findById(queuedRun!.id)?.status).toBe('succeeded')
+
+    // 1 tick 1 action: 次の tick が、完了した同じ review を使って source Job を resume する。
+    resetPlLoopInFlightForTest()
+    const resumed = await runPlTick(storage, deps({
+      now: () => new Date().toISOString(),
+      diagnose: async () => JSON.stringify({ actionKind: 'resume_task', rationale: 'review completed', riskLevel: 'LOW' }),
+      coordinatorDeps: alignedCoordinatorDeps,
+    }))
+    expect(resumed.status).toBe('acted')
     expect(storage.jobs.findByTaskId(taskId).filter((j) => j.workflowStepKey === `resume:${sourceJobId}:1`)).toHaveLength(1)
   })
 

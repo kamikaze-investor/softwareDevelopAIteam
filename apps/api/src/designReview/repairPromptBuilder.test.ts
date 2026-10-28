@@ -35,6 +35,38 @@ describe('buildRepairPrompt', () => {
     expect(stderrPos).toBeLessThan(end)
   })
 
+  it('SafeCommand excerpt は untrusted 境界の内側だけに置かれる', () => {
+    const excerpt = 'src/a.ts(3,1): error TS2322: Type mismatch'
+    const prompt = buildRepairPrompt({
+      ...BASE,
+      job: { safeCommandEvidence: { source: 'safe_command_log', excerpt } },
+    })
+    const start = prompt.indexOf('<<<UNTRUSTED_FAILURE_DATA>>>')
+    const end = prompt.indexOf('<<<END_UNTRUSTED_FAILURE_DATA>>>')
+    const excerptPos = prompt.indexOf(excerpt)
+
+    expect(excerptPos).toBeGreaterThan(start)
+    expect(excerptPos).toBeLessThan(end)
+    expect(prompt.slice(0, start)).not.toContain(excerpt)
+    expect(prompt.slice(end)).not.toContain(excerpt)
+  })
+
+  it('withheld SafeCommand evidence は理由だけを表示し、出力本文を持たない', () => {
+    const prompt = buildRepairPrompt({
+      ...BASE,
+      job: {
+        safeCommandEvidence: {
+          source: 'safe_command_log',
+          excerpt: 'MUST_NOT_RENDER',
+          withheld: 'secret_scan',
+        },
+      },
+    })
+
+    expect(prompt).toContain('safeCommand output excerpt: withheld (secret_scan)')
+    expect(prompt).not.toContain('MUST_NOT_RENDER')
+  })
+
   it('Design Contractをtrusted sectionとしてuntrusted境界の前に含める', () => {
     const prompt = buildRepairPrompt({ ...BASE, job: { exitCode: 1, stderr: 'boom' } })
     const contractPos = prompt.indexOf('## Design Contract')
