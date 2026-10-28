@@ -15,17 +15,10 @@ import path from 'node:path'
 import type { TargetProjectRiskScanResult } from './targetProjectRiskScan.js'
 import type { StepReviewResult } from './stepReview.js'
 import type { PostReviewResult } from './postReviewer.js'
-import type { SafetyCheckId, SafetyVerificationResult } from './safetyVerifier.js'
+import type { SafetyVerificationResult } from './safetyVerifier.js'
 
 const SUMMARY_MAX_LENGTH = 200
 const LOG_FILE_NAME = 'review_observation.jsonl'
-
-/**
- * jobRunner.tsの現在の接続方法では、実行結果（CommandExecutionResult）を渡していないため
- * 常にfail-closedになる項目。危険検出とは別に「入力が揃って実質評価できた項目数」を
- * 集計するために使う（詳細は docs/multi_ai_step_review_flow.md 6-3章）。
- */
-const CHECKS_WITHOUT_INPUT: SafetyCheckId[] = ['TYPECHECK', 'RELATED_TESTS', 'FULL_TESTS']
 
 export interface ObservationLogInput {
   jobId: string
@@ -64,7 +57,10 @@ export interface ObservationLogEntry {
   safetyVerification: {
     overallPassed: boolean | null
     blockingFailures: string[]
-    /** 入力が揃って実質評価できた項目数（TYPECHECK/RELATED_TESTS/FULL_TESTSは含まない） */
+    /**
+     * 入力が揃って実質評価できた項目数。入力の無い項目（旧 TYPECHECK/RELATED_TESTS/FULL_TESTS）を
+     * safetyVerifier から外したため、現在は totalChecksCount と同じ値になる。それ以前の行は 9 / 12。
+     */
     supportedChecksCount: number | null
     totalChecksCount: number | null
   }
@@ -105,9 +101,7 @@ export function buildObservationLogEntry(input: ObservationLogInput): Observatio
     safetyVerification: {
       overallPassed: input.safetyVerificationResult?.overallPassed ?? null,
       blockingFailures: input.safetyVerificationResult?.blockingFailures ?? [],
-      supportedChecksCount: input.safetyVerificationResult
-        ? input.safetyVerificationResult.checks.filter(check => !CHECKS_WITHOUT_INPUT.includes(check.id)).length
-        : null,
+      supportedChecksCount: input.safetyVerificationResult?.checks.length ?? null,
       totalChecksCount: input.safetyVerificationResult?.checks.length ?? null,
     },
   }

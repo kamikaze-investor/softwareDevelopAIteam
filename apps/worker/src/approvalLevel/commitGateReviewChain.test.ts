@@ -96,7 +96,7 @@ function makePassingSafetyVerificationResult(): SafetyVerificationResult {
     jobId: 'job-1',
     taskId: 'task-1',
     overallPassed: true,
-    checks: [makeSafetyCheck('TYPECHECK', true)],
+    checks: [makeSafetyCheck('UNEXPECTED_FILES', true)],
     blockingFailures: [],
     verifiedAt: '2026-07-01T00:00:00.000Z',
   }
