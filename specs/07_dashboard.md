@@ -360,3 +360,5 @@ Project Summaryだけで
 Human Dashboardは管理画面ではない。
 
 **CEOが AI開発チームを経営するための 経営ダッシュボードである。**
+
+<!-- probe: required-check forgery test, DO NOT MERGE -->
