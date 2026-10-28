@@ -346,7 +346,9 @@ export function buildEngineeringPrincipleReviewGuidance(principles: EngineeringP
     // Root Cause Generalization（core 原則 evidence-not-spec の一部）の finding 側。reviewer は diff の外を
     // 見られないので、見えている同原因箇所だけを指摘させる（全数調査を要求させない）。新しい category は作らない。
     // 原則 verdict 側の同じ上限は buildApplicablePrinciplesSection() が持つ。
-    '- root cause (evidence-not-spec): report a same-cause site only when the material shows it and the change leaves it untouched and unreported; use the category of that defect and start the message with [root_cause]. Never request a search the material cannot show.',
+    // 対症療法と過剰な汎用化の両方を同じ 1 行で扱う（片側だけだと reviewer は常に「広げろ」側へ倒れる）。
+    // 過剰な汎用化は over_constraint の一種として報告させる（新しい category は作らない）。
+    '- root cause (evidence-not-spec): report a same-cause site only when the material shows it and the change leaves it untouched and unreported; use the category of that defect and start the message with [root_cause]. Report a generalization (new abstraction, shared layer, cross-cutting rewrite) for which the material shows no second same-cause site as over_constraint, also starting with [root_cause]. Never request a search the material cannot show.',
   ].join('\n')
 }
 
@@ -374,7 +376,7 @@ export function buildApplicablePrinciplesSection(selection: readonly PrincipleSe
     // verdict を集計する全経路（Design Review / focused review）がこの関数を通るので、ここに 1 箇所だけ置く。
     // [root_cause] は記録される reason 上の検索用接頭辞（ledger は解析しない）。
     ...(selection.some((item) => item.slug === 'evidence-not-spec')
-      ? ['For evidence-not-spec, give CONFLICT on root cause only when the material shows a same-cause site the change leaves untouched and unreported, and start that reason with [root_cause]; otherwise judge root cause ALIGNED, and UNCERTAIN only when the material hints at a same-cause site it cannot confirm.']
+      ? ['For evidence-not-spec, give CONFLICT on root cause only when the material shows a same-cause site the change leaves untouched and unreported, or a generalization (new abstraction, shared layer, cross-cutting rewrite) for which it shows no second same-cause site, and start that reason with [root_cause]; otherwise judge root cause ALIGNED, and UNCERTAIN only when the material hints at either but cannot confirm it.']
       : []),
   ].join('\n')
 }

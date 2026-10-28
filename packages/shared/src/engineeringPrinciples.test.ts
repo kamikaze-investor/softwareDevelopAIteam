@@ -219,6 +219,13 @@ describe('corePrincipleSlugs', () => {
     // core-only の repair prompt には「範囲を広げろ」だけが届く。
     expect(contract).toContain('scaled to risk')
     expect(contract).toContain('within the Task scope')
+    // 修正範囲の選択（局所 / 共通機構）と、過剰な汎用化の禁止・根拠不足時の調査・修正後再発時の拡大も
+    // 同じ 1 行で届くこと。片側だけ届くと実装者は対症療法か過剰汎用化のどちらかへ倒れる。
+    expect(contract).toContain('fix at the smallest sufficient scope')
+    expect(contract).toContain('the shared mechanism when sites share it')
+    expect(contract).toContain('never a generalization the evidence does not require')
+    expect(contract).toContain('investigate, do not guess, when the evidence is thin')
+    expect(contract).toContain('a symptom that survives a fix means the cause was misnamed')
   })
 })
 
@@ -325,6 +332,8 @@ describe('buildApplicablePrinciplesSection', () => {
     expect(section).not.toContain('an unfalsifiable TODO')
     // root cause の verdict 上限は verdict を返す全 reviewer へ届く必要がある（ledger の集計対象）。
     expect(section).toContain('give CONFLICT on root cause only when the material shows a same-cause site')
+    // 過剰な汎用化も同じ verdict 経路で CONFLICT になる（対症療法側だけを罰すると reviewer は常に拡大を求める）。
+    expect(section).toContain('or a generalization (new abstraction, shared layer, cross-cutting rewrite) for which it shows no second same-cause site')
   })
 
   it('says so explicitly when nothing could be selected', () => {
@@ -346,6 +355,7 @@ describe('buildEngineeringPrincipleReviewGuidance', () => {
     // canonical-domain-meaning は contextual principle なので、選択結果を経ずに常時注入しない。
     expect(guidance).not.toContain('semantic_reinference')
     expect(guidance).toContain('start the message with [root_cause]')
+    expect(guidance).toContain('no second same-cause site as over_constraint, also starting with [root_cause]')
   })
 
   it('renders an unavailable notice when principles are unavailable', () => {
