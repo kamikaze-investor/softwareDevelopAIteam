@@ -5483,9 +5483,12 @@ describe('SafeCommand の出力超過（後始末は成功）は quarantine で�
     'placement_failed',
     'spawn_failed',
     'unavailable',
+    // 将来追加される未知の結果も quarantine に倒れる
+    'future_unknown_outcome',
   ] as const)('後始末・containment が %s で失敗した場合は通常失敗にせず quarantine へ伝播する', async (outcome) => {
     failSafeCommandWith(new TestContainmentInfrastructureError(`containment failed: ${outcome}`, {
-      outcome,
+      // 未知の結果は ContainmentOutcome の union に無いので、型をすり抜けて注入する
+      outcome: outcome as never,
       exitCode: null,
       stdout: '',
       stderr: '',

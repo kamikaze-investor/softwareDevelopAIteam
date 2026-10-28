@@ -132,6 +132,10 @@ describe('isOutputOverflowAfterSafeCleanup', () => {
     }
   })
 
+  it('将来追加される未知の結果も false にする（quarantine に倒れる）', () => {
+    expect(isOutputOverflowAfterSafeCleanup(failure('future_unknown_outcome' as ContainmentOutcome))).toBe(false)
+  })
+
   it('containment 失敗でない例外は false にする', () => {
     expect(isOutputOverflowAfterSafeCleanup(new Error('containment failed: output_overflow'))).toBe(false)
     expect(isOutputOverflowAfterSafeCleanup(undefined)).toBe(false)
