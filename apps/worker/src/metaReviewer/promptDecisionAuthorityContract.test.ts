@@ -337,7 +337,7 @@ describe('Meta Reviewer 判定契約 — containment / quarantine の分類変�
     expect(clause).toContain('1〜6 への違反が差分に実際にあり、それによって次のどれかが起きる場合は Safety boundary の弱体化であり、意図・説明にかかわらず A + `blocked` とする')
     expect(clause).toContain('- unsafe・uncertain・整合検査に失敗した・未知の結果が quarantine を免れる')
     expect(clause).toContain('- 結果が不明なものを成功として扱う')
-    expect(clause).toContain('- 同等の証明なしに例外を広げる')
+    expect(clause).toContain('- 1〜4 を満たさないことが示された結果・呼び出し元へ例外を広げる（証拠が足りないだけの場合は A であり、ここには当たらない）')
     expect(clause).toContain('例（網羅ではない）')
     expect(clause).toContain('整合検査の失敗を通常の failed に変える差分')
     expect(clause).toContain('dirty な workspace のまま解除を認める差分')
@@ -360,7 +360,7 @@ describe('Meta Reviewer 判定契約 — containment / quarantine の分類変�
     expect(checklistSection).toContain('quarantine に残る結果・行について、解除条件・Human Resume / abort / Human Recovery の拒否・新規 claim の拒否・workspace 所有権の保持が変わっていない')
     expect(checklistSection).toContain('呼び出し元ごとに 1〜5 を満たしている')
     expect(checklistSection).toContain('証拠が足りないだけなら A とした')
-    expect(checklistSection).toContain('A + blocked とした（例は網羅ではない）')
+    expect(checklistSection).toContain('1〜4 を満たさないことが示された結果・呼び出し元へ例外を広げる場合は A + blocked とした（証拠不足だけなら A。例は網羅ではない）')
   })
 })
 

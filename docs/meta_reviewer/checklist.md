@@ -142,7 +142,7 @@ quarantine に入る条件の変更は、それだけでは Approval Tuple (b) �
 - [ ] 4: 移した結果を成功として扱わない
 - [ ] 5: quarantine に残る結果・行について、解除条件・Human Resume / abort / Human Recovery の拒否・新規 claim の拒否・workspace 所有権の保持が変わっていない
 - [ ] 6: 変更は特定の呼び出し箇所に限られる（他の呼び出し元を変えるなら、呼び出し元ごとに 1〜5 を満たしている）
-- [ ] 証拠が足りないだけなら A とした。1〜6 への違反が実際にあり、unsafe / uncertain / 整合検査失敗 / 未知の結果が quarantine を免れる・結果不明を成功扱いする・同等の証明なく例外を広げる場合は A + blocked とした（例は網羅ではない）
+- [ ] 証拠が足りないだけなら A とした。1〜6 への違反が実際にあり、unsafe / uncertain / 整合検査失敗 / 未知の結果が quarantine を免れる・結果不明を成功扱いする・1〜4 を満たさないことが示された結果・呼び出し元へ例外を広げる場合は A + blocked とした（証拠不足だけなら A。例は網羅ではない）
 
 ### CLAUDE.md
 - [ ] Green Zone / Yellow Zone / Red Zone の内容が変更されていない（変更されていれば、欠陥が無い限り `requiresCeoApproval: true`）
