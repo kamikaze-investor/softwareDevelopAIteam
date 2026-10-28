@@ -63,10 +63,17 @@ CEO 指示「改善案を作る前に根本原因と適切な修正範囲を判�
 - **入れたもの**: one-liner に (1)〜(4)。全文に 6 つの判断基準・既存機構改善の優先・「両側とも defect」・
   3 回連続失敗との接続（AGENTS.md Q10 / OpenCode 3-failure を停止点とし、同じ修正を繰り返さず 1 段広げる。
   CEO escalation は Constitution 3.15 のまま）・既存の review finding / decision の再利用。
-  Reviewer の verdict 行・finding 行に「同原因の第 2 箇所が material に無い汎用化」を `[root_cause]` +
+  Reviewer の verdict 行・finding 行に「範囲が証拠・設計上の必要で正当化されない汎用化」を `[root_cause]` +
   over_constraint として追加（category は増やさない）
-- **AGENTS.md Q10**: 「3 回で止めて CEO へ報告」→「3 回で止め、原因を命名し直して 1 段広げ、
-  それでも根拠が無ければ CEO へ報告」。CEO への報告経路は残している（弱めていない）
+- **過剰汎用化の判定基準（CEO レビュー 2026-10-28 で修正）**: 初版は「同原因の 2 箇所目が material に無い
+  汎用化は CONFLICT」だったが、厳しすぎると指摘された（1 箇所の不具合でも原因が既存の共通機構にある、
+  不変条件・安全境界が要求する場合は共通機構の修正が正しい）。基準を「選んだ修正範囲が証拠
+  （他の同原因箇所、または原因が共通機構にあること）か設計上の必要（不変条件・安全/データ境界・単一 owner）で
+  正当化されるか」に変更。CONFLICT は material が原因の局所性を示し、正当化が何も示されない場合だけ。
+  material で決着しない（証拠不足）場合は UNCERTAIN（明確な違反と区別する）
+- **AGENTS.md Q10**: 「3 回で止めて CEO へ報告」→「同じ修正を繰り返さず、AI が自律的に原因を再分析して
+  調査範囲を 1 段広げる。調査・修正方法は技術判断なので CEO に求めない。escalation は Constitution 3.15 と
+  既存の権限・安全境界で人間判断が必要な場合だけ」（CEO 指示 2026-10-28）
 - **「既存の 3 回連続で調査範囲を拡大する原則」について**: その文言の原則はリポジトリに無かった。
   最も近いのは AGENTS.md Q10（3 回で停止・CEO 報告）と OpenCode の 3 回連続失敗で戦略変更。これらへ接続した
 - **届け先**: one-liner は core なので、`buildTaskDesignContract()`（初回実装・POST /jobs・repair・
@@ -83,4 +90,4 @@ CEO 指示「改善案を作る前に根本原因と適切な修正範囲を判�
   汎用化の罠 / 根拠不足 / 修正後再発の実装側 6 件は**新旧とも期待どおり**（旧文言でも既に機能していた）。
   差が出たのは reviewer の過剰汎用化ケース: 旧 = 原則 verdict ALIGNED（別の over_constraint finding のみ）、
   新 = CONFLICT `[root_cause]`。サンプル数 1 なので効果の大きさは主張しない。継続観測は既存 ledger の
-  `[root_cause]` reason 検索で行う
+  `[root_cause]` reason 検索で行う（この評価は初版の「2 箇所目」基準に対するもの。修正版の評価は PR #428 に記録）
