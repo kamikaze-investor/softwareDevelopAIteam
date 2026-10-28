@@ -163,9 +163,14 @@ function canonicalRepoWithCommit(files: Record<string, string>): string {
 }
 
 /** ADMIN が承認した Task 単位の ApprovalRequest（abort_task / reconcile_external_completion 用）。 */
-async function approvedRequest(taskId: string, requestedAction: string): Promise<string> {
+async function approvedRequest(
+  taskId: string,
+  requestedAction: string,
+  /** reconcile 承認は commit と根拠の digest に束縛する（preview が返す値をそのまま載せる）。 */
+  binding: { targetCommit: string; targetDiffHash: string } = { targetCommit: 'n/a', targetDiffHash: 'n/a' },
+): Promise<string> {
   const created = await env.api<{ id: string }>('POST', '/api/approval-requests', {
-    taskId, targetBranch: 'master', targetCommit: 'n/a', targetDiffHash: 'n/a', riskLevel: 'HIGH', requestedAction,
+    taskId, targetBranch: 'master', ...binding, riskLevel: 'HIGH', requestedAction,
   })
   expect(created.statusCode, JSON.stringify(created.body)).toBe(201)
   expect((await env.ceo.approve(created.body.id)).statusCode).toBe(200)
@@ -199,17 +204,20 @@ async function blockedTaskWithExternalCompletion(id: string, shape: 'guard' | 'r
 
   process.env.DESIGN_REVIEW_REPO_ROOT = canonicalRepoWithCommit(Object.fromEntries(files.map((file) => [file, 'completed outside the loop\n'])))
   const externalSha = execFileSync('git', ['rev-parse', 'HEAD'], { cwd: process.env.DESIGN_REVIEW_REPO_ROOT, encoding: 'utf-8' }).trim()
-  const reconcileApproval = await approvedRequest(task.id, 'reconcile_external_completion')
-  const reconcileBody = {
-    approvalRequestId: reconcileApproval,
-    sourceJobId: carrier.id,
-    evidence: {
-      roadmapItemId: id, commitSha: externalSha, pullRequestUrl: `https://example.invalid/pr/${id}`,
-      independentReviewVerdict: 'approved', ciResult: 'green', acceptanceEvidence: 'verified on master',
-      approvedScope: `docs/${id}`,
-    },
+  const evidence = {
+    roadmapItemId: id, commitSha: externalSha, pullRequestUrl: `https://example.invalid/pr/${id}`,
+    independentReviewVerdict: 'approved', ciResult: 'green', acceptanceEvidence: 'verified on master',
+    approvedScope: `docs/${id}`,
   }
-  return { task, carrier, reconcileApproval, reconcileBody }
+  // 承認依頼に載せる束縛値は読み取り専用の preview から取る（Mobile と同じ手順）。
+  const preview = await env.api<{ approvalTargetDiffHash: string }>(
+    'POST', `/api/tasks/${task.id}/reconcile-external-completion/preview`, { sourceJobId: carrier.id, evidence },
+  )
+  expect(preview.statusCode, JSON.stringify(preview.body)).toBe(200)
+  const binding = { targetCommit: externalSha, targetDiffHash: preview.body.approvalTargetDiffHash }
+  const reconcileApproval = await approvedRequest(task.id, 'reconcile_external_completion', binding)
+  const reconcileBody = { approvalRequestId: reconcileApproval, sourceJobId: carrier.id, evidence }
+  return { task, carrier, reconcileApproval, reconcileBody, binding }
 }
 
 /** reconcile 拒否 → abort → 本物の Worker cleanup 報告 → park → reconcile、の一連（両 shape 共通の期待）。 */
@@ -218,7 +226,7 @@ async function refuseAbortParkReconcile(
   /** Worker の観測の前に operator が行う操作（D4: backup 後に worktree を開始 commit へ戻す）。 */
   beforeWorkerReport?: () => Promise<void>,
 ): Promise<void> {
-  const { task, carrier, reconcileApproval, reconcileBody } = fx
+  const { task, carrier, reconcileApproval, reconcileBody, binding } = fx
 
   // Operation 1: reconcile. Expected: 409 TASK_HAS_BLOCKED_JOBS before the Gate (approval not consumed).
   const refused = await env.api<{ code?: string }>('POST', `/api/tasks/${task.id}/reconcile-external-completion`, reconcileBody)
@@ -249,13 +257,15 @@ async function refuseAbortParkReconcile(
   // park"), including the reconcile approval issued before the abort — intended: the CEO re-approves the
   // reconcile against the parked state.
   expect(env.storage.approvalRequests.findById(reconcileApproval)?.status).toBe('STALE')
-  const freshApproval = await approvedRequest(task.id, 'reconcile_external_completion')
+  const freshApproval = await approvedRequest(task.id, 'reconcile_external_completion', binding)
 
   // Operation 4: reconcile again with the fresh approval. Expected: 200, Task done, audit recorded.
   const done = await env.api('POST', `/api/tasks/${task.id}/reconcile-external-completion`, { ...reconcileBody, approvalRequestId: freshApproval })
   expect(done.statusCode, JSON.stringify(done.body)).toBe(200)
   expect(env.task(task.id).status).toBe('done')
   expect(env.storage.auditLog.findByEntity('task', task.id).some((row) => row.operation === 'reconcile_external_completion')).toBe(true)
+  // 取り込みは承認を完了と同じ transaction で使い切る（done 後に生きた承認を残さない）。
+  expect(env.storage.approvalRequests.findById(freshApproval)?.status).toBe('CONSUMED')
 }
 
 describe('External completion of a Task with a blocked row: refused → abort/park → reconciled', () => {

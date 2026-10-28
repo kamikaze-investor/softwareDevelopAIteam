@@ -30,6 +30,7 @@
  */
 
 import { execFileSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import path from 'node:path'
 import { getBaseRoadmapId, isFollowUpTaskKey } from '@ai-team/shared'
 import type { Job } from '@ai-team/shared'
@@ -94,7 +95,7 @@ export interface ExternalCompletionEvidence {
 }
 
 export type ExternalCompletionCheck =
-  | { ok: true; verified: { changedFiles: readonly string[]; stableHead: string } }
+  | { ok: true; verified: { commit: string; changedFiles: readonly string[]; stableHead: string } }
   | { ok: false; reason: string }
 
 /** Stable（API が動いているリポジトリ）のルート。Design Review と同じ解決方法を使う。 */
@@ -175,9 +176,12 @@ export function verifyExternalCompletion(
   }
 
   let stableHead: string
+  let commit: string
   let changedFiles: readonly string[]
   try {
     stableHead = git(repoRoot, ['rev-parse', 'HEAD'])
+    // 承認との束縛（`checkApprovalEvidenceBinding`）で短縮 SHA と完全 SHA を同じ commit として比べるため、解決しておく。
+    commit = git(repoRoot, ['rev-parse', '--verify', `${evidence.commitSha}^{commit}`])
     // **merge 済みかつ deploy 済み**を1回で確かめる。
     // Stable の HEAD の祖先である ⇒ master に入っていて、かつ稼働中のコードに含まれる。
     git(repoRoot, ['merge-base', '--is-ancestor', evidence.commitSha, 'HEAD'])
@@ -199,5 +203,177 @@ export function verifyExternalCompletion(
     return { ok: false, reason: `commit ${evidence.commitSha} changed no files` }
   }
 
-  return { ok: true, verified: { changedFiles, stableHead } }
+  return { ok: true, verified: { commit, changedFiles, stableHead } }
+}
+
+/**
+ * 根拠の digest。**承認依頼の `targetDiffHash` に載せ、承認と根拠を同じ記録へ束縛する**ために使う
+ * （Mobile の 1 画面取り込み。CEO が画面で確認した根拠そのものに承認を結び付ける）。
+ *
+ * key の順序を固定した JSON の sha256。前後空白は schema と同じく落としてから数える。
+ */
+export function externalCompletionEvidenceDigest(
+  taskId: string,
+  sourceJobId: string,
+  evidence: ExternalCompletionEvidence,
+): string {
+  const canonical = JSON.stringify([
+    taskId,
+    sourceJobId,
+    evidence.roadmapItemId.trim(),
+    evidence.commitSha.trim().toLowerCase(),
+    evidence.pullRequestUrl.trim(),
+    evidence.independentReviewVerdict.trim(),
+    evidence.ciResult.trim(),
+    evidence.acceptanceEvidence.trim(),
+    evidence.approvedScope.trim(),
+  ])
+  return createHash('sha256').update(canonical).digest('hex')
+}
+
+/** 承認依頼の `targetDiffHash` に載せる値（requestedAction を前置して他の action の値と混ざらないようにする）。 */
+export function externalCompletionApprovalDiffHash(digest: string): string {
+  return `reconcile_external_completion:sha256:${digest}`
+}
+
+/**
+ * `.github/CODEOWNERS`（Stable HEAD）で Code Owner の付く変更ファイル。**表示専用**で、authorization にも
+ * eligible にも使わない。照合は Code Owner Approval check と同じ正本（`.github/scripts/codeowners.mjs`）を使う。
+ * 読めなければ `undefined`（画面は「確認できない」と出す）。
+ *
+ * 正本は ESM（`.mjs`）なので **dynamic import** で読む。API の build（NodeNext / CommonJS 出力）で静的 import にすると
+ * `require()` になり、require(esm) の無い Node では起動時に落ちる。dynamic import はそのまま残る。
+ */
+async function codeOwnedFiles(repoRoot: string, files: readonly string[]): Promise<string[] | undefined> {
+  try {
+    const { ownersFor, parseCodeownersRules } = await import('../../../../.github/scripts/codeowners.mjs')
+    const rules = parseCodeownersRules(git(repoRoot, ['show', 'HEAD:.github/CODEOWNERS']))
+    return files.filter((file) => ownersFor(file, rules).length > 0)
+  } catch {
+    return undefined
+  }
+}
+
+/** 承認と根拠の束縛が崩れているときの code（取り込み route が 409 で返す）。 */
+export const APPROVAL_EVIDENCE_MISMATCH = 'APPROVAL_EVIDENCE_MISMATCH' as const
+
+/**
+ * **承認が、いま取り込もうとしている commit と根拠そのものに対して下されたか**を確かめる。
+ *
+ * Gate（`checkApprovalGate`）は Task・action・APPROVED・期限・人の記録を見るが、承認依頼の
+ * `targetCommit` / `targetDiffHash` は見ない。そのままだと、ある commit・根拠で下りた承認で
+ * 別の commit・別の PR / CI / 受入根拠 / scope を取り込めてしまう。ここで
+ *
+ * - `targetCommit` が根拠の commit と**同じ commit object** に解決される
+ * - `targetDiffHash` が実行 body から server が計算し直した digest と一致する
+ *
+ * の両方を要求する。古い形（`targetDiffHash` に digest を持たない）承認は通さない —— 改めて
+ * この根拠に対する人の承認を取る（Codex design review）。承認依頼が無ければここでは判定せず、
+ * Gate に「存在しない」と断らせる。
+ */
+export function checkApprovalEvidenceBinding(
+  storage: IStorage,
+  input: { approvalRequestId: string; taskId: string; sourceJobId: string; evidence: ExternalCompletionEvidence; commit: string },
+  repoRoot: string = resolveRepoRoot(),
+): { ok: true } | { ok: false; reason: string } {
+  const request = storage.approvalRequests.findById(input.approvalRequestId)
+  if (!request) return { ok: true }
+
+  const expected = externalCompletionApprovalDiffHash(
+    externalCompletionEvidenceDigest(input.taskId, input.sourceJobId, input.evidence),
+  )
+  if (request.targetDiffHash !== expected) {
+    return {
+      ok: false,
+      reason:
+        `approval request ${input.approvalRequestId} was not issued for this evidence `
+        + '(targetDiffHash does not match the digest of the submitted evidence); '
+        + 'issue a new approval request with the digest returned by the preview',
+    }
+  }
+  const approvedCommit = /^[0-9a-f]{7,40}$/i.test(request.targetCommit) ? resolveCommit(repoRoot, request.targetCommit) : undefined
+  if (approvedCommit !== input.commit) {
+    return {
+      ok: false,
+      reason: `approval request ${input.approvalRequestId} was issued for commit "${request.targetCommit}", not ${input.commit}`,
+    }
+  }
+  return { ok: true }
+}
+
+function resolveCommit(repoRoot: string, sha: string): string | undefined {
+  try {
+    return git(repoRoot, ['rev-parse', '--verify', '--quiet', `${sha}^{commit}`])
+  } catch {
+    return undefined
+  }
+}
+
+/** 取り込み前の確認結果（読むだけ。状態は何も変えない）。 */
+export interface ExternalCompletionPreview {
+  task: { id: string; title: string; status: string; parked: boolean; roadmapTaskKey: string | null }
+  /** 取り込みの入口条件をすべて満たすか（実行時に API がもう一度すべて確かめる）。 */
+  eligible: boolean
+  /** 満たさない条件（CEO に見せる。空なら eligible）。 */
+  problems: string[]
+  verification:
+    | { ok: true; commit: string; changedFiles: readonly string[]; codeOwnedFiles: readonly string[] | null; stableHead: string }
+    | { ok: false; reason: string }
+  sourceJobValid: boolean
+  blockingJobIds: string[]
+  evidenceDigest: string
+  approvalTargetDiffHash: string
+}
+
+/**
+ * 取り込み（`POST /api/tasks/:id/reconcile-external-completion`）と**同じ検査を、状態を変えずに**行う。
+ * 根拠の検証は `verifyExternalCompletion()`、blocked Job は `findBlockedJobsPreventingReconcile()` をそのまま使い、
+ * 判定を複製しない。Gate（承認）はここでは評価しない —— 承認はこの確認の後に CEO が下す。
+ */
+export async function previewExternalCompletion(
+  storage: IStorage,
+  taskId: string,
+  sourceJobId: string,
+  evidence: ExternalCompletionEvidence,
+  repoRoot: string = resolveRepoRoot(),
+): Promise<ExternalCompletionPreview | undefined> {
+  const task = storage.tasks.findById(taskId)
+  if (!task) return undefined
+
+  const problems: string[] = []
+  const checked = verifyExternalCompletion(storage, taskId, evidence, repoRoot)
+  if (!checked.ok) problems.push(checked.reason)
+
+  const source = storage.jobs.findById(sourceJobId)
+  const sourceJobValid = source !== undefined && source.taskId === taskId
+  if (!sourceJobValid) problems.push('Source Job not found for this Task')
+
+  const blockingJobIds = findBlockedJobsPreventingReconcile(storage, taskId).map((job) => job.id)
+  if (blockingJobIds.length > 0) problems.push(`Task still has blocked job(s) ${blockingJobIds.join(', ')}`)
+
+  const evidenceDigest = externalCompletionEvidenceDigest(taskId, sourceJobId, evidence)
+  return {
+    task: {
+      id: task.id,
+      title: task.title,
+      status: task.status,
+      parked: storage.tasks.isParked(task.id),
+      roadmapTaskKey: task.roadmapTaskKey ?? null,
+    },
+    eligible: problems.length === 0,
+    problems,
+    verification: checked.ok
+      ? {
+        ok: true,
+        commit: checked.verified.commit,
+        changedFiles: checked.verified.changedFiles,
+        codeOwnedFiles: (await codeOwnedFiles(repoRoot, checked.verified.changedFiles)) ?? null,
+        stableHead: checked.verified.stableHead,
+      }
+      : { ok: false, reason: checked.reason },
+    sourceJobValid,
+    blockingJobIds,
+    evidenceDigest,
+    approvalTargetDiffHash: externalCompletionApprovalDiffHash(evidenceDigest),
+  }
 }
