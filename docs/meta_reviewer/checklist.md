@@ -132,17 +132,17 @@ DA (2) はファイル名・ラベルではなく Approval Tuple の意味で判
 
 #### containment / quarantine の分類変更
 
-quarantine は Approval Tuple (b) の人の承認ではない（`approval_rules.md` R-11: 解放は clear-quarantine だけ）。ただし、静止・整合を証明できない workspace を他 Task へ渡さない Safety boundary である（`specs/22` §1-7）。詳細は `prompt.md`「containment / quarantine の分類を変える差分」。
+quarantine に入る条件の変更は、それだけでは Approval Tuple (b) の変更ではない（`approval_rules.md` R-11: 解放は clear-quarantine だけで、Human Resume では解放しない）。ただし R-11 と `specs/22` §1-7 から、quarantine は静止・整合を証明できない workspace を他 Task へ渡さない Safety boundary と読める。詳細は `prompt.md`「containment / quarantine の分類を変える差分」。
 
-- [ ] 「quarantine に入る条件を変えた」ことだけで DA (2)(b) の縮小としていない
-- [ ] 「quarantine に関わる変更」をまとめて B ともしていない。以下をすべて差分・既存コード・テストで確認できた場合だけ B とした
-- [ ] 移す結果はプロセス後始末の成功後にだけ生じ、その不変条件が崩れたら落ちるテストがある
-- [ ] 移した path でも実行後の workspace 整合検査が走り、その失敗は quarantine のままである（テストあり）
-- [ ] 他の unsafe / uncertain な結果と未知の結果は quarantine のままである（結果ごとのテストあり。汎用 safe 判定を広げていない）
-- [ ] 移した結果を成功として扱わない
-- [ ] quarantine の解除条件・Human Resume / abort / Human Recovery の拒否・workspace 所有権の保持が変わっていない
-- [ ] 変更は特定の呼び出し箇所に限られる（他の呼び出し元を変えるなら、呼び出し元ごとに上の確認を満たしている）
-- [ ] どれかを示せなければ A とした。後始末の失敗や整合不明の workspace を quarantine から外す差分・dirty な workspace のままの解除・解除条件の緩和は A + blocked とした
+- [ ] 「quarantine に入る条件を変えた」ことだけで DA (2)(b) の縮小としていない。人の承認を要する action・effect を別の形で変えていないかは確認した
+- [ ] 「quarantine に関わる変更」をまとめて B ともしていない。以下 1〜6 をすべて自分で差分・既存コード・テストから確かめた場合だけ B とした（DA (2) の B の要件も適用した）
+- [ ] 1: 移す結果を作る production の全箇所と、後始末成功を決める全入力をたどった。成功の証拠はその実行に機械的に結びつき、必要な観測がすべて成功した後にだけ作られる（欠けた・壊れた・呼び出し元が渡した・mock だけの証拠では足りない）。不変条件が崩れたら落ちるテストがある
+- [ ] 2: 移した path でも実行後の workspace 整合検査が走り、その失敗は quarantine のままである。production entrypoint から失敗を注入し、quarantine の記録に至るテストがある
+- [ ] 3: 他の unsafe / uncertain な結果と未知の結果は quarantine のままである（結果ごとのテストあり。汎用 safe 判定を広げていない）
+- [ ] 4: 移した結果を成功として扱わない
+- [ ] 5: quarantine に残る結果・行について、解除条件・Human Resume / abort / Human Recovery の拒否・新規 claim の拒否・workspace 所有権の保持が変わっていない
+- [ ] 6: 変更は特定の呼び出し箇所に限られる（他の呼び出し元を変えるなら、呼び出し元ごとに 1〜5 を満たしている）
+- [ ] 証拠が足りないだけなら A とした。1〜6 への違反が実際にあり、unsafe / uncertain / 整合検査失敗 / 未知の結果が quarantine を免れる・結果不明を成功扱いする・同等の証明なく例外を広げる場合は A + blocked とした（例は網羅ではない）
 
 ### CLAUDE.md
 - [ ] Green Zone / Yellow Zone / Red Zone の内容が変更されていない（変更されていれば、欠陥が無い限り `requiresCeoApproval: true`）

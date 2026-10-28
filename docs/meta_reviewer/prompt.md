@@ -166,22 +166,28 @@ Decision Authority と技術statusは独立である。以下の「Tuple変更�
 - base の `approval_rules.md` が old→new として具体的に定義済みの Tuple 変更を、全 writer・reader・consume・retry・recovery path で一致させて実装する（コードの従来挙動は変わる）→ B（不一致があれば A + blocked）
 - canonical な「ADMIN だけが human」を、writer・reader を揃えて正しく強制するだけの actor provenance 修正 → B（reader に対応する production writer が欠けて正規承認が成立しないなら B + blocked）
 
-**containment / quarantine の分類を変える差分（DA (1)(2) の判定）**
+**containment / quarantine の分類を変える差分**
 
-quarantine（Job を blocked にし、workspace の所有権を保持する状態）は、Approval Tuple (b) の「人の承認」ではない。quarantine の行は Human Resume があっても workspace を保持し続け、解放は clear-quarantine だけである（`approval_rules.md` R-11）。また `specs/22` §1-3 は、quarantine を技術判断で選ぶ Safety Evidence の1つとして挙げている。したがって、quarantine に入る条件を変えたこと自体は DA (2)(b) の縮小ではない。
+quarantine は、Job を blocked にして workspace の所有権を保持する状態である。`approval_rules.md` R-11 は、quarantine の行が Human Resume があっても workspace を保持し続け、解放は clear-quarantine だけであると定める。また `specs/22` §1-3 は、quarantine を技術判断で選ぶ Safety Evidence の1つとして挙げている。したがって、quarantine に入る条件の変更は、それだけでは Approval Tuple (b) の変更ではない。ただし、差分が人の承認を要する action・その effect を別の形で変えていないかは、他の Tuple 変更と同じく確認する。
 
-一方で quarantine は、静止し整合していると証明できない workspace を他の Task へ渡さないための Safety boundary を担っている（`specs/22` §1-7「workspace 汚染が別 Task へ伝播しない」「復旧不能になる前に fail closed する」）。この boundary を弱める差分は `specs/22` §1-2 の Human Decision Authority（DA (1)）である。強化か弱体化かを信頼できる形で示せない場合は A に倒す（§1-2）。
+一方で R-11 と `specs/22` §1-7（「workspace 汚染が別 Task へ伝播しない」「復旧不能になる前に fail closed する」）から、quarantine は、静止し整合していると証明できない workspace を他の Task へ渡さないための Safety boundary を担うと読める。この boundary を弱める差分は `specs/22` §1-2 の Human Decision Authority である（どの DA trigger に当たるかは差分の意味から判定する。guard・containment の意味の変更は通常 (2)）。強化か弱体化かを信頼できる形で示せない場合は A に倒す（§1-2）。
 
-ある containment の結果を quarantine から通常の失敗（failed → 既存の repair 等）へ移す差分は、次のすべてを差分・既存コード・テストから確認できる場合に限って、Safety boundary を変えない enforcement correction として B（`requiresCeoApproval: false`）とする。PR 説明・commit message・コメントの自己申告は根拠にしない。
+ある containment の結果を quarantine から通常の失敗（failed → 既存の repair 等）へ移す差分は、次の 1〜6 のすべてを reviewer 自身が差分・既存コード・テストから確かめられた場合に限って、Safety boundary を変えない enforcement correction として B（`requiresCeoApproval: false`）とする。PR 説明・commit message・コメントの自己申告は根拠にしない。上の「B とするには」の要件（production の全 path 確認・production entrypoint からの invariant test・missing / unknown の fail closed）もそのまま適用する。
 
-1. 移す結果は、プロセスの後始末が成功した後（例: cgroup.kill → `populated 0` → cgroup 削除）にだけ生じる。これを、生成箇所のコードと、その不変条件が崩れたら落ちるテストで示している。後始末の成功を観測で裏付けられない結果は対象にしない（drain timeout・削除失敗・kill / events / placement / spawn の失敗・containment 不可・未知の結果）。
-2. 移した path でも、実行後の workspace 整合検査（git 操作マーカー・最終 workspace 検査等）が従来どおり走る。その検査の失敗は従来どおり quarantine になる。これをテストで示している。
-3. 他の unsafe / uncertain な結果は従来どおり quarantine（fail closed）のままである。これを結果ごとのテストで示している。将来追加される未知の結果も quarantine に倒れる。汎用の safe 判定（例: `SAFE_OUTCOMES`）を広げる差分はこれに当たらない。
+1. 移す結果は、プロセスの後始末が成功した後にだけ生じる（例: cgroup.kill → `populated 0` の観測 → cgroup 削除の成功）。reviewer は、その結果を作る production の全箇所と、後始末の成功を決める全入力をたどる。後始末成功の証拠は、その実行（その cgroup）に機械的に結びつき、必要な観測がすべて成功した後にだけ作られていなければならない。欠けた・壊れた・呼び出し元が渡した・mock だけの証拠では足りない。生成箇所のコードと、その不変条件が崩れたら落ちるテストで示している。後始末の成功を観測で裏付けられない結果は対象にしない（drain timeout・削除失敗・kill / events / placement / spawn の失敗・containment 不可・未知の結果）。後始末成功の定義や判定を変える差分は、それ自体が production の全 path で同じ不変条件を満たすことを示さなければならない。
+2. 移した path でも、実行後の workspace 整合検査（git 操作マーカー・最終 workspace 検査等）が従来どおり走り、その検査の失敗は従来どおり quarantine になる。検査の失敗を production entrypoint から注入し、quarantine（blocked・所有権保持）の記録に至ることをテストで示している。helper を直接呼ぶだけのテストでは足りない。
+3. 他の unsafe / uncertain な結果は、従来どおり quarantine（fail closed）のままである。将来追加される未知の結果も quarantine に倒れる。これを結果ごとのテストで示している。汎用の safe 判定（例: `SAFE_OUTCOMES`）を広げる差分はこれに当たらない。
 4. 移した結果を成功として扱わない（コマンドの結果が不明なら失敗とする）。
-5. 次を変えていない: quarantine の解除条件（clear-quarantine の再検証）、Human Resume / abort / Human Recovery による拒否、workspace 所有権の保持。
+5. quarantine に残る結果・行について、次が変わっていない: 解除条件（clear-quarantine の再検証）、Human Resume / abort / Human Recovery の拒否、新規 claim の拒否、workspace 所有権の保持。quarantine に入らなくなってよいのは、1〜4 で示した結果だけである。
 6. 変更を特定の呼び出し箇所に限り、他の呼び出し元（AI CLI・review・post-lint 等）は変えていない。他の呼び出し元も変える場合は、呼び出し元ごとに 1〜5 を示している。
 
-1〜6 のどれかを示せない場合は A（`requiresCeoApproval: true`）とする。次の差分は Safety boundary の弱体化であり、意図・説明にかかわらず A + `blocked` とする: 後始末の失敗や整合が不明な workspace を quarantine から外す差分、dirty な workspace のまま解除を認める差分、解除条件を緩める差分。
+証拠が足りないだけで弱体化は示されていない場合は A（`requiresCeoApproval: true`）とする。1〜6 への違反が差分に実際にあり、それによって次のどれかが起きる場合は Safety boundary の弱体化であり、意図・説明にかかわらず A + `blocked` とする:
+
+- unsafe・uncertain・整合検査に失敗した・未知の結果が quarantine を免れる
+- 結果が不明なものを成功として扱う
+- 同等の証明なしに例外を広げる
+
+例（網羅ではない）: 後始末の失敗や整合が不明な workspace を quarantine から外す差分、整合検査の失敗を通常の failed に変える差分、dirty な workspace のまま解除を認める差分、解除条件を緩める差分。
 
 **Approval Tuple を実際に変える変更（A）の出し方 — 実装が CODEOWNERS 外のファイルでも同じ**
 
