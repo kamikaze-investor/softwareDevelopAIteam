@@ -3,38 +3,22 @@ import { describe, expect, it } from 'vitest'
 import type { ApprovalLevelResult, ReviewPolicy } from '@ai-team/shared'
 import {
   checkApprovalGateWeakening,
-  checkFullTestResult,
   checkMechanicalGateFiles,
   checkMetaReviewCodeUntouched,
   checkOutsideRepoFiles,
   checkPermissionGuardWeakening,
   checkPostTestHookUntouched,
   checkPurposeDiffAlignment,
-  checkRelatedTestResult,
   checkSecretScanWeakening,
-  checkTypecheckResult,
   checkUnexpectedFiles,
   runSafetyVerification,
 } from './safetyVerifier.js'
 import type {
-  CommandExecutionResult,
   SafetyCheckId,
   SafetyVerificationInput,
 } from './safetyVerifier.js'
 
 const REPO_ROOT = path.resolve('repo-root')
-const OK_COMMAND: CommandExecutionResult = {
-  exitCode: 0,
-  stdout: 'ok',
-  stderr: '',
-  durationMs: 10,
-}
-const FAILED_COMMAND: CommandExecutionResult = {
-  exitCode: 1,
-  stdout: '',
-  stderr: 'Type error: expected string',
-  durationMs: 10,
-}
 
 function makeApprovalLevelResult(
   mechanicalGateTriggered = false,
@@ -86,9 +70,6 @@ function makePassingVerificationInput(overrides: Partial<SafetyVerificationInput
     diffText: '+export const value = 1',
     approvalLevelResult: makeApprovalLevelResult(false),
     repoRoot: REPO_ROOT,
-    typecheckResult: OK_COMMAND,
-    relatedTestResult: OK_COMMAND,
-    fullTestResult: OK_COMMAND,
     postReviewAlignmentVerdict: 'aligned',
     ...overrides,
   }
@@ -282,69 +263,6 @@ describe('checkOutsideRepoFiles', () => {
   })
 })
 
-describe('checkTypecheckResult', () => {
-  it('undefinedならfail closedにする', () => {
-    const result = checkTypecheckResult()
-
-    expectFailure(result)
-  })
-
-  it('exitCode:0ならpassed:true', () => {
-    const result = checkTypecheckResult(OK_COMMAND)
-
-    expect(result.passed).toBe(true)
-  })
-
-  it('exitCode:1ならstderrをevidenceに入れてfailedにする', () => {
-    const result = checkTypecheckResult(FAILED_COMMAND)
-
-    expectFailure(result)
-    expect(result.evidence?.[0]).toContain('Type error')
-  })
-})
-
-describe('checkRelatedTestResult', () => {
-  it('undefinedならfail closedにする', () => {
-    const result = checkRelatedTestResult()
-
-    expectFailure(result)
-  })
-
-  it('exitCode:0ならpassed:true', () => {
-    const result = checkRelatedTestResult(OK_COMMAND)
-
-    expect(result.passed).toBe(true)
-  })
-
-  it('exitCode:1ならstderrをevidenceに入れてfailedにする', () => {
-    const result = checkRelatedTestResult(FAILED_COMMAND)
-
-    expectFailure(result)
-    expect(result.evidence?.[0]).toContain('Type error')
-  })
-})
-
-describe('checkFullTestResult', () => {
-  it('undefinedならfail closedにする', () => {
-    const result = checkFullTestResult()
-
-    expectFailure(result)
-  })
-
-  it('exitCode:0ならpassed:true', () => {
-    const result = checkFullTestResult(OK_COMMAND)
-
-    expect(result.passed).toBe(true)
-  })
-
-  it('exitCode:1ならstderrをevidenceに入れてfailedにする', () => {
-    const result = checkFullTestResult(FAILED_COMMAND)
-
-    expectFailure(result)
-    expect(result.evidence?.[0]).toContain('Type error')
-  })
-})
-
 describe('checkPurposeDiffAlignment', () => {
   it('alignedならpassed:trueかつblocking:true', () => {
     const result = checkPurposeDiffAlignment('aligned')
@@ -373,7 +291,7 @@ describe('checkPurposeDiffAlignment', () => {
 })
 
 describe('runSafetyVerification', () => {
-  it('12項目すべてpassedならoverallPassed:trueにする', () => {
+  it('全項目passedならoverallPassed:trueにする', () => {
     const result = runSafetyVerification(makePassingVerificationInput())
     const expectedOrder: SafetyCheckId[] = [
       'UNEXPECTED_FILES',
@@ -384,16 +302,13 @@ describe('runSafetyVerification', () => {
       'PERMISSION_GUARD_WEAKENING',
       'SECRET_SCAN_WEAKENING',
       'OUTSIDE_REPO_FILES',
-      'TYPECHECK',
-      'RELATED_TESTS',
-      'FULL_TESTS',
       'PURPOSE_DIFF_ALIGNMENT',
     ]
 
     expect(result.overallPassed).toBe(true)
     expect(result.blockingFailures).toEqual([])
     expect(result.checks.map(check => check.id)).toEqual(expectedOrder)
-    expect(result.checks).toHaveLength(12)
+    expect(result.checks).toHaveLength(9)
   })
 
   it('Post-Review未実装の標準ケースではfail closedでPURPOSE_DIFF_ALIGNMENTを失敗にする', () => {
@@ -405,13 +320,31 @@ describe('runSafetyVerification', () => {
     expect(result.blockingFailures).toContain('PURPOSE_DIFF_ALIGNMENT')
   })
 
-  it('typecheckResult未指定ならTYPECHECKを失敗にする', () => {
+  it('typecheck / test の結果を渡さない通常の呼び出し（jobRunner と同じ形）でも、それを理由に失敗しない', () => {
+    // jobRunner は SafeCommand より前に呼ぶため typecheck / test の結果を持たない。
+    // 以前はそれだけで TYPECHECK / RELATED_TESTS / FULL_TESTS が失敗になり overallPassed が常に false だった。
+    const result = runSafetyVerification(makePassingVerificationInput())
+
+    expect(result.overallPassed).toBe(true)
+    expect(result.blockingFailures).toEqual([])
+    const ids: string[] = result.checks.map(check => check.id)
+    expect(ids).not.toContain('TYPECHECK')
+    expect(ids).not.toContain('RELATED_TESTS')
+    expect(ids).not.toContain('FULL_TESTS')
+  })
+
+  it('残りの項目は従来どおり失敗を検出する（項目を外しても他の検出は弱まらない）', () => {
     const result = runSafetyVerification(makePassingVerificationInput({
-      typecheckResult: undefined,
+      allowedPaths: ['apps/worker/src/approvalLevel'],
+      changedFiles: ['apps/worker/src/approvalLevel/safetyVerifier.ts', 'apps/worker/scripts/postTestHook.ps1', '../outside-repo/file.ts'],
+      approvalLevelResult: makeApprovalLevelResult(false),
+      postReviewAlignmentVerdict: 'misaligned',
     }))
 
     expect(result.overallPassed).toBe(false)
-    expect(result.blockingFailures).toContain('TYPECHECK')
+    expect(result.blockingFailures).toEqual(expect.arrayContaining([
+      'UNEXPECTED_FILES', 'MECHANICAL_GATE_FILES', 'POST_TEST_HOOK', 'OUTSIDE_REPO_FILES', 'PURPOSE_DIFF_ALIGNMENT',
+    ]))
   })
 
   it('postTestHook.ps1を含む場合はPOST_TEST_HOOKを失敗にする', () => {

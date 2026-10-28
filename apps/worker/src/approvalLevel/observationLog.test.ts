@@ -62,19 +62,16 @@ describe('buildObservationLogEntry', () => {
           overallPassed: false,
           checks: [
             { id: 'UNEXPECTED_FILES', passed: true, blocking: true, detail: 'x' },
-            { id: 'MECHANICAL_GATE_FILES', passed: true, blocking: true, detail: 'x' },
+            { id: 'MECHANICAL_GATE_FILES', passed: false, blocking: true, detail: 'Mechanical Gate対象を検出' },
             { id: 'POST_TEST_HOOK', passed: true, blocking: true, detail: 'x' },
             { id: 'META_REVIEW_CODE', passed: true, blocking: true, detail: 'x' },
             { id: 'APPROVAL_GATE_WEAKENING', passed: true, blocking: true, detail: 'x' },
             { id: 'PERMISSION_GUARD_WEAKENING', passed: true, blocking: true, detail: 'x' },
             { id: 'SECRET_SCAN_WEAKENING', passed: true, blocking: true, detail: 'x' },
             { id: 'OUTSIDE_REPO_FILES', passed: true, blocking: true, detail: 'x' },
-            { id: 'TYPECHECK', passed: false, blocking: true, detail: 'typecheckが未実行' },
-            { id: 'RELATED_TESTS', passed: false, blocking: true, detail: '関連テストが未実行' },
-            { id: 'FULL_TESTS', passed: false, blocking: true, detail: '全テストが未実行' },
             { id: 'PURPOSE_DIFF_ALIGNMENT', passed: true, blocking: true, detail: 'Post-Review verdict: aligned' },
           ],
-          blockingFailures: ['TYPECHECK', 'RELATED_TESTS', 'FULL_TESTS'],
+          blockingFailures: ['MECHANICAL_GATE_FILES'],
           verifiedAt: '2026-01-01T00:00:00.000Z',
         },
       }),
@@ -90,8 +87,8 @@ describe('buildObservationLogEntry', () => {
     expect(entry.postReview.confidence).toBe(0.9)
     expect(entry.postReview.alignmentVerdict).toBe('aligned')
     expect(entry.safetyVerification.overallPassed).toBe(false)
-    expect(entry.safetyVerification.blockingFailures).toEqual(['TYPECHECK', 'RELATED_TESTS', 'FULL_TESTS'])
-    expect(entry.safetyVerification.totalChecksCount).toBe(12)
+    expect(entry.safetyVerification.blockingFailures).toEqual(['MECHANICAL_GATE_FILES'])
+    expect(entry.safetyVerification.totalChecksCount).toBe(9)
     expect(entry.safetyVerification.supportedChecksCount).toBe(9)
   })
 
