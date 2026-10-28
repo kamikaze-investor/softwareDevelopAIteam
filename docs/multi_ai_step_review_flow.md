@@ -241,8 +241,8 @@ commitGateが要求する3つの成果物（`safetyVerificationResult`/`preRevie
 | 成果物 | 必要な入力 | jobRunnerに既にあるか |
 |---|---|---|
 | `postReviewResult` | `diffText`・`changedFiles`・`purposeSummary`・`implementerProvider` | ある（Risk Scan/Step Reviewと同じpost-diffデータ。`purposeSummary`はStep Reviewと同様`job.aiCliPrompt`等で代用可） |
-| `safetyVerificationResult`（12項目中8項目） | `changedFiles`・`diffText`・`approvalLevelResult`・`repoRoot` | ある |
-| `safetyVerificationResult`（`TYPECHECK`/`RELATED_TESTS`/`FULL_TESTS`） | 実際のtypecheck/test実行結果（`CommandExecutionResult`） | **testは「ある」／typecheckは「ない」（2026-09-24 Production実測で訂正）。** implement Jobの SafeCommand は `kind: 'test'` であり、Workerが AI CLI 終了後に `pnpm test` を実際に実行している（Job `569cd4ae` 実測: 合計2,961 tests全通過・exitCode 0）。`FULL_TESTS` が埋まらないのは仕組みが無いからではなく**順序**の問題で、`runSafetyVerification()` の呼び出しが SafeCommand 実行より前にあるため、判定時点で結果がまだ存在しない。`TYPECHECK` は 1Job=1SafeCommand のため implement Job では本当に実行されない（`pnpm test` に typecheck は含まれない）。未接続の場合、`buildCommandResultCheck()`の実装により`passed:false, blocking:true, detail:"〜が未実行"`と**fail-closedで返る**（バグではなく、この関数の意図した既存挙動） |
+| `safetyVerificationResult`（設計時12項目中8項目。2026-10-28 以降は全9項目） | `changedFiles`・`diffText`・`approvalLevelResult`・`repoRoot` | ある |
+| `safetyVerificationResult`（`TYPECHECK`/`RELATED_TESTS`/`FULL_TESTS`）— **削除済み** | 実際のtypecheck/test実行結果（`CommandExecutionResult`。削除済み） | **2026-10-28 PR #430（`8b6e6d8b`）で3項目と入力ごと削除した（safetyVerifier へ結果を渡す実装はしない）。** workflow の implement Job は SafeCommand（`verificationProfile: implement` → `pnpm run verify:implement` = 全パッケージ typecheck → test。#355）が実際に実行し、失敗すれば Job が failed になって post-implement review / git_commit へ進まない。safetyVerifier はそれより前に走るため結果を受け取れず、3項目は常に「未実行」で `overallPassed` を false にするだけだった（2026-10-27 Job `7c784d9a` 実測）。以下は削除前の記録（typecheck 未実行の記述は #355 で解消済み）: **testは「ある」／typecheckは「ない」（2026-09-24 Production実測で訂正）。** implement Jobの SafeCommand は `kind: 'test'` であり、Workerが AI CLI 終了後に `pnpm test` を実際に実行している（Job `569cd4ae` 実測: 合計2,961 tests全通過・exitCode 0）。`FULL_TESTS` が埋まらないのは仕組みが無いからではなく**順序**の問題で、`runSafetyVerification()` の呼び出しが SafeCommand 実行より前にあるため、判定時点で結果がまだ存在しない。`TYPECHECK` は 1Job=1SafeCommand のため implement Job では本当に実行されない（`pnpm test` に typecheck は含まれない）。未接続の場合、`buildCommandResultCheck()`の実装により`passed:false, blocking:true, detail:"〜が未実行"`と**fail-closedで返る**（バグではなく、この関数の意図した既存挙動） |
 | `safetyVerificationResult`（`PURPOSE_DIFF_ALIGNMENT`） | `postReviewResult.alignmentVerdict` | **ない（postReviewerが先に接続されて初めて得られる）**。未接続の場合`checkPurposeDiffAlignment()`が`passed:false, blocking:true, detail:"Post-Review未実施または判定不能"`とfail-closedで返る（同様に意図した既存挙動） |
 | `preReviewResult` | `planText`（実装前の変更計画テキスト）・`purposeSummary`・`targetFiles`・`implementerProvider` | **ない。**jobRunnerは実装（AI CLI実行）前に「計画テキスト」を保持する仕組みを持たない。加えてpreReviewはpolicy=`full_pre_post_review`（Level2相当）のみ対象という前提があるが、Step6-B0の結論により`approvalLevelResult`（control repo基準）はtarget_project向けJobのreviewPolicy判定として信頼できないため、「このJobがfull_pre_post_review対象か」を安全に判定する手段自体が別途必要 |
 
@@ -250,7 +250,7 @@ commitGateが要求する3つの成果物（`safetyVerificationResult`/`preRevie
 
 理由:
 - postReviewerは既存のRisk Scan/Step Reviewと全く同じタイミング・同じ入力（post-diffデータ）で呼べるため、追加の設計課題がない。最も接続しやすい。
-- safetyVerifierは12項目中8項目が既存情報だけで評価可能。残る4項目（`TYPECHECK`/`RELATED_TESTS`/`FULL_TESTS`のcommand実行結果系3項目・`PURPOSE_DIFF_ALIGNMENT`1項目）は接続後もfail-closedのまま観察するに留め、無理に埋めようとしない（2026-09-24訂正: testの実行結果は SafeCommand として既に存在しており、衝突ではなく呼び出し順序の問題である。詳細は上表の該当行と `tasks/roadmap.md` の `review-gate-layers-implemented-but-unwired` を参照。typecheckについては未実行のまま）。
+- safetyVerifierは12項目中8項目が既存情報だけで評価可能。残る4項目（`TYPECHECK`/`RELATED_TESTS`/`FULL_TESTS`のcommand実行結果系3項目・`PURPOSE_DIFF_ALIGNMENT`1項目）は接続後もfail-closedのまま観察するに留め、無理に埋めようとしない（2026-09-24訂正: testの実行結果は SafeCommand として既に存在しており、衝突ではなく呼び出し順序の問題である。詳細は上表の該当行と `tasks/roadmap.md` の `review-gate-layers-implemented-but-unwired` を参照。typecheckについては未実行のまま）。**2026-10-28 更新:** command 実行結果系3項目は PR #430 で削除し、safetyVerifier は全9項目になった。入力が無いと fail-closed になるのは `PURPOSE_DIFF_ALIGNMENT` だけである。typecheck / test は SafeCommand `verify:implement`（#355）が担う。
 - preReviewerは（a）実装前という異なるタイミングへの接続が必要、（b）対象policy判定自体が未解決、という2つの未解決設計課題があるため、無理に今回の順序に含めず、独立した設計課題として先送りする。
 
 **R4実装の分割案:**
@@ -264,6 +264,7 @@ R4-B: safetyVerifierの観察モード接続（部分評価であることを明
   - R4-Aの後（PURPOSE_DIFF_ALIGNMENTにpostReviewResult.alignmentVerdictを渡すため）
   - typecheckResult/relatedTestResult/fullTestResultは今回未指定（undefined）のまま渡す
     → 3項目は意図的にfail-closedのまま観察する（実行結果を渡す仕組みは別途設計が必要）
+    → 2026-10-28 PR #430 で3項目と入力自体を削除（typecheck/test は SafeCommand verify:implement が担う）
   - safetyVerificationResultをJobRunResultに保持するだけ。overallPassed:falseでもJobは止めない
 
 R4-C: commitGateの観察モード接続（6-2章の設計に基づく）
@@ -280,7 +281,7 @@ preReviewerの接続設計:
 
 **失敗時にJobを止めない設計にできるか（全ステップ共通）:** できる。Gemini Step Reviewと同じ非停止・soft-fail方針を踏襲する。postReviewer/safetyVerifierの呼び出し自体が失敗した場合（例外・パース失敗）も、既存の`buildFailureResult()`（reviewerAdapter.ts）や、safetyVerifierの各checkのfail-closed設計により、「失敗＝blocking扱いの結果オブジェクトを返す」だけで、jobRunner側で例外を投げることはない。ただしこれは「結果としてblocking:trueが多く出る」ことを意味し、commitGate接続前（R4-A/B段階）ではこの結果を観察するだけに留め、実際のcommit可否には使わない。
 
-**既存Risk Scan/Gemini Step Reviewとの重複確認:** postReviewerは「実装目的とdiffの整合性」をAIが判断する点でRisk Scan（パターンマッチ検出）ともStep Review（重要度の一次判定）とも異なる。safetyVerifierは機械的な12項目チェックであり、Gemini呼び出しを含まない点でGemini系（Step Review/postReviewer）とは別レイヤー。重複なし。
+**既存Risk Scan/Gemini Step Reviewとの重複確認:** postReviewerは「実装目的とdiffの整合性」をAIが判断する点でRisk Scan（パターンマッチ検出）ともStep Review（重要度の一次判定）とも異なる。safetyVerifierは機械的なチェック（2026-10-28 以降9項目）であり、Gemini呼び出しを含まない点でGemini系（Step Review/postReviewer）とは別レイヤー。重複なし。
 
 **preReviewer調査結果（2026-07-06。接続は見送り）:** R4-A/B完了後、R4-C再開条件の1つである「preReviewer接続」を別途調査した。結論は**接続しない**。理由: (1) このコードベースには独立した「実装計画」成果物が存在せず、`planText`の実質は`job.aiCliPrompt`になるため、**postReviewerと判断材料がほぼ重複する**（postReviewは同じ元データに対しdiff生成後にレビューする）。(2) preReviewer本来のタイミングはAI CLI実行前だが、その時点では`changedFiles`/`diffText`/Risk Scan severityが存在せず、既存のRisk Scan/Step Review/postReview/safetyVerifierが使う「severity: medium/high」という呼び出しゲート条件が使えない。(3) 観察モード（非停止）では、preReviewer本来の価値である「実装前に止める」が活きない。破棄ではなく、MVP後の設計再検討対象として扱う（`tasks/roadmap.md`参照）。
 
@@ -586,7 +587,7 @@ ChatGPTがコミット前レビュー
 
 | 仕様書上の位置づけ | 対応する既存実装 | 状態 |
 |---|---|---|
-| Mechanical Safety Checks | `apps/worker/src/approvalLevel/safetyVerifier.ts`（12項目チェック）、`packages/shared/src/approvalLevelClassifier.ts`（Mechanical Gate） | 実装済み（Step1-2, Step3。コミット b159d73, 3b3d1fb） |
+| Mechanical Safety Checks | `apps/worker/src/approvalLevel/safetyVerifier.ts`（advisory の9項目チェック。typecheck/test の3項目は2026-10-28 #430 で削除）、`packages/shared/src/approvalLevelClassifier.ts`（Mechanical Gate） | 実装済み（Step1-2, Step3。コミット b159d73, 3b3d1fb） |
 | Risk Scan | `apps/worker/src/approvalLevel/targetProjectRiskScan.ts`（severity付きリスク検出） | 実装済み・観察モードでjobRunner接続済み（コミット d16a709〜afab85c）。現在ログ観察期間中 |
 | commitGate（成果物確認） | `apps/worker/src/approvalLevel/commitGate.ts`（reviewPolicy別必須成果物チェック） | 実装済み・未接続（Step5完了、コミット 351840f） |
 | 既存Gemini Reviewer（実行ブロック権限あり） | `apps/worker/src/approvalLevel/preReviewer.ts` / `postReviewer.ts` / `reviewerAdapter.ts` | 実装済み・未接続（Step4完了、コミット a7d3f81）。**2-1章の通り、本仕様書のGemini Flash Stepレビューとは別物として扱う** |
