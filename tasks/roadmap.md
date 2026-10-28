@@ -7030,6 +7030,18 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
    それでも review Job の `status` は `exitCode` を含むため `git_commit` Job の生成は
    fail-closed にできる（reviewer への証跡提示とは別の効果）。着手時に両者を混同しないこと。
 
+   **(3) は削除で解決済み — 2026-10-28 PR #430（`8b6e6d8b`）**: 「配線する / 記述と必須指定を実態へ合わせる」のうち
+   後者を選び、`safetyVerifier` から `TYPECHECK` / `RELATED_TESTS` / `FULL_TESTS` と入力（`CommandExecutionResult`）を削除した。
+   typecheck / test は workflow の implement Job で SafeCommand（`verificationProfile: implement` →
+   `pnpm run verify:implement` = 全パッケージ typecheck → test。#355）が実際に実行し、失敗すれば Job が failed になって
+   post-implement review / git_commit へ進まない。上の「typecheck は本当に未実行」「review Job の SafeCommand を typecheck に替える」
+   は #355 以前の記述で、**結果を safetyVerifier へ渡す作業はもう行わない**。`overallPassed` は残る9項目の合否として意味を持つ。
+   `commitGate.ts` の必須成果物へ `SAFETY_VERIFICATION_RESULT` を戻すかは別の判断で、#430 では変えていない
+   （commit gate は shadow のまま。(4) と合わせて判断する）。
+   なお profile の無い手動 test Job（Mobile から作るもの等）は `pnpm test` だけで typecheck しない。これは #430 以前からの状態で、
+   外した3項目も検出していなかった。本 item の (3) には含めない。
+   **本 item に残るのは (1)(2)(4)(5)**。`state` は `planned` のまま。
+
    **(4) Shadow Commit Gate が観測記録を残さない**: `jobRunner.ts` は
    「判定結果はconsole.logのみ。停止・通知・永続化は行わない（Job結果にも載せない）」。
    直後の `appendObservationLog` に commit-gate フィールドが無い。
