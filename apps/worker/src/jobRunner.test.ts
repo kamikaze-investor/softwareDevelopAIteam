@@ -13,7 +13,7 @@ vi.mock('./outbox/outboxStore.js', () => outboxMocks)
 
 import { resolveCommand } from './commandResolver.js'
 import { fileChangeGuard } from './guards/fileChangeGuard.js'
-import { saveJobLogs } from './jobLogger.js'
+import { readSafeCommandEvidence, saveJobLogs } from './jobLogger.js'
 import { persistJobResult } from './index.js'
 import {
   WorkspaceReconciliationError,
@@ -325,6 +325,7 @@ class ChangeDetectionErrorStub extends Error {
   }
 }
 const saveJobLogsMock = vi.mocked(saveJobLogs)
+const readSafeCommandEvidenceMock = vi.mocked(readSafeCommandEvidence)
 const callGateCheckMock = vi.mocked(callGateCheck)
 const callConsumeMock = vi.mocked(callConsume)
 const resolvePolicyMock = vi.mocked(resolvePolicy)
@@ -542,6 +543,15 @@ beforeEach(() => {
     allowed: true,
     violations: [],
     reasons: {},
+  })
+
+  readSafeCommandEvidenceMock.mockReturnValue({
+    source: 'unavailable',
+    separated: false,
+    excerpt: '',
+    omittedChars: 0,
+    summaryLines: [],
+    note: 'verification evidence unavailable (test stub)',
   })
 
   // execFileSync: git ヘルパー呼び出しの既定値
@@ -860,9 +870,14 @@ describe('runJob', () => {
     expect(result.status).toBe('failed')
     expect(result.exitCode).toBe(2)
     expect(result.stdout).toBe('partial output')
-    expect(result.stderr).toBe('fatal error')
+    expect(result.stderr).toBe('[jobRunner] SafeCommand kind=git_status exited 2\nfatal error')
     expect(result.changedFiles).toEqual([])
-    expect(saveJobLogsMock).toHaveBeenCalledWith('job-1', 'partial output', 'fatal error', 'partial output')
+    expect(saveJobLogsMock).toHaveBeenCalledWith(
+      'job-1',
+      'partial output',
+      '[jobRunner] SafeCommand kind=git_status exited 2\nfatal error',
+      'partial output',
+    )
   })
 
   it('Guard で止めたら stderr に理由と allowedPaths を出す（原因の誤読を防ぐ）', async () => {
@@ -1094,16 +1109,22 @@ describe('runJob', () => {
       expect(result.status).toBe('failed')
       expect(result.exitCode).toBe(1)
       expect(result.safeCommandFailureKind).toBe('safe_command_timeout')
+      expect(result.safeCommandEvidence).toBeUndefined()
       expect(result.providerFailureKind).toBeUndefined()
       expect(result.stderr).toContain('command timed out after 600000ms (test budget)')
     })
 
-    it('ordinary non-zero exit (not a timeout) does not set safeCommandFailureKind', async () => {
+    it('ordinary non-zero exit carries a trusted fact and bounded untrusted evidence', async () => {
       resolveCommandMock.mockReturnValue({ argv: ['pnpm', 'run', 'test'], description: 'pnpm test' })
       execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => gitFallback(args))
+      readSafeCommandEvidenceMock.mockReturnValue({
+        source: 'safe_command_log', separated: true,
+        excerpt: 'src/a.ts(3,1): error TS2322: Type mismatch', omittedChars: 0,
+        summaryLines: ['src/a.ts(3,1): error TS2322: Type mismatch'], note: 'dedicated log',
+      })
       captureSafeCommand(() => ({
         outcome: 'clean', signal: null, killedDescendants: false, drainMs: 0,
-        exitCode: 1, stdout: '', stderr: '1 test failed', timedOut: false,
+        exitCode: 2, stdout: 'tsc failed', stderr: '1 test failed', timedOut: false,
       }))
 
       const result = await runJob(
@@ -1112,7 +1133,89 @@ describe('runJob', () => {
       )
 
       expect(result.status).toBe('failed')
-      expect(result.safeCommandFailureKind).toBeUndefined()
+      expect(result.safeCommandFailureKind).toBe('safe_command_failed')
+      expect(result.stderr?.split('\n')[0]).toBe('[jobRunner] SafeCommand kind=test exited 2')
+      expect(result.safeCommandEvidence).toEqual({
+        source: 'safe_command_log',
+        excerpt: 'src/a.ts(3,1): error TS2322: Type mismatch\nsrc/a.ts(3,1): error TS2322: Type mismatch',
+      })
+      expect(readSafeCommandEvidenceMock).toHaveBeenCalledWith({
+        kind: 'test', stdoutPath: '/logs/job-1/stdout.txt', aiCliUsed: false,
+      })
+    })
+
+    it('Guard block also happens after a failed SafeCommand, so the Guard note remains first', async () => {
+      resolveCommandMock.mockReturnValue({ argv: ['pnpm', 'run', 'test'], description: 'pnpm test' })
+      execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => {
+        if (Array.isArray(args) && args.includes('--name-only')) return 'src/outside.ts\n'
+        return gitFallback(args)
+      })
+      captureSafeCommand(() => ({
+        outcome: 'clean', signal: null, killedDescendants: false, drainMs: 0,
+        exitCode: 2, stdout: '', stderr: 'tsc failed', timedOut: false,
+      }))
+      fileChangeGuardMock
+        .mockReturnValueOnce({ allowed: true, violations: [], reasons: {} })
+        .mockReturnValueOnce({
+          allowed: false,
+          violations: ['src/outside.ts'],
+          reasons: { 'src/outside.ts': 'Not in task.allowedPaths' },
+        })
+
+      const result = await runJob(
+        createJob({ safeCommand: { kind: 'test', workingDir: '/workspace/target' } }),
+        createPolicy({ allowedPaths: Object.freeze(['src/inside.ts']) }),
+      )
+
+      expect(result.stderr?.split('\n')[0]).toContain('File Change Guard blocked')
+      expect(result.stderr).toContain('[jobRunner] SafeCommand kind=test exited 2')
+    })
+
+    it('secret-shaped SafeCommand output is withheld instead of carried', async () => {
+      resolveCommandMock.mockReturnValue({ argv: ['pnpm', 'run', 'test'], description: 'pnpm test' })
+      execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => gitFallback(args))
+      const secretShaped = `const ${['pass', 'word'].join('')} = "hunter2"`
+      readSafeCommandEvidenceMock.mockReturnValue({
+        source: 'safe_command_log', separated: true, excerpt: secretShaped, omittedChars: 0,
+        summaryLines: [], note: 'dedicated log',
+      })
+      captureSafeCommand(() => ({
+        outcome: 'clean', signal: null, killedDescendants: false, drainMs: 0,
+        exitCode: 1, stdout: secretShaped, stderr: '', timedOut: false,
+      }))
+
+      const result = await runJob(
+        createJob({ safeCommand: { kind: 'test', workingDir: '/workspace/target' } }),
+        createPolicy(),
+      )
+
+      expect(result.safeCommandEvidence).toEqual({ source: 'safe_command_log', withheld: 'secret_scan' })
+      expect(JSON.stringify(result.safeCommandEvidence)).not.toContain('hunter2')
+    })
+
+    it('SafeCommand evidence は3000文字以内で、長い要約より因果を示す末尾を残す', async () => {
+      resolveCommandMock.mockReturnValue({ argv: ['pnpm', 'run', 'test'], description: 'pnpm test' })
+      execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => gitFallback(args))
+      readSafeCommandEvidenceMock.mockReturnValue({
+        source: 'safe_command_log',
+        separated: true,
+        excerpt: `${'x'.repeat(4_000)}CAUSAL_TAIL`,
+        omittedChars: 0,
+        summaryLines: ['s'.repeat(4_000)],
+        note: 'dedicated log',
+      })
+      captureSafeCommand(() => ({
+        outcome: 'clean', signal: null, killedDescendants: false, drainMs: 0,
+        exitCode: 1, stdout: '', stderr: '', timedOut: false,
+      }))
+
+      const result = await runJob(
+        createJob({ safeCommand: { kind: 'test', workingDir: '/workspace/target' } }),
+        createPolicy(),
+      )
+
+      expect(result.safeCommandEvidence?.excerpt).toHaveLength(3_000)
+      expect(result.safeCommandEvidence?.excerpt).toMatch(/CAUSAL_TAIL$/)
     })
 
     it('persistJobResult は safe_command_timeout を既存 failureMetadata.kind へ保存する', async () => {
@@ -1129,6 +1232,26 @@ describe('runJob', () => {
       expect(patchJob).toHaveBeenCalledWith('job-1', expect.objectContaining({
         status: 'failed',
         failureMetadata: expect.objectContaining({ kind: 'safe_command_timeout' }),
+      }))
+    })
+
+    it('persistJobResult は SafeCommand evidence を failureMetadata へ保存する', async () => {
+      const patchJob = vi.fn().mockResolvedValue(true)
+      await persistJobResult('job-1', {
+        status: 'failed',
+        exitCode: 2,
+        safeCommandFailureKind: 'safe_command_failed',
+        safeCommandEvidence: { source: 'safe_command_log', excerpt: 'error TS2322' },
+        guardResult: { permissionAllowed: true, fileChangeAllowed: true, fileViolations: [] },
+        startedAt: '2026-10-23T00:00:00.000Z',
+        completedAt: '2026-10-23T00:02:00.000Z',
+      }, 'failed', { patchJob })
+
+      expect(patchJob).toHaveBeenCalledWith('job-1', expect.objectContaining({
+        failureMetadata: expect.objectContaining({
+          kind: 'safe_command_failed',
+          safeCommandEvidence: { source: 'safe_command_log', excerpt: 'error TS2322' },
+        }),
       }))
     })
 

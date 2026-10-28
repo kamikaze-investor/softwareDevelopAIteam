@@ -26,9 +26,11 @@ import type {
   Task,
 } from '@ai-team/shared'
 import {
+  SAFE_COMMAND_FAILED_FAILURE_KIND,
   SAFE_COMMAND_TIMEOUT_FAILURE_KIND,
   aiCliTimeoutMs,
   findGateTechnicalStopCode,
+  isPromptSafe,
   runRiskReview,
 } from '@ai-team/shared'
 import { z } from 'zod'
@@ -366,11 +368,12 @@ export interface JobRunResult {
   completedAt: string
   providerFailureKind?: AiCliResult['providerFailureKind']
   /**
-   * SafeCommand が kind 別の実行予算で containment に kill されたときだけ立つ。
+   * SafeCommand が timeout または通常の非0終了で失敗したときに立つ。
    * 既存 `failureMetadata.kind` へ保存される（新しい保存欄は作らない）。
    * provider failure は SafeCommand 実行前に return するので両者は同時に立たない。
    */
-  safeCommandFailureKind?: typeof SAFE_COMMAND_TIMEOUT_FAILURE_KIND
+  safeCommandFailureKind?: typeof SAFE_COMMAND_TIMEOUT_FAILURE_KIND | typeof SAFE_COMMAND_FAILED_FAILURE_KIND
+  safeCommandEvidence?: JobFailureMetadata['safeCommandEvidence']
   refusal?: JobFailureMetadata['refusal']
   workspaceState?: 'unchanged' | 'changed' | 'unknown'
   /** 子プロセスと Job 固有 cleanup が終わった時点の value-free workspace fingerprint。 */
@@ -1311,6 +1314,8 @@ export async function runJob(
   let createdCommitHash: string | undefined
   // SafeCommand が kind 別の実行予算で containment に kill されたか（構造化して API へ渡す）。
   let safeCommandTimedOut = false
+  let safeCommandFailed = false
+  let safeCommandExitedWithoutCode = false
 
   if (!job.dryRun) {
     // アトミックジョブの場合は実行前コミットハッシュを記録
@@ -1342,6 +1347,7 @@ export async function runJob(
         stderr = contained.stderr
       } else {
         exitCode = contained.exitCode ?? 1
+        safeCommandExitedWithoutCode = contained.exitCode === null || contained.exitCode === undefined
         safeCommandTimedOut = contained.timedOut
         stderr = contained.stderr || (contained.timedOut
           ? `command timed out after ${timeoutMs}ms (${job.safeCommand.kind} budget) and was terminated by containment`
@@ -1355,6 +1361,19 @@ export async function runJob(
       exitCode = typeof failure.status === 'number' ? failure.status : 1
       stdout = outputToString(failure.stdout)
       stderr = outputToString(failure.stderr) || formatUnknownError(err)
+    }
+
+    safeCommandFailed = !safeCommandTimedOut && exitCode !== 0
+    if (safeCommandFailed) {
+      // コマンド出力は信頼済みの `[jobRunner]` 行へ混ぜない。ここに置けば、
+      // 後段の Guard / containment / ログ保存失敗の注記が必要に応じて先頭を上書きできる。
+      // signal 等で終了コードが無い場合は、代入した 1 を「exited 1」と書かない（独立レビュー B4）。
+      stderr = withLeadingNote(
+        stderr,
+        safeCommandExitedWithoutCode
+          ? `SafeCommand kind=${job.safeCommand.kind} terminated without an exit code`
+          : `SafeCommand kind=${job.safeCommand.kind} exited ${exitCode}`,
+      )
     }
 
     // アトミックジョブの場合は実行後コミットハッシュを記録
@@ -1472,6 +1491,14 @@ export async function runJob(
     stderr = withLeadingNote(stderr, note)
   }
 
+  const safeCommandEvidence = safeCommandFailed
+    ? buildSafeCommandFailureEvidence({
+        kind: job.safeCommand.kind,
+        stdoutPath,
+        aiCliUsed: Boolean(job.aiCliProvider && job.aiCliMode),
+      })
+    : undefined
+
   // アトミックジョブの RollbackInfo を自動生成
   let rollbackInfo: RollbackInfo | undefined
   if (isAtomic && beforeCommitHash && exitCode === 0) {
@@ -1522,8 +1549,49 @@ export async function runJob(
       preChangedPaths: [...preManifest.paths],
     },
     reviewResult: structuredReviewResult,
-    ...(safeCommandTimedOut ? { safeCommandFailureKind: SAFE_COMMAND_TIMEOUT_FAILURE_KIND } : {}),
+    ...(safeCommandTimedOut
+      ? { safeCommandFailureKind: SAFE_COMMAND_TIMEOUT_FAILURE_KIND }
+      : safeCommandFailed ? { safeCommandFailureKind: SAFE_COMMAND_FAILED_FAILURE_KIND } : {}),
+    ...(safeCommandEvidence !== undefined ? { safeCommandEvidence } : {}),
   }
+}
+
+const SAFE_COMMAND_FAILURE_EVIDENCE_MAX_CHARS = 3_000
+const SAFE_COMMAND_FAILURE_EVIDENCE_MIN_TAIL_CHARS = 1_500
+
+/**
+ * 修正 prompt へ渡す未信頼出力を、要約が末尾の直接原因を押し出さない形で有界化する。
+ * `readSafeCommandEvidence()` が分離を証明できない場合は本文を一切運ばない。
+ */
+function buildSafeCommandFailureEvidence(input: {
+  kind: string
+  stdoutPath?: string
+  aiCliUsed: boolean
+}): NonNullable<JobFailureMetadata['safeCommandEvidence']> {
+  const evidence = readSafeCommandEvidence(input)
+  if (!evidence.separated) {
+    return { source: evidence.source, withheld: 'unavailable' }
+  }
+
+  const summary = evidence.summaryLines.join('\n')
+  const reservedTail = Math.min(evidence.excerpt.length, SAFE_COMMAND_FAILURE_EVIDENCE_MIN_TAIL_CHARS)
+  const separatorLength = summary.length > 0 && evidence.excerpt.length > 0 ? 1 : 0
+  const summaryBudget = Math.max(
+    0,
+    SAFE_COMMAND_FAILURE_EVIDENCE_MAX_CHARS - reservedTail - separatorLength,
+  )
+  const boundedSummary = summary.slice(0, summaryBudget)
+  const tailBudget = SAFE_COMMAND_FAILURE_EVIDENCE_MAX_CHARS
+    - boundedSummary.length
+    - (boundedSummary.length > 0 && evidence.excerpt.length > 0 ? 1 : 0)
+  const tail = evidence.excerpt.slice(-tailBudget)
+  const excerpt = [boundedSummary, tail].filter((part) => part.length > 0).join('\n')
+
+  // 切り詰め前の本文も検査する。末尾切り出しが secret の形を途中で割ると、切った後だけの
+  // 検査では一致しなくなる（独立レビュー B3）。
+  return isPromptSafe(excerpt) && isPromptSafe(`${summary}\n${evidence.excerpt}`)
+    ? { source: evidence.source, excerpt }
+    : { source: evidence.source, withheld: 'secret_scan' }
 }
 
 /**

@@ -331,6 +331,10 @@ function readRepositoryFile(
 export function buildRepositoryContextSection(
   targetFiles: readonly string[],
   repoRoot: string = TARGET_ROOT,
+  limits: { maxFileChars: number; maxTotalChars: number } = {
+    maxFileChars: REPOSITORY_CONTEXT_MAX_FILE_CHARS,
+    maxTotalChars: REPOSITORY_CONTEXT_MAX_TOTAL_CHARS,
+  },
 ): string {
   if (targetFiles.length === 0) return ''
 
@@ -344,7 +348,7 @@ export function buildRepositoryContextSection(
     ].join('\n')
   }
 
-  let remaining = REPOSITORY_CONTEXT_MAX_TOTAL_CHARS
+  let remaining = limits.maxTotalChars
   const sections = targetFiles.map(file => {
     let result: { content: string } | { omitted: string }
     try {
@@ -357,7 +361,7 @@ export function buildRepositoryContextSection(
       if (remaining <= 0) {
         result = { omitted: 'repository context全体の上限に達したため載せていません' }
       } else {
-        const limit = Math.min(REPOSITORY_CONTEXT_MAX_FILE_CHARS, remaining)
+        const limit = Math.min(limits.maxFileChars, remaining)
         const excerpt = result.content.slice(0, limit)
         if (!isPromptSafe(excerpt)) {
           result = { omitted: 'secret scanに一致したため載せていません' }

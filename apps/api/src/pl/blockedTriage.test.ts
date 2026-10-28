@@ -465,6 +465,14 @@ describe('triageBlocked — 原因分類とレーン選択', () => {
       dryRun: false,
     } as Parameters<IStorage['jobs']['create']>[0])
     expect(job.id).toBeDefined()
+    storage.jobs.update(job.id, {
+      exitCode: 2,
+      stderr: 'UNTRUSTED_TSC_OUTPUT',
+      failureMetadata: {
+        kind: 'safe_command_failed',
+        safeCommandEvidence: { source: 'safe_command_log', excerpt: 'UNTRUSTED_EXCERPT' },
+      },
+    } as Parameters<IStorage['jobs']['update']>[1])
     storage.tasks.update(taskId, { status: 'blocked' })
 
     const diagnosis = triageBlocked(storage, attentionOf(storage, 'job_failed'))
@@ -472,6 +480,12 @@ describe('triageBlocked — 原因分類とレーン選択', () => {
     expect(diagnosis.rootCauseClass).toBe('unknown')
     expect(diagnosis.confidence).toBe('low')
     expect(diagnosis.recommendedLane).not.toBe('auto_recovery')
+    expect(diagnosis.evidence).toEqual([
+      { fact: 'job.exitCode', id: job.id, value: '2' },
+      { fact: 'job.failureMetadata.kind', id: job.id, value: 'safe_command_failed' },
+      { fact: 'job.safeCommand.kind', id: job.id, value: 'test' },
+    ])
+    expect(JSON.stringify(diagnosis.evidence)).not.toContain('UNTRUSTED')
   })
 
   it('quarantine された workspace は PL では解除できないので CEO_ESCALATION', () => {
