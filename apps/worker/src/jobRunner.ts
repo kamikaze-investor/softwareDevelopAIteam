@@ -414,7 +414,7 @@ export interface JobRunResult {
    * safetyVerifier結果（Step R4-B・観察モード）。
    * targetProjectRiskScanResult.highestSeverity が medium/high の場合のみ呼び出す
    * （postReviewer/Gemini Step Reviewと同じ既存シグナルを流用。新しい分類器は作らない）。
-   * typecheck / test は扱わない（SafeCommand の verify:implement が実行し、失敗なら Job が failed）。
+   * typecheck / test は扱わない（workflow の Implement Job は SafeCommand の verify:implement が実行し、失敗なら Job が failed）。
    * 呼び出し自体に失敗しても（想定外入力・実装バグ等）Jobは止めず、undefinedのまま。
    */
   safetyVerificationResult?: SafetyVerificationResult
@@ -1182,7 +1182,7 @@ export async function runJob(
   //   （commitGate.ts getRequiredArtifacts 注釈参照）。
   //   観察モードとして medium/high でのみ計測・ログを蓄積する。
   // typecheck / test はこの verifier では扱わない。この位置は SafeCommand 実行より前で結果が無く、
-  // 実際の検証は SafeCommand（verify:implement）が行い、失敗すれば Job は failed になる（#355）。
+  // workflow の Implement Job では SafeCommand（verify:implement）が検証し、失敗すれば Job は failed になる（#355）。
   let safetyVerificationResult: SafetyVerificationResult | undefined
   if (isRiskSeverityMediumOrHigh) {
     try {

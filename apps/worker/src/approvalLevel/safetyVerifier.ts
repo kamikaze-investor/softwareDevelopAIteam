@@ -9,11 +9,13 @@ import type {
 } from '@ai-team/shared'
 
 /**
- * typecheck / test の結果はここでは扱わない。Implement Job の SafeCommand（`pnpm run verify:implement`
- * = 全パッケージの typecheck → test）が実際に実行し、失敗すれば Job が failed になって
+ * typecheck / test の結果はここでは扱わない。workflow の Implement Job（verificationProfile: implement）は
+ * SafeCommand（`pnpm run verify:implement` = 全パッケージの typecheck → test）が実際に実行し、失敗すれば Job が failed になって
  * post-implement review / git_commit へ進まない（#355）。この verifier は SafeCommand より前に
  * 走るため結果を受け取れず、以前の TYPECHECK / RELATED_TESTS / FULL_TESTS は常に「未実行」で
  * overallPassed を false にするだけだった（2026-10-27 Job 7c784d9a で実測）。
+ * なお profile の無い手動 test Job（Mobile から作るもの等）は `pnpm test` だけで typecheck しない。
+ * これは以前からの状態で、外した3項目も入力を受け取らず検出していなかった。
  */
 export type SafetyCheckId =
   | 'UNEXPECTED_FILES'
