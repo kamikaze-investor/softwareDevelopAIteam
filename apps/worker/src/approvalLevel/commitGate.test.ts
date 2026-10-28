@@ -81,7 +81,7 @@ function makeSafetyVerificationResult(
     taskId: 'task-1',
     overallPassed,
     checks: [
-      makeSafetyCheck('TYPECHECK', true),
+      makeSafetyCheck('UNEXPECTED_FILES', true),
       ...blockingFailures.map(id => makeSafetyCheck(id, false)),
     ],
     blockingFailures,
@@ -309,13 +309,13 @@ describe('evaluateCommitGate', () => {
       postReviewResult: makePostReviewResult(),
       safetyVerificationResult: makeSafetyVerificationResult({
         overallPassed: false,
-        blockingFailures: ['TYPECHECK', 'FULL_TESTS'],
+        blockingFailures: ['UNEXPECTED_FILES', 'OUTSIDE_REPO_FILES'],
       }),
     }))
 
     expect(result.allowed).toBe(false)
-    expectBlockingReasonContaining(result, 'TYPECHECK')
-    expectBlockingReasonContaining(result, 'FULL_TESTS')
+    expectBlockingReasonContaining(result, 'UNEXPECTED_FILES')
+    expectBlockingReasonContaining(result, 'OUTSIDE_REPO_FILES')
   })
 
   it('full_pre_post_review で preReviewResult.blocked:true なら allowed:false（artifact未要求でも渡された場合のblocking判定）', () => {
@@ -361,14 +361,14 @@ describe('evaluateCommitGate', () => {
     const result = evaluateCommitGate(makeInput('full_pre_post_review', {
       safetyVerificationResult: makeSafetyVerificationResult({
         overallPassed: false,
-        blockingFailures: ['TYPECHECK'],
+        blockingFailures: ['UNEXPECTED_FILES'],
       }),
     }))
 
     expect(result.allowed).toBe(false)
     expect(result.blockingReasons.length).toBeGreaterThanOrEqual(2)
     expectBlockingReasonContaining(result, 'POST_REVIEW_RESULT')
-    expectBlockingReasonContaining(result, 'TYPECHECK')
+    expectBlockingReasonContaining(result, 'UNEXPECTED_FILES')
   })
 
   it('task-023相当の full_pre_post_review で approval-level-result と post-review-result が有効なら allowed:true', () => {

@@ -8,14 +8,15 @@ import type {
   MechanicalGatePattern,
 } from '@ai-team/shared'
 
-/** typecheck / test の実行結果（jobRunner側でexecFileSync実行後に渡す。ここでは実行しない） */
-export interface CommandExecutionResult {
-  exitCode: number
-  stdout: string
-  stderr: string
-  durationMs: number
-}
-
+/**
+ * typecheck / test の結果はここでは扱わない。workflow の Implement Job（verificationProfile: implement）は
+ * SafeCommand（`pnpm run verify:implement` = 全パッケージの typecheck → test）が実際に実行し、失敗すれば Job が failed になって
+ * post-implement review / git_commit へ進まない（#355）。この verifier は SafeCommand より前に
+ * 走るため結果を受け取れず、以前の TYPECHECK / RELATED_TESTS / FULL_TESTS は常に「未実行」で
+ * overallPassed を false にするだけだった（2026-10-27 Job 7c784d9a で実測）。
+ * なお profile の無い手動 test Job（Mobile から作るもの等）は `pnpm test` だけで typecheck しない。
+ * これは以前からの状態で、外した3項目も入力を受け取らず検出していなかった。
+ */
 export type SafetyCheckId =
   | 'UNEXPECTED_FILES'
   | 'MECHANICAL_GATE_FILES'
@@ -25,9 +26,6 @@ export type SafetyCheckId =
   | 'PERMISSION_GUARD_WEAKENING'
   | 'SECRET_SCAN_WEAKENING'
   | 'OUTSIDE_REPO_FILES'
-  | 'TYPECHECK'
-  | 'RELATED_TESTS'
-  | 'FULL_TESTS'
   | 'PURPOSE_DIFF_ALIGNMENT'
 
 export interface SafetyCheckResult {
@@ -51,9 +49,6 @@ export interface SafetyVerificationInput {
   approvalLevelResult: ApprovalLevelResult
   /** リポジトリルートの絶対パス（境界チェック用） */
   repoRoot: string
-  typecheckResult?: CommandExecutionResult
-  relatedTestResult?: CommandExecutionResult
-  fullTestResult?: CommandExecutionResult
   /**
    * Post-Review AI（別AI）による「実装目的とdiffが整合しているか」の判定。
    * Step3時点ではPost-Reviewは未実装のため、呼び出し側は未指定(undefined)で渡すことになる。
@@ -65,7 +60,7 @@ export interface SafetyVerificationInput {
 export interface SafetyVerificationResult {
   jobId: string
   taskId: string
-  /** 12項目すべてpassed（blocking違反なし）の場合のみ true */
+  /** 全項目passed（blocking違反なし）の場合のみ true */
   overallPassed: boolean
   checks: SafetyCheckResult[]
   /** blockingかつfailedだったcheckのid一覧（空なら通過） */
@@ -124,38 +119,6 @@ function getMatchingDiffPatternLabels(diffText: string, patterns: MechanicalGate
   return patterns
     .filter(pattern => pattern.pattern.test(diffText))
     .map(pattern => pattern.label)
-}
-
-function buildCommandResultCheck(
-  id: SafetyCheckId,
-  result: CommandExecutionResult | undefined,
-  label: string,
-): SafetyCheckResult {
-  if (!result) {
-    return {
-      id,
-      passed: false,
-      blocking: true,
-      detail: `${label}が未実行`,
-    }
-  }
-
-  if (result.exitCode === 0) {
-    return {
-      id,
-      passed: true,
-      blocking: true,
-      detail: `${label}通過`,
-    }
-  }
-
-  return {
-    id,
-    passed: false,
-    blocking: true,
-    detail: `${label}失敗`,
-    evidence: [result.stderr.slice(0, 500)],
-  }
 }
 
 export function checkUnexpectedFiles(
@@ -374,18 +337,6 @@ export function checkOutsideRepoFiles(changedFiles: string[], repoRoot: string):
   }
 }
 
-export function checkTypecheckResult(result?: CommandExecutionResult): SafetyCheckResult {
-  return buildCommandResultCheck('TYPECHECK', result, 'typecheck')
-}
-
-export function checkRelatedTestResult(result?: CommandExecutionResult): SafetyCheckResult {
-  return buildCommandResultCheck('RELATED_TESTS', result, '関連テスト')
-}
-
-export function checkFullTestResult(result?: CommandExecutionResult): SafetyCheckResult {
-  return buildCommandResultCheck('FULL_TESTS', result, '全テスト')
-}
-
 export function checkPurposeDiffAlignment(
   verdict?: 'aligned' | 'misaligned' | 'unknown',
 ): SafetyCheckResult {
@@ -438,9 +389,6 @@ export function runSafetyVerification(
     checkPermissionGuardWeakening(input.changedFiles, input.diffText),
     checkSecretScanWeakening(input.changedFiles, input.diffText),
     checkOutsideRepoFiles(input.changedFiles, input.repoRoot),
-    checkTypecheckResult(input.typecheckResult),
-    checkRelatedTestResult(input.relatedTestResult),
-    checkFullTestResult(input.fullTestResult),
     purposeDiffAlignmentCheck,
   ]
 
