@@ -1,7 +1,7 @@
 # Outcome-Oriented Generalization Principle
 
 <!-- principle-id: evidence-not-spec -->
-<!-- principle-oneliner: Define required outcomes first; current implementation is evidence, not specification; a reported failure is evidence of its cause: name the cause (investigate, do not guess, when the evidence is thin), check where it plausibly recurs within the Task scope (scaled to risk), fix at the smallest sufficient scope (the site when the cause is local, the shared mechanism when sites share it, never a wider scope than evidence or design need justifies) and report suspected sites beyond it; a symptom that survives a fix means the cause was misnamed, so widen the search instead of patching again. -->
+<!-- principle-oneliner: Define required outcomes first; current implementation is evidence, not specification; a reported failure is evidence of its cause: name the cause (investigate, do not guess, when the evidence is thin), check where it plausibly recurs within the Task scope (scaled to risk), fix at the smallest sufficient scope (the site when the cause is local, the shared mechanism when the cause lives there or sites share it, even if only one site has failed, never a wider scope than evidence or design need justifies) and report suspected sites beyond it; a symptom that survives a fix calls for re-analyzing the cause, not the same patch again, and repeated survival widens the search. -->
 <!-- principle-category: outcome-definition -->
 <!-- principle-scope: universal -->
 <!-- principle-tier: core -->
@@ -41,11 +41,12 @@ mechanism) or by design need (an invariant, a safety or data boundary, or the si
 requires); the number of sites that have failed decides nothing by itself. Generalization is never the goal. When the evidence
 cannot tell local from shared, investigate the minimum needed to tell (Constitution 3.14) instead of
 choosing a scope by guess; if that investigation is outside the Task, report it rather than guess.
-A symptom that recurs after a fix is evidence the cause was misnamed or the scope too narrow: do not
-apply the same fix again; re-name the cause and widen the search one level (site -> shared mechanism
--> cross-cutting). Three consecutive similar failures is the existing stop point (AGENTS.md Q10, the
-OpenCode three-failure rule): stop repeating the approach, re-analyze the cause and widen the
-investigation autonomously. The choice of investigation or fix method is technical and is never
+A symptom that recurs after a fix calls for re-analysis, not the same fix again: the fix may have been
+wrong or incomplete, or the cause misnamed or the scope too narrow; when the re-analysis points to the
+latter, widen the search one level (site -> shared mechanism -> cross-cutting; already cross-cutting:
+reframe the cause and broaden the evidence collected, within existing boundaries). Three consecutive
+similar failures is the existing stop point (AGENTS.md Q10, the OpenCode three-failure rule): stop
+repeating the approach, re-analyze the cause and widen the investigation autonomously. The choice of investigation or fix method is technical and is never
 escalated to the CEO; escalation stays limited to Constitution 3.15 and the existing authority and
 safety boundaries. Reuse earlier review findings and decision records for the same cause
 instead of re-deciding it. State the generalized cause, the chosen scope (local / shared / cross-cutting)
@@ -55,10 +56,11 @@ item), not silently widened into the change and not silently dropped. The cross-
 to whoever scopes the work (PL / triage, when it decomposes findings and delegates), not to an
 implementer inside a bounded Task; the shared cause is itself the one finding of one bounded Task,
 which lists the reported symptoms it closes. A reviewer marks this principle CONFLICT only when the material it was given shows a same-cause
-site the change leaves untouched and unreported, or shows the chosen scope is unjustified (a wider
-scope -- new abstraction, shared layer, cross-cutting rewrite -- where the material shows a cause
-local to the site and neither the change nor the material gives a shared-mechanism cause or a design
-need for it), and starts that reason with `[root_cause]`. When the material shows neither the verdict
+site the change leaves untouched and unreported, or shows the cause in a shared mechanism that the
+change works around locally (no second site needed), or shows the chosen scope is unjustified (a
+wider scope -- new abstraction, shared layer, cross-cutting rewrite -- where the material shows a
+cause local to the site and substantiates no shared-mechanism cause or design need for it; a bare
+claim of one does not count), and starts that reason with `[root_cause]`. When the material shows neither the verdict
 is ALIGNED; when it cannot settle whether a site or a scope is justified (missing evidence, not a
 shown violation) the verdict is UNCERTAIN, not CONFLICT; never a demand for a search the material
 cannot show.
