@@ -50,3 +50,55 @@ Lifecycle 修復と並行して変えない。後続 Task として Roadmap
 上限が届いていない blocker → `buildApplicablePrinciplesSection` へ移して解消。上の gap のみ記録に留めた。
 最終修正に対する別 agent の再レビュー: PASS_WITH_NITS（blocker 解消を確認）。minor 1 件（実装者の「確認」も
 Task scope 内に限定する）と文言 nit 2 件を反映。reviewerAdapter で verdict と issue が別々に出る点は仕様上許容し、変更しない。
+
+## 追補（2026-10-28）: 修正範囲の選択と過剰汎用化の防止
+
+CEO 指示「改善案を作る前に根本原因と適切な修正範囲を判断する」を受け、**同じ `evidence-not-spec` を拡張した**。
+新しい原則・Gate・Review 工程・finding category は追加していない。
+
+- **何が足りなかったか**: 既存の RCG は「同原因箇所を探して共通原因を直す」方向だけで、
+  (1) 局所 / 共通機構 / 横断のどれを選ぶか、(2) 証拠の無い汎用化を防ぐ側、(3) 根拠不足時は推測せず調査、
+  (4) 修正後に再発したら同じ修正を繰り返さず原因を再分析する（修正自体の誤り・不完全もあり得るので
+  機械的には広げない。再分析が原因の誤命名・範囲不足を示すか、繰り返し再発したら 1 段広げる）、が
+  one-liner に無かった。Reviewer 側も対症療法だけを CONFLICT にでき、過剰な汎用化は principle verdict で捕まらなかった
+- **入れたもの**: one-liner に (1)〜(4)。全文に 6 つの判断基準・既存機構改善の優先・「両側とも defect」・
+  3 回連続失敗との接続（AGENTS.md Q10 / OpenCode 3-failure を停止点とし、同じ修正を繰り返さず再分析して 1 段広げる。
+  横断済みなら原因を捉え直し既存境界内で証拠を広げる）・既存の review finding / decision の再利用。
+  Reviewer の verdict 行・finding 行に「範囲が証拠・設計上の必要で正当化されない汎用化」を `[root_cause]` +
+  over_constraint として追加（category は増やさない）
+- **過剰汎用化の判定基準（CEO レビュー 2026-10-28 で修正）**: 初版は「同原因の 2 箇所目が material に無い
+  汎用化は CONFLICT」だったが、厳しすぎると指摘された（1 箇所の不具合でも原因が既存の共通機構にある、
+  不変条件・安全境界が要求する場合は共通機構の修正が正しい）。基準を「選んだ修正範囲が証拠
+  （他の同原因箇所、または原因が共通機構にあること）か設計上の必要（不変条件・安全/データ境界・単一 owner）で
+  正当化されるか」に変更。CONFLICT は material が原因の局所性を示し、正当化が何も裏付けられない場合だけ
+  （変更側の主張だけでは正当化にならない）。material で決着しない（証拠不足）場合は UNCERTAIN（明確な違反と区別する）。
+  対症療法側も 2 箇所目を要求しない: material が原因を共通機構に示し、変更がそれを局所で回避していれば CONFLICT
+- **AGENTS.md Q10**: 「3 回で止めて CEO へ報告」→「同じ修正を繰り返さず、AI が自律的に原因を再分析して
+  調査範囲を 1 段広げる。調査・修正方法は技術判断なので CEO に求めない。escalation は Constitution 3.15 と
+  既存の権限・安全境界で人間判断が必要な場合だけ」（CEO 指示 2026-10-28）
+- **「既存の 3 回連続で調査範囲を拡大する原則」について**: その文言の原則はリポジトリに無かった。
+  最も近いのは AGENTS.md Q10（3 回で停止・CEO 報告）と OpenCode の 3 回連続失敗で戦略変更。これらへ接続した
+- **届け先**: one-liner は core なので、`buildTaskDesignContract()`（初回実装・POST /jobs・repair・
+  PL remediation・resume）と全 reviewer（Design Review / focused review / Meta Review / step review）へ
+  既存経路のまま届く。blocked triage は決定論コードで prompt を持たないため対象外
+- **代償**: `evidence-not-spec` の versionHash が変わり、ledger 実績はこの原則だけ 0 から数え直し（前回と同じ扱い）
+
+### 検証
+
+- 単体: 実装側 Design Contract・verdict 行・finding 行それぞれに新しい節が載ることを
+  `engineeringPrinciples.test.ts` で固定。api / worker の prompt・ledger 系テストは通過
+  （reviewerAdapter の symlink 2 件は Windows の EPERM で、変更前から失敗）
+- 行動評価（blind・sonnet 1 サンプルずつ・新旧の配信テキストのみを与える）: 局所 / 共通 / 横断 /
+  汎用化の罠 / 根拠不足 / 修正後再発の実装側 6 件は**新旧とも期待どおり**（旧文言でも既に機能していた）。
+  差が出たのは reviewer の過剰汎用化ケース: 旧 = 原則 verdict ALIGNED（別の over_constraint finding のみ）、
+  新 = CONFLICT `[root_cause]`。サンプル数 1 なので効果の大きさは主張しない。継続観測は既存 ledger の
+  `[root_cause]` reason 検索で行う（この評価は初版の「2 箇所目」基準に対するもの）
+- 修正版の行動評価（同条件・reviewer 8 件）: 局所原因への過剰 middleware → CONFLICT / 1 箇所失敗でも原因が
+  共通 helper → ALIGNED / 単一 owner での不変条件 → ALIGNED / 材料不足の retry wrapper → UNCERTAIN（質問として）/
+  同原因箇所の放置 → CONFLICT / typo → ALIGNED / 共通 helper の原因を局所回避 → CONFLICT /
+  裏付けの無い「single owner」主張での新 layer → CONFLICT。8 件すべて期待どおり
+- 独立レビュー（Codex gpt-5.6-sol、vendor 分離あり）: round 1 changes_requested（HIGH 2: 共通機構の原因を局所回避する
+  変更を CONFLICT にできない / one-liner が複数箇所を要求しているように読める、MEDIUM: 主張だけで正当化できる /
+  「再発＝誤命名」が断定的 / テストが判定境界でなく配信文字列、LOW: 横断済みでの「1 段拡大」未定義）→ テスト以外を反映。
+  テストは「判定は LLM が prompt を読んで行うので、単体テストで固定できるのは配信まで。判定境界は blind 評価で確認し、
+  prompt 評価基盤の新設はスコープ外」とし、round 2 で受け入れられた。round 2 の残指摘（本記録の (4) の旧表現）を反映

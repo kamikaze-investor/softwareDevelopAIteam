@@ -1,7 +1,7 @@
 # Outcome-Oriented Generalization Principle
 
 <!-- principle-id: evidence-not-spec -->
-<!-- principle-oneliner: Define required outcomes first; current implementation is evidence, not specification; a reported failure is evidence of its cause: name the cause, check where it plausibly recurs within the Task scope (scaled to risk), fix the shared cause there and report suspected sites beyond it. -->
+<!-- principle-oneliner: Define required outcomes first; current implementation is evidence, not specification; a reported failure is evidence of its cause: name the cause (investigate, do not guess, when the evidence is thin), check where it plausibly recurs within the Task scope (scaled to risk), fix at the smallest sufficient scope (the site when the cause is local, the shared mechanism when the cause lives there or sites share it, even if only one site has failed, never a wider scope than evidence or design need justifies) and report suspected sites beyond it; a symptom that survives a fix calls for re-analyzing the cause, not the same patch again, and repeated survival widens the search. -->
 <!-- principle-category: outcome-definition -->
 <!-- principle-scope: universal -->
 <!-- principle-tier: core -->
@@ -23,16 +23,47 @@ the same conclusion (Constitution 3.14 still bounds verification). When several 
 repair the shared cause and add what keeps it from recurring (the owner, contract, invariant or test
 that would have caught it) instead of patching each site; a duplicated or re-inferred owner is a
 common shared cause (`canonical-domain-meaning`). It targets sites sharing a found cause; it is not a
-reason to rewrite unrelated code (`existing-code-grandfather`). State the generalized cause and the
-scope searched in the change or its report (one line suffices for a small fix). Same-cause sites
+reason to rewrite unrelated code (`existing-code-grandfather`).
+Fix scope selection: choose the smallest scope that removes the named cause, from three: (a) local --
+the cause is specific to the site and no other site plausibly shares it; (b) shared mechanism --
+the cause lives in an existing helper, contract, owner or rule (even if only one site has failed so
+far) or the sites share it: improve that mechanism, so the fix is made once and not re-implemented
+per site; (c) cross-cutting -- only when the cause spans independent
+mechanisms with no shared owner, and then as the smallest change that gives the cause one owner.
+Before choosing, ask: is the cause specific or shared; can other sites on the same structure fail the
+same way; would improving an existing shared mechanism or rule solve them together; would a local
+fix let the cause recur or be re-implemented elsewhere; would generalizing add complexity, maintenance
+or safety risk the evidence does not justify (Constitution 3.16, `standard-design-frame`)? Prefer
+improving an existing mechanism over adding a new one. Both failure modes are defects: a symptom patch
+that leaves a shared cause in place, and a scope wider than evidence and design need justify.
+A wider scope is justified by evidence (other same-cause sites, or the cause located in a shared
+mechanism) or by design need (an invariant, a safety or data boundary, or the single owner the fix
+requires); the number of sites that have failed decides nothing by itself. Generalization is never the goal. When the evidence
+cannot tell local from shared, investigate the minimum needed to tell (Constitution 3.14) instead of
+choosing a scope by guess; if that investigation is outside the Task, report it rather than guess.
+A symptom that recurs after a fix calls for re-analysis, not the same fix again: the fix may have been
+wrong or incomplete, or the cause misnamed or the scope too narrow; when the re-analysis points to the
+latter, widen the search one level (site -> shared mechanism -> cross-cutting; already cross-cutting:
+reframe the cause and broaden the evidence collected, within existing boundaries). Three consecutive
+similar failures is the existing stop point (AGENTS.md Q10, the OpenCode three-failure rule): stop
+repeating the approach, re-analyze the cause and widen the investigation autonomously. The choice of investigation or fix method is technical and is never
+escalated to the CEO; escalation stays limited to Constitution 3.15 and the existing authority and
+safety boundaries. Reuse earlier review findings and decision records for the same cause
+instead of re-deciding it. State the generalized cause, the chosen scope (local / shared / cross-cutting)
+and the scope searched in the change or its report (one line suffices for a small fix). Same-cause sites
 outside the current Task scope are recorded through an existing path (report, review finding, roadmap
 item), not silently widened into the change and not silently dropped. The cross-site search belongs
 to whoever scopes the work (PL / triage, when it decomposes findings and delegates), not to an
 implementer inside a bounded Task; the shared cause is itself the one finding of one bounded Task,
 which lists the reported symptoms it closes. A reviewer marks this principle CONFLICT only when the material it was given shows a same-cause
-site the change leaves untouched and unreported, and starts that reason with `[root_cause]`; when the
-material shows no other site the verdict is ALIGNED; UNCERTAIN only when the material hints at one it
-cannot confirm; never a demand for a search the material cannot show.
+site the change leaves untouched and unreported, or shows the cause in a shared mechanism that the
+change works around locally (no second site needed), or shows the chosen scope is unjustified (a
+wider scope -- new abstraction, shared layer, cross-cutting rewrite -- where the material shows a
+cause local to the site and substantiates no shared-mechanism cause or design need for it; a bare
+claim of one does not count), and starts that reason with `[root_cause]`. When the material shows neither the verdict
+is ALIGNED; when it cannot settle whether a site or a scope is justified (missing evidence, not a
+shown violation) the verdict is UNCERTAIN, not CONFLICT; never a demand for a search the material
+cannot show.
 
 <!-- principle-id: standard-design-frame -->
 <!-- principle-oneliner: Name the failure a constraint prevents before adding it. -->

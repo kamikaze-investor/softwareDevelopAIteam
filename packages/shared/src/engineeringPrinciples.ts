@@ -346,7 +346,11 @@ export function buildEngineeringPrincipleReviewGuidance(principles: EngineeringP
     // Root Cause Generalization（core 原則 evidence-not-spec の一部）の finding 側。reviewer は diff の外を
     // 見られないので、見えている同原因箇所だけを指摘させる（全数調査を要求させない）。新しい category は作らない。
     // 原則 verdict 側の同じ上限は buildApplicablePrinciplesSection() が持つ。
-    '- root cause (evidence-not-spec): report a same-cause site only when the material shows it and the change leaves it untouched and unreported; use the category of that defect and start the message with [root_cause]. Never request a search the material cannot show.',
+    // 対症療法と過剰な汎用化の両方を同じ 1 行で扱う（片側だけだと reviewer は常に「広げろ」側へ倒れる）。
+    // 過剰な汎用化は over_constraint の一種として報告させる（新しい category は作らない）。
+    // 判定は「2 箇所目の有無」ではなく「選んだ範囲が証拠か設計上の必要で正当化されるか」。1 箇所の不具合でも
+    // 原因が既存の共通機構にある・不変条件や安全境界が要求するなら共通機構の修正は正当（CEO 指摘 2026-10-28）。
+    '- root cause (evidence-not-spec): report a same-cause site only when the material shows it and the change leaves it untouched and unreported, or when the material shows the cause in a shared mechanism the change works around locally (no second site needed); use the category of that defect and start the message with [root_cause]. Report a wider scope (new abstraction, shared layer, cross-cutting rewrite) as over_constraint, also starting with [root_cause], only when the material shows the cause is local to the site and substantiates no shared-mechanism cause or design need (invariant, safety or data boundary, single owner) for it; a bare claim of one does not count, and the number of failed sites alone is not a reason. When the material cannot settle it, say so as a question, not a defect. Never request a search the material cannot show.',
   ].join('\n')
 }
 
@@ -374,7 +378,7 @@ export function buildApplicablePrinciplesSection(selection: readonly PrincipleSe
     // verdict を集計する全経路（Design Review / focused review）がこの関数を通るので、ここに 1 箇所だけ置く。
     // [root_cause] は記録される reason 上の検索用接頭辞（ledger は解析しない）。
     ...(selection.some((item) => item.slug === 'evidence-not-spec')
-      ? ['For evidence-not-spec, give CONFLICT on root cause only when the material shows a same-cause site the change leaves untouched and unreported, and start that reason with [root_cause]; otherwise judge root cause ALIGNED, and UNCERTAIN only when the material hints at a same-cause site it cannot confirm.']
+      ? ['For evidence-not-spec, give CONFLICT on root cause only when the material shows a same-cause site the change leaves untouched and unreported, or the cause in a shared mechanism the change works around locally (no second site needed), or shows the chosen fix scope is unjustified (a wider scope where the material shows a cause local to the site and substantiates no shared-mechanism cause or design need such as an invariant, safety or data boundary, or single owner; a bare claim of one does not count), and start that reason with [root_cause]; the number of failed sites alone decides nothing. Judge root cause ALIGNED when the material shows neither, and UNCERTAIN, not CONFLICT, when the material cannot settle whether a site or a scope is justified.']
       : []),
   ].join('\n')
 }

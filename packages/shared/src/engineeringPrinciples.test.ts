@@ -219,6 +219,16 @@ describe('corePrincipleSlugs', () => {
     // core-only の repair prompt には「範囲を広げろ」だけが届く。
     expect(contract).toContain('scaled to risk')
     expect(contract).toContain('within the Task scope')
+    // 修正範囲の選択（局所 / 共通機構）と、過剰な汎用化の禁止・根拠不足時の調査・修正後再発時の拡大も
+    // 同じ 1 行で届くこと。片側だけ届くと実装者は対症療法か過剰汎用化のどちらかへ倒れる。
+    expect(contract).toContain('fix at the smallest sufficient scope')
+    // 1 箇所しか失敗していなくても、原因が共通機構にあれば共通機構を直す（実装者は one-liner しか見ない）。
+    expect(contract).toContain('the shared mechanism when the cause lives there or sites share it, even if only one site has failed')
+    expect(contract).toContain('never a wider scope than evidence or design need justifies')
+    expect(contract).toContain('investigate, do not guess, when the evidence is thin')
+    // 1 回の再発で機械的に広げない（修正自体の誤りもあり得る）。再分析し、繰り返し再発したら広げる。
+    expect(contract).toContain('a symptom that survives a fix calls for re-analyzing the cause, not the same patch again')
+    expect(contract).toContain('repeated survival widens the search')
   })
 })
 
@@ -325,6 +335,18 @@ describe('buildApplicablePrinciplesSection', () => {
     expect(section).not.toContain('an unfalsifiable TODO')
     // root cause の verdict 上限は verdict を返す全 reviewer へ届く必要がある（ledger の集計対象）。
     expect(section).toContain('give CONFLICT on root cause only when the material shows a same-cause site')
+    // 過剰な汎用化も同じ verdict 経路で CONFLICT になる（対症療法側だけを罰すると reviewer は常に拡大を求める）。
+    expect(section).toContain('or shows the chosen fix scope is unjustified')
+    // 判定は「2 箇所目の有無」ではない。1 箇所でも共通機構が原因・設計上の必要があれば正当で、
+    // 資料で決着しないときは CONFLICT ではなく UNCERTAIN（証拠不足と明確な違反を区別する）。
+    expect(section).toContain('no shared-mechanism cause or design need')
+    expect(section).toContain('the number of failed sites alone decides nothing')
+    expect(section).toContain('UNCERTAIN, not CONFLICT, when the material cannot settle whether a site or a scope is justified')
+    expect(section).not.toContain('no second same-cause site')
+    // 対症療法側も 2 箇所目を要求しない: 共通機構にある原因を局所で回避する変更は CONFLICT にできる。
+    expect(section).toContain('or the cause in a shared mechanism the change works around locally (no second site needed)')
+    // 変更側の主張だけでは正当化にならない。
+    expect(section).toContain('a bare claim of one does not count')
   })
 
   it('says so explicitly when nothing could be selected', () => {
@@ -346,6 +368,11 @@ describe('buildEngineeringPrincipleReviewGuidance', () => {
     // canonical-domain-meaning は contextual principle なので、選択結果を経ずに常時注入しない。
     expect(guidance).not.toContain('semantic_reinference')
     expect(guidance).toContain('start the message with [root_cause]')
+    expect(guidance).toContain('as over_constraint, also starting with [root_cause], only when the material shows the cause is local to the site')
+    expect(guidance).toContain('the number of failed sites alone is not a reason')
+    expect(guidance).toContain('the cause in a shared mechanism the change works around locally (no second site needed)')
+    expect(guidance).toContain('a bare claim of one does not count')
+    expect(guidance).toContain('When the material cannot settle it, say so as a question, not a defect.')
   })
 
   it('renders an unavailable notice when principles are unavailable', () => {
