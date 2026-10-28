@@ -266,6 +266,60 @@ describe('Meta Reviewer 判定契約 — Approval Tuple を実際に変える A 
   })
 })
 
+/**
+ * containment / quarantine の分類変更（2026-10-29 CEO 判断）。
+ * 「quarantine に入る条件を変えた」だけで DA (2)(b) の縮小とせず、かといって quarantine 関連の変更を
+ * 一律に B ともしない。後始末の成功・整合検査の維持・unsafe / uncertain な結果の fail closed を
+ * 差分とテストで示せた場合だけ B で、示せなければ A、弱体化なら A + blocked。
+ */
+describe('Meta Reviewer 判定契約 — containment / quarantine の分類変更は条件付きでのみ B', () => {
+  const da2Section = section(prompt, '### DA trigger (2) — Authority / Approval boundary の意味で判定する')
+  const CHECKLIST_HEADING = '#### containment / quarantine の分類変更'
+  const checklistSection = checklist.slice(checklist.indexOf(CHECKLIST_HEADING))
+
+  it('quarantine は人の承認ではないことを canonical rule から引き、Safety boundary であることも明記する', () => {
+    expect(da2Section).toContain('**containment / quarantine の分類を変える差分（DA (1)(2) の判定）**')
+    expect(da2Section).toContain('quarantine に入る条件を変えたこと自体は DA (2)(b) の縮小ではない')
+    expect(da2Section).toContain('（`approval_rules.md` R-11）')
+    expect(da2Section).toContain('`specs/22` §1-7')
+    expect(da2Section).toContain('この boundary を弱める差分は `specs/22` §1-2 の Human Decision Authority（DA (1)）である')
+    expect(da2Section).toContain('強化か弱体化かを信頼できる形で示せない場合は A に倒す')
+  })
+
+  it('B は「次のすべて」を差分・コード・テストで示せた場合に限られ、自己申告は根拠にならない', () => {
+    expect(da2Section).toContain('次のすべてを差分・既存コード・テストから確認できる場合に限って')
+    expect(da2Section).toContain('PR 説明・commit message・コメントの自己申告は根拠にしない')
+    for (const condition of [
+      '1. 移す結果は、プロセスの後始末が成功した後',
+      '後始末の成功を観測で裏付けられない結果は対象にしない',
+      '2. 移した path でも、実行後の workspace 整合検査',
+      '3. 他の unsafe / uncertain な結果は従来どおり quarantine（fail closed）のままである',
+      '汎用の safe 判定（例: `SAFE_OUTCOMES`）を広げる差分はこれに当たらない',
+      '4. 移した結果を成功として扱わない',
+      '5. 次を変えていない: quarantine の解除条件',
+      '6. 変更を特定の呼び出し箇所に限り',
+    ]) {
+      expect(da2Section).toContain(condition)
+    }
+  })
+
+  it('示せなければ A、後始末失敗・整合不明・dirty 解除・解除条件の緩和は A + blocked', () => {
+    expect(da2Section).toContain('1〜6 のどれかを示せない場合は A（`requiresCeoApproval: true`）とする')
+    expect(da2Section).toContain('Safety boundary の弱体化であり、意図・説明にかかわらず A + `blocked` とする')
+    expect(da2Section).toContain('後始末の失敗や整合が不明な workspace を quarantine から外す差分')
+    expect(da2Section).toContain('dirty な workspace のまま解除を認める差分')
+    expect(da2Section).toContain('解除条件を緩める差分')
+  })
+
+  it('checklist も同じ意味で、quarantine 関連を一律 B にしない', () => {
+    expect(checklist.indexOf(CHECKLIST_HEADING)).toBeGreaterThanOrEqual(0)
+    expect(checklistSection).toContain('「quarantine に関わる変更」をまとめて B ともしていない')
+    expect(checklistSection).toContain('移す結果はプロセス後始末の成功後にだけ生じ')
+    expect(checklistSection).toContain('他の unsafe / uncertain な結果と未知の結果は quarantine のままである')
+    expect(checklistSection).toContain('どれかを示せなければ A とした')
+  })
+})
+
 describe('Meta Reviewer 判定契約 — DA (2) の rule は実際に model へ渡る prompt に全文入る', () => {
   it.each([
     ['apps/api/src/designReview/resumeActor.ts'],
