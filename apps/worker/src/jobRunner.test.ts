@@ -195,6 +195,21 @@ vi.mock('./guards/gitOperationState.js', () => ({
 
 // 部分モック。`PREVIEW_LENGTH` / `safeCommandSectionHeader` のような定数・純関数まで
 // 差し替えると、export が増えるたびにこの suite が壊れる（実際に壊れた）。
+/**
+ * `saveJobLogs` mock の既定実装。top-level `beforeEach` で毎回入れ直す。
+ * `vi.clearAllMocks()` は呼び出し履歴しか消さないため、例外を投げる実装へ差し替えたテストの後に
+ * 戻さないと、後続の全テストが巨大な「could not be saved」ログを出し続ける。2026-10-28 には
+ * これが `verify:implement` の stdout の約 458 KB を占め、1 MiB の出力上限を超える一因になった（Job 71538c24）。
+ */
+const jobLoggerDefaults = vi.hoisted(() => ({
+  saveJobLogs: (jobId: string, stdout: string, stderr: string) => ({
+    stdoutPath: `/logs/${jobId}/stdout.txt`,
+    stderrPath: `/logs/${jobId}/stderr.txt`,
+    stdoutPreview: stdout.slice(0, 4000),
+    stderrPreview: stderr.slice(0, 4000),
+  }),
+}))
+
 vi.mock('./jobLogger.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./jobLogger.js')>()
   return {
@@ -209,12 +224,7 @@ vi.mock('./jobLogger.js', async (importOriginal) => {
       summaryLines: [],
       note: 'verification evidence unavailable (test stub)',
     })),
-    saveJobLogs: vi.fn((jobId: string, stdout: string, stderr: string) => ({
-      stdoutPath: `/logs/${jobId}/stdout.txt`,
-      stderrPath: `/logs/${jobId}/stderr.txt`,
-      stdoutPreview: stdout.slice(0, 4000),
-      stderrPreview: stderr.slice(0, 4000),
-    })),
+    saveJobLogs: vi.fn(jobLoggerDefaults.saveJobLogs),
     buildLogPreviews: vi.fn((stdout: string, stderr: string) => ({
       stdoutPreview: stdout.slice(0, 4000),
       stderrPreview: stderr.slice(0, 4000),
@@ -471,6 +481,7 @@ function createStructuredReviewContext(): StructuredReviewContext {
 
 beforeEach(() => {
   vi.clearAllMocks()
+  saveJobLogsMock.mockImplementation(jobLoggerDefaults.saveJobLogs)
   outboxMocks.recordPending.mockReturnValue({
     eventId: 'event-1',
     payloadHash: 'payload-hash-1',
@@ -1428,8 +1439,9 @@ describe('saveJobLogs 失敗は Job 結果に影響しない', () => {
   // git_commit 経路で、先に置かれた証跡ログの注記がプレビューから押し出されないことを検証する
   // （注記1件あたりの上限 LEADING_NOTE_MAX_LENGTH が効いていることの回帰テスト）。
   it('T6: ログ保存失敗のエラーが極端に長くても、注記2件が両方とも結果のstderrに残る', async () => {
+    // 注記1件あたりの上限（300字）を超えていれば十分。6000字にしても検証内容は変わらず、出力だけが増える
     saveJobLogsMock.mockImplementation(() => {
-      throw new Error('y'.repeat(6000))
+      throw new Error('y'.repeat(400))
     })
     resolveCommandMock.mockReturnValue({
       argv: ['git', 'commit', '-m', 'test'],
@@ -5377,6 +5389,141 @@ describe('P1 Phase 2: containment / reconciliation の失敗は握り潰さな�
     await expect(runJob(createJob(), createPolicy())).rejects.toThrow(
       /process quiescence does not prove git consistency/,
     )
+  })
+})
+
+/**
+ * 2026-10-28 Job 71538c24: SafeCommand（verify:implement）の出力が 1 MiB を超え、後始末（kill → drain → rmdir）は
+ * 成功していたのに quarantine になり、AI が書いた3ファイルを捨てない限り戻れなくなった。
+ * 後始末が成功した出力超過は timeout の killed と同じ静止の証拠を持つので、SafeCommand では通常の失敗として扱い、
+ * 最終 workspace 検査を通す。後始末の失敗・git 状態の不整合は従来どおり quarantine に残す。
+ */
+describe('SafeCommand の出力超過（後始末は成功）は quarantine ではなく通常の失敗にする', () => {
+  const OVERFLOW_MESSAGE = 'containment failed: output_overflow (output exceeded 1048576 bytes per stream)'
+
+  beforeEach(() => {
+    resolveCommandMock.mockReturnValue({ argv: ['pnpm', 'run', 'verify:implement'], description: 'pnpm run verify:implement' })
+    execFileSyncMock.mockImplementation((_cmd: string, args: readonly string[] | undefined) => gitFallback(args))
+    detectGitOperationStateMock.mockReturnValue([])
+  })
+
+  afterEach(() => {
+    clearContainedCommandOverride()
+  })
+
+  function verifyJob(): Job {
+    return createJob({
+      safeCommand: { kind: 'test', workingDir: '/workspace/target', params: { verificationProfile: 'implement' } },
+    })
+  }
+
+  /** main SafeCommand（attemptId が safe-command-*）だけに containment 失敗を注入し、他は従来どおり転送する */
+  function failSafeCommandWith(error: TestContainmentInfrastructureError): void {
+    setContainedCommandOverride(async (options) => {
+      if (options.attemptId.startsWith('safe-command-')) throw error
+      return forwardToExecFileSync(execFileSyncMock as unknown as ExecFileSyncLike, options)
+    })
+  }
+
+  function overflow(childExitCode: number | null): TestContainmentInfrastructureError {
+    return new TestContainmentInfrastructureError(OVERFLOW_MESSAGE, {
+      outcome: 'output_overflow',
+      exitCode: childExitCode,
+      signal: null,
+      stdout: 'Test Files  12 passed (truncated stdout)',
+      stderr: 'partial stderr',
+      timedOut: false,
+      killedDescendants: true,
+      drainMs: 3,
+      detail: 'output exceeded 1048576 bytes per stream',
+    })
+  }
+
+  it('Job は quarantine されず failed になり、出力超過と検証結果不明を stderr に残す', async () => {
+    failSafeCommandWith(overflow(null))
+
+    const result = await runJob(verifyJob(), createPolicy())
+
+    expect(result.status).toBe('failed')
+    expect(result.exitCode).toBe(1)
+    // 既存の「SafeCommand が失敗した」分類に乗る（#431 で失敗した SafeCommand の証跡を repair へ渡す経路）
+    expect(result.safeCommandFailureKind).toBe('safe_command_failed')
+    expect(result.stderr).toContain('SafeCommand kind=test terminated without an exit code')
+    expect(result.stderr).toContain('SafeCommand output exceeded the per-stream limit')
+    expect(result.stderr).toContain('verification result unknown')
+    expect(result.stderr).toContain('output exceeded 1048576 bytes per stream')
+    expect(result.stderr).toContain('partial stderr')
+    expect(result.stdout).toContain('Test Files  12 passed (truncated stdout)')
+  })
+
+  it('子プロセスが exit 0 で終わっていても、切られた出力の検証は成功扱いにしない', async () => {
+    failSafeCommandWith(overflow(0))
+
+    const result = await runJob(verifyJob(), createPolicy())
+
+    expect(result.status).toBe('failed')
+    expect(result.exitCode).toBe(1)
+    expect(result.stderr).toContain('verification result unknown')
+  })
+
+  it('出力超過の後も最終 workspace 検査を通り、git 操作マーカーが残っていれば従来どおり quarantine へ伝播する', async () => {
+    failSafeCommandWith(overflow(null))
+    detectGitOperationStateMock
+      .mockReturnValueOnce([])
+      .mockReturnValue(['index.lock'])
+
+    await expect(runJob(verifyJob(), createPolicy())).rejects.toThrow(/index\.lock/)
+  })
+
+  it.each([
+    'drain_timeout',
+    'cleanup_failed',
+    'kill_failed',
+    'events_failed',
+    'placement_failed',
+    'spawn_failed',
+    'unavailable',
+    // 将来追加される未知の結果も quarantine に倒れる
+    'future_unknown_outcome',
+  ] as const)('後始末・containment が %s で失敗した場合は通常失敗にせず quarantine へ伝播する', async (outcome) => {
+    failSafeCommandWith(new TestContainmentInfrastructureError(`containment failed: ${outcome}`, {
+      // 未知の結果は ContainmentOutcome の union に無いので、型をすり抜けて注入する
+      outcome: outcome as never,
+      exitCode: null,
+      stdout: '',
+      stderr: '',
+      timedOut: false,
+    }))
+
+    await expect(runJob(verifyJob(), createPolicy())).rejects.toThrow(new RegExp(outcome))
+  })
+
+  it('出力超過の失敗処理は workspace の変更を捨てない（reset / checkout / clean / restore / stash を実行しない）', async () => {
+    failSafeCommandWith(overflow(null))
+
+    const result = await runJob(verifyJob(), createPolicy())
+
+    expect(result.status).toBe('failed')
+    const destructive = execFileSyncMock.mock.calls.filter((call) => {
+      const args = (call[1] ?? []) as readonly string[]
+      return call[0] === 'git' && ['reset', 'checkout', 'clean', 'restore', 'stash'].includes(args[0] ?? '')
+    })
+    expect(destructive).toEqual([])
+  })
+
+  it('AI CLI 経路の出力超過はこの変更の対象外で、従来どおり quarantine へ伝播する', async () => {
+    createAiCliAdapterMock.mockReturnValue({
+      run: vi.fn().mockRejectedValue(overflow(null)),
+    } as never)
+
+    const job = createJob({
+      aiCliProvider: 'claude_code',
+      aiCliPrompt: 'なにか変更してください',
+      aiCliMode: 'implement',
+      safeCommand: { kind: 'test', workingDir: '/workspace/target', params: { verificationProfile: 'implement' } },
+    })
+
+    await expect(runJob(job, createPolicy())).rejects.toThrow(/output_overflow/)
   })
 })
 

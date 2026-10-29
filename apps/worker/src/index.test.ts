@@ -1,6 +1,7 @@
 import type { Job, Task } from '@ai-team/shared'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { JobRunResult } from './jobRunner.js'
+import { WorkspaceReconciliationError } from './jobRunner.js'
 import { ContainmentInfrastructureError } from './execution/runContainedCommand.js'
 
 const outboxMocks = vi.hoisted(() => ({
@@ -1716,6 +1717,37 @@ describe('P1 Phase 2: containment 失敗時の quarantine（B3）', () => {
     expect(terminal.failureMetadata?.quarantined).toBe(true)
     expect(terminal.failureMetadata?.kind).toBe('workspace_containment_failure')
     expect(terminal.failureMetadata?.quarantineReason).toContain('drain_timeout')
+  })
+
+  // 2026-10-28 Job 71538c24: SafeCommand の出力超過（後始末は成功）は runJob 内で通常の失敗になるが、
+  // その後の最終 workspace 検査が失敗すれば WorkspaceReconciliationError が投げられる。
+  // production entrypoint でそれが従来どおり quarantine（blocked・所有権保持）に記録されることを固定する。
+  it('出力超過の後に workspace 整合検査が失敗したら（WorkspaceReconciliationError）blocked + quarantine になる', async () => {
+    const patchJob = vi.fn().mockResolvedValue(true)
+    const executeJob = vi.fn().mockRejectedValue(
+      new WorkspaceReconciliationError(
+        'git operation markers remain after execution (index.lock); process quiescence does not prove git consistency',
+      ),
+    )
+    const alert = vi.fn().mockResolvedValue(undefined)
+
+    const status = await processQueuedWork({ job, task, jobs: [job] }, {
+      patchJob,
+      executeJob,
+      alert,
+      now: () => NOW,
+    })
+
+    expect(status).toBe('blocked')
+    const terminal = patchJob.mock.calls.at(-1)?.[1] as {
+      status?: string
+      failureMetadata?: { quarantined?: boolean; quarantineReason?: string; kind?: string; workspaceState?: string }
+    }
+    expect(terminal.status).toBe('blocked')
+    expect(terminal.failureMetadata?.quarantined).toBe(true)
+    expect(terminal.failureMetadata?.kind).toBe('workspace_containment_failure')
+    expect(terminal.failureMetadata?.workspaceState).toBe('unknown')
+    expect(terminal.failureMetadata?.quarantineReason).toContain('index.lock')
   })
 
   it('containment 失敗では CRITICAL アラートを出す', async () => {
