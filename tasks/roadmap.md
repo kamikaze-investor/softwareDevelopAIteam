@@ -5826,6 +5826,9 @@ deploy canary は全 PASS だった。
 1. [ ] **外部ハーネス代替検証 Tier 0: 全層の文書評価（repo・記録・git 履歴だけを使い、docs のみ変更する）** — 2026-10-29 登録（CEO 判断）。
       根拠: `docs/project_memory/decisions/harness_pivot_assessment_2026_10_28.md` の 3-1。
       外部への接続・Production への接続・外部ツールの実行は行わない。成果物は `docs/project_memory/decisions/` 配下の記録 1 件とする。
+      **承認ルールの正本は `docs/project_memory/rules/approval_rules.md` と `specs/22` であり、本項目は承認ルールを定義しない。**
+      本項目は docs のみの Tier 0 で、既存 Green Zone（ドキュメント更新・Task作成・更新）に当たる。Tier 1 以降は
+      既存 Yellow Zone の判定と `execution-runtime-harness-bakeoff` の CEO HOLD に従う（本項目では解除しない）。
       **成果物**:
       1. 機能単位ごとの代替可能性と推奨分類の表。同記録の 1-1 にある暫定の分類表を、repo の根拠で確定させる。各単位について、次の 5 点を書く。
          - 候補が代替しうるもの

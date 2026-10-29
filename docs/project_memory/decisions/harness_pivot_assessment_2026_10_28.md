@@ -1,7 +1,13 @@
 # 外部ハーネス代替検証：棚卸し・代替可能性・証拠ラダー（Tier 0〜2）・Roadmap 変更（2026-10-28 作成、2026-10-29 CEO 判断）
 
-**状態:** CEO は 2026-10-29 に方針を承認した（0 章）。本 PR で行うのは、この記録の追加と、Tier 0 の Roadmap 項目 1 件の追加（4 章）だけである。**`execution-runtime-harness-bakeoff` の CEO HOLD は、本 PR では変更しない**（10 章）。
+**状態:** CEO は 2026-10-29 に評価方法を指示した（0 章）。本 PR で行うのは、この記録の追加と、Tier 0 の Roadmap 項目 1 件の追加（4 章）だけである。**`execution-runtime-harness-bakeoff` の CEO HOLD は、本 PR では変更しない**（10 章）。
 Goal・Design Philosophy・CEO Decision Authority・安全境界・既存 Gate はどれも変更しない。新しい Gate や安全機構も作らない。
+
+**承認ルールの正本（2026-10-29 CEO 指示）:** 何に人の承認が要るか・誰が承認するか・承認が何を許可するか・いつ失効するかの正本は
+`docs/project_memory/rules/approval_rules.md` と `specs/22_safety_approval_design_principle.md` だけである。
+**本記録と `tasks/roadmap.md` は、独立した承認ルールを定義しない。** 本記録の Tier ごとの扱いは、既存の
+Yellow Zone / Green Zone（`approval_rules.md`「CEOの承認が必要（Yellow Zone）」「承認不要（Green Zone）」）を
+この件へ当てはめた結果であり、新しい Approval Tuple ではない。CEO が付した条件は、その個別承認に対する実施前の確認事項である。
 
 - 基準 commit: `origin/master` 8e85f68c。
 - 作成者: PL（Claude Opus）。r1〜r20 の draft は採用しない。採用しない理由と、その経緯は 5・6 章に記録した。
@@ -10,9 +16,9 @@ Goal・Design Philosophy・CEO Decision Authority・安全境界・既存 Gate �
 
 ## 0. CEO 判断（2026-10-29）
 
-1. r1〜r19 の execution-heavy な設計を、**Tier 0〜2 の証拠ラダー**に置き換える。Tier 3 は延期する。
-2. **Tier 1 は条件付きで承認する。** 条件は「Production の credential がなく、network にも接続しない使い捨て環境」に限ること。実行前に、この条件を満たしているか確認する。**この承認を repo に記録する作業（bakeoff の HOLD の解除）は、本 PR には含めない。** どう記録するかは、10 章の CEO 判断に従う。
-3. **Tier 2 は、まだ承認しない。** Tier 0〜1 の結果で必要性が示され、共有 quota への影響が評価されてから判断する。
+1. r1〜r19 の execution-heavy な設計を、**Tier 0〜2 の証拠ラダー**に置き換える。Tier 3 は延期する。これは `execution-runtime-harness-bakeoff` という 1 項目の**評価方法の整理**であり、Goal・Design Philosophy・Constitution・Policy の意味は変えない。
+2. **Tier 1 の実施を、個別に承認した（条件付き）。** Tier 1 は既存 `approval_rules.md` Yellow Zone「リポジトリ外への操作 — 新しい外部対象への操作」に当たるため CEO 承認が必要であり、CEO はこの 1 件について承認した。付した条件は「Production の credential がなく、network にも接続しない使い捨て環境」に限ることで、実行前に確認する（3-2）。**これは既存ルールに基づく個別承認の記録であって、承認ルールの変更ではない。** 実施は CEO の指示を受けた外部 session が行う。**bakeoff の HOLD（PL の採用を機械的に止める `state=deferred`）は、本 PR では変更しない**（10 章）。
+3. **Tier 2 は、まだ承認していない。** Tier 2 は credential と有料 API を使うため、既存 Yellow Zone「外部サービス追加」「有料API / 課金発生」に当たる。Tier 0〜1 の結果で必要性が示され、共有 quota への影響が評価されてから CEO が判断する。
 
 **合わせて指示された訂正:**
 - Claude Code／Codex をすでに使っていることを、それらが本質的に信頼できる根拠にしない。リスクは「信頼できる vendor だから」という前提ではなく、**能力とアクセスを制限することで下げる。**
@@ -20,7 +26,7 @@ Goal・Design Philosophy・CEO Decision Authority・安全境界・既存 Gate �
 - r1〜r19 の findings は、歴史的な evidence として残す。ただし、その中の execution protocol は採用しない。
 - 20 ラウンドで収束しなかったことを、横断的なアーキテクチャ・review 責務の監査への evidence として記録する。その際、既存の Design Challenger 原則が実際に適用されたかを調べる。
 - quarantine 中の Job は、既存の Lifecycle escalation の経路で解決する。並行する復旧 workflow は作らない。
-- Tier 1 と Tier 2 は、承認条件を満たすまで実行しない。
+- Tier 1 は、付された条件の確認を終えるまで実行しない。Tier 2 は、既存 Yellow Zone に基づく CEO 承認を得るまで実行しない。
 
 ---
 
@@ -174,9 +180,9 @@ Goal・Design Philosophy・CEO Decision Authority・安全境界・既存 Gate �
 
 | Tier | 内容 | 状態 | 実施する主体 | 安全の担保 |
 |---|---|---|---|---|
-| **0** 文書評価 | repo と記録だけで行う評価（下記） | **承認済み** | PL が自律採用する（通常の Tier A 項目。docs のみ） | 既存の Gate と Tier A の境界 |
-| **1** credential を使わない機構 PoC | 封じ込めの障害を、モデルを呼ばずに再現する | **CEO は条件付きで承認する方針**。HOLD の解除はまだ記録していない（10 章）。実行前に、条件を満たしていることを確認する | 外部 session | 使い捨て環境に Production の credential がなく、network にも接続しない |
-| **2** credential を使う比較 | review 層と原則伝達の比較 | **未承認** | — | Tier 0〜1 の結果と quota 評価を踏まえて CEO が判断する |
+| **0** 文書評価 | repo と記録だけで行う評価（下記） | **承認不要**（既存 Green Zone「ドキュメント更新」「Task作成・更新」） | PL が自律採用する（通常の Tier A 項目。docs のみ） | 既存の Gate と Tier A の境界 |
+| **1** credential を使わない機構 PoC | 封じ込めの障害を、モデルを呼ばずに再現する | **CEO が個別に承認済み（条件付き）**。該当する既存ルールは Yellow Zone「リポジトリ外への操作」。HOLD は変更していない（10 章）。実行前に条件を確認する（3-2） | 外部 session | 使い捨て環境に Production の credential がなく、network にも接続しない |
+| **2** credential を使う比較 | review 層と原則伝達の比較 | **未承認**（該当する既存ルールは Yellow Zone「外部サービス追加」「有料API / 課金発生」） | — | Tier 0〜1 の結果と quota 評価を踏まえて CEO が判断する |
 | 3 | 外部へ書き込む agent を使う PoC | **延期** | — | — |
 
 ### 3-1. Tier 0（文書評価）の範囲
@@ -195,9 +201,13 @@ repo・記録・git 履歴だけを使う。外部への接続も Production へ
 3. **Tier 1 の fixture 一覧。** `execution-runtime-harness-bakeoff` の障害再現リストから、モデルを呼ばずに再現できる項目を選び出す。各項目について、AIteamOS で実際に起きた障害（decision record・roadmap の記録）との対応を示す。さらに、Tier 1 の環境条件（Production の credential なし・network なし）で実行できるかを判定する。
 4. **Tier 2 の必要性と quota 影響の見積り。** Tier 1 では答えられない問いを列挙し、Tier 2 で必要になる呼び出しの回数と量を見積もる。見積りは、Production の Codex／Claude の利用と共有する quota への影響として示す。**この項目は、CEO が Tier 2 を判断するための材料である。** Tier 2 の実施を前提にしない。
 
-### 3-2. Tier 1 の承認条件と、実行前の確認
+### 3-2. Tier 1 の個別承認に付された条件と、実行前の確認
 
-**承認条件（CEO 2026-10-29）:** 使い捨て環境であること、Production の credential がないこと、network に接続しないこと。
+**該当する既存ルール:** `approval_rules.md` Yellow Zone「リポジトリ外への操作 — 新しい外部対象への操作」。
+Tier 1 はこれに当たるため CEO 承認を要する。**本節は、その個別承認に CEO が付した条件の記録であり、
+新しい承認ルールではない**（承認ルールの正本は冒頭に記したとおり `approval_rules.md` / `specs/22`）。
+
+**条件（CEO 2026-10-29、この 1 件に対して）:** 使い捨て環境であること、Production の credential がないこと、network に接続しないこと。
 
 **実行前の確認**（既存のツールで確認し、結果を記録に残す。新しい安全機構は作らない）:
 - 環境が使い捨てであること。作成と破棄の手順を、結果の記録に書く。
@@ -253,7 +263,7 @@ Codex gpt-5.6-sol による独立レビューは、r1〜r19 がすべて changes
 | r1 | bakeoff には、CEO が定めた評価条件（障害再現リスト・候補・Phase）がある。これを統合して範囲を狭めてはいけない | 既存項目を修正し、評価条件はそのまま残す |
 | r2 | 対照群を置かずに、過去 30 日の集計と比べても、同一条件の比較にならない | Tier 1 は、同じ fixture を現行の機構と候補の両方に適用する。統計的な厳密さが必要かは Tier 2 で判断する |
 | r4 | `failure-explanation-pregeneration` の延期案では、代替の Explainer が実際に動くかを確かめていなかった | 延期しない |
-| r5 | PC には VPS への ssh 鍵と bot の token がある。PC 上で候補を直接動かすと、Production に届いてしまう | Tier 1 の承認条件（Production の credential なし）として確認する |
+| r5 | PC には VPS への ssh 鍵と bot の token がある。PC 上で候補を直接動かすと、Production に届いてしまう | Tier 1 に付された条件（Production の credential なし）として実行前に確認する |
 | r6〜r8 | 認証された環境の中では、候補が provider の credential を読める | Tier 1 は credential なしで行う。Tier 2 を判断するときの論点として残す |
 | r9 | 共有 quota を使い切ると、Production の review や Job を止めうる | Tier 2 の判断材料（Tier 0 の 4 番目の成果物） |
 | r17 | hosted 候補（GitHub 上の agent、managed Platform）では、ローカル側の制御を適用できない | 本計画の対象外（Tier 3 以降） |
@@ -313,7 +323,7 @@ Codex gpt-5.6-sol による独立レビューは、r1〜r19 がすべて changes
 ## 8. やらないこと・未確定事項
 
 - **やらないこと:**
-  - Tier 1・2 の実行（承認条件を満たし、確認を終えるまで行わない）
+  - Tier 1・2 の実行（Tier 1 は付された条件の確認を終えるまで、Tier 2 は CEO 承認を得るまで行わない）
   - 新しい Gate や安全機構の追加
   - 再 review の繰り返し
   - Production の変更
@@ -331,9 +341,51 @@ Codex gpt-5.6-sol による独立レビューは、r1〜r19 がすべて changes
   - 承認された例外ではない。今後は 3-2 に従う。
 - **rules/003:** Codex の review を 20 ラウンド回した（6-2）。
 
+**いずれも終了している（未解決の例外を残さない）。** 逸脱していた作業は r20 で終了し、本 PR では
+サブエージェント調査も Codex ラウンドも行っていない。**既存ルール（AGENTS.md 3-2・`rules/003`）は
+そのまま有効で、本記録はそこに例外・免除・新しい上限を一切作らない。** 以後は既存ルールどおりに委任する。
+なぜ原則が効かなかったかの分析は 6 章にあり、横断監査の入力として
+`cross_task_drift_audit_design.md` 7 章から参照する（新しい Gate や工程は作らない）。
+
 ## 10. 残る CEO 判断事項
 
-### 10-1. Tier 1 の HOLD 解除をどう記録するか
+### 10-1. HOLD と承認の owner（2026-10-29 CEO 判断で決着。未解決事項ではない）
+
+**CEO 判断（2026-10-29）:** 承認の owner は**既存の Decision Authority の正規ルール側**に置く。
+`approval_rules.md` と `specs/22` を正本とし、**Roadmap や decision record に独立した承認ルールを作らない。**
+今回の CEO 判断は既存ルールの範囲内なので、**正規ルール自体は変更しない。**
+新しい承認機構も、重複した authority 定義も追加しない。
+
+**したがって、初版で挙げた選択肢のうち (a) は採らない。** `tasks/roadmap.md` と
+`docs/project_memory/decisions/` を CODEOWNERS へ加えることはしない。CODEOWNERS は 2026-10-08 の
+CEO 決定により「authority / cage を定義・実装する正本だけを載せる」面であり（`.github/CODEOWNERS` の
+当該節）、記録・台帳はそこに載らない。Human Gate を得ることだけを目的にした保護対象ファイルの追加は
+`docs/meta_reviewer/prompt.md` が manipulation として禁じている。
+
+**正規の経路は、すでに 2 つある（どちらも既存のもの。新設しない）:**
+
+1. **承認ルール自体を変える場合** — `docs/project_memory/rules/approval_rules.md` または
+   `specs/22_safety_approval_design_principle.md` を、実装・記録と同じ PR で変更する。
+   両ファイルは CODEOWNERS 対象なので、**code-owner review が必ず要る**（`prompt.md` の
+   「Approval Tuple を実際に変える変更（A）の出し方」に一致する）。
+2. **ルールを変えない個別承認・HOLD の解除** — CEO が GitHub 上で行う（初版の (b)）。
+   AI が代わりに書き換えない。
+
+**「正規の経路がない」という初版の見立ては撤回する。** AI が CEO HOLD を解除しようとした場合、
+変更ファイルが CODEOWNERS 外である限り Meta Review が fail closed で止める。これは 2026-10-08 の
+設計どおりで、初版 `1ff0bc31` の BLOCKED がその実証である。CEO 自身は GitHub 上でいつでも変更できる。
+よって enforcement の欠落ではなく、**未解消の矛盾でもない。**
+
+**Tier 1 に HOLD の解除は要らない。** `state=deferred` は PL の自律採用を機械的に止めるためのもので
+（`apps/api/src/pl/adoptionStep.ts` の allowlist）、CEO が承認した外部 session の実施を妨げない。
+PL が Tier 1 を採用する必要が生じたときに、初めて上記 2 の経路で CEO が state を変更する。
+
+**本 PR が authority に対して行っていないこと:** Approval Tuple (a)〜(d) の変更／canonical rule
+（`approval_rules.md`・`specs/22`）の変更／CODEOWNERS・Ruleset・保護設定の変更／既存 Gate・
+Safety boundary の変更／既存項目の state 変更。記録しているのは、既存 Yellow / Green Zone を
+この件へ当てはめた結果と、CEO の個別承認 1 件である。
+
+### 10-1-1. 初版（`1ff0bc31`）で何が起きたか（経緯の記録）
 
 **初版の結果:** PR #440 の初版（`1ff0bc31`）には、bakeoff の HOLD を条件付きで解除する記述が入っていた。これに対し、Meta Review（PR 実行側と base 側の両方）は BLOCKED を返した。
 - 判定は DA (1)／(2) で、欠陥の指摘はなかった。
@@ -342,19 +394,15 @@ Codex gpt-5.6-sol による独立レビューは、r1〜r19 がすべて changes
 **照合の結果:**
 - 判定の中身は妥当である。CEO 自身がかけた HOLD を解除することは、`specs/22` §1-2 の「CEO が明示的に Human-only と指定した事項」にあたり、A に該当する。
 - fail closed になるのは、2026-10-08 の CEO 決定どおりの設計である。Human Decision Authority は CODEOWNERS と code-owner review に委ねられている（`autoReview.ts`）。
-- **一方で、Roadmap の HOLD（`tasks/roadmap.md`）も decision record（`docs/project_memory/decisions/`）も CODEOWNERS の対象ではない。** そのため、今の仕組みでは、Roadmap 項目に CEO がかけた HOLD を解除しても、それを CEO の判断として記録する正規の経路がない。
+- Roadmap の HOLD（`tasks/roadmap.md`）も decision record（`docs/project_memory/decisions/`）も CODEOWNERS の対象ではない。初版ではこれを「正規の経路がない」と読んだが、**その読みは誤りだった**。正しい経路は 10-1 の 1・2 であり、AI による HOLD 解除が fail closed で止まること自体が設計どおりの enforcement である。
 
 **本 PR の対応:**
 - HOLD の変更を本 PR から外し、Tier 0 の文書評価だけを残した。Tier 1 は Tier 0 の成果物（fixture と環境の判定）が揃うまで実行しないので、今の時点で HOLD を解除しておく必要はない。
-- 承認条件は 0 章と 3-2 に方針として残した。ただし、repo 上の HOLD は変えていない。
+- CEO が個別承認に付した条件は 0 章と 3-2 に残した。ただし、repo 上の HOLD は変えていない。
 - Human Gate を通すためだけに、保護対象のファイルを編集したり、CODEOWNERS を追加したりはしていない（`docs/meta_reviewer/prompt.md` の manipulation 規定に従う）。
 
-**CEO に判断を求める事項:** Tier 1 を実施するときに、HOLD の解除をどう記録するか。
-- (a) `tasks/roadmap.md` のうち CEO HOLD を持つ項目を、CODEOWNERS の対象に加える。これは CODEOWNERS の変更なので、CEO の判断が要る。
-- (b) CEO 自身が HOLD を解除する変更を GitHub 上で行う。
-- (c) その他、既存の正規経路があれば、それに従う。
-
-PL としての推奨はない。どの経路を選ぶかは authority の設計の問題であり、CEO の判断事項である。
+**初版が CEO へ出した問い（HOLD 解除をどう記録するか）は、2026-10-29 の CEO 判断で決着した。** 内容は 10-1 のとおり。
+(a)（Roadmap・decision record を CODEOWNERS へ加える）は採らない。既存の 2 経路に従う。
 
 ### 10-2. 引き続き未決のもの
 
