@@ -20,7 +20,18 @@ name: Meta Review (base)
 # - **判定の re-roll を許さない**: 完了した審査が BLOCKED を返した内容（同じ commit、この PR の同じ tree の別 commit、
 #   force-push で外された同じ tree の旧 head）に後から success を付けない（`reopened` でも再審査しない）。
 #   infra 失敗（`error:`）は再実行で上書きできる。残るもの: 同じ tree を別 PR として出し直す経路、
-#   bot の classic token による run の force-cancel（token を Actions 書き込み権限の無いものへ替えるまで）。
+#   内容を少し変えた commit（新しい内容として再審査される）。
+# - **判定の握りつぶしも許さない**（2026-10-29）: bot の token は public repository で run を force-cancel できる
+#   （`always()` の post も止まる）。審査が BLOCKED を出した後、post が投稿する前に止めて再実行・同じ tree の
+#   再 push をすると、BLOCKED が一度も記録されないまま再審査になる。そこで model を実行しない `start` job が
+#   審査の前に、この run・attempt を target_url に持つ pending status を付ける。post は success を付ける前に、
+#   同じ tree の commit に「start はあるが、同じ run・attempt の最終 status が無い」記録（github-actions[bot] が
+#   付けたものだけ）を探し、あれば fail closed にする。status は削除できないので run の削除でも消えない。
+#   同じ tree の commit は PR の commit 一覧に加え、force-push で外された各 head の下の commit まで数える
+#   （250 commit 超・compare の切り詰め・読み切れない status 数は判定せず fail closed）。
+#   代償（すべてマージが止まる側）: post が status を付ける前に runner が失われた場合や、同じ tree の push 直後に
+#   古い run の post が遅れた場合も withheld になる。その内容のままでは通らないので、実際の変更を push する
+#   （空 commit は tree が同じなので効かない）。
 # - fork からの PR は審査しない（secret 付きで誰でも起動できるため）。status は failure（fail closed）。
 #
 # 段階:
@@ -43,8 +54,30 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # model を実行しない。審査を始める前に、この run・attempt の開始を status として残すだけ。
+  start:
+    name: Start Meta Review (base)
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    permissions:
+      statuses: write
+    steps:
+      - name: Post start marker
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7.1.0
+        with:
+          script: |
+            const { owner, repo } = context.repo
+            // No attempt number, no marker: review is skipped and post fails closed.
+            if (!/^[1-9]\d*$/.test(process.env.GITHUB_RUN_ATTEMPT ?? '')) throw new Error('GITHUB_RUN_ATTEMPT is not a positive integer')
+            const runKey = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}/attempts/${process.env.GITHUB_RUN_ATTEMPT}`
+            await github.rest.repos.createCommitStatus({
+              owner, repo, sha: context.payload.pull_request.head.sha, state: 'pending',
+              context: 'Meta Review (base)', description: 'started: review in progress', target_url: runKey,
+            })
+
   review:
     name: Meta Review (base-run)
+    needs: start
     runs-on: ubuntu-latest
     if: github.event.pull_request.head.repo.full_name == github.repository
     permissions:
@@ -121,7 +154,7 @@ jobs:
 
   post:
     name: Post Meta Review (base)
-    needs: review
+    needs: [start, review]
     if: always()
     runs-on: ubuntu-latest
     permissions:
@@ -142,6 +175,8 @@ jobs:
             const sha = pr.head.sha
             const CONTEXT = 'Meta Review (base)'
             const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`
+            // Same string as the start job's marker, so a later run can tell this attempt finished.
+            const runKey = `${runUrl}/attempts/${process.env.GITHUB_RUN_ATTEMPT}`
             const RISK = new Set(['low', 'medium', 'high', 'critical'])
             const STATUS = new Set(['approved', 'changes_requested', 'blocked'])
 
@@ -178,27 +213,52 @@ jobs:
             if (state === 'success') {
               // The sticky lookup must not fail open: any error here posts a non-success.
               try {
+                // Without a real attempt number every attempt would share one runKey and count as "this run".
+                if (!/^[1-9]\d*$/.test(process.env.GITHUB_RUN_ATTEMPT ?? '')) throw new Error('GITHUB_RUN_ATTEMPT is not a positive integer')
                 const commits = await github.paginate(github.rest.pulls.listCommits, { owner, repo, pull_number: pr.number, per_page: 100 })
+                // listCommits stops at 250 commits; past that the lookup would silently miss commits.
+                if (commits.length >= 250) throw new Error('250+ commits: same-tree lookup would be partial')
                 const head = await github.rest.git.getCommit({ owner, repo, commit_sha: sha })
-                // Heads that were force-pushed away are no longer in listCommits; read every one from the PR timeline.
-                const forcedSame = []
+                const pushed = commits.map((c) => ({ sha: c.sha, tree: c.commit.tree.sha }))
+                // Heads that were force-pushed away are no longer in listCommits; read every one from the PR timeline,
+                // with every commit under it (a commit pushed between two force-pushes is reachable only from the
+                // later force-push's beforeCommit).
+                const forcedHeads = []
                 let cursor = null
                 for (;;) {
                   const page = await github.graphql(
-                    'query($o:String!,$r:String!,$n:Int!,$c:String){repository(owner:$o,name:$r){pullRequest(number:$n){timelineItems(itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT],first:100,after:$c){pageInfo{hasNextPage endCursor} nodes{... on HeadRefForcePushedEvent{beforeCommit{oid tree{oid}}}}}}}}',
+                    'query($o:String!,$r:String!,$n:Int!,$c:String){repository(owner:$o,name:$r){pullRequest(number:$n){timelineItems(itemTypes:[HEAD_REF_FORCE_PUSHED_EVENT],first:100,after:$c){pageInfo{hasNextPage endCursor} nodes{... on HeadRefForcePushedEvent{beforeCommit{oid}}}}}}}',
                     { o: owner, r: repo, n: pr.number, c: cursor },
                   )
                   const items = page.repository.pullRequest.timelineItems
-                  for (const e of items.nodes ?? []) if (e?.beforeCommit && e.beforeCommit.tree.oid === head.data.tree.sha) forcedSame.push(e.beforeCommit.oid)
+                  for (const e of items.nodes ?? []) if (e?.beforeCommit) forcedHeads.push(e.beforeCommit.oid)
                   if (!items.pageInfo.hasNextPage) break
                   cursor = items.pageInfo.endCursor
                 }
-                const sameTree = [...new Set([sha, ...commits.filter((c) => c.commit.tree.sha === head.data.tree.sha).map((c) => c.sha), ...forcedSame])]
+                for (const before of new Set(forcedHeads)) {
+                  const cmp = await github.rest.repos.compareCommitsWithBasehead({ owner, repo, basehead: `${pr.base.sha}...${before}`, per_page: 100 })
+                  if (cmp.data.total_commits > cmp.data.commits.length) throw new Error(`force-pushed head ${before.slice(0, 7)} has too many commits to check`)
+                  pushed.push(...cmp.data.commits.map((c) => ({ sha: c.sha, tree: c.commit.tree.sha })))
+                }
+                const sameTree = [...new Set([sha, ...pushed.filter((c) => c.tree === head.data.tree.sha).map((c) => c.sha)])]
                 for (const s of sameTree) {
                   const statuses = await github.paginate(github.rest.repos.listCommitStatusesForRef, { owner, repo, ref: s, per_page: 100 })
+                  // A list this long may not be complete; do not decide on part of it.
+                  if (statuses.length >= 1000) throw new Error(`too many statuses on ${s.slice(0, 7)} to read completely`)
                   if (statuses.some((st) => st.context === CONTEXT && st.state === 'failure' && (st.description ?? '').startsWith('verdict: blocked'))) {
                     state = 'failure'
                     description = `verdict: blocked (sticky from ${s.slice(0, 7)}; a later run cannot clear it)`
+                    break
+                  }
+                  // Withheld verdict: an earlier run or attempt started reviewing this content but never posted
+                  // its final status (force-cancelled after the model answered). Only this workflow's own
+                  // statuses count; a status posted with a PAT cannot mark a run as finished.
+                  const ours = statuses.filter((st) => st.context === CONTEXT && st.creator?.login === 'github-actions[bot]')
+                  const finished = new Set(ours.filter((st) => st.state !== 'pending').map((st) => st.target_url))
+                  const withheld = ours.find((st) => st.state === 'pending' && st.target_url !== runKey && !finished.has(st.target_url))
+                  if (withheld) {
+                    state = 'failure'
+                    description = `withheld: an earlier review of this content (${s.slice(0, 7)}) never posted its verdict; push a real change (an empty commit is not enough)`
                     break
                   }
                 }
@@ -208,7 +268,7 @@ jobs:
               }
             }
 
-            await github.rest.repos.createCommitStatus({ owner, repo, sha, state, context: CONTEXT, description: description.slice(0, 140), target_url: runUrl })
+            await github.rest.repos.createCommitStatus({ owner, repo, sha, state, context: CONTEXT, description: description.slice(0, 140), target_url: runKey })
             core.info(`${CONTEXT}: ${state} — ${description}`)
 
             if (!verdictValid) return
