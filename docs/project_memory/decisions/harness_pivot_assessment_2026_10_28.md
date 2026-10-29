@@ -1,6 +1,6 @@
 # 外部ハーネス代替検証：棚卸し・代替可能性・証拠ラダー（Tier 0〜2）・Roadmap 変更（2026-10-28 作成、2026-10-29 CEO 判断）
 
-**状態:** CEO は 2026-10-29 に方針を承認した（0 章）。本 PR で行うのは、この記録の追加と Roadmap の最小限の変更（4 章）だけである。
+**状態:** CEO は 2026-10-29 に方針を承認した（0 章）。本 PR で行うのは、この記録の追加と、Tier 0 の Roadmap 項目 1 件の追加（4 章）だけである。**`execution-runtime-harness-bakeoff` の CEO HOLD は、本 PR では変更しない**（10 章）。
 Goal・Design Philosophy・CEO Decision Authority・安全境界・既存 Gate はどれも変更しない。新しい Gate や安全機構も作らない。
 
 - 基準 commit: `origin/master` 8e85f68c。
@@ -11,7 +11,7 @@ Goal・Design Philosophy・CEO Decision Authority・安全境界・既存 Gate �
 ## 0. CEO 判断（2026-10-29）
 
 1. r1〜r19 の execution-heavy な設計を、**Tier 0〜2 の証拠ラダー**に置き換える。Tier 3 は延期する。
-2. **Tier 1 は条件付きで承認する。** 条件は「Production の credential がなく、network にも接続しない使い捨て環境」に限ること。実行前に、この条件を満たしているか確認する。
+2. **Tier 1 は条件付きで承認する。** 条件は「Production の credential がなく、network にも接続しない使い捨て環境」に限ること。実行前に、この条件を満たしているか確認する。**この承認を repo に記録する作業（bakeoff の HOLD の解除）は、本 PR には含めない。** どう記録するかは、10 章の CEO 判断に従う。
 3. **Tier 2 は、まだ承認しない。** Tier 0〜1 の結果で必要性が示され、共有 quota への影響が評価されてから判断する。
 
 **合わせて指示された訂正:**
@@ -74,6 +74,59 @@ Goal・Design Philosophy・CEO Decision Authority・安全境界・既存 Gate �
    | (c) サーバ側の merge／deploy の強制 | 28、7、5 | 強制の仕組みは維持する。判断する主体（LLM）だけを比較対象にする |
    | (d) アプリ内 policy と LLM の判断 | 8〜13、15〜17 | 境界ではなく判断である |
 
+### 1-1. 推奨分類（暫定）
+
+この表は Tier 0 の出発点にすぎない。根拠・削減効果・難易度は Tier 0 で repo の根拠をもとに確定させる。
+
+**目的:** 自前開発と保守の負担を減らす。ただし、自律開発・原則遵守・安全性・スマホ管理は維持する（2026-10-29 CEO）。
+
+**分類:**
+- **維持**: 自前で持ち続ける
+- **置換候補**: 外部へ置き換えられる可能性がある
+- **廃止候補**: 不要なので、なくせる可能性がある
+- **保留**: 現時点では判断できない
+
+**削減効果の見方:** 削減効果は「その単位をすべて外した場合の上限」として、src の LOC と 60 日間の touch 数で示す。touch 数は単位をまたいで重複して数えているので、合計しない。
+
+**移行・廃止の判断:** 実際に移行するか、廃止するかは CEO が別途判断する。
+
+| # | 機能単位 | 推奨（暫定） | 根拠 | 削減効果の上限 | 移行の難易度・リスク | 判断できない事項 |
+|---|---|---|---|---|---|---|
+| 1 | Job 実行・cgroup containment | 保留 | OS による強制で、descendant を確実に回収できる。候補の sandbox が同等かは実証されていない | 7.2k／56 | 高い。Worker の中核で、Production の封じ込めに当たる | Tier 1 の結果 |
+| 2 | Safety guards | **維持**（policy の正本） | Task 単位の path policy は workspace 単位の sandbox と等価ではない | 2.8k／4（小さい） | — | 強制の backend を替えるべきか（Tier 1） |
+| 3 | Approval Gate | **維持** | API の認可（境界の種類 b）。承認の正本である | — | — | — |
+| 4 | 承認・失敗の AI 説明 | 保留 | 外部のチャット UI で代替できる可能性はあるが、Explainer の動作実績を確認していない | 1.7k／11 | 低い | 現在動作しているか |
+| 5 | Approval Level／Independent Review | **維持**（commit gate） | 判定の強制はコードが担う。判断する主体だけは差し替えられる | — | — | 判断主体を差し替えるか（Tier 2） |
+| 6 | AI CLI adapter | **維持** | 薄い差し替え点で、harness を交換できるようにする要（G5）である | 1.8k／10 | — | — |
+| 7 | Meta Review CI | 置換候補（判断主体のみ） | 同一 SHA で verdict が反転した実績がある。強制の仕組み（required check）は GitHub 側にあり、維持する | 3.2k／22 | 中程度。reviewer の独立性と base 実行を保つ必要がある | Tier 2 の比較 |
+| 8 | Strategic review／materiality | 一部は廃止候補 | materiality detector は observe-only で、CI に配線されておらず、M4 も未承認 | 3.4k／19 | 低い（配線されていないため） | strategic review 本体を残す価値 |
+| 9 | Design Review・repair | **維持**（簡素化の対象） | 外部に同等品が見つからない。churn が最大で、保守負担の中心である | 5.3k／94 | — | 外部化ではなく簡素化で負担を減らせるか |
+| 10 | PL 実行ループ | **維持** | 同等品が見つからない | 4.7k／74 | — | H-E（Tier 3） |
+| 11 | Adoption・commit evidence | **維持** | git evidence と Roadmap の正本に直結する | 3.8k／39 | — | — |
+| 12 | Independent remediation | 保留 | 9 と一体で評価する | 2.2k／13 | — | 9 の簡素化の結果 |
+| 13 | Recovery | **維持**（簡素化の対象） | 同等品が見つからない。churn は 2 番目に大きい | 5.1k／89 | — | 同上 |
+| 14 | Operator request／chat | 保留 | スマホから PL へ問い合わせる経路。外部アプリで代替できる可能性はあるが、credential の境界（種類 b）が関わる | 1.2k／3 | 中程度 | 外部アプリの権限制限 |
+| 15 | Roadmap ledger・sync | **維持** | 正本である（G2・G3） | — | — | — |
+| 16 | CTO AI・Context Pack | Context Pack は置換候補 | Context Pack は CLI まで届いていない。repo-native の注入方式（H-C）で代替できる可能性がある | 2.8k／33 の一部 | 低〜中 | 原則遵守を下げずに済むか（Tier 2） |
+| 17 | Project Memory・knowledge graph | 正本は**維持**、一部は保留 | 正本は外へ移さない。knowledge graph 系の table が実際に読まれているか確認していない | 3.2k／15 | — | table が読まれている経路（Tier 0 でコードを確認） |
+| 18 | Supervised delegation | 廃止候補 | 本番に配線されていない。`supervised_runs` は 0 件で、delegate.sh は Windows で壊れている | 1.6k／2 | 低い | `pl-review-process-supervision` と `deleg-001-watchdog-respawn` との関係（C-1〜C-13 の契約の扱い） |
+| 19 | Watchdog | 保留 | 小さく、動いている | 0.4k／2 | — | — |
+| 20 | 通知・outbox（LINE） | **維持** | 小さく、動いている。スマホ管理を担う | 0.6k／4 | — | — |
+| 21 | External completion reconcile | **維持** | — | 1.2k／5 | — | — |
+| 22 | Auth・credential class | **維持** | 境界（種類 b） | — | — | — |
+| 23 | Storage | **維持**（簡素化の対象） | DB が正本である。`sqlite.ts` は 8k LOC で、churn が最大 | 10.5k／127 | — | 外部化ではなく分割・簡素化で負担を減らせるか |
+| 24 | Core API・system state | **維持** | 境界（種類 b） | 4.0k／109 | — | — |
+| 25 | Cross-task audit・canary | **維持** | — | 1.5k／6 | — | — |
+| 26 | MCP gateway | **維持** | 小さい。外部 harness から読み取りで参照する経路になる（G5） | 0.5k／2 | — | — |
+| 27 | Mobile UI | 保留 | merge／deploy の承認は GitHub Mobile へ寄せられる可能性がある（H-D）。job 内の承認は残る | 10.2k／41 の一部 | 中程度 | GitHub Mobile で environment を承認できるか |
+| 28 | GitHub governance | **維持**（すでに外部） | — | — | — | — |
+| 29 | Lifecycle E2E harness | **維持** | — | 1.4k／11 | — | — |
+
+**暫定の見立て:**
+1. 外部へ置き換えるだけで減る保守負担は、限られている（7・8 の一部・16 の一部・18）。
+2. 保守負担の大半は、外部に同等品のない自前の状態機械（9・13・23・24）にある。負担を減らす主な手段は、外部化ではなく**簡素化**である可能性が高い。Tier 0 でこの点を churn の実数で確認する。
+3. 安全境界（境界の種類 b、(a′) の path policy の正本、GitHub 側の強制）は、どの分類でも維持する。
+
 ---
 
 ## 2. 外部ハーネス・ツールの代替可能性一覧（2026-10-28 調査）
@@ -122,7 +175,7 @@ Goal・Design Philosophy・CEO Decision Authority・安全境界・既存 Gate �
 | Tier | 内容 | 状態 | 実施する主体 | 安全の担保 |
 |---|---|---|---|---|
 | **0** 文書評価 | repo と記録だけで行う評価（下記） | **承認済み** | PL が自律採用する（通常の Tier A 項目。docs のみ） | 既存の Gate と Tier A の境界 |
-| **1** credential を使わない機構 PoC | 封じ込めの障害を、モデルを呼ばずに再現する | **条件付きで承認**（下記の条件を満たすことを、実行前に確認する） | 外部 session | 使い捨て環境に Production の credential がなく、network にも接続しない |
+| **1** credential を使わない機構 PoC | 封じ込めの障害を、モデルを呼ばずに再現する | **CEO は条件付きで承認する方針**。HOLD の解除はまだ記録していない（10 章）。実行前に、条件を満たしていることを確認する | 外部 session | 使い捨て環境に Production の credential がなく、network にも接続しない |
 | **2** credential を使う比較 | review 層と原則伝達の比較 | **未承認** | — | Tier 0〜1 の結果と quota 評価を踏まえて CEO が判断する |
 | 3 | 外部へ書き込む agent を使う PoC | **延期** | — | — |
 
@@ -130,7 +183,14 @@ Goal・Design Philosophy・CEO Decision Authority・安全境界・既存 Gate �
 
 repo・記録・git 履歴だけを使う。外部への接続も Production への接続も行わない。
 
-1. **機能単位ごとの代替可能性表。** 1 章の各単位について次を表にする: どの候補が何を代替しうるか、等価であることを示す既存のテスト・責務の owner、代替した場合に失う責務。
+1. **機能単位ごとの代替可能性と推奨分類の表。** 1-1 の暫定表を出発点にして、各単位について次の項目を repo の根拠で確定させる。
+   - どの候補が何を代替しうるか
+   - 等価であることを示す既存のテストと、その責務の owner
+   - 代替した場合に失う責務
+   - 推奨分類と、その根拠
+   - 保守負担の削減効果
+   - 移行の難易度とリスク
+   - 現時点では判断できない事項
 2. **churn の再集計。** unique commit 単位で行う（パスと単位の対応表と、使った git コマンドを添える）。
 3. **Tier 1 の fixture 一覧。** `execution-runtime-harness-bakeoff` の障害再現リストから、モデルを呼ばずに再現できる項目を選び出す。各項目について、AIteamOS で実際に起きた障害（decision record・roadmap の記録）との対応を示す。さらに、Tier 1 の環境条件（Production の credential なし・network なし）で実行できるかを判定する。
 4. **Tier 2 の必要性と quota 影響の見積り。** Tier 1 では答えられない問いを列挙し、Tier 2 で必要になる呼び出しの回数と量を見積もる。見積りは、Production の Codex／Claude の利用と共有する quota への影響として示す。**この項目は、CEO が Tier 2 を判断するための材料である。** Tier 2 の実施を前提にしない。
@@ -166,18 +226,17 @@ r20 の再評価では「Claude Code／Codex は既に Production で使って�
 
 | 提案（r20 の再評価時点） | 既存の項目 | 扱い |
 |---|---|---|
-| Tier 1（機構 PoC） | `execution-runtime-harness-bakeoff`（deferred、CEO HOLD）。評価の方法（実際の障害を再現して比較する）と障害再現リストを、そのまま含んでいる | **既存項目を修正する。** Tier 1 に限って HOLD を条件付きで解除したことを追記する。state は `deferred` のまま（外部 session が実施し、PL は採用しない） |
+| Tier 1（機構 PoC） | `execution-runtime-harness-bakeoff`（deferred、CEO HOLD）。評価の方法（実際の障害を再現して比較する）と障害再現リストを、そのまま含んでいる | **既存項目で扱う。新しい項目は作らない。** 本 PR では変更しない。HOLD の解除をどう記録するかは 10 章で判断する |
 | Tier 0（文書評価） | 実行層については、bakeoff の評価方法の前段に当たる。review 層・知識層・承認 UI には、それぞれ部分的に重なる項目がある（`pl-console-candidate-evaluation`：PL Console の UI のみ。`system-one-decision-layer-generalization`：判断 engine のみ。`opencode-feasibility-reviewer`：OpenCode のみ）。どれも deferred で、範囲が狭い | **新規 1 件**（`harness-pivot-desk-evaluation`、planned）。全層を横断する文書評価は既存のどの項目の範囲にも入らないため。重なる 3 項目は変更せず、本文で参照するだけにする |
 | Tier 0 の fixture／比較表の雛形 | 同上 | 新規項目に統合する（r20 で提案した 2 件目は作らない） |
 | Tier 2 | `independent-review-verdict-instability`、`opencode-feasibility-reviewer`、`project-auto-gemini-worker-eligibility`（いずれも deferred） | **項目は作らない**（CEO が未承認のため）。必要性は Tier 0 の 4 番目の成果物で示す |
 
-**結果: 新規は 1 件、修正は 1 件。既存項目の state は 1 件も変えない。** r1〜r19 で提案した延期・統合の分類（新規 14〜16 件と、延期 2〜6 件）は、すべて取り下げる。
+**結果: 新規は 1 件。既存項目は 1 件も変更しない。** r1〜r19 で提案した延期・統合の分類（新規 14〜16 件と、延期 2〜6 件）は、すべて取り下げる。
 
 ### 4-2. 実際の変更（本 PR）
 
-1. `execution-runtime-harness-bakeoff`: title の HOLD 表記を更新し、本文の末尾に「2026-10-29 CEO 判断」の節を追記する。追記する内容は、Tier 1 に限った条件付きの解除、承認条件、実行前の確認、Tier 2・Tier 3・managed Platform・Phase 3 は対象外であること、の 4 点。
-2. `harness-pivot-desk-evaluation`（新規、planned）: 3-1 の 4 つの成果物を作る。これは docs だけを扱う項目である。
-3. `docs/PROJECT_CURRENT_STATE.md` を再生成する（`roadmap:sync`）。
+1. `harness-pivot-desk-evaluation`（新規、planned）: 3-1 にある 4 つの成果物を作る。docs だけを扱う項目である。
+2. `docs/PROJECT_CURRENT_STATE.md` を再生成する（`roadmap:sync`）。
 
 ---
 
@@ -271,3 +330,33 @@ Codex gpt-5.6-sol による独立レビューは、r1〜r19 がすべて changes
   - 調査は OpenCode Go にも Codex Sol にも委任せず、Claude サブエージェントに行わせた。OpenCode Go はモデルが 0 件で、委任を試していない。
   - 承認された例外ではない。今後は 3-2 に従う。
 - **rules/003:** Codex の review を 20 ラウンド回した（6-2）。
+
+## 10. 残る CEO 判断事項
+
+### 10-1. Tier 1 の HOLD 解除をどう記録するか
+
+**初版の結果:** PR #440 の初版（`1ff0bc31`）には、bakeoff の HOLD を条件付きで解除する記述が入っていた。これに対し、Meta Review（PR 実行側と base 側の両方）は BLOCKED を返した。
+- 判定は DA (1)／(2) で、欠陥の指摘はなかった。
+- BLOCKED の理由は、Human Decision Authority が必要と判定されたのに、変更されたファイルがどれも CODEOWNERS の対象ではなかったことである。
+
+**照合の結果:**
+- 判定の中身は妥当である。CEO 自身がかけた HOLD を解除することは、`specs/22` §1-2 の「CEO が明示的に Human-only と指定した事項」にあたり、A に該当する。
+- fail closed になるのは、2026-10-08 の CEO 決定どおりの設計である。Human Decision Authority は CODEOWNERS と code-owner review に委ねられている（`autoReview.ts`）。
+- **一方で、Roadmap の HOLD（`tasks/roadmap.md`）も decision record（`docs/project_memory/decisions/`）も CODEOWNERS の対象ではない。** そのため、今の仕組みでは、Roadmap 項目に CEO がかけた HOLD を解除しても、それを CEO の判断として記録する正規の経路がない。
+
+**本 PR の対応:**
+- HOLD の変更を本 PR から外し、Tier 0 の文書評価だけを残した。Tier 1 は Tier 0 の成果物（fixture と環境の判定）が揃うまで実行しないので、今の時点で HOLD を解除しておく必要はない。
+- 承認条件は 0 章と 3-2 に方針として残した。ただし、repo 上の HOLD は変えていない。
+- Human Gate を通すためだけに、保護対象のファイルを編集したり、CODEOWNERS を追加したりはしていない（`docs/meta_reviewer/prompt.md` の manipulation 規定に従う）。
+
+**CEO に判断を求める事項:** Tier 1 を実施するときに、HOLD の解除をどう記録するか。
+- (a) `tasks/roadmap.md` のうち CEO HOLD を持つ項目を、CODEOWNERS の対象に加える。これは CODEOWNERS の変更なので、CEO の判断が要る。
+- (b) CEO 自身が HOLD を解除する変更を GitHub 上で行う。
+- (c) その他、既存の正規経路があれば、それに従う。
+
+PL としての推奨はない。どの経路を選ぶかは authority の設計の問題であり、CEO の判断事項である。
+
+### 10-2. 引き続き未決のもの
+
+- Tier 2 の承認（Tier 0 の 4 番目の成果物を見てから判断する）
+- 1-1 で廃止候補・置換候補とした単位について、実際に移行・廃止するか（Tier 0 の確定版を見てから判断する）
