@@ -377,7 +377,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Approval の consume と `git commit` の間でクラッシュすると、復旧が repair（新しい Approval 要求）にしか無い**（state: deferred）
 - **M1: HIGH の技術的 git_commit を、強化した Safety Evidence（ベンダー分離の独立レビュー）で通す**（state: deferred）
 - **M2: `RISK_RULES` の部分文字列一致が誤検知する（authorBadge / tokenizer / dropdown / guardian）**（state: deferred）
-- **M3: DA trigger 3/4/5 の決定論的検出（新規依存・外部サービス、新規 public route、不可逆 migration）**（state: deferred）
+- **M3: DA trigger 3/4/5 の決定論的検出（(3) 外部 service・有償依存・公開範囲 / route、(4) 個人データ・保持・削除方針、(5) 不可逆変更）**（state: deferred）
 - **M4: Approval consume の不変条件が足りない**（state: deferred）
 - **M5: commit 直前に branch を再確認し、resulting-commit binding が失敗したら Task を完了させない**（state: deferred）
 - **M6: `blockedTriage` の残りの rule を技術制約 lane へ移し、「技術的・自動再開なし・CEO 判断なし」の PL lane を足す**（state: deferred）
@@ -390,6 +390,9 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Candidate を Lifecycle 一括修復後の master へ同期する（`b8d0fc5d` が正規の経路で終わった後）**（state: deferred）
 - **abort の帰属判定が Job の作成時刻を文字列のまま比べている**（state: deferred）
 - **RiskLevel の順位表が複数箇所に重複している**（state: deferred）
+- **initial-implement と resume の Design Review は変更ファイルを渡さないので、常に medium・単一 focus で審査され、独立レビューが走らない**（state: planned）
+- **runtime の Design Review（low-load 経路）が PR 時の Meta Review の prompt をそのまま使うため、片方を変えるともう片方の判定の意味も変わる**（state: deferred）
+- **正本文書どうしの記述の矛盾のうち、既に CEO 承認済みの上位正本へ合わせるだけで済むもの（方針は変えない）**（state: deferred）
 
 詳細は `tasks/roadmap.md`「スマホ操作MVP残タスク」を参照。
 <!-- AUTO-GENERATED:ROADMAP_CURRENT_STATE:END -->
