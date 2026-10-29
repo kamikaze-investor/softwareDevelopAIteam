@@ -349,61 +349,45 @@ Codex gpt-5.6-sol による独立レビューは、r1〜r19 がすべて changes
 
 ## 10. 残る CEO 判断事項
 
-### 10-1. HOLD と承認の owner（2026-10-29 CEO 判断で決着。未解決事項ではない）
+### 10-1. CEO 判断の記録の保護と、承認の owner（2026-10-29 CEO 最終判断。決着済み）
 
-**CEO 判断（2026-10-29）:** 承認の owner は**既存の Decision Authority の正規ルール側**に置く。
-`approval_rules.md` と `specs/22` を正本とし、**Roadmap や decision record に独立した承認ルールを作らない。**
-今回の CEO 判断は既存ルールの範囲内なので、**正規ルール自体は変更しない。**
-新しい承認機構も、重複した authority 定義も追加しない。
+**CEO 最終判断（2026-10-29）:** 案 1 を採用する。既存の `.github/CODEOWNERS` を拡張し、**今回の CEO 判断記録（本ファイル）1 ファイルだけを literal path で追加**する。これにより、本記録の変更には GitHub 上の code-owner review（CEO）が必要になる。
 
-**したがって、初版で挙げた選択肢のうち (a) は採らない。** `tasks/roadmap.md` と
-`docs/project_memory/decisions/` を CODEOWNERS へ加えることはしない。CODEOWNERS は 2026-10-08 の
-CEO 決定により「authority / cage を定義・実装する正本だけを載せる」面であり（`.github/CODEOWNERS` の
-当該節）、記録・台帳はそこに載らない。Human Gate を得ることだけを目的にした保護対象ファイルの追加は
-`docs/meta_reviewer/prompt.md` が manipulation として禁じている。
+- **維持すること:** Decision Authority の正本は、引き続き `docs/project_memory/rules/approval_rules.md` と `specs/22` だけである。本記録と `tasks/roadmap.md` は、独立した承認ルールを定義しない（冒頭の記載どおり）。
+- **CODEOWNERS の役割:** CODEOWNERS の追加は承認ルールを変えない。何に人の承認が要るかは、正本が定める。CODEOWNERS が担うのは、その正本に従って CEO が判断した結果の記録を、GitHub の code-owner review で保護することだけである。
+- **保護範囲:**
+  - ディレクトリ単位ではなく、ファイル単位の literal path にとどめる。
+  - `docs/project_memory/decisions/` 全体も `tasks/roadmap.md` も載せない。技術的な decision record は、これまでどおり CEO review の対象外である。
+  - 新たな CEO 判断を記録するときは、その記録の path を CODEOWNERS へ追加する変更を同じ PR に含める。この追加自体も CODEOWNERS の変更なので、code-owner review を受ける。
+- **作らないもの:** 新しい Gate、承認機構、重複した authority 定義。
 
-**正規の経路は、すでに 2 つある（どちらも既存のもの。新設しない）:**
+**ff0013d1 の判断の訂正:** ff0013d1 は「(a) を採らない。CODEOWNERS は authority／cage の正本だけを載せる面であり、記録や台帳は載らない」としていた。CEO はこの判断を採用しなかった。
 
-1. **承認ルール自体を変える場合** — `docs/project_memory/rules/approval_rules.md` または
-   `specs/22_safety_approval_design_principle.md` を、実装・記録と同じ PR で変更する。
-   両ファイルは CODEOWNERS 対象なので、**code-owner review が必ず要る**（`prompt.md` の
-   「Approval Tuple を実際に変える変更（A）の出し方」に一致する）。
-2. **ルールを変えない個別承認・HOLD の解除** — CEO が GitHub 上で行う（初版の (b)）。
-   AI が代わりに書き換えない。
+- 判断記録の追加は、Human Gate を得るためだけの無関係な保護ファイル編集（`docs/meta_reviewer/prompt.md` が manipulation として禁じるもの）ではない。CEO 判断そのものを記録する文書を、その判断の正規の review 経路に載せるものである。
+- ff0013d1 のそれ以外の変更は維持する。具体的には、承認ルールの正本の明記、Tier ごとに既存の Yellow／Green Zone を当てはめた整理、9 章の注記である。
 
-**「正規の経路がない」という初版の見立ては撤回する。** AI が CEO HOLD を解除しようとした場合、
-変更ファイルが CODEOWNERS 外である限り Meta Review が fail closed で止める。これは 2026-10-08 の
-設計どおりで、初版 `1ff0bc31` の BLOCKED がその実証である。CEO 自身は GitHub 上でいつでも変更できる。
-よって enforcement の欠落ではなく、**未解消の矛盾でもない。**
+**HOLD の解除（Tier 1）について:**
 
-**Tier 1 に HOLD の解除は要らない。** `state=deferred` は PL の自律採用を機械的に止めるためのもので
-（`apps/api/src/pl/adoptionStep.ts` の allowlist）、CEO が承認した外部 session の実施を妨げない。
-PL が Tier 1 を採用する必要が生じたときに、初めて上記 2 の経路で CEO が state を変更する。
+- 本 PR は `execution-runtime-harness-bakeoff` の HOLD を変更しない。
+- Tier 1 を実施するときに HOLD を解除する場合は、解除を記録した本記録（または新しい CEO 判断記録とその CODEOWNERS 追加）を、同じ PR に含めて code-owner review を受ける。
+- 承認ルール自体を変える場合は、`approval_rules.md`／`specs/22` を同じ PR で変更する（どちらも既存の CODEOWNERS 対象）。
 
-**本 PR が authority に対して行っていないこと:** Approval Tuple (a)〜(d) の変更／canonical rule
-（`approval_rules.md`・`specs/22`）の変更／CODEOWNERS・Ruleset・保護設定の変更／既存 Gate・
-Safety boundary の変更／既存項目の state 変更。記録しているのは、既存 Yellow / Green Zone を
-この件へ当てはめた結果と、CEO の個別承認 1 件である。
+**本 PR が authority に対して行っていないこと:**
 
-### 10-1-1. 初版（`1ff0bc31`）で何が起きたか（経緯の記録）
+- Approval Tuple (a)〜(d) の変更
+- canonical rule（`approval_rules.md`・`specs/22`）の変更
+- Ruleset・保護設定の変更
+- 既存 Gate・Safety boundary の変更
+- 既存項目の state の変更
 
-**初版の結果:** PR #440 の初版（`1ff0bc31`）には、bakeoff の HOLD を条件付きで解除する記述が入っていた。これに対し、Meta Review（PR 実行側と base 側の両方）は BLOCKED を返した。
-- 判定は DA (1)／(2) で、欠陥の指摘はなかった。
-- BLOCKED の理由は、Human Decision Authority が必要と判定されたのに、変更されたファイルがどれも CODEOWNERS の対象ではなかったことである。
+CODEOWNERS への変更は、本記録 1 ファイルの追加だけである。
 
-**照合の結果:**
-- 判定の中身は妥当である。CEO 自身がかけた HOLD を解除することは、`specs/22` §1-2 の「CEO が明示的に Human-only と指定した事項」にあたり、A に該当する。
-- fail closed になるのは、2026-10-08 の CEO 決定どおりの設計である。Human Decision Authority は CODEOWNERS と code-owner review に委ねられている（`autoReview.ts`）。
-- Roadmap の HOLD（`tasks/roadmap.md`）も decision record（`docs/project_memory/decisions/`）も CODEOWNERS の対象ではない。初版ではこれを「正規の経路がない」と読んだが、**その読みは誤りだった**。正しい経路は 10-1 の 1・2 であり、AI による HOLD 解除が fail closed で止まること自体が設計どおりの enforcement である。
+### 10-1-1. 経緯
 
-**本 PR の対応:**
-- HOLD の変更を本 PR から外し、Tier 0 の文書評価だけを残した。Tier 1 は Tier 0 の成果物（fixture と環境の判定）が揃うまで実行しないので、今の時点で HOLD を解除しておく必要はない。
-- CEO が個別承認に付した条件は 0 章と 3-2 に残した。ただし、repo 上の HOLD は変えていない。
-- Human Gate を通すためだけに、保護対象のファイルを編集したり、CODEOWNERS を追加したりはしていない（`docs/meta_reviewer/prompt.md` の manipulation 規定に従う）。
-
-**初版が CEO へ出した問い（HOLD 解除をどう記録するか）は、2026-10-29 の CEO 判断で決着した。** 内容は 10-1 のとおり。
-(a)（Roadmap・decision record を CODEOWNERS へ加える）は採らない。既存の 2 経路に従う。
-
+- **初版 `1ff0bc31`:** bakeoff の HOLD を解除する記述を入れた。変更したファイルがどれも CODEOWNERS の対象外だったため、Meta Review（PR 実行側と base 側の両方）が DA (1)／(2) で fail closed した。これは 2026-10-08 の設計どおりの動作である。
+- **`994aaffc`:** HOLD の変更を取り下げた。それでも、CEO 判断の記録が CODEOWNERS の対象外であることを理由に、BLOCKED のままだった。
+- **`ff0013d1`（別 session）:** 承認ルールの正本を明記し、Meta Review は両方とも APPROVED になった。ただしこの状態では、変更が CODEOWNERS の対象外なので、GitHub は CEO の review を要求しない。そのため、CEO の承認がなくても merge できる状態だった。
+- **本修正:** 案 1 に従い、本記録を CODEOWNERS に追加した。これで本 PR は、CEO の code-owner review なしには merge できなくなる。
 ### 10-2. 引き続き未決のもの
 
 - Tier 2 の承認（Tier 0 の 4 番目の成果物を見てから判断する）
