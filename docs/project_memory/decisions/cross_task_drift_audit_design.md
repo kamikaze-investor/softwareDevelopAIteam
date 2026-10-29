@@ -126,6 +126,8 @@ Improvement Planner が実装されたら、反復する finding の clustering 
 **集計 script は作らない**（最初の 3 回は記録の中で手で数える）。3 回で手間の大きい手順が分かってから作る。
 **3 回目の監査記録に「仕組みの評価」節を必ず置き、継続・発火条件変更・廃止のいずれかを書く**（`observation-closes-loop`）。
 
+**次回の監査への入力（2026-10-29 CEO 指示）**: `harness_pivot_assessment_2026_10_28.md` の 6 章を参照。外部ハーネス代替検証の設計 review が、20 ラウンドで収束しなかった事例である。1 章の表にある Design Challenger は、3 観点・状態の除去・期待価値による限定・停止条件の、どれも実際には適用されていなかった。この事例を、仕組みの評価（review 責務）の材料にする。
+
 Production 挙動（問い `production_divergence`）は、State API の既存 GET（`/api/pl/triage-summary`、`/api/principles/stats`）の
 出力を `--production <file>` で渡したときだけ答える。渡さなければ uncertain で、**コードから Production 挙動を推測しない**。
 

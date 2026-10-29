@@ -320,7 +320,8 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Roadmap 採用経路の残作業3件（`roadmap-item-adoption` の後続）**（state: planned）
 - **Maintenance Lane v0 = Tier B: 自分では触れない変更を、正本を手放さずに管理する**（state: planned）
 - **Project 単位 workspace 分離（Multi-Project の前提・最優先）**（state: planned）
-- **Harness Bake-off / Execution Runtime Evaluation（CEO HOLD: 明示解除まで着手しない）**（state: deferred）
+- **Harness Bake-off / Execution Runtime Evaluation（CEO HOLD: 2026-10-29 に Tier 1（credential なし・network なし）のみ条件付きで解除。外部 session が実施し、PL は採用しない）**（state: deferred）
+- **外部ハーネス代替検証 Tier 0: 全層の文書評価（repo・記録・git 履歴だけを使い、docs のみ変更する）**（state: planned）
 - **Containment adversarial escape（cgroup migration / git external helper）（state: deferred）
 - **Worker unit の cgroup delegation を明示契約にする（systemd contract hardening・低〜中優先）**（state: deferred）
 - **Containment success path の可観測性（低優先 hardening）**（state: deferred）

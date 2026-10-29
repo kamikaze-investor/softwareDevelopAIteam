@@ -5737,7 +5737,7 @@ deploy canary は全 PASS だった。
       (2026-10-22 roadmap integrity audit: S3 は Tier B のみ — S3 が変える `apps/worker/src/guards/permissionGuard.ts`・`apps/worker/src/aiCli/adapter.ts`・`apps/worker/src/utils/pathUtils.ts`・`apps/worker/src/index.ts` は protected path（`ALWAYS_FORBIDDEN_PATTERNS`）で、Tier A では採用できない。S1・S2 はこの制約を受けない)
 
 <!-- roadmap:id=execution-runtime-harness-bakeoff state=deferred -->
-1. [ ] **Harness Bake-off / Execution Runtime Evaluation（CEO HOLD: 明示解除まで着手しない）** —
+1. [ ] **Harness Bake-off / Execution Runtime Evaluation（CEO HOLD: 2026-10-29 に Tier 1（credential なし・network なし）のみ条件付きで解除。外部 session が実施し、PL は採用しない）** —
       High-priority Recovery修正が一段落した後、
       **新規機能を増やす前に**実施する評価項目。第一候補としてOpenHands等のvendor-neutral /
       self-host可能なHarnessを評価するが、**特定ベンダー前提にはしない**。評価候補には
@@ -5821,6 +5821,38 @@ deploy canary は全 PASS だった。
       完了後に判断する。
 
       (2026-10-22 roadmap integrity audit: deferred — title の CEO HOLD（明示解除まで着手しない）を state に反映しただけで、CEO 判断は変えていない。本文の「`deferred` でも採用は妨げられない／この抑止のためだけに state を変更しない」は 2026-09-15 時点の記述で、現在の採用は `planned` のみの allowlist（`apps/api/src/pl/adoptionStep.ts` `readAdoptionCandidates()`、本ファイル冒頭）なので、HOLD を機械的に守るには `deferred` が正しい。CEO が HOLD を解除したら `planned` に戻す)
+
+      **2026-10-29 CEO 判断（`docs/project_memory/decisions/harness_pivot_assessment_2026_10_28.md`）**
+      - CEO HOLD は **Tier 1 に限って条件付きで解除**する。Tier 1 とは、モデルを呼ばず credential も使わない機構 PoC で、本項目の障害再現リストのうち、その条件で再現できるものを対象にする。
+        **承認条件**: 使い捨ての環境であること。Production の credential（VPS の ssh 鍵、gh／bot の token、Production の env、provider の認証情報）がないこと。network に接続しないこと。
+        **実行の前に**、この条件を既存のツールで確認し、結果を記録する。1 つでも確認できなければ実行しない。新しい安全機構は作らない。
+      - state は `deferred` のまま変えない。実施するのは外部 session で、PL の採用対象には入れない。
+        どの fixture を使うか、どの環境方式にするか、実行できるかどうかの判定は、`harness-pivot-desk-evaluation` で行う。
+      - **対象外**:
+        - Tier 2（credential を使う比較）。未承認で、Tier 0〜1 の結果と共有 quota への影響評価を見てから CEO が判断する。
+        - Tier 3（外部へ書き込む agent を使う PoC）。延期する。
+        - managed Agent Platform、hosted 候補、Phase 3（executor の選択機構）。
+      - Tier 1 の結果は「機構としてその挙動を持つか」の証拠にとどまる。Production の kernel・cgroup・AppArmor 上で同じ挙動になることの証拠ではない。
+      - 結果は decision record に記録し、通常の PR で提出する。
+
+<!-- roadmap:id=harness-pivot-desk-evaluation state=planned -->
+1. [ ] **外部ハーネス代替検証 Tier 0: 全層の文書評価（repo・記録・git 履歴だけを使い、docs のみ変更する）** — 2026-10-29 登録（CEO 判断）。
+      根拠: `docs/project_memory/decisions/harness_pivot_assessment_2026_10_28.md` の 3-1。
+      外部への接続・Production への接続・外部ツールの実行は行わない。成果物は `docs/project_memory/decisions/` 配下の記録 1 件とする。
+      **成果物**:
+      1. 機能単位ごとの代替可能性の表。同記録の 1 章にある各単位について、次の 3 点を書く。
+         - 候補が代替しうるもの
+         - 等価であることを示す既存のテストと、その責務の owner
+         - 代替した場合に失う責務
+         (a′) Task 単位の path policy の正本と、(b) API の認可は、代替の対象にしない。
+      2. unique commit で数えた churn の再集計。単位とパスの対応表、および使った git コマンドを添える。
+      3. Tier 1 の fixture 一覧。`execution-runtime-harness-bakeoff` の障害再現リストから、モデルを呼ばずに再現できる項目を選ぶ。各項目には次の 3 点を付ける。
+         - 実際の障害記録との対応
+         - Tier 1 の環境条件（Production の credential なし・network なし）で実行できるかどうかの判定
+         - 環境方式の候補
+      4. Tier 2 が必要かどうかと、共有 quota への影響の見積り。CEO の判断材料として作るもので、Tier 2 の実施を前提にしない。
+      **関連する既存項目（変更しない）**: `pl-console-candidate-evaluation`、`system-one-decision-layer-generalization`、`opencode-feasibility-reviewer`。
+      **対象外**: Tier 1・2 の実行、新しい Gate や安全機構、既存項目の state 変更。
 
 <!-- roadmap:id=containment-adversarial-escape-threat-model state=deferred -->
 2. [ ] **Containment adversarial escape（cgroup migration / git external helper）— security Finding** —
