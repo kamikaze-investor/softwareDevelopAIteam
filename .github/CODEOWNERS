@@ -45,6 +45,14 @@ docs/project_memory/design_philosophy.md @kamikaze-investor
 docs/project_memory/rules/approval_rules.md @kamikaze-investor
 docs/multi_ai_step_review_flow.md @kamikaze-investor
 
+# CEO 判断の記録（2026-10-29 CEO 決定。PR #440）
+#
+# CEO 判断（specs/22 §1-2）を記録した decision record だけを、ファイル単位の literal path で載せる。
+# docs/project_memory/decisions/ 全体は載せないので、技術的な decision record は CEO review の対象外のままとする。
+# 何に人の承認が要るかの正本は approval_rules.md / specs/22 であり、ここでは定義しない。
+# 新しい CEO 判断を記録するときは、その path をここへ追加する変更を同じ PR に含める（その追加も code-owner review を受ける）。
+docs/project_memory/decisions/harness_pivot_assessment_2026_10_28.md @kamikaze-investor
+
 # Meta Review 自身（required check のコードと判定契約）
 apps/worker/src/metaReviewer/ @kamikaze-investor
 packages/shared/src/types/meta_review.ts @kamikaze-investor
