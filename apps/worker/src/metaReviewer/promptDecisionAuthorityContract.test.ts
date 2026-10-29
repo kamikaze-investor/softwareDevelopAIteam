@@ -266,6 +266,104 @@ describe('Meta Reviewer 判定契約 — Approval Tuple を実際に変える A 
   })
 })
 
+/**
+ * containment / quarantine の分類変更（2026-10-29 CEO 判断）。
+ * 「quarantine に入る条件を変えた」だけで DA (2)(b) の縮小とせず、かといって quarantine 関連の変更を
+ * 一律に B ともしない。後始末の成功・整合検査の維持・unsafe / uncertain な結果の fail closed を
+ * 差分とテストで示せた場合だけ B で、示せなければ A、弱体化なら A + blocked。
+ */
+describe('Meta Reviewer 判定契約 — containment / quarantine の分類変更は条件付きでのみ B', () => {
+  const CLAUSE_HEADING = '**containment / quarantine の分類を変える差分**'
+  const clause = (() => {
+    const start = prompt.indexOf(CLAUSE_HEADING)
+    expect(start, 'containment clause not found').toBeGreaterThanOrEqual(0)
+    const end = prompt.indexOf('**Approval Tuple を実際に変える変更（A）の出し方', start)
+    expect(end).toBeGreaterThan(start)
+    return prompt.slice(start, end)
+  })()
+  const CHECKLIST_HEADING = '#### containment / quarantine の分類変更'
+  const checklistSection = (() => {
+    const start = checklist.indexOf(CHECKLIST_HEADING)
+    expect(start, 'checklist section not found').toBeGreaterThanOrEqual(0)
+    const rest = checklist.slice(start + CHECKLIST_HEADING.length)
+    const next = rest.search(/\n#{2,4} /)
+    return next === -1 ? rest : rest.slice(0, next)
+  })()
+
+  it('clause は DA (2) 節の中にある', () => {
+    expect(section(prompt, '### DA trigger (2) — Authority / Approval boundary の意味で判定する')).toContain(CLAUSE_HEADING)
+  })
+
+  it('canonical rule の読みは過大でない: R-11 から「それだけでは (b) の変更ではない」に留め、別形の Tuple 変更は確認する', () => {
+    expect(clause).toContain('quarantine に入る条件の変更は、それだけでは Approval Tuple (b) の変更ではない')
+    expect(clause).toContain('差分が人の承認を要する action・その effect を別の形で変えていないかは、他の Tuple 変更と同じく確認する')
+    expect(clause).toContain('`approval_rules.md` R-11')
+    expect(clause).toContain('`specs/22` §1-3')
+    expect(clause).toContain('`specs/22` §1-7')
+    expect(clause).toContain('この boundary を弱める差分は `specs/22` §1-2 の Human Decision Authority である')
+    expect(clause).toContain('強化か弱体化かを信頼できる形で示せない場合は A に倒す')
+    // 「quarantine は人の承認ではない」という断定や、DA (1) への固定ラベルに戻っていない
+    expect(clause).not.toContain('Approval Tuple (b) の「人の承認」ではない')
+    expect(clause).not.toContain('Human Decision Authority（DA (1)）')
+  })
+
+  it('B は 1〜6 のすべてを reviewer 自身が確かめた場合に限られ、DA (2) の B 要件も適用する', () => {
+    expect(clause).toContain('次の 1〜6 のすべてを reviewer 自身が差分・既存コード・テストから確かめられた場合に限って')
+    expect(clause).toContain('PR 説明・commit message・コメントの自己申告は根拠にしない')
+    expect(clause).toContain('上の「B とするには」の要件（production の全 path 確認・production entrypoint からの invariant test・missing / unknown の fail closed）もそのまま適用する')
+  })
+
+  // 各条件の「守る側の後半」まで固定する（前半だけだと、fail closed の部分を消してもテストが通ってしまう）
+  it.each([
+    ['1: 後始末成功の生成箇所と入力', 'reviewer は、その結果を作る production の全箇所と、後始末の成功を決める全入力をたどる'],
+    ['1: 証拠の結びつきと出どころ', '後始末成功の証拠は、その実行（その cgroup）に機械的に結びつき、必要な観測がすべて成功した後にだけ作られていなければならない'],
+    ['1: 足りない証拠', '欠けた・壊れた・呼び出し元が渡した・mock だけの証拠では足りない'],
+    ['1: 対象外の結果', '後始末の成功を観測で裏付けられない結果は対象にしない（drain timeout・削除失敗・kill / events / placement / spawn の失敗・containment 不可・未知の結果）'],
+    ['1: 成功の定義の変更', '後始末成功の定義や判定を変える差分は、それ自体が production の全 path で同じ不変条件を満たすことを示さなければならない'],
+    ['2: 整合検査の失敗は quarantine', 'その検査の失敗は従来どおり quarantine になる'],
+    ['2: entrypoint からの注入', '検査の失敗を production entrypoint から注入し、quarantine（blocked・所有権保持）の記録に至ることをテストで示している。helper を直接呼ぶだけのテストでは足りない'],
+    ['3: 他の結果と未知の結果', '他の unsafe / uncertain な結果は、従来どおり quarantine（fail closed）のままである。将来追加される未知の結果も quarantine に倒れる。これを結果ごとのテストで示している'],
+    ['3: 汎用 safe 判定', '汎用の safe 判定（例: `SAFE_OUTCOMES`）を広げる差分はこれに当たらない'],
+    ['4: 成功にしない', '4. 移した結果を成功として扱わない（コマンドの結果が不明なら失敗とする）'],
+    ['5: quarantine に残るものの扱い', 'quarantine に残る結果・行について、次が変わっていない: 解除条件（clear-quarantine の再検証）、Human Resume / abort / Human Recovery の拒否、新規 claim の拒否、workspace 所有権の保持'],
+    ['5: 免れてよいもの', 'quarantine に入らなくなってよいのは、1〜4 で示した結果だけである'],
+    ['6: 呼び出し元ごと', '他の呼び出し元も変える場合は、呼び出し元ごとに 1〜5 を示している'],
+  ])('条件 %s', (_label, sentence) => {
+    expect(clause).toContain(sentence)
+  })
+
+  it('証拠不足は A、実際の違反による弱体化は A + blocked。例は網羅ではない', () => {
+    expect(clause).toContain('証拠が足りないだけで弱体化は示されていない場合は A（`requiresCeoApproval: true`）とする')
+    expect(clause).toContain('1〜6 への違反が差分に実際にあり、それによって次のどれかが起きる場合は Safety boundary の弱体化であり、意図・説明にかかわらず A + `blocked` とする')
+    expect(clause).toContain('- unsafe・uncertain・整合検査に失敗した・未知の結果が quarantine を免れる')
+    expect(clause).toContain('- 結果が不明なものを成功として扱う')
+    expect(clause).toContain('- 1〜4 を満たさないことが示された結果・呼び出し元へ例外を広げる（証拠が足りないだけの場合は A であり、ここには当たらない）')
+    expect(clause).toContain('例（網羅ではない）')
+    expect(clause).toContain('整合検査の失敗を通常の failed に変える差分')
+    expect(clause).toContain('dirty な workspace のまま解除を認める差分')
+    expect(clause).toContain('解除条件を緩める差分')
+  })
+
+  it('clause は quarantine 関連を一律 B にする文を持たない', () => {
+    expect(clause).not.toMatch(/quarantine[^\n。]*は(すべて|一律|常に)\s*B/)
+  })
+
+  it('checklist も同じ意味で、条件 1〜6 と A / A + blocked の区別を持つ', () => {
+    expect(checklistSection).toContain('人の承認を要する action・effect を別の形で変えていないかは確認した')
+    expect(checklistSection).toContain('「quarantine に関わる変更」をまとめて B ともしていない')
+    expect(checklistSection).toContain('以下 1〜6 をすべて自分で差分・既存コード・テストから確かめた場合だけ B とした（DA (2) の B の要件も適用した）')
+    expect(checklistSection).toContain('後始末成功を決める全入力をたどった')
+    expect(checklistSection).toContain('欠けた・壊れた・呼び出し元が渡した・mock だけの証拠では足りない')
+    expect(checklistSection).toContain('production entrypoint から失敗を注入し、quarantine の記録に至るテストがある')
+    expect(checklistSection).toContain('他の unsafe / uncertain な結果と未知の結果は quarantine のままである')
+    expect(checklistSection).toContain('4: 移した結果を成功として扱わない')
+    expect(checklistSection).toContain('quarantine に残る結果・行について、解除条件・Human Resume / abort / Human Recovery の拒否・新規 claim の拒否・workspace 所有権の保持が変わっていない')
+    expect(checklistSection).toContain('呼び出し元ごとに 1〜5 を満たしている')
+    expect(checklistSection).toContain('証拠が足りないだけなら A とした')
+    expect(checklistSection).toContain('1〜4 を満たさないことが示された結果・呼び出し元へ例外を広げる場合は A + blocked とした（証拠不足だけなら A。例は網羅ではない）')
+  })
+})
+
 describe('Meta Reviewer 判定契約 — DA (2) の rule は実際に model へ渡る prompt に全文入る', () => {
   it.each([
     ['apps/api/src/designReview/resumeActor.ts'],
