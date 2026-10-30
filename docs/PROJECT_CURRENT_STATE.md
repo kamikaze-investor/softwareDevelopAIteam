@@ -354,6 +354,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Design Review runner が本番経路でのみ 120s timeout する（Root Cause 未確定）**（state: planned）
 - **Review provider が枯渇したとき、別 provider へ正式に再審査を依頼できるようにする**（state: planned）
 - **traversal / loop に termination guarantee があるかの横断監査（read-only）**（state: planned）
+- **cheap AI（OpenCode CLI）経路が provider のエラー本文を捨て、audit に「exit code 1」しか残らない**（state: planned）
 - **#409 が除いた「最初の `{` から最後の `}`」JSON 抽出が、#406 の materiality parser で再導入され M5 の recall を黙って下げる**（state: planned）
 - **CODEOWNERS 対象 PR にだけ Code Owner 承認を必須にする（`Code Owner Approval` required check）**（state: in_progress）
 - **Stage 0: Meta Review を base（default branch）のコードで実行し、required check の source を固定する**（state: in_progress）

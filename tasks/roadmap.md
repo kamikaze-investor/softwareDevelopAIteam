@@ -10445,6 +10445,33 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       **再評価（`observation-closes-loop`）**: 3 回目の監査記録に「仕組みの評価」節を置き、
       発火回数・finding の採用率（false positive）・escaped・コストから、継続 / 発火条件の変更 / 集計 script の要否 / 廃止を決める。
 
+<!-- roadmap:id=cheap-ai-provider-error-dropped state=planned -->
+0. [ ] **cheap AI（OpenCode CLI）経路が provider のエラー本文を捨て、audit に「exit code 1」しか残らない** —
+      2026-10-30登録（Cross-Task Drift Audit `cross_task_audit_2026_10_30.md` の `xta-67f9f35-03`・`04`。PL が実行で再現済み）。
+
+      **確認された事実**:
+      - OpenCode CLI は provider のエラーを stdout の JSON event（`{"type":"error",...}`）として出し、stderr は空のまま exit 1 する
+        （2026-10-30 Production の HTTP 410 `mimo-v2.5` 廃止。#446 の commit message に実測あり）
+      - `runOpenCodeCli()`（`apps/api/src/aiExplain/cheapAiClient.ts`）は exit≠0 のとき stderr だけから message を作り、stdout を見ない。
+        exit 0 でも、text event が無ければ `parseOpenCodeOutput()` が error event を読まずに "did not contain text" を返す
+      - 2026-10-30 PL 実行（spawn mock、window head `1a8a63c1`）: stdout に 410 の error event・stderr 空で
+        exit 1 → `OpenCode CLI failed with exit code 1`、exit 0 → `OpenCode CLI response did not contain text`。どちらも 410 が消える
+      - そのため PL adoption の `diagnosis_failed` audit、承認説明の失敗のどちらにも原因が残らず、2026-10-30 は人が CLI を手で叩くまで
+        原因が分からなかった。2026-10-23 にも同じ見え方が 10 件あった（provider 側の原因）
+      - 同じ「provider の原文を失敗理由に残す」扱いは Design Review 経路には既にある（`ce9df9b` の stderr 保持。
+        `provider-outage-burns-attempt-budget` の実測はこれで原因が残った）。cheap AI 経路だけに乗っていない
+
+      **方向（着手時に反証する）**: `cheapAiClient.ts` の中だけで、exit≠0 のとき、および text が無いときに、stdout の error event の
+      本文を既存の `redactApiKey()` を通し、長さを切って `CheapAiAttemptError` の message に足す。**retry の分類（`non_retryable`）・
+      通知（`executionLoop.ts` の `STRUCTURED_AUDIT_FIELDS` で自由文を通知へ流さない）・adoption の fingerprint は変えない**。
+      原文が残るのは audit だけで、通知は今と同じ。
+
+      **Acceptance Criteria**: stdout に error event・stderr 空・exit 1 の CLI で、message に provider の本文が入る（API key は `[REDACTED]`）/
+      exit 0・text 無し・error event ありでも同じ / 既存の stderr のテスト（exit 2 + stderr）はそのまま通る / 修正前に新テストが落ちることを確認する。
+
+      **やらないこと**: 新しい failure class・status・retry・監視・常時 probe。model id を設定化すること（`role-model-registry` の責務）。
+      通知文面の変更。`provider-outage-burns-attempt-budget`（予算の数え方）との統合。
+
 <!-- roadmap:id=materiality-parser-greedy-json-reintroduced state=planned -->
 0. [ ] **#409 が除いた「最初の `{` から最後の `}`」JSON 抽出が、#406 の materiality parser で再導入され M5 の recall を黙って下げる** —
       2026-10-26登録（Cross-Task Drift Audit `cross_task_audit_2026_10_26b.md` の `xta-97567fd-01`・`02`。PL が実行で再現済み）。
