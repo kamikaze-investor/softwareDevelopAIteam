@@ -6,6 +6,9 @@ import {
   callGeminiWithUsage,
   emptyUsage,
   classifyApiError,
+  codexArgs,
+  cliEnv,
+  CLI_ARG_PATTERN,
   correctnessFlags,
   DETECTOR_MAX_OUTPUT_TOKENS,
   promptVersion,
@@ -313,4 +316,35 @@ it('client 側の request timeout は、最小間隔と足しても既定の観�
 
 it('detector の出力上限は thinking を含めても JSON が切れない大きさ（live の 8192 より大きい）', () => {
   expect(DETECTOR_MAX_OUTPUT_TOKENS).toBeGreaterThan(8192)
+})
+
+it.each([
+  ["codex: You've hit your usage limit. Try again later", 'quota'],
+  ['claude: Not logged in · Please run /login', 'auth'],
+  ["codex: The 'gpt-5.5' model is not supported when using Codex with a ChatGPT account.", 'auth'],
+  ['codex: tool use refused (2 items)', 'policy'],
+  ['claude: tool use refused (1 denials)', 'policy'],
+])('CLI provider の停止対象エラー: %s → %s', (message, errorClass) => {
+  expect(classifyApiError(message).errorClass).toBe(errorClass)
+})
+
+it('Codex は user config・rules を読まず、tool 系 feature を切り、sandbox を緩める flag を持たない', () => {
+  const args = codexArgs('gpt-5.6-sol', 'medium')
+  expect(args).toEqual(expect.arrayContaining(['--ignore-user-config', '--ignore-rules', '--ephemeral']))
+  expect(args[args.indexOf('--sandbox') + 1]).toBe('read-only')
+  for (const f of ['shell_tool', 'apps', 'plugins', 'browser_use', 'computer_use']) expect(args.join(' ')).toContain(`--disable ${f}`)
+  expect(args.some((x) => /dangerously|bypass|full-access|workspace-write/.test(x))).toBe(false)
+})
+
+it.each(['gpt-5.6-sol', 'claude-sonnet-5-5', 'medium'])('CLI に渡す値として %s を許す', (v) => {
+  expect(CLI_ARG_PATTERN.test(v)).toBe(true)
+})
+
+it.each(['--dangerously-bypass-approvals-and-sandbox', 'x" -c sandbox_mode=danger-full-access', 'a b', ''])('CLI に渡す値として %s を拒む', (v) => {
+  expect(CLI_ARG_PATTERN.test(v)).toBe(false)
+})
+
+it('CLI の子 process には allowlist の環境変数だけを渡し、他の credential を継がせない', () => {
+  const env = cliEnv({ PATH: '/bin', USERPROFILE: 'C:/u', GEMINI_API_KEY: 'k', GITHUB_TOKEN: 't', OPENAI_API_KEY: 'o', ANTHROPIC_API_KEY: 'a' })
+  expect(env).toEqual({ PATH: '/bin', USERPROFILE: 'C:/u' })
 })

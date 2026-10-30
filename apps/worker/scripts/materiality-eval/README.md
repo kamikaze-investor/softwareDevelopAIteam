@@ -27,3 +27,27 @@ The workflow file is **not part of this directory**. The AI bot's GitHub token d
 - waiting while a Meta Review run is queued or in progress.
 
 The API key reaches only the detect step. It never appears in logs, artifacts or results.
+
+## Model comparison (local CLI providers)
+
+`detect --provider codex|claude` sends the same prompts, diffs and record excerpts to another model through an existing local login. It is used only for offline model comparison and is run by an operator on their own machine. CI and `materiality-eval.yml` never pass `--provider`, so they always use Gemini.
+
+```bash
+# from apps/worker; frame.json and mutants.json copied into OUT first
+tsx scripts/designMaterialityEval.ts detect --provider codex --model gpt-5.6-sol --effort medium \
+  --repo <repo> --out <OUT> --items scripts/materiality-eval/compare-items-2026-10-27.json --max-calls 150 --min-interval-ms 20000
+CLAUDE_CLI=<path to claude executable> tsx scripts/designMaterialityEval.ts detect --provider claude --model claude-sonnet-5-5 \
+  --repo <repo> --out <OUT> --items scripts/materiality-eval/compare-items-2026-10-27.json --max-calls 150 --min-interval-ms 20000
+```
+
+**Isolation.** The prompt carries repository diffs, which are untrusted text:
+- **Working directory:** each CLI runs in an empty temporary directory.
+- **Environment:** the child process gets an allowlisted environment, so other credentials are not inherited.
+- **Codex:** `--ignore-user-config --ignore-rules --sandbox read-only --ephemeral`, with shell, apps, plugins, browser and computer use disabled.
+- **Claude:** `--tools "" --strict-mcp-config --disable-slash-commands --no-session-persistence` and a neutral system prompt.
+- **Stopping:** any tool use or permission denial discards the response and stops the run (`policy`). A nonzero exit is an error. Quota and auth stop the run as for Gemini.
+
+**Data.**
+- `compare-items-2026-10-27.json`: the 70 items.
+- `model-compare-2026-10-28.json`: the scoring fields of every observation, for all three models.
+- Results: `docs/project_memory/decisions/meta_review_model_comparison_2026_10_28.md`.

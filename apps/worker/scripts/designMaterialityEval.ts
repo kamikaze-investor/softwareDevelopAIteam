@@ -19,7 +19,7 @@
  *   score   --labels <labels.json>        重み付き recall / precision / routine flag rate（bootstrap 95% CI）と再現性を report.json に書く
  */
 
-import { execFileSync } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -305,6 +305,10 @@ export interface DetectionRecord {
   usage?: TokenUsage
   /** API の失敗。検出結果（observation）とは別に記録し、unavailable が API 側か応答の形かを後で分ける */
   apiErrors: ApiErrorRecord[]
+  /** CLI provider が tool（command 実行・権限拒否）を使った回数。0 でなければ入力条件が他 provider と違う */
+  cliToolUses?: number
+  /** CLI が返した API 換算費用（Claude のみ。subscription では実請求ではない） */
+  costUsd?: number
   observation: MaterialityObservation
 }
 
@@ -412,6 +416,107 @@ export async function yieldToWorkflow(
   }
 }
 
+export type ProviderKind = 'gemini' | 'codex' | 'claude'
+
+/** CLI provider の request timeout（agent CLI は REST より遅い）。detect の観測待機上限もこれに合わせる */
+export const CLI_REQUEST_TIMEOUT_MS = 300_000
+
+/** 比較のため、どの provider にも同じ prompt 本文を stdin で渡す。CLI は空の作業ディレクトリで動かし、repo を読ませない */
+export interface CliCallResult { text: string; usage: TokenUsage; toolUses: number; costUsd: number | null }
+
+/**
+ * CLI に渡す環境変数。OS・login の解決に要るものだけにし、GEMINI_API_KEY・GITHUB_TOKEN など
+ * 他の credential を子 process へ継がせない
+ */
+export const CLI_ENV_ALLOWLIST = ['PATH', 'Path', 'PATHEXT', 'SystemRoot', 'SYSTEMROOT', 'WINDIR', 'ComSpec', 'TEMP', 'TMP', 'TMPDIR',
+  'HOME', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH', 'APPDATA', 'LOCALAPPDATA', 'CODEX_HOME', 'CLAUDE_CONFIG_DIR', 'LANG', 'LC_ALL'] as const
+
+export function cliEnv(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return Object.fromEntries(CLI_ENV_ALLOWLIST.flatMap((k) => source[k] === undefined ? [] : [[k, source[k]]]))
+}
+
+function runCli(command: string, args: string[], prompt: string, timeoutMs: number): Promise<{ stdout: string; code: number | null }> {
+  return new Promise((resolve, reject) => {
+    const cwd = mkdtempSync(path.join(tmpdir(), 'materiality-cli-'))
+    const child = spawn(command, args, { cwd, env: cliEnv(), stdio: ['pipe', 'pipe', 'ignore'], windowsHide: true })
+    let stdout = ''
+    const timer = setTimeout(() => { child.kill(); reject(new Error(`timeout after ${timeoutMs} ms`)) }, timeoutMs)
+    child.stdout.on('data', (d) => { stdout += d })
+    child.on('error', (e) => { clearTimeout(timer); reject(e) })
+    child.on('close', (code) => {
+      clearTimeout(timer)
+      try { rmSync(cwd, { recursive: true, force: true }) } catch { /* 片付けの失敗は結果に影響しない */ }
+      resolve({ stdout, code })
+    })
+    child.stdin.end(prompt)
+  })
+}
+
+/**
+ * prompt には repo の diff（信頼できない入力）が入る。read-only sandbox は shell の書き込みしか止めず、
+ * 読み取り・MCP app・plugin・browser・computer use は残るので、user config を読まず tool 系 feature を切る。
+ * それでも tool を使った応答は捨てて run を止める（下の CLI_TOOL_USE_REFUSED）
+ */
+export const CODEX_DISABLED_FEATURES = ['shell_tool', 'apps', 'plugins', 'browser_use', 'browser_use_external', 'computer_use', 'in_app_browser', 'multi_agent', 'image_generation', 'goals'] as const
+
+export function codexArgs(model: string, effort: string): string[] {
+  return ['exec', '--ignore-user-config', '--ignore-rules', '--sandbox', 'read-only', '--skip-git-repo-check', '--ephemeral',
+    ...CODEX_DISABLED_FEATURES.flatMap((f) => ['--disable', f]),
+    '-m', model, '-c', `model_reasoning_effort=${effort}`, '--json', '-']
+}
+
+/** tool を使った CLI 応答は比較条件を満たさず、信頼できない入力に動かされた可能性もあるので捨てる */
+export const CLI_TOOL_USE_REFUSED = 'tool use refused'
+
+/** CLI に渡す model・effort は operator 指定でも英数字と . _ - だけ（argv・-c 値への混入を防ぐ） */
+export const CLI_ARG_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/
+
+/** Codex CLI（既存の ChatGPT login）。実行ファイルは npm の global install に固定する */
+export async function callCodexWithUsage(prompt: string, model: string, effort: string, timeoutMs = CLI_REQUEST_TIMEOUT_MS): Promise<CliCallResult> {
+  const codexJs = path.join(process.env.APPDATA ?? '', 'npm/node_modules/@openai/codex/bin/codex.js')
+  const { stdout, code } = await runCli(process.execPath, [codexJs, ...codexArgs(model, effort)], prompt, timeoutMs)
+  const events = stdout.split('\n').flatMap((l) => { try { return [JSON.parse(l)] } catch { return [] } })
+  const toolUses = events.filter((e) => e.item && e.item.type !== 'agent_message' && e.item.type !== 'error' && e.item.type !== 'reasoning').length
+  if (toolUses > 0) throw new Error(`codex: ${CLI_TOOL_USE_REFUSED} (${toolUses} items)`)
+  const failed = events.find((e) => e.type === 'turn.failed' || e.type === 'error')
+  if (failed) throw new Error(`codex: ${JSON.stringify(failed).slice(0, 300)}`)
+  if (code !== 0) throw new Error(`codex exited with code ${code}`)
+  const text = [...events].reverse().find((e) => e.item?.type === 'agent_message')?.item?.text
+  if (typeof text !== 'string' || text.length === 0) throw new Error('codex returned no agent message')
+  const u = [...events].reverse().find((e) => e.type === 'turn.completed')?.usage ?? {}
+  const input = Number(u.input_tokens ?? 0)
+  const output = Number(u.output_tokens ?? 0) + Number(u.reasoning_output_tokens ?? 0)
+  return {
+    text,
+    usage: { calls: 1, promptTokens: input, candidatesTokens: Number(u.output_tokens ?? 0), totalTokens: input + output },
+    toolUses,
+    costUsd: null,
+  }
+}
+
+/** Claude Code CLI（既存の subscription login）。tool 無し・session 非保存・MCP 無し・中立な system prompt */
+export async function callClaudeWithUsage(prompt: string, model: string, timeoutMs = CLI_REQUEST_TIMEOUT_MS): Promise<CliCallResult> {
+  const exe = process.env.CLAUDE_CLI
+  if (!exe) throw new Error('CLAUDE_CLI is not configured')
+  const { stdout, code } = await runCli(exe, ['-p', '--output-format', 'json', '--model', model, '--tools', '', '--no-session-persistence',
+    '--strict-mcp-config', '--disable-slash-commands', '--system-prompt', 'Follow the user instructions exactly. Answer only from the text you are given.'], prompt, timeoutMs)
+  let j: Record<string, any>
+  try { j = JSON.parse(stdout) } catch { throw new Error(`claude returned non-JSON output (${stdout.length} chars)`) }
+  const denials = j.permission_denials?.length ?? 0
+  if (denials > 0) throw new Error(`claude: ${CLI_TOOL_USE_REFUSED} (${denials} denials)`)
+  if (j.is_error || typeof j.result !== 'string') throw new Error(`claude: ${String(j.result ?? j.terminal_reason ?? 'error').slice(0, 200)}`)
+  if (code !== 0) throw new Error(`claude exited with code ${code}`)
+  const u = j.usage ?? {}
+  const input = Number(u.input_tokens ?? 0) + Number(u.cache_read_input_tokens ?? 0) + Number(u.cache_creation_input_tokens ?? 0)
+  const output = Number(u.output_tokens ?? 0)
+  return {
+    text: j.result,
+    usage: { calls: 1, promptTokens: input, candidatesTokens: output, totalTokens: input + output },
+    toolUses: denials,
+    costUsd: typeof j.total_cost_usd === 'number' ? j.total_cost_usd : null,
+  }
+}
+
 export interface PromptVersion { detection: string; evaluation: string }
 
 export function promptVersion(instructions: { detection: string; evaluation: string }): PromptVersion {
@@ -419,7 +524,7 @@ export function promptVersion(instructions: { detection: string; evaluation: str
   return { detection: h(instructions.detection), evaluation: h(instructions.evaluation) }
 }
 
-export type ApiErrorClass = 'quota' | 'auth' | 'transient' | 'other'
+export type ApiErrorClass = 'quota' | 'auth' | 'policy' | 'transient' | 'other'
 
 export interface ApiErrorRecord {
   stage: 'detection' | 'evaluation'
@@ -436,8 +541,9 @@ export interface ApiErrorRecord {
 export function classifyApiError(message: string): { errorClass: ApiErrorClass; httpStatus: number | null } {
   const status = message.match(/\[(\d{3})\b/)?.[1] ?? message.match(/\b([45]\d\d)\b/)?.[1]
   const httpStatus = status === undefined ? null : Number(status)
-  if (httpStatus === 429 || httpStatus === 402 || /RESOURCE_EXHAUSTED|quota|billing|credit/i.test(message)) return { errorClass: 'quota', httpStatus }
-  if (httpStatus === 401 || httpStatus === 403 || /API key|PERMISSION_DENIED|UNAUTHENTICATED|GEMINI_API_KEY/i.test(message)) return { errorClass: 'auth', httpStatus }
+  if (httpStatus === 429 || httpStatus === 402 || /RESOURCE_EXHAUSTED|quota|billing|credit|usage limit|rate limit/i.test(message)) return { errorClass: 'quota', httpStatus }
+  if (httpStatus === 401 || httpStatus === 403 || /API key|PERMISSION_DENIED|UNAUTHENTICATED|GEMINI_API_KEY|not logged in|CLAUDE_CLI is not configured|not supported when using Codex/i.test(message)) return { errorClass: 'auth', httpStatus }
+  if (message.includes(CLI_TOOL_USE_REFUSED)) return { errorClass: 'policy', httpStatus }
   if ((httpStatus !== null && httpStatus >= 500) || /timeout|ECONNRESET|ETIMEDOUT|fetch failed|network/i.test(message)) return { errorClass: 'transient', httpStatus }
   return { errorClass: 'other', httpStatus }
 }
@@ -744,11 +850,25 @@ async function main(): Promise<void> {
   }
 
   if (cmd === 'plan' || cmd === 'detect') {
-    const model = process.env.GEMINI_MODEL?.trim() || 'gemini-2.5-flash'
+    // --provider codex|claude は手元の既存 CLI login で動く比較用。既定（gemini）は CI の Meta Review と同じ経路
+    const providerKind = (a.provider ?? 'gemini') as ProviderKind
+    if (!['gemini', 'codex', 'claude'].includes(providerKind)) throw new Error(`unknown provider: ${providerKind}`)
+    const effort = a.effort ?? 'medium'
+    if (providerKind !== 'gemini') {
+      for (const v of [effort, a.model].filter((x): x is string => x !== undefined)) {
+        if (!CLI_ARG_PATTERN.test(v)) throw new Error(`invalid --model/--effort value: ${JSON.stringify(v.slice(0, 64))}`)
+      }
+    }
+    const model = providerKind === 'gemini'
+      ? process.env.GEMINI_MODEL?.trim() || 'gemini-2.5-flash'
+      : `${providerKind}:${a.model ?? (providerKind === 'codex' ? 'gpt-5.6-sol' : 'claude-sonnet-5-5')}${providerKind === 'codex' ? `@${effort}` : ''}`
     const instructions = readInstructions(path.resolve(__dirname, '../../..'))
     const frame = JSON.parse(readFileSync(file('frame.json'), 'utf-8')) as Frame
     const mutants = JSON.parse(readFileSync(file('mutants.json'), 'utf-8')) as Mutant[]
-    const work = buildWorkList(repo, frame, mutants)
+    const allWork = buildWorkList(repo, frame, mutants)
+    // --items <file>: 比較対象を `kind:itemId:run` の一覧に絞る（同じ評価対象を全 provider に渡すため）
+    const only = a.items ? new Set(JSON.parse(readFileSync(a.items, 'utf-8')) as string[]) : undefined
+    const work = only ? allWork.filter((w) => only.has(`${w.kind}:${w.itemId}:${w.run}`)) : allWork
 
     if (cmd === 'plan') {
       // API を呼ばずに、detection prompt の件数と大きさを出す（correctness は候補が出た item だけ・最大で同数）
@@ -776,7 +896,9 @@ async function main(): Promise<void> {
     let calls = 0
     let lastCallAt = 0
     let stopReason: string | undefined
-    let current: { stageIndex: number; apiErrors: ApiErrorRecord[]; promptChars: number; usage: TokenUsage } = { stageIndex: 0, apiErrors: [], promptChars: 0, usage: emptyUsage() }
+    let current: { stageIndex: number; apiErrors: ApiErrorRecord[]; promptChars: number; usage: TokenUsage; toolUses: number; costUsd: number } = { stageIndex: 0, apiErrors: [], promptChars: 0, usage: emptyUsage(), toolUses: 0, costUsd: 0 }
+    const requestTimeoutMs = providerKind === 'gemini' ? PROVIDER_REQUEST_TIMEOUT_MS : CLI_REQUEST_TIMEOUT_MS
+    const bareModel = model.replace(/^(codex|claude):/, '').replace(/@.*$/, '')
     const yieldTo = a['yield-to-workflow']
     // **同時実行1を client 側でも保証する。** provider 呼び出し全体（間隔待ち + request）を1つの in-flight として扱い、
     // 観測が待つのをやめた（timeout）呼び出しが残っていれば、次を始める前に決着を待つ
@@ -798,14 +920,23 @@ async function main(): Promise<void> {
         calls++
         ctx.promptChars += prompt.length
         try {
-          const { text, usage } = await callGeminiWithUsage(prompt, model, { timeoutMs: PROVIDER_REQUEST_TIMEOUT_MS })
-          addUsage(ctx.usage, usage)
-          return text
+          if (providerKind === 'gemini') {
+            const { text, usage } = await callGeminiWithUsage(prompt, model, { timeoutMs: PROVIDER_REQUEST_TIMEOUT_MS })
+            addUsage(ctx.usage, usage)
+            return text
+          }
+          const r = providerKind === 'codex'
+            ? await callCodexWithUsage(prompt, bareModel, effort, CLI_REQUEST_TIMEOUT_MS)
+            : await callClaudeWithUsage(prompt, bareModel, CLI_REQUEST_TIMEOUT_MS)
+          addUsage(ctx.usage, r.usage)
+          ctx.toolUses += r.toolUses
+          if (r.costUsd !== null) ctx.costUsd += r.costUsd
+          return r.text
         } catch (err) {
           const message = sanitizeMessage(err instanceof Error ? err.message : String(err))
           const classified = classifyApiError(message)
           ctx.apiErrors.push({ stage, ...classified, message })
-          if (classified.errorClass === 'quota' || classified.errorClass === 'auth') stopReason = `${classified.errorClass} error at ${stage}`
+          if (classified.errorClass === 'quota' || classified.errorClass === 'auth' || classified.errorClass === 'policy') stopReason = `${classified.errorClass} error at ${stage}`
           throw err
         }
       })()
@@ -813,7 +944,7 @@ async function main(): Promise<void> {
       return run
     }
     // 観測の待機上限は「間隔待ち + request timeout」より長くする（通常の呼び出しを timeout 扱いにしない）
-    const observationTimeoutMs = minIntervalMs + PROVIDER_REQUEST_TIMEOUT_MS + 10_000
+    const observationTimeoutMs = minIntervalMs + requestTimeoutMs + 10_000
     // 再開は **同じ入力**の run だけを済みとみなす（model や prompt を変えて再開すると別の run として足される）
     const done = new Set(existsSync(file('results.jsonl'))
       ? readFileSync(file('results.jsonl'), 'utf-8').split('\n').filter(Boolean).map((l) => {
@@ -834,7 +965,7 @@ async function main(): Promise<void> {
         const y = await yieldToWorkflow(yieldTo, { log: (line) => console.log(line) })
         if (y.waitedMs > 0 || y.reason !== 'idle') console.log(`yield: ${y.reason} after ${Math.round(y.waitedMs / 1000)}s`)
       }
-      current = { stageIndex: 0, apiErrors: [], promptChars: 0, usage: emptyUsage() }
+      current = { stageIndex: 0, apiErrors: [], promptChars: 0, usage: emptyUsage(), toolUses: 0, costUsd: 0 }
       const started = Date.now()
       const observation = await observeDesignMateriality({
         title: w.title, diff: w.diff, records: gitRecordReader(repo, w.base),
@@ -844,6 +975,8 @@ async function main(): Promise<void> {
         itemId: w.itemId, kind: w.kind, run: w.run, model, promptVersion: promptVersion(instructions),
         inputFingerprint: fingerprint, latencyMs: Date.now() - started, promptChars: current.promptChars,
         usage: current.usage, apiErrors: current.apiErrors, observation,
+        ...(providerKind === 'gemini' ? {} : { cliToolUses: current.toolUses }),
+        ...(current.costUsd > 0 ? { costUsd: current.costUsd } : {}),
       }
       // quota / 認証で止まった後に終わった run は検出結果に入れない（API 側の失敗であって「未検出」ではない）
       await inflight.catch(() => undefined)
