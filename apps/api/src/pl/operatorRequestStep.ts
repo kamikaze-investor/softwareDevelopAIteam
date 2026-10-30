@@ -32,14 +32,24 @@
  *
  * `operator/projection.ts` で削った状態だけを渡す（stderr・prompt 等は渡さない）。
  * 回答はそのまま外部へ返るため、渡していない情報は回答にも載らない。
+ * question にはこれに加えて正式 Roadmap ledger の要約（`summarizeRoadmapLedger()`）を渡す。
  */
 
+import { readFileSync } from 'node:fs'
 import type { OperatorRequest, OperatorRequestDisposition, OperatorRequestPlAction } from '@ai-team/shared'
 import type { IStorage } from '../storage/interface'
 import { buildSystemState, type AttentionItem } from '../state/systemState'
 import { requestText } from '../aiExplain/cheapAiClient'
 import { triageBlocked, readLatestDesignReview } from './blockedTriage'
 import { capText, projectAttention, projectLatestDesignReview, projectProjectState } from '../operator/projection'
+import {
+  classifyAdoptionCandidates,
+  countLedgerItemsByState,
+  PL_ADOPTION_CANDIDATE_LIMIT,
+  readAdoptionCandidates,
+  resolveLedgerPath,
+  type PlAdoptionDeps,
+} from './adoptionStep'
 
 /** 回答の token 枠。PL 診断（700）より少し長い（説明文を書くため）。 */
 export const OPERATOR_ANSWER_MAX_TOKENS = 900
@@ -85,6 +95,8 @@ export interface OperatorRequestStepDeps {
    * （ここに渡るのは対象キーだけで、依頼本文は渡らない）。
    */
   actOnTarget: (targetKey: string) => Promise<PlActionOutcome>
+  /** ledger の読み取り。既定は採用経路と同じ `tasks/roadmap.md`（テスト差し替え用）。 */
+  readLedger?: PlAdoptionDeps['readLedger']
   now?: () => string
 }
 
@@ -117,6 +129,17 @@ export const OPERATOR_ANSWER_SYSTEM = [
   '',
   ...SECURITY_RULES,
   '- Do not say that anything was resumed, approved, retried, cleared or changed.',
+  '',
+  'How to read the Roadmap state:',
+  '- projects[].roadmap counts only the Tasks already adopted into the database. isComplete=true means',
+  '  those adopted Tasks are done. It does NOT mean the Roadmap ledger, the Project or its Goal is',
+  '  finished: the Project continues until its Goal is reached.',
+  '- projects[].roadmapLedger is the Roadmap ledger (tasks/roadmap.md): item counts by state, which',
+  '  planned items the PL could adopt next, and which are not available and why. The PL adopts the',
+  '  next item by itself when the Project has no current Task and nothing waits on the CEO; which',
+  '  item it picks is decided at adoption time, so do not promise a specific order.',
+  '- If roadmapLedger is missing or unavailable, say that the open ledger items are unknown. Never',
+  '  conclude that no work remains from isComplete alone.',
   '',
   'What the PL can do on its own, only when the mandatory gates allow it: re-run a stalled',
   'Design Review; resume a stalled task when an ALIGNED Design Review evidence exists;',
@@ -152,10 +175,62 @@ export const OPERATOR_TARGET_SYSTEM = [
   '{"targetKey": "<one candidate targetKey>|null"}',
 ].join('\n')
 
+/**
+ * 正式 Roadmap ledger の要約。`projects[].roadmap`（DB に採用済みの Task だけの集計）しか渡さないと、
+ * Task を消化した直後の `isComplete=true` を PL が「ロードマップ全体が完了」と読む
+ * （2026-10-30 Production 実測: planned 35 件が残るのに「全タスク完了・次は無い」と回答した）。
+ *
+ * 候補の分類は採用経路の `readAdoptionCandidates()` / `classifyAdoptionCandidates()` をそのまま使う。
+ * 新しい判定も state も持たない。読めなければ unavailable とだけ渡す（推測させない）。
+ */
+function summarizeRoadmapLedger(
+  storage: IStorage,
+  projectId: string,
+  readLedger: () => string,
+): Record<string, unknown> {
+  let ledger: string
+  try {
+    ledger = readLedger()
+  } catch {
+    return { unavailable: true }
+  }
+  const itemCountByState = countLedgerItemsByState(ledger)
+  // question は何も書かない。awaiting-promotion の初回検出 audit は採用経路の tick に任せる。
+  const classified = classifyAdoptionCandidates(
+    storage, projectId, readAdoptionCandidates(() => ledger), { recordAudit: false },
+  )
+  const adoptable = classified.filter((candidate) => candidate.kind !== 'not_available')
+  const notAvailable = classified.filter((candidate) => candidate.kind === 'not_available')
+  const lastAdoptionAttempt = storage.auditLog
+    .findByEntity('pl_loop_target', `adopt:${projectId}`)
+    .reduce<{ result: string; createdAt: string } | undefined>(
+      (latest, entry) => (latest === undefined || entry.createdAt > latest.createdAt ? entry : latest),
+      undefined,
+    )
+  return {
+    source: 'tasks/roadmap.md',
+    itemCountByState,
+    plannedItemCount: classified.length,
+    adoptableNowCount: adoptable.length,
+    notAvailableCount: {
+      awaitingPromotion: notAvailable.filter((c) => c.notAvailableReason === 'awaiting_promotion').length,
+      technicalAbortUnchanged: notAvailable.filter((c) => c.notAvailableReason === 'technical_abort_unchanged').length,
+      other: notAvailable.filter((c) => c.notAvailableReason === undefined).length,
+    },
+    adoptableItems: adoptable
+      .slice(0, PL_ADOPTION_CANDIDATE_LIMIT)
+      .map((c) => ({ id: c.id, title: c.title, kind: c.kind, ...(c.highPriority ? { highPriority: true } : {}) })),
+    ...(lastAdoptionAttempt
+      ? { lastAdoptionAttempt: { result: lastAdoptionAttempt.result, at: lastAdoptionAttempt.createdAt } }
+      : {}),
+  }
+}
+
 function buildOperatorContext(
   storage: IStorage,
   request: OperatorRequest,
   deps: OperatorRequestStepDeps,
+  options: { includeRoadmapLedger?: boolean } = {},
 ): { context: unknown; inScopeKeys: Set<string> } {
   const state = buildSystemState(storage, deps.now ? { now: deps.now } : {})
   const task = request.taskId !== undefined ? storage.tasks.findById(request.taskId) : undefined
@@ -189,7 +264,19 @@ function buildOperatorContext(
     totals: state.totals,
     projects: state.projects
       .filter((project) => projectId === undefined || project.id === projectId)
-      .map(projectProjectState),
+      .map((project) => ({
+        ...projectProjectState(project),
+        // ledger は採用先（running な Project）にだけ意味がある。対象選択（request）には渡さない。
+        ...(options.includeRoadmapLedger && project.status === 'running'
+          ? {
+              roadmapLedger: summarizeRoadmapLedger(
+                storage,
+                project.id,
+                deps.readLedger ?? (() => readFileSync(resolveLedgerPath(), 'utf-8')),
+              ),
+            }
+          : {}),
+      })),
     ...(task
       ? {
           task: {
@@ -386,7 +473,7 @@ async function handleQuestion(
 ): Promise<OperatorRequestStepResult> {
   let raw: string
   try {
-    const { context } = buildOperatorContext(storage, request, deps)
+    const { context } = buildOperatorContext(storage, request, deps, { includeRoadmapLedger: true })
     raw = await answerWith(deps, OPERATOR_ANSWER_MAX_TOKENS)(OPERATOR_ANSWER_SYSTEM, buildUserPrompt(context, request.message))
   } catch (error: unknown) {
     return failRequest(storage, request, 'provider_failure', error)

@@ -224,12 +224,14 @@ function hasBoundCandidateGateEvidence(storage: IStorage, taskId: string, source
  *
  * 検出した source completion は既存 audit_log へ一度だけ記録する。分類器と authoritative seam の
  * どちらから呼ばれても、同じ entity id で重複しない。
+ * `recordAudit: false` は観測だけの呼び出し元（Operator の question 回答）用で、判定は同じまま何も書かない。
  */
 export function checkRoadmapCompletionAwaitingPromotion(
   storage: IStorage,
   projectId: string,
   roadmapId: string,
   knownLedgerIds: ReadonlySet<string>,
+  options: { recordAudit?: boolean } = {},
 ): AwaitingPromotionCompletion[] {
   const completions = storage.tasks.findByProjectId(projectId).flatMap((task) => {
     if (
@@ -267,6 +269,7 @@ export function checkRoadmapCompletionAwaitingPromotion(
     }]
   })
 
+  if (options.recordAudit === false) return completions
   for (const completion of completions) {
     const entityId = awaitingPromotionAuditKey(projectId, roadmapId, completion.sourceJobId)
     const alreadyRecorded = storage.auditLog
