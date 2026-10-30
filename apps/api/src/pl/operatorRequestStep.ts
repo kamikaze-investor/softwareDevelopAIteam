@@ -42,9 +42,9 @@ import { buildSystemState, type AttentionItem } from '../state/systemState'
 import { requestText } from '../aiExplain/cheapAiClient'
 import { triageBlocked, readLatestDesignReview } from './blockedTriage'
 import { capText, projectAttention, projectLatestDesignReview, projectProjectState } from '../operator/projection'
-import { getValidRoadmapItems } from '@ai-team/worker/scripts/roadmap/roadmapParser.js'
 import {
   classifyAdoptionCandidates,
+  countLedgerItemsByState,
   PL_ADOPTION_CANDIDATE_LIMIT,
   readAdoptionCandidates,
   resolveLedgerPath,
@@ -194,10 +194,7 @@ function summarizeRoadmapLedger(
   } catch {
     return { unavailable: true }
   }
-  const itemCountByState: Record<string, number> = {}
-  for (const item of getValidRoadmapItems(ledger)) {
-    itemCountByState[item.state] = (itemCountByState[item.state] ?? 0) + 1
-  }
+  const itemCountByState = countLedgerItemsByState(ledger)
   // question は何も書かない。awaiting-promotion の初回検出 audit は採用経路の tick に任せる。
   const classified = classifyAdoptionCandidates(
     storage, projectId, readAdoptionCandidates(() => ledger), { recordAudit: false },

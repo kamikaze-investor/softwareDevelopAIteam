@@ -660,6 +660,15 @@ export function readAdoptionCandidates(
   // **ここでは切らない。** 絞り込みは `selectAdoptionCandidates()` の責務である。
 }
 
+/** ledger 全項目の state 別件数。観測用（Operator の question 回答）。parser 依存はこのファイルに留める。 */
+export function countLedgerItemsByState(ledger: string): Record<string, number> {
+  const counts: Record<string, number> = {}
+  for (const item of getValidRoadmapItems(ledger)) {
+    counts[item.state] = (counts[item.state] ?? 0) + 1
+  }
+  return counts
+}
+
 /**
  * checkbox 行から次の roadmap metadata 行の手前までを本文とみなし、先頭だけ返す。
  *
