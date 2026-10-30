@@ -355,6 +355,8 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Review provider が枯渇したとき、別 provider へ正式に再審査を依頼できるようにする**（state: planned）
 - **traversal / loop に termination guarantee があるかの横断監査（read-only）**（state: planned）
 - **#409 が除いた「最初の `{` から最後の `}`」JSON 抽出が、#406 の materiality parser で再導入され M5 の recall を黙って下げる**（state: planned）
+- **external completion reconcile の「承認が何に効くか」の束縛 predicate が CODEOWNERS に無く、Code Owner 承認なしで弱められる**（state: planned）
+- **Cross-Task Audit の 3 回目評価で提案した発火条件の変更と、`--base` 指定の可視化**（state: planned）
 - **CODEOWNERS 対象 PR にだけ Code Owner 承認を必須にする（`Code Owner Approval` required check）**（state: in_progress）
 - **Stage 0: Meta Review を base（default branch）のコードで実行し、required check の source を固定する**（state: in_progress）
 - **Meta Review が diff に無い記述（PR 説明文だけ）を根拠に BLOCKED と判定する**（state: deferred）
