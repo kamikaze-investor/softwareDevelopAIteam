@@ -480,7 +480,7 @@ describe('著者の独立性 — 自分の却下案を自分で書き直させ�
   it('PL の model 識別子は `cheapAiClient` の設定をそのまま使う（複製しない）', () => {
     // 複製すると PL の model を替えたときに、ここだけ古い値で「分離した」と言い続ける。
     // この値が flagship 候補と一致すれば、その候補は選ばれなくなる。
-    expect(CHEAP_AI_CONFIG.model).toBe('mimo-v2.5')
+    expect(CHEAP_AI_CONFIG.model).toBe('mimo-v2.6-flash')
     expect(FLAGSHIP_REMEDIATION_CANDIDATES.map((c) => c.model)).not.toContain(CHEAP_AI_CONFIG.model)
   })
 

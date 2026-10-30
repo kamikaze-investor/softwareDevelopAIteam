@@ -782,7 +782,7 @@ describe('proposal_unusable — adoption proposal diagnostics', () => {
 
     const result = await runAdoptionStep(storage, projectId, {
       propose: async () => raw,
-      proposerId: 'opencode-go/mimo-v2.5',
+      proposerId: 'opencode-go/mimo-v2.6-flash',
       readLedger: () => LEDGER,
     })
 
@@ -790,7 +790,7 @@ describe('proposal_unusable — adoption proposal diagnostics', () => {
     const [diagnostic] = findProposalDiagnostics(storage, projectId)
     expect(diagnostic).toEqual({
       reason: 'no_json_object_found',
-      proposer: 'opencode-go/mimo-v2.5',
+      proposer: 'opencode-go/mimo-v2.6-flash',
       promptVersion: adoptionPromptVersion(),
       candidateCount: 1,
       followUpCandidateCount: 0,
