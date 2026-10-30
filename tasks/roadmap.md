@@ -7091,6 +7091,8 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
 
    (2026-10-22 roadmap integrity audit: Tier B のみ — (1)(3)(4) の修正点 `apps/worker/src/jobRunner.ts` は protected path（`ALWAYS_FORBIDDEN_PATTERNS`）で、Tier A では採用できない。(2) の `apps/api/src/routes/approvalGate.ts` は CODEOWNERS 対象、(3) の `commitGate.ts` は K-2 で HIGH)
 
+   (2026-10-29 責務アーキテクチャ監査（8e85f68c、read-only。設計承認ではない）: 【確認済み】`evaluateCommitGate()` は `specs/22` 14-3 が git_commit の Safety Evidence として挙げるが、実装は shadow のみで console 出力だけ（`apps/worker/src/jobRunner.ts` 1209-1256 行）であり、shadow と real の比較が永続化されず効果検証できない。本項目 (4) の「既存 `observationLog` へフィールドを足す」に shadow decision・real decision・policy version・差異理由を含め、件数・false allow・false block の終了基準を受入条件に加える。commitGate は削除せず、Decision Authority 判定へ吸収もしない（commit evidence と「誰が決めるか」は別の owner。enforce 化・削除は `specs/22` の CEO 契約に従う）。なお `approvalLevelClassifier` の `runMechanicalGate()`（`gitCommitEvidence.ts` 229 行・`plActionPolicy`）と `safetyAuditor` の `toGateDecision()`（`jobRunner.ts` 2664 行）は live な依存であり、本項目の「未配線」に数えない)
+
 <!-- roadmap:id=allowed-paths-empty-disables-file-change-guard state=planned priority=high -->
 0. [ ] **`allowedPaths` が空配列だと File Change Guard の範囲チェックが丸ごと無効になる** — 2026-09-15 監査（Confirmed / P1。**#212 が close した `task-allowed-paths-not-normalized` とは失敗方向が逆の別 Finding**）。
 
@@ -7166,6 +7168,8 @@ Context Pack 系 2 件は `project-auto-context-pack-wiring` へ吸収した。
 ---
 
 ### 優先度 2: Escalation / recovery / resume
+
+   (2026-10-29 責務アーキテクチャ監査: 【確認済み・同一 Finding】同じ「範囲が宣言されているか」の判定が経路で逆向きになっている。git_commit Safety Evidence は allowedPaths が空なら拒否する（`apps/api/src/gitCommitEvidence.ts` 231 行）が、File Change Guard は全許可する（`fileChangeGuard.ts` 229 行）。また `POST /tasks`・`PATCH /tasks` は allowedPaths を zod 検査だけで受理し、adoption の範囲検査（`assertAdoptionScopeIsBounded`）を通らない（`apps/api/src/routes/tasks.ts` 115-138 行）。新規 id は作らず、受入条件に「Task 作成・更新経路から来た空・無制限の allowedPaths も implement Job に届かない」を加える)
 
 <!-- roadmap:id=pl-escalation-recorded-without-delivery state=done priority=high -->
 0. [x] **PL Escalation の配達結果が記録されず、配達済み・未配達・意図的抑制を区別できない** — 2026-09-15 監査（Confirmed / P1相当。2026-09-15 master で再確認済み）。
@@ -10212,6 +10216,10 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       `pnpm` と `@github/copilot` だけ）。`agy is not available on PATH` は CI では
       設計どおりの skip であって drift ではない —— `agy` は VPS 側の CLI である。
 
+      (2026-10-29 責務アーキテクチャ監査: 「一時障害や attempt の誤消費を判断と取り違える」同系統の欠陥として本項目で扱い、受入条件に次の 2 点を加える。Gate の強さは変えない。
+      - 【確認済み】Meta Review は provider 障害時の結果に `requiresCeoApproval: true` を立て（`apps/worker/src/metaReviewer/autoReview.ts` 384 行）、旧 workflow は「CEO判断が必要です」と表示する（`meta-review.yml` 121-123 行）。インフラ障害は Decision Authority の問いではない（`specs/22` 1-3）。技術的な failure / blocked は維持し、CEO 判断の表示だけを外す。**Meta Review のコードに触れるため、Stage 0b/0c（`meta-review-base-run`）の完了前には着手・merge しない**
+      - 【確認済み】technical resume の budget key が Job 単位なので、successor ができるたびにリセットされる（`apps/api/src/pl/technicalResumePolicy.ts` 145 行）。lineage 単位で数える)
+
 <!-- roadmap:id=design-review-runner-production-timeout state=planned -->
 2. [ ] **Design Review runner が本番経路でのみ 120s timeout する（Root Cause 未確定）** — 2026-09-14登録。
       **盲目的に re-kick しないこと**（CEO 指示）。
@@ -10506,6 +10514,8 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       あわせて評価中の head 移動・同一 SHA の直列化・`dir/*` の照合を修正。
 
       **やらないこと**: `required_approving_review_count` の変更（Option A・通常 PR に承認を追加する）。新しい Approval 経路。
+
+      (2026-10-29 責務アーキテクチャ監査: 本項目の範囲と完了条件は変えない。Stage 0 完了後のフォローとして記録するだけである。【確認済み】CODEOWNERS の解釈が 2 実装ある。`apps/worker/src/metaReviewer/autoReview.ts` 103-164 行は literal pattern しか扱わず、glob に当たると undefined（fail-closed）を返し、rename の旧名を見ない。`.github/scripts/codeowners.mjs` 39-90 行は glob・last-match-wins・rename の旧名に対応している。同じ外部契約の解釈を codeowners.mjs 側の規則へ一本化する。**Stage 0b/0c の完了前には着手・merge しない**)
 
 <!-- roadmap:id=meta-review-base-run state=in_progress -->
 0. [~] **Stage 0: Meta Review を base（default branch）のコードで実行し、required check の source を固定する** —
@@ -11804,6 +11814,8 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
 
       **やらないこと**: 新しい status / Gate / budget 定数の追加。予算上限の値の変更。
 
+      (2026-10-29 責務アーキテクチャ監査: 【確認済み・責務混在】PL の `handleTarget`（`apps/api/src/pl/executionLoop.ts` 1918-2225 行）は、triage・技術 abort・attempt budget・LLM 診断・gate・実行・検証・escalate を 1 つの関数で行い、triage が 1 tick に 3〜4 回走る（1843・1951・2022 行と、608 行経由の 488 行）。CONFLICT の `job_blocked` / `job_failed` は remediation に分類されるが（`blockedTriage.ts` 794-811 行）、remediation は `task_ready_without_job` にしか配線されていない（`executionLoop.ts` 1943 行）。それでも escalate の文面は「remediation で解決しなかった」と述べる（737-742 行）。これらを本項目の owner 分割の対象に含める。triage を 1 回にまとめる部分は `blocked-triage-technical-lane`（M6）と整合させる)
+
 <!-- roadmap:id=remediation-attempt-admission-not-atomic state=deferred -->
 5. [ ] **Remediation の試行受付が原子的でない（複数 API プロセス前提でのみ問題になる）** —
       2026-09-18登録（`independent-remediation-design-review-conflict` の Independent Review 指摘）。
@@ -12327,6 +12339,21 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
 
       (2026-10-22 roadmap integrity audit: in_progress のまま。受入条件「出口の無い停止が残らない」は `b8d0fc5d` の形（最新 Job が失敗した SafeCommand。`abort-blocked-dirty-baseline-cannot-complete` 参照）で反証されているので、それが解消するまで done にしない)
 
+      (2026-10-29 責務アーキテクチャ監査（8e85f68c、read-only。設計承認ではない）による受入条件・検証条件の補強。行番号は 8e85f68c 時点。新しい workflow / Gate / review 工程 / status は足さない。
+      - 【確認済み → W1】repair admission の検査（scope = allowedPaths・critical finding・review verdict・Design Review blocking）は Task が blocked の経路でしか走らない。pending の Task では、review が rejected や critical でも自動で repair される（`apps/api/src/designReview/repairFlow.ts` 1301-1378 行と 889-1233 行の比較）。受入条件に「repair admission の検査結果が Task status に依存しない」を加える
+      - 【確認済み → W1】quarantine の判定が 7 箇所に複製されている（`repairFlow.ts` 1464、`resumeAdmission.ts` 100、`abortTask.ts` 290 と 392、`routes/jobs.ts` 519、`storage/sqlite.ts` 2529 と 2996、`apps/worker/src/index.ts` 235 行）
+      - 【確認済み → W1・REJECT の出口】git_commit REJECT の判定が 3 実装あり、たどる hop の深さが違う。`sqlite.ts` は検出を 1 hop、解決を多 hop でたどる（2255・2274-2312 行）。ほかの 2 実装は `blockedTriage.ts` 407-459 行と `linkedGitCommitRejection.ts` 20 行
+      - 【確認済み → W2】REVIEW_UNAVAILABLE（再計算できない場合を含む）の解釈が 4 通りある（`designReviewCoordinator.ts` 934、`repairFlow.ts` 765 と 846、`terminalRepairEscalationRecovery.ts` 69、`remediationStep.ts` 619 行）
+      - 【確認済み → W2】`POST /design-review-evidence` は呼び出し側が送った decision を recompute せずに保存する（`routes/designReviewEvidence.ts` 22-43 行）。split mode では ADMIN 限定で、手動 CLI（`apps/worker/scripts/designReview.ts`）の正式な経路でもある。すぐには削除しない。completed run の runId を受け取り、server が decision を導出する形へ移す。free-form の writer は、legacy の手動行の互換規則を決め、全 consumer を切り替えた後で外す
+      - 【確認済み → W2】`POST /reviews` は Job 種別も一意性も検査しない（`routes/reviews.ts` 68-77 行）。そのため 1 件余計に入るだけで git_commit evidence が fail-closed になる（`gitCommitEvidence.ts` 258-260 行）
+      - 【確認済み → W2】同じ設計が CONFLICT から ALIGNED へ判定し直された場合、implement Job の gate はそれを受け入れ、判定の逆転は commit の時にしか検出されない（`designReviewEvidencePolicy.ts` 63-75 行と `gitCommitEvidence.ts` 303-307 行の比較）。CEO への routing をどうするかは M8 の決定待ち
+      - 【確認済み → W4】承認が有効かどうかの判定が route と storage で食い違う。読めない expiresAt を route は有効として扱い（`routes/approvalGate.ts` 635・657 行、`approvalGateLogic.ts` 214 行）、storage は EXPIRED として扱う（`sqlite.ts` 1403 行）。人による承認かどうかも route は見ず、storage が SUPERSEDE する（`approvalGateLogic.ts` 284-288 行と `sqlite.ts` 5438 行の比較）。canonical な述語は全経路で fail-closed にする
+      - 【確認済み → W3】Worker の `resolvePolicy` は API が返した `block_until_approved` を `continue_safe_work_only` に上書きし、その結果として承認待ちの通知を出さない（`apps/worker/src/guards/gatePolicy.ts` 147-160 行、`jobRunner.ts` 626 行）
+      - 【確認済み → W1・W5】`failContinuation` は Task を blocked に直接書き込み、escalate の owner を通らない（`ctoAi/taskContinuation.ts` 85 行）。escalation の dedup key も経路ごとに違う（`state/systemState.ts` 710 と 757、`pl/executionLoop.ts` 482、`sqlite.ts` 1626 行）
+      - 【確認済み → W1】Worker は API が再開できるかを推測して failed か blocked かを選び、その値を API が上書きする（`apps/worker/src/jobRunner.ts` 517・1858-1861 行、`routes/jobs.ts` 882-898 行）
+      **検証条件（重複を整理する前に満たすこと）**: 重複した判定を 1 つにまとめる前に、各経路が守っている安全条件（park・quarantine・live Job・人による承認・hop の範囲・fail-closed の向き）を列挙する。そのうえで、統合した後も各経路で同じ条件が成り立つことをテストで固定する。異なる安全条件を 1 つの述語へ潰さない（`canonical-domain-meaning`: distinct meanings kept distinct）。次のものは正当な分散なので統合しない。API と Worker の Job 遷移表（actor と operation が違う）、resume と recover の admission、Worker と API それぞれの startup reconciler、planned allowlist を 3 経路で検査していること（意図的な多層防御）、手動 abort と技術 abort、種類の違う attempt budget
+      **調査項目（修正方針はまだ決めない）**: 汎用の `PATCH /jobs` による requeue は resume admission を通らず、park と Design Review evidence しか見ない（`routes/jobs.ts` 900-980 行）。これが PL の retry 用に意図した別経路なのか、admission の重複・迂回なのかを確認してから扱いを決める。また `parked` は audit log から導出される隠れ状態になっている（`sqlite.ts` 1020-1026 行）。件数と consumer を測ってから判断する)
+
 <!-- roadmap:id=lifecycle-consume-commit-crash-recovery state=deferred -->
 12. [ ] **Approval の consume と `git commit` の間でクラッシュすると、復旧が repair（新しい Approval 要求）にしか無い** —
       2026-10-17登録（Lifecycle 一括修復 `lifecycle-semantic-integrity-batch-repair` と独立監査
@@ -12371,7 +12398,7 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       **やらないこと**: rule の追加・削除（照合方法だけを直す）。
 
 <!-- roadmap:id=da-triggers-345-deterministic-detectors state=deferred -->
-15. [ ] **M3: DA trigger 3/4/5 の決定論的検出（新規依存・外部サービス、新規 public route、不可逆 migration）** —
+15. [ ] **M3: DA trigger 3/4/5 の決定論的検出（(3) 外部 service・有償依存・公開範囲 / route、(4) 個人データ・保持・削除方針、(5) 不可逆変更）** —
       2026-10-17登録（独立監査 M3。`deferred`）。
 
       **確認された事実**: Decision Authority の trigger 3（新規依存または外部サービス）・4（新規 public route）・
@@ -12382,6 +12409,8 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       **順序制約**: **`high-git-commit-pass-on-strengthened-safety-evidence`（M1）より前に着手する。**
 
       **やらないこと**: LLM による判定への置換。新しい Gate。
+
+      (2026-10-29 責務アーキテクチャ監査: 【確認済み・正本との不一致】この項目の見出しは 2026-10-29 に正本の意味へ直した。登録時の見出しは「新規依存・外部サービス、新規 public route、不可逆 migration」だった。上の「確認された事実」は今も trigger 4 を「新規 public route」と書いているが、`specs/22` 14-3 の正本では (3) が「新しい外部 service・有償依存・公開範囲・公開 route」、(4) が「個人データ・保持・削除方針の変更」、(5) が「不可逆（destructive migration・データ削除）」である。つまり個人データ・保持・削除方針の検出がこの計画から抜けていた。着手するときは正本の意味で detector を定義し、public route は (3) に含める。**受入条件**: 正本の (3)(4)(5) それぞれについて、detector・runtime への配線・false-negative と unknown-input のテストが揃うまで完了にしない。検出結果は Meta Review に入力として渡すが、Meta Review の意味判定を置き換えない。完了するまでは既存の path-risk backstop（HIGH/CRITICAL なら人へ）を維持する。ただしこれは未検出の DA 変更を LOW のまま通しうる補助線であり、DA の coverage には数えない。M1 との順序制約は変えない)
 
 <!-- roadmap:id=approval-consume-invariants state=deferred -->
 16. [ ] **M4: Approval consume の不変条件が足りない** —
@@ -12396,6 +12425,8 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       **やらないこと**: 新しい Approval status。
 
       (2026-10-22 roadmap integrity audit: `approval-gate-evidence-not-action-bound` の残り（`approval_gate` を要求する PL action で、Gate 経路の承認を1回限りで消費すること）も本項目が持つ)
+
+      (2026-10-29 責務アーキテクチャ監査: 承認が有効かどうか（期限・状態・人による承認・binding・鮮度）を判定する関数は約 11 箇所にある。例として `resolveEffectiveStatus`、`approvalLiveness.ts` の各述語、`consumeForJob` / `consumeForCommandJob` / `verifyAndConsumeTaskApproval`、`checkApprovalGate`、`approveAndResumeJob` がある。route 側の食い違いは `lifecycle-semantic-integrity-batch-repair` の W4 で扱い、本項目は consume 側の不変条件だけを扱う。【検証項目】consume 時の判定が W4 の canonical 述語と同じ結果を返すことを確かめる)
 
 <!-- roadmap:id=pre-commit-branch-recheck-and-binding-failure state=deferred -->
 17. [ ] **M5: commit 直前に branch を再確認し、resulting-commit binding が失敗したら Task を完了させない** —
@@ -12418,6 +12449,8 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
 
       (2026-10-22 roadmap integrity audit: 「技術的・自動再開なし・CEO 判断なし」の見える停止は既にある: rule 6.8 / 6.9 は T-3 により技術 lane のまま `technical_exhausted` になる（`apps/api/src/pl/blockedTriage.ts` `technicalStop`、`apps/api/src/pl/executionLoop.ts`）。本項目の範囲は残りの rule（provider 汚染・原因不明・review attempt 枯渇）をこの既存の形へ寄せることだけで、6.8 / 6.9 は作り直さない。停止回数は CEO escalation 条件にしない（`specs/22` 14-3）)
 
+      (2026-10-29 責務アーキテクチャ監査: 受入条件の候補として「triage は 1 tick に 1 回だけ走る」を加える。現状は 3〜4 回走っている（`executionLoop.ts` 1843・488・1951・2022 行）。これは `conflict-recovery-judgment-owner-split` と同じ handleTarget の分割に属するため、両者を一緒に設計する)
+
 <!-- roadmap:id=review-disagreement-ceo-routing-decision state=deferred -->
 19. [ ] **M8: レビュー不一致・安全方向の判定不能・Meta Review UNCERTAIN だけを理由に CEO へ回してよいか — 【CEO 判断待ち】** —
       2026-10-17登録（独立監査 M8。`deferred`）。**CEO の決定を待っている。決定前に適用しない。**
@@ -12429,6 +12462,8 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       **関連**: `blocked-triage-technical-lane`（M6）。
 
       (2026-10-22 roadmap integrity audit: 正本で既に決まっている部分: provider 失敗・判定の無い run は不一致ではなく技術扱い（`approval_rules.md` R-7、`specs/22` 1-3）、「Review verdict の不一致が未解消」は DA trigger 7 で CEO 候補（`specs/22` 14-3）。推奨案③を文字どおり適用すると未解消の verdict 不一致まで技術 lane へ移り DA trigger 7 を外すことになるので、その部分は CEO による DA trigger 7 の変更としてだけ扱う。CEO 判断待ちであることは変えない)
+
+      (2026-10-29 責務アーキテクチャ監査: 正本どうしの矛盾として、DA trigger (6)(7) の行き先が文書によって食い違う。`specs/22` 14-3 は「1 件でも当たれば CEO 候補」とし、`docs/meta_reviewer/prompt.md` 230 行は「(6)(7) は blocked」とする。どちらに揃えても CEO が判断する範囲が変わるので、本項目の CEO 判断に含めて扱い、単独では決めない。CEO 判断待ちであることは変えない)
 
 <!-- roadmap:id=reopened-promoted-id-stays-awaiting-promotion state=deferred -->
 20. [ ] **Promotion 済みの roadmap id を `planned` に戻すと、恒久的に「promotion 待ち」のままになる** —
@@ -12519,6 +12554,71 @@ DB へ入れるのは**適用と判定の記録だけ**で、原則の定義（r
       **Tier B のみ**: 対象の多くは protected path（`apps/worker/src/guards/**`、`ALWAYS_FORBIDDEN_PATTERNS`）または
       CODEOWNERS 対象で、Tier A では採用できない。
 
+<!-- roadmap:id=design-review-initial-resume-review-load-blind state=planned -->
+28. [ ] **initial-implement と resume の Design Review は変更ファイルを渡さないので、常に medium・単一 focus で審査され、独立レビューが走らない** —
+      2026-10-29登録（責務アーキテクチャ監査、8e85f68c。【確認済み】）。
+
+      **確認された事実**: `apps/api/src/ctoAi/initialImplementWorkflow.ts` 102 行と `apps/api/src/designReview/resumeBlockedTask.ts` 59 行は、
+      どちらも `changedFiles: []` を渡す。入力が空だと review load は `medium` になり（`apps/worker/src/approvalLevel/reviewLoadClassifier.ts` 43-48 行）、
+      focus は `scope_simplicity` の 1 つだけになる（`apps/worker/src/metaReviewer/focusSelector.ts` 20-29 行）。そのためこの 2 経路では、
+      `strategic_alignment` も、critical のときに走るはずの独立レビューも一度も走らない。一方 repair の Design Review は実際の changed file を使うので
+      （`repairFlow.ts` 1368 行）、同じ Task が経路によって違う深さで審査される。`remediationStep.ts` 557-562 行のコメントは、initial が critical に
+      なりうる前提で書かれている。
+
+      **方向**: Task が宣言している範囲（`allowedPaths` など）を、実際の変更を表す `changedFiles` とは**別の入力**（例: `declaredScopeFiles`）として
+      review load の判定に使う。予定の範囲を実際の変更として装わない。宣言された範囲は load を上げる方向にだけ使い、下げる方向には使わない。
+
+      **受入条件**: 宣言範囲に critical 対象を含む Task では、initial と resume の Design Review が critical として扱われ、独立レビューが走る（テストで固定）。
+      宣言範囲が空の Task の扱いは現状（medium）より弱くならない。review load の分類規則そのものは変えない。新しい Gate・review 工程・status は足さない。
+
+      **関連（重複して実装しない）**: `lifecycle-semantic-integrity-batch-repair` の W2（判定 pipeline）。Tier A か Tier B かは、着手時に対象 path を見て判定する。
+
+<!-- roadmap:id=design-review-shares-meta-review-prompt state=deferred -->
+29. [ ] **runtime の Design Review（low-load 経路）が PR 時の Meta Review の prompt をそのまま使うため、片方を変えるともう片方の判定の意味も変わる** —
+      2026-10-29登録（責務アーキテクチャ監査、8e85f68c。【確認済み】。`deferred`: Stage 0b/0c（`meta-review-base-run`）が完了するまで着手しない）。
+
+      **確認された事実**: `apps/worker/src/metaReviewer/strategicReview.ts` 443 行は、low-load の Design Review で `buildMetaReviewPrompt()` を使う。
+      そのため PR gate 用の規則（`requiresCeoApproval`・Approval Tuple・roadmap 証拠の採否・条件付きルール）が、着手前の設計レビューにも流れ込む。
+      Meta Review に規則を足すと、runtime の Design Review の判定も知らないうちに変わる。同じ `changes_requested` が、CI では SUCCESS
+      （`autoReview.ts` 444-446 行）、Design Review では CONFLICT（`strategicReview.ts` 358-364 行）になる。Design Review 側は `requiresCeoApproval` を
+      計算しているが、API はそれを読んでいない（`apps/api/src` からの参照は 0 件）。
+
+      **方向**: 憲法的な共通部分だけを共有し、PR gate 固有の部分と Design Review 固有の部分を分ける。既存 prompt の分割であり、新しい review 工程は作らない。
+
+      **検証項目（本項目で結論を出す。設計上の問題がないとは前提しない）**: Meta Review の中で、Decision Authority の判定（DA (1)〜(7)・Approval Tuple）と
+      品質レビュー（architecture drift・小さく変更・rollback・テスト・Phase 2 の自由レビュー）の責務が論理的に分かれているかを確かめる。
+      現状は両者が 1 つの `status` を共有しており、品質の指摘による `changes_requested` も、cage / DA による `blocked` も、同じ出力欄から同じ check に写像される。
+      「正本が Meta Review に割り当てている」ことだけを理由に、分離は不要と判定しない。確認する点は次の 4 つ。
+      (a) 出力のどの欄がどの責務の結論を表しているか。
+      (b) 品質の指摘が DA 判定の結果（`requiresCeoApproval`・blocked）を変えうるか。逆向きも確かめる。
+      (c) 片方の規則を変えたとき、もう片方の判定が変わる経路があるか。
+      (d) 決定的に求まる事実（CODEOWNERS の照合・diff 内の secret・M3 の検出結果）を入力として渡せば足りるか。
+      分離が必要だと分かった場合でも、Meta Review の意味判定を置き換えてよいのは、置き換え先が base-run の required check の中で fail-closed に動き、
+      既存の DA fixture に対する parity・false-negative・unknown-input のテストを満たした後だけである。
+
+      **やらないこと**: Meta Review の DA 判定を先に削除・縮小すること。新しい Gate / Review / subsystem。Stage 0b/0c の完了前に着手・merge すること。
+
+<!-- roadmap:id=canonical-doc-wording-contradictions state=deferred -->
+30. [ ] **正本文書どうしの記述の矛盾のうち、既に CEO 承認済みの上位正本へ合わせるだけで済むもの（方針は変えない）** —
+      2026-10-29登録（責務アーキテクチャ監査、8e85f68c。【確認済み】。`deferred`: 対象の多くは CODEOWNERS と DA (1) の面にあるので、
+      Stage 0b/0c が完了するまで着手・merge しない。code-owner review を受ける）。
+
+      **対象（記述を揃えるだけで、Authority も Zone の項目も変えないもの）**:
+      - Review Level 3 を「Human/CEO 確認必須」とする記述（`docs/multi_ai_step_review_flow.md` 446・10・311・322 行、`AGENTS.md` 259 行）。
+        `specs/22` 1-3 と同ファイル 375 行は「High だけを理由に CEO 承認必須にしない」としている。CEO の確認は DA trigger に当たる場合だけ、という書き方に揃える
+      - `specs/00_constitution.md` 3.13 が参照する章番号（「11 / 11-1」と書かれているが、実際は 10 章と 12 章）
+      - `specs/08_permissions.md` に `specs/22` への上位参照がない。参照だけを足し、Zone の項目は変えない（CLAUDE.md の Authority 節によれば、Zone は個別に承認されるまで現行のまま有効）
+      - merge の扱い（`specs/08` 52 行では Green Zone。`AGENTS.md` 113-120 行の条件付き規則を参照する形に揃える）
+      - "Red Zone" という呼び名が 3 つの意味で使われている。範囲は変えずに呼び名だけ区別する
+      - `blocked` について。`AGENTS.md` 360-363 行は「修正方針は CEO が判断する」、`docs/meta_reviewer/prompt.md` 80 行は「CEO の承認では解除しない」としている。
+        「技術的な停止であり、承認では解除されず修正によってだけ解除される。CEO へ報告し、修正方針は CEO が判断する」と両方を併記する。
+        修正方針を AI が決めるように変えるのは方針変更なので、本項目には含めない
+
+      **含めないもの（CEO 判断待ちの方針変更）**: DA trigger (6)(7) の行き先（M8 で扱う）、Yellow Zone の項目の違い、`specs/08` の Decision Rule
+      「Git で戻せない → 人間承認」、constitution 3.15 の CEO 確認リスト、CLAUDE.md の通知条件、constitution 3.16 の改定案。これらは CEO が承認する前に実装タスクにしない。
+
+      **やらないこと**: Zone の項目・CEO が判断する範囲・Gate の変更。
+
 ---
 
-*Updated: 2026-10-22*
+*Updated: 2026-10-29*
