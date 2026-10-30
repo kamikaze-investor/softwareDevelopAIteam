@@ -10494,7 +10494,7 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       **やらないこと**: 束縛の意味（commit + 根拠 digest）の変更。CODEOWNERS 規則そのものの変更。Ruleset の変更。
 
 <!-- roadmap:id=cross-task-audit-trigger-revision state=planned -->
-0. [ ] **Cross-Task Audit の 3 回目評価で決めた発火条件の変更と、`--base` 指定の可視化** —
+0. [ ] **Cross-Task Audit の 3 回目評価で提案した発火条件の変更と、`--base` 指定の可視化** —
       2026-10-28登録（`cross_task_audit_2026_10_28.md` 5 章の判断 2・3・5。`cross-task-drift-audit` の `observation-closes-loop`）。
 
       **確認された事実（3 回分の記録）**:

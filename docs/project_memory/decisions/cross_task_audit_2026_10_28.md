@@ -101,6 +101,11 @@ CLI は `--base` を明示されると chain の head を使わず、警告も�
 
 ### 5-2. 判断
 
+**効力の範囲**: 以下は設計 7 章が 3 回目の記録に求める「仕組みの評価」であり、**この記録で発効するものは無い。**
+`evaluateDue()` の発火条件・`--base` の扱い・設計記録 `cross_task_drift_audit_design.md` は、この PR の後も現行のままである。
+2・3・5 は `cross-task-audit-trigger-revision`（planned）の提案で、効力はその実装 PR が通常の review（CI・Meta Review・該当すれば Code Owner）を
+通ったときにだけ生じる。この監査は何も止めない仕組みで（設計 4・6 章）、Gate policy・Approval Tuple・Decision Authority のどれも変えない。
+
 1. **継続する。** 3 回とも、per-Task review を通った変更の組合せから、確認できる欠陥が出た。false positive は 0、コストは 1 回あたり 1 呼び出し
 2. **発火条件を変える**:
    - authority surface の重複は**発火条件から外し**、packet の情報（authority surface changes 節）としてだけ残す
