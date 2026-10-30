@@ -187,6 +187,91 @@ describe('runPlTick — Operator Request', () => {
     expect(storage.operatorRequests.findById(request.id)?.response).not.toContain('【システム記録】')
   })
 
+  // ── Roadmap ledger（2026-10-30 Production: isComplete=true を「全体完了・次は無い」と回答した）──
+
+  const LEDGER = [
+    '# Roadmap',
+    '',
+    '<!-- roadmap:id=next-item state=planned -->',
+    '1. [ ] **次に採用できる項目** — 本文',
+    '',
+    '<!-- roadmap:id=hold-item state=deferred -->',
+    '2. [ ] **CEO HOLD の項目** — 解除まで着手しない',
+    '',
+    '<!-- roadmap:id=finished-item state=done -->',
+    '3. [x] **完了済みの項目**',
+  ].join(String.fromCharCode(10))
+
+  /** question の回答 prompt に載った observed state を取り出す。 */
+  async function askAndReadContext(ledger: () => string): Promise<{ system: string; context: any }> {
+    ask('question', 'いまロードマップってどんな感じ？ 次は何をやる？')
+    let system = ''
+    let user = ''
+    await runPlTick(storage, deps({
+      readLedger: ledger,
+      answerOperatorRequest: async (s, u) => {
+        system = s
+        user = u
+        return JSON.stringify({ disposition: 'answered', response: 'ok' })
+      },
+    }))
+    const json = user.split('Observed system state (facts you may use):\n')[1]?.split('\n\n<<<OPERATOR_REQUEST')[0] ?? '{}'
+    return { system, context: JSON.parse(json) }
+  }
+
+  it('active Task 1件 done（isComplete=true）でも、ledger に planned が残ることを回答 prompt に渡す', async () => {
+    storage.tasks.update(taskId, { status: 'done' })
+
+    const { system, context } = await askAndReadContext(() => LEDGER)
+    const project = context.projects[0]
+
+    expect(project.roadmap).toEqual({ totalTaskCount: 1, completedTaskCount: 1, isComplete: true })
+    expect(project.roadmapLedger).toMatchObject({
+      source: 'tasks/roadmap.md',
+      itemCountByState: { planned: 1, deferred: 1, done: 1 },
+      plannedItemCount: 1,
+      adoptableNowCount: 1,
+      adoptableItems: [{ id: 'next-item', kind: 'fresh' }],
+    })
+    // HOLD（deferred）は採用可能として渡さない。
+    expect(JSON.stringify(project.roadmapLedger.adoptableItems)).not.toContain('hold-item')
+    // isComplete の意味（DB に採用済みの Task だけ・Goal 達成ではない）を prompt で明示する。
+    expect(system).toContain('isComplete=true means')
+    expect(system).toContain('Never')
+    expect(system).toContain('conclude that no work remains from isComplete alone.')
+  })
+
+  it('ledger 要約を作っても operator_request 以外の audit を書かない', async () => {
+    storage.tasks.update(taskId, { status: 'done' })
+    const before = storage.auditLog.findAll().length
+
+    await askAndReadContext(() => LEDGER)
+
+    // epoch 行は tick 自体が初回に書くもので、ledger 要約とは無関係。
+    expect(storage.auditLog.findAll().slice(before).map((entry) => entry.operation)
+      .filter((operation) => operation !== 'implement_timeout_policy_epoch_started'))
+      .toEqual(['operator_request'])
+  })
+
+  it('ledger の未完了がすべて HOLD なら、採用可能 0 件として渡す（実行可能と誤認させない）', async () => {
+    storage.tasks.update(taskId, { status: 'done' })
+    const holdOnly = LEDGER.replace('id=next-item state=planned', 'id=next-item state=deferred')
+
+    const { context } = await askAndReadContext(() => holdOnly)
+
+    expect(context.projects[0].roadmapLedger).toMatchObject({
+      itemCountByState: { deferred: 2, done: 1 },
+      plannedItemCount: 0,
+      adoptableNowCount: 0,
+      adoptableItems: [],
+    })
+  })
+
+  it('ledger を読めないときは unavailable とだけ渡す（「残作業なし」を推測させない）', async () => {
+    const { context } = await askAndReadContext(() => { throw new Error('ENOENT') })
+    expect(context.projects[0].roadmapLedger).toEqual({ unavailable: true })
+  })
+
   // ── 2 / 7. request が許可される場合 ─────────────────────────
 
   it('[2][7] request: 自律ループと同じ判断経路へ進み、Gate が許せば既存 resume が実行され、その実結果が記録される', async () => {

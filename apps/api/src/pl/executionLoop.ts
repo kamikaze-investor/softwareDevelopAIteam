@@ -1825,6 +1825,7 @@ export async function runPlTick(storage: IStorage, deps: PlLoopDeps = {}): Promi
       describePlLoopStatus: (target) => describePlLoopStatus(storage, target, deps.resumeInstruction),
       targetKeyOf,
       actOnTarget: (targetKey) => actOnOperatorTarget(storage, deps, targetKey),
+      ...(deps.readLedger ? { readLedger: deps.readLedger } : {}),
       ...(deps.now ? { now: deps.now } : {}),
     })
     lastTickHandledOperatorRequest = operatorRequest !== undefined

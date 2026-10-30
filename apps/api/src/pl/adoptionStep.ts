@@ -169,6 +169,8 @@ export function classifyAdoptionCandidates(
   storage: IStorage,
   projectId: string,
   open: readonly RoadmapCandidate[],
+  /** `false` は観測だけの呼び出し元用（awaiting-promotion の初回検出 audit を書かない）。 */
+  options: { recordAudit?: boolean } = {},
 ): ClassifiedCandidate[] {
   const projectTasks = storage.tasks.findByProjectId(projectId)
   const pendingContinuations = storage.taskContinuations.findPendingByProjectId(projectId).length
@@ -211,6 +213,7 @@ export function classifyAdoptionCandidates(
       projectId,
       candidate.id,
       ledgerIds,
+      options,
     )
     if (awaitingPromotion.length > 0) {
       return {

@@ -1281,6 +1281,19 @@ describe('checkRoadmapCompletionAwaitingPromotion — Safety Evidence path（#34
     ])
   })
 
+  it('recordAudit: false は同じ判定を返し、初回検出 audit を書かない（Operator question は観測だけ）', async () => {
+    const { storage, projectId, taskId, sourceJobId } = await withEvidenceCompletion()
+    const auditCount = (): number => storage.auditLog.findAll()
+      .filter((entry) => entry.operation === 'roadmap_completion_awaiting_promotion').length
+
+    expect(checkRoadmapCompletionAwaitingPromotion(storage, projectId, 'first-item', LEDGER_IDS, { recordAudit: false }))
+      .toEqual([{ taskId, sourceJobId, candidateCommitHash: 'candidate-commit' }])
+    expect(auditCount()).toBe(0)
+
+    checkRoadmapCompletionAwaitingPromotion(storage, projectId, 'first-item', LEDGER_IDS)
+    expect(auditCount()).toBe(1)
+  })
+
   it('source Job 自身の bind 済み ALLOW evidence があれば promotion 待ちとして検出し、seam も follow-up を拒否する', async () => {
     const { storage, projectId, taskId, sourceJobId } = await withEvidenceCompletion()
 
