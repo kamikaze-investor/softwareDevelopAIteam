@@ -213,6 +213,9 @@ export const CREATE_TABLES = `
     -- 再開する Job id。retry cooldown 中の PL 待機が「この Job の復旧はこの run 待ち」を
     -- timestamp ではなく同一性で証明するために使う。それ以外（legacy 含む）は NULL。
     resume_source_job_id TEXT,
+    -- 別 provider での正式再審査が指定した provider / model。それ以外の run は NULL（runner 既定）。
+    review_provider TEXT,
+    review_model TEXT,
     FOREIGN KEY (task_id) REFERENCES tasks(id)
   );
 
@@ -494,6 +497,9 @@ export const MIGRATION_STATEMENTS: Array<{ table: string; column: string; defini
   // resume provenance（C3-c）。**nullable・default 無し**。既存行は NULL のまま（推論で backfill しない）
   // で、NULL の run は「resume 元を証明できない」として扱われる。
   { table: 'design_review_runs', column: 'resume_source_job_id', definition: 'TEXT' },
+  // 別 provider での正式再審査の指定。**nullable・default 無し**。既存行は NULL（= runner 既定の連鎖）。
+  { table: 'design_review_runs', column: 'review_provider', definition: 'TEXT' },
+  { table: 'design_review_runs', column: 'review_model', definition: 'TEXT' },
   // evidence を生んだ run（失効順序を timestamp ではなく run の挿入順で決めるため）。
   // **nullable・default 無し**。既存の evidence は NULL のまま（推測で run を結び付けない）で、
   // その行には従来の timestamp 規則が残る（designReviewEvidencePolicy.findSupersedingRun）。

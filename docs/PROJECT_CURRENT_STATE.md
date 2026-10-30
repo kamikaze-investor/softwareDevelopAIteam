@@ -327,7 +327,7 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Containment success path の可観測性（低優先 hardening）**（state: deferred）
 - **Failure Explanation の事前生成と CEO 向け構造化（次段改善）（state: planned）
 - **Worker 自身から `GET /api/jobs` へ 401 が継続している（原因未特定・記録段階）**（state: planned）
-- **Role / Provider / Model Registry（役割別ルーティング設定表）**（state: planned）
+- **Role / Provider / Model Registry（役割別ルーティング設定表）**（state: in_progress）
 - **Gemini 3.7 Flash Free Tier Worker適合性調査**（state: deferred）
 - **`continue_safe_work_only` が AI CLI のコード変更を止めていない**（state: planned）
 - **実装済みと記録されているレビュー / Gate 層が Job 経路に配線されておらず、うち1つは gate 緩和の理由になった**（state: planned）
@@ -352,7 +352,9 @@ Self Diagnosis / Improvement Planner / Experiment / Evolution 等は、上記い
 - **Job の `failureMetadata` が実行をまたいで残り、前の失敗の印が次の実行に付いたままになる**（state: planned）
 - **provider の一時障害が bounded attempt を使い切り、復旧後も Task が終端のまま残る**（state: planned）
 - **Design Review runner が本番経路でのみ 120s timeout する（Root Cause 未確定）**（state: planned）
-- **Review provider が枯渇したとき、別 provider へ正式に再審査を依頼できるようにする**（state: planned）
+- **Review provider が枯渇したとき、別 provider へ正式に再審査を依頼できるようにする**（state: in_progress）
+- **別 provider での正式再審査を end-to-end で動かす（runner 対応と PL 接続）**（state: planned）
+- **Role / Provider / Model Registry を実際の設定の正本にする（既存の散在設定の引き上げ）**（state: planned）
 - **traversal / loop に termination guarantee があるかの横断監査（read-only）**（state: planned）
 - **#409 が除いた「最初の `{` から最後の `}`」JSON 抽出が、#406 の materiality parser で再導入され M5 の recall を黙って下げる**（state: planned）
 - **CODEOWNERS 対象 PR にだけ Code Owner 承認を必須にする（`Code Owner Approval` required check）**（state: in_progress）

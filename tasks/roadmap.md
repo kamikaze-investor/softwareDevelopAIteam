@@ -6570,7 +6570,7 @@ Routing（タスク種別ごとの固定モデル割当）に相当する仕組�
       Design Philosophy 8（効果検証可能性）を満たすための前提であり、
       `role-model-registry` の効果測定もこの記録が無いと行えない。
 
-<!-- roadmap:id=role-model-registry state=planned -->
+<!-- roadmap:id=role-model-registry state=in_progress -->
 1. [ ] **Role / Provider / Model Registry（役割別ルーティング設定表）** — 2026-09-13登録。
       **【制約: 実行経路は CLI を既定とし、特定 provider へ密結合しない（CEO 指示・2026-09-14）】**
       Role への provider/model 割り当ては、**既存の CLI 実行経路（`AiCliProvider`）を既定**とする。
@@ -6770,6 +6770,13 @@ shell）・Deterministic（validator / test runner / linter）等を含める。
 基盤／複雑な選択確信度計算／機械学習によるモデルルーティング／モデル選択ルールの自動変更／本番成果物への
 Shadow結果の自動反映／CEO承認なしの予算上限超過／Model Registryの自動インターネット更新／
 プロダクションコードの変更。
+
+      **【2026-10-28 Promotion: 段階1（shared の契約のみ）が master へ到達】**
+      Tier A Task `31a01411`（Candidate `0a6385b`）は採用時に `packages/shared/src` だけへ絞られ、
+      Registry の型・runtime schema・「CLI 実行経路を既定とする」制約の validator を追加した。
+      本項目の残り（既存設定の引き上げ・Meta Review fallback model の明示）は未着手のため、
+      **本 ID は `in_progress` のまま残し PL の自動採用対象にしない**（Promotion 済み Tier A 項目の ID 運用）。
+      PL が採用する残作業は `role-model-registry-adoption`（planned）へ移した。
 
 <!-- roadmap:id=project-auto-gemini-worker-eligibility state=deferred -->
 1. [ ] **Gemini 3.7 Flash Free Tier Worker適合性調査** — 2026-08-14、CEO指示により新規登録。本節の
@@ -10264,7 +10271,7 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       （VPS 上の PL が居れば検知・調査・復旧できたはず）。実際 2026-09-14 の実復旧 E2E では、
       PL がこの timeout を2回観測して「systemic な問題」と判断し CEO Escalation へ倒した。
 
-<!-- roadmap:id=review-provider-exhausted-alternate-rereview state=planned priority=high -->
+<!-- roadmap:id=review-provider-exhausted-alternate-rereview state=in_progress priority=high -->
 2. [ ] **Review provider が枯渇したとき、別 provider へ正式に再審査を依頼できるようにする** — 2026-09-15登録。
       **CEO 判断（2026-09-15）**: Review 要件の緩和は承認しない。Review を skip しない。
       既存 BLOCK を override しない。attempt を使い切った run を無理に再利用しない。
@@ -10359,6 +10366,68 @@ AIteamOSのPL指示画面として利用可能かを評価したうえで採否�
       - PL action の配線そのものは `vps-pl-execution-loop` の受け皿に載せる
       - `provider-outage-burns-attempt-budget` … **同じ provider のまま attempt 予算の数え方を直す**。
         本項目は予算を使い切って終端した後の話であり、別の層を担当する
+
+      **【2026-10-28 Promotion: 段階1（API 側の基盤）が master へ到達】**
+      Tier A Task `3e3ee32b`（Candidate `0630101`）は採用時に API 側だけへ絞られた
+      （allowedPaths: `apps/api/src` / `packages/shared/src`、worker-side は対象外）。その受入条件7件は充足した:
+      新しい run の作成経路 `createAlternateProviderDesignReview()`（`alternateProviderReview.ts`）、
+      `design_review_runs.review_provider` / `review_model`（nullable）、PL action
+      `rereview_design_with_alternate_provider` の語彙と Gate 行、provider 申告の照合（不一致は fail-closed）。
+      **ただし本項目の目的（別 provider での正式再審査が end-to-end で動くこと）は未達である**。
+      runner（`strategicReview.ts`）は指定 provider を使わず `providerUsed` も返さないため、指定付き run は
+      毎回 `runner did not confirm the requested review provider` で終端する。PL executor も無いので、
+      現時点では PL から到達できない（`allowedActionsFor()` は配線済み action しか提示しない）。
+      **本 ID は `in_progress` のまま残す。** 残作業は `alternate-provider-rereview-runner-and-pl-wiring`（planned）。
+
+
+<!-- roadmap:id=alternate-provider-rereview-runner-and-pl-wiring state=planned priority=high -->
+2. [ ] **別 provider での正式再審査を end-to-end で動かす（runner 対応と PL 接続）** — 2026-10-28登録
+      （`review-provider-exhausted-alternate-rereview` の段階2。段階1は Candidate `0630101` で master へ到達済み）。
+      **CEO 判断（2026-09-15）の不変条件は親項目のものをそのまま守る**: Review を skip しない /
+      既存 BLOCK を override しない / 3/3 の run を再利用しない / 判定は `recomputeDecision()` だけ /
+      生成担当と同一 vendor にしない / 回数は `ALTERNATE_PROVIDER_REVIEW_MAX_RUNS` まで、尽きたら CEO Escalation。
+
+      **既に存在するもの（作り直さない）**: `createAlternateProviderDesignReview()`
+      （`apps/api/src/designReview/alternateProviderReview.ts`）、`selectAlternateReviewProvider()`
+      （`packages/shared/src/alternateReviewProvider.ts`）、run の `reviewProvider` / `reviewModel`、
+      `executeDesignReviewRun()` の provider 申告照合、Gate 行 `rereview_design_with_alternate_provider`、
+      `roleModelRegistry.ts` の型と validator、`reviewWithProviderFallback()` が既に返す `providerUsed`。
+
+      **不足している最小分（ここだけ補う）**:
+      1. **runner**: `apps/worker/src/metaReviewer/strategicReview.ts` が runner 入力の `reviewProvider` /
+         `reviewModel` を受け取り、その provider で審査し、結果へ `providerUsed`（と requested model）を
+         additive に返す。指定の無い run は従来どおり（既定の連鎖、出力 key も増やさない）。
+         `copilotRouter.ts` / `metaReviewFallbackRouter.ts` は変更しない（親項目の protected 境界）
+      2. **PL 接続**: `apps/api/src/pl/executionLoop.ts` の `PL_ACTION_EXECUTORS` に executor を足し、
+         `design_review_failed`（attempt 枯渇）の候補へ載せる。**PL は provider を指定できない**
+         （指定できると `switch_provider` の迂回になる）。これをテストで固定する
+      3. **Registry の供給**: Reviewer Role の候補を `roleModelRegistry` の形で API へ渡す。
+         候補表を二重に持たない。供給が無いときは executor が fail-closed で CEO Escalation へ倒す
+
+      **完了の定義（AC）**: (a) 上記 1〜3 のテスト。とくに「PL が provider を指定できない」
+      「指定付き run で runner が別 provider の申告を返したら採用しない」「指定の無い run の入出力は不変」。
+      (b) **Production での end-to-end 確認**: 自然に発生した attempt 枯渇（3/3 failed）の Task Design Review に対し、
+      PL が本 action を選び、別 vendor の provider で新しい run が作られ、`recomputeDecision()` の判定が出て、
+      `result_json` に `providerUsed` が残ること。**検証のために枯渇を人工的に起こさない**。
+      自然発生が無い間は (b) を未検証として記録し、本項目を done にしない。
+
+      **触る範囲**: `apps/worker/src/metaReviewer/strategicReview.ts`（CODEOWNERS。promotion に CEO の
+      Code Owner 承認が要る）、`apps/api/src/pl/executionLoop.ts`、`apps/api/src/designReview/`、
+      `packages/shared/src`。**やらないこと**: 新しい Gate / 新しい失敗分類 / 新しい retry framework /
+      Copilot を Independent Review の provider へ加えること / 従量課金 API 経路。
+
+<!-- roadmap:id=role-model-registry-adoption state=planned -->
+2. [ ] **Role / Provider / Model Registry を実際の設定の正本にする（既存の散在設定の引き上げ）** — 2026-10-28登録
+      （`role-model-registry` の段階2。段階1の型・validator は Candidate `0a6385b` で master へ到達済み）。
+      **やること**: `apps/api/src/aiExplain/cheapAiClient.ts` のハードコード定数（`CHEAP_AI_CONFIG`）と
+      `Task.provider` の既定値を Registry の entry から読む形へ引き上げる。Meta / Design Review の
+      Copilot fallback model を Reviewer Role の entry として明示し、`auto` / 未指定を許さない
+      （fallback の発動条件は既存 `COPILOT_ELIGIBLE_FAILURE_CLASSES` が正本。緩めない）。
+      Reviewer Role の候補供給は `alternate-provider-rereview-runner-and-pl-wiring` が持つので、ここでは重複させない。
+      **維持する不変条件・やらないことは親項目 `role-model-registry` のとおり**（静的な対応表のみ /
+      Dynamic Model Routing・新しい Gate・別枠の Provider 評価をしない / 生成担当と独立 Review 担当の分離を緩めない）。
+      **完了の定義（AC）**: 引き上げた各設定の値が変わらないこと（既定値の同値テスト）と、
+      Registry 値と router 既定値が乖離したら fail-closed になるテスト。
 
 
 <!-- roadmap:id=termination-guarantee-audit state=planned -->

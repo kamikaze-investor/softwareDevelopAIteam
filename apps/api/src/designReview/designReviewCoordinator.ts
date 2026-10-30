@@ -117,6 +117,8 @@ export interface RawStrategicResult {
   finalDecision?: unknown
   /** runner が REVIEW_UNAVAILABLE を返したときの理由（任意）。 */
   unavailableReason?: unknown
+  /** 実際に審査した provider（runner の申告）。provider を指定した run でだけ照合する。判定には使わない。 */
+  providerUsed?: unknown
 }
 
 export type RecomputedDecision = 'ALIGNED' | 'CONFLICT' | 'UNCERTAIN' | 'REVIEW_UNAVAILABLE'
@@ -731,6 +733,9 @@ export async function executeDesignReviewRun(
       changedFiles,
       workingDir: deps.workingDir,
       controlContextDir: deps.controlContextDir,
+      // 指定の無い run では従来どおり key ごと出さない（runner 既定の provider 連鎖）。
+      ...(run.reviewProvider !== undefined ? { reviewProvider: run.reviewProvider } : {}),
+      ...(run.reviewModel !== undefined ? { reviewModel: run.reviewModel } : {}),
     })
   } else if (run.reviewKind === 'roadmap') {
     runnerInput = JSON.stringify({
@@ -792,6 +797,19 @@ export async function executeDesignReviewRun(
     return finalizeFailure(storage, claimed.run, claimToken, 'runner returned no usable output (not a JSON object)')
   }
   const raw = parsed
+
+  // **provider を指定した run は、runner がその provider で審査したと申告しない限り判定として採用しない。**
+  // 採用すると、既定連鎖（指定を知らない runner）の判定が「別 provider での再審査」として残り、
+  // 何が審査したのかを後から検証できなくなる。新しい失敗分類は作らず、runner crash と同じ
+  // finalizeFailure で終端する（attempt 上限も同じ）。
+  if (run.reviewProvider !== undefined && raw.providerUsed !== run.reviewProvider) {
+    return finalizeFailure(
+      storage,
+      claimed.run,
+      claimToken,
+      `runner did not confirm the requested review provider ${run.reviewProvider} (providerUsed=${String(raw.providerUsed ?? 'none')})`,
+    )
+  }
 
   // 再計算で何が投げても run を running のまま残さない。
   let outcome: RecomputeOutcome
@@ -878,6 +896,9 @@ export async function createAndExecuteDesignReview(
     changedFiles: string[]
     /** resume-with-design-review だけが渡す、resume 対象 Job の id（`DesignReviewRun.resumeSourceJobId`）。 */
     resumeSourceJobId?: string
+    /** 別 provider での正式再審査だけが渡す（`DesignReviewRun.reviewProvider` / `reviewModel`）。 */
+    reviewProvider?: string
+    reviewModel?: string
   },
   deps: CoordinatorDeps,
 ): Promise<ExecuteDesignReviewResult> {
