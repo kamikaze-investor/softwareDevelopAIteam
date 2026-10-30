@@ -197,7 +197,7 @@ describe('OpenCode Go CLI client', () => {
     expect(args.slice(0, 7)).toEqual([
       'run',
       '-m',
-      'opencode-go/mimo-v2.5',
+      'opencode-go/mimo-v2.6-flash',
       '--format',
       'json',
       '--dir',

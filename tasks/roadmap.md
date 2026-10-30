@@ -5822,6 +5822,30 @@ deploy canary は全 PASS だった。
 
       (2026-10-22 roadmap integrity audit: deferred — title の CEO HOLD（明示解除まで着手しない）を state に反映しただけで、CEO 判断は変えていない。本文の「`deferred` でも採用は妨げられない／この抑止のためだけに state を変更しない」は 2026-09-15 時点の記述で、現在の採用は `planned` のみの allowlist（`apps/api/src/pl/adoptionStep.ts` `readAdoptionCandidates()`、本ファイル冒頭）なので、HOLD を機械的に守るには `deferred` が正しい。CEO が HOLD を解除したら `planned` に戻す)
 
+<!-- roadmap:id=harness-pivot-desk-evaluation state=planned -->
+1. [ ] **外部ハーネス代替検証 Tier 0: 全層の文書評価（repo・記録・git 履歴だけを使い、docs のみ変更する）** — 2026-10-29 登録（CEO 判断）。
+      根拠: `docs/project_memory/decisions/harness_pivot_assessment_2026_10_28.md` の 3-1。
+      外部への接続・Production への接続・外部ツールの実行は行わない。成果物は `docs/project_memory/decisions/` 配下の記録 1 件とする。
+      **承認ルールの正本は `docs/project_memory/rules/approval_rules.md` と `specs/22` であり、本項目は承認ルールを定義しない。**
+      本項目は docs のみの Tier 0 で、既存 Green Zone（ドキュメント更新・Task作成・更新）に当たる。Tier 1 以降は
+      既存 Yellow Zone の判定と `execution-runtime-harness-bakeoff` の CEO HOLD に従う（本項目では解除しない）。
+      **成果物**:
+      1. 機能単位ごとの代替可能性と推奨分類の表。同記録の 1-1 にある暫定の分類表を、repo の根拠で確定させる。各単位について、次の 5 点を書く。
+         - 候補が代替しうるもの
+         - 等価であることを示す既存のテストと、その責務の owner
+         - 代替した場合に失う責務
+         - 推奨分類（自前で維持／外部へ置換／不要のため廃止／判断保留）とその根拠
+         - 保守負担の削減効果（対象の LOC と、unique commit で数えた churn）、移行の難易度とリスク、現時点で判断できない事項
+         (a′) Task 単位の path policy の正本と、(b) API の認可は、代替の対象にしない。
+      2. unique commit で数えた churn の再集計。単位とパスの対応表、および使った git コマンドを添える。
+      3. Tier 1 の fixture 一覧。`execution-runtime-harness-bakeoff` の障害再現リストから、モデルを呼ばずに再現できる項目を選ぶ。各項目には次の 3 点を付ける。
+         - 実際の障害記録との対応
+         - Tier 1 の環境条件（Production の credential なし・network なし）で実行できるかどうかの判定
+         - 環境方式の候補
+      4. Tier 2 が必要かどうかと、共有 quota への影響の見積り。CEO の判断材料として作るもので、Tier 2 の実施を前提にしない。
+      **関連する既存項目（変更しない）**: `pl-console-candidate-evaluation`、`system-one-decision-layer-generalization`、`opencode-feasibility-reviewer`。
+      **対象外**: Tier 1・2 の実行、新しい Gate や安全機構、既存項目の state 変更。
+
 <!-- roadmap:id=containment-adversarial-escape-threat-model state=deferred -->
 2. [ ] **Containment adversarial escape（cgroup migration / git external helper）— security Finding** —
       2026-09-07、P1 Phase 2（async per-job cgroup containment）のCodex独立設計レビューで指摘。

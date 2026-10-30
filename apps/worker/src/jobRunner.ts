@@ -93,6 +93,7 @@ import type { GateResult } from './guards/gateProcessor.js'
 import { sendAlert } from './notifier/notifier.js'
 import {
   isContainmentInfrastructureError,
+  isOutputOverflowAfterSafeCleanup,
   runContainedOrThrow,
 } from './execution/runContainedCommand.js'
 import { safeCommandTimeoutMs } from './execution/safeCommandTimeout.js'
@@ -1351,13 +1352,26 @@ export async function runJob(
           : '')
       }
     } catch (err: unknown) {
-      // containment 失敗は通常のコマンド失敗ではない。ここで exitCode へ潰すと
-      // 「workspace が静止したと証明できていない」事実が消え、Job が terminalize され得る。
-      if (isContainmentInfrastructureError(err)) throw err
-      const failure = toExecFileFailure(err)
-      exitCode = typeof failure.status === 'number' ? failure.status : 1
-      stdout = outputToString(failure.stdout)
-      stderr = outputToString(failure.stderr) || formatUnknownError(err)
+      if (isOutputOverflowAfterSafeCleanup(err)) {
+        // 出力超過でも後始末は成功している（timeout の killed と同じ静止の証拠）。quarantine にせず
+        // exit code 不明の通常失敗として扱い、下の最終 workspace 検査へ進める。切られた出力は検証の
+        // 証拠にならないので、子が exit 0 でも成功にしない（2026-10-28 Job 71538c24）。
+        exitCode = 1
+        safeCommandExitedWithoutCode = true
+        stdout = err.result.stdout
+        stderr = withLeadingNote(
+          err.result.stderr,
+          `SafeCommand output exceeded the per-stream limit and was terminated by containment; verification result unknown (${err.result.detail ?? 'output_overflow'})`,
+        )
+      } else {
+        // containment 失敗は通常のコマンド失敗ではない。ここで exitCode へ潰すと
+        // 「workspace が静止したと証明できていない」事実が消え、Job が terminalize され得る。
+        if (isContainmentInfrastructureError(err)) throw err
+        const failure = toExecFileFailure(err)
+        exitCode = typeof failure.status === 'number' ? failure.status : 1
+        stdout = outputToString(failure.stdout)
+        stderr = outputToString(failure.stderr) || formatUnknownError(err)
+      }
     }
 
     safeCommandFailed = !safeCommandTimedOut && exitCode !== 0

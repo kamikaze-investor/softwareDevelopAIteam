@@ -9,6 +9,7 @@
 
 import { existsSync, readFileSync, rmdirSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
+import ts from 'typescript'
 import { afterAll, describe, expect, it } from 'vitest'
 import {
   buildCgroupName,
@@ -18,6 +19,10 @@ import {
   runContainedCommand,
   runContainedOrThrow,
   isContainmentInfrastructureError,
+  isOutputOverflowAfterSafeCleanup,
+  ContainmentInfrastructureError,
+  type ContainedResult,
+  type ContainmentOutcome,
   removeCgroupWithRetry,
   CLEANUP_RETRY_DELAYS_MS,
   DEFAULT_DRAIN_MS,
@@ -86,6 +91,110 @@ describe('isContainmentSafe', () => {
     ] as const) {
       expect(isContainmentSafe(outcome)).toBe(false)
     }
+  })
+})
+
+/**
+ * 出力超過だが後始末は成功した失敗だけを見分ける（2026-10-28 Job 71538c24）。
+ * jobRunner は SafeCommand でこれを quarantine にせず通常失敗として扱うので、
+ * 後始末が失敗した結果まで true にすると、静止を証明できていない workspace を解放してしまう。
+ */
+describe('isOutputOverflowAfterSafeCleanup', () => {
+  function failure(outcome: ContainmentOutcome): ContainmentInfrastructureError {
+    const result: ContainedResult = {
+      outcome,
+      exitCode: null,
+      signal: null,
+      stdout: 'partial',
+      stderr: '',
+      timedOut: false,
+      killedDescendants: true,
+      drainMs: 1,
+    }
+    return new ContainmentInfrastructureError(result)
+  }
+
+  it('output_overflow の containment 失敗だけを true にする', () => {
+    expect(isOutputOverflowAfterSafeCleanup(failure('output_overflow'))).toBe(true)
+  })
+
+  it('後始末が失敗した結果・その他の containment 失敗は false にする（quarantine を維持）', () => {
+    for (const outcome of [
+      'drain_timeout',
+      'cleanup_failed',
+      'spawn_failed',
+      'placement_failed',
+      'kill_failed',
+      'events_failed',
+      'unavailable',
+    ] as const) {
+      expect(isOutputOverflowAfterSafeCleanup(failure(outcome))).toBe(false)
+    }
+  })
+
+  it('将来追加される未知の結果も false にする（quarantine に倒れる）', () => {
+    expect(isOutputOverflowAfterSafeCleanup(failure('future_unknown_outcome' as ContainmentOutcome))).toBe(false)
+  })
+
+  it('containment 失敗でない例外は false にする', () => {
+    expect(isOutputOverflowAfterSafeCleanup(new Error('containment failed: output_overflow'))).toBe(false)
+    expect(isOutputOverflowAfterSafeCleanup(undefined)).toBe(false)
+  })
+
+  it('output_overflow は後始末が安全だった分岐の内側でだけ返る（ソース不変条件）', () => {
+    const candidates = [
+      path.join(process.cwd(), 'src/execution/runContainedCommand.ts'),
+      path.join(process.cwd(), 'apps/worker/src/execution/runContainedCommand.ts'),
+    ]
+    const sourcePath = candidates.find((candidate) => existsSync(candidate))
+    expect(sourcePath).toBeDefined()
+    const source = readFileSync(sourcePath!, 'utf-8')
+
+    // 文字列やコメント内の括弧に惑わされないよう、構文木で確かめる。
+    // 'output_overflow' という値の出現をすべて分類する。型の union と `===` の比較（読むだけ）以外は
+    // 「値を作る箇所」とみなす（別名の const や別の return へ移すと、ここで2件以上になる）。
+    const sourceFile = ts.createSourceFile(sourcePath!, source, ts.ScriptTarget.Latest, true)
+    const producers: ts.StringLiteral[] = []
+    const visit = (node: ts.Node): void => {
+      if (ts.isStringLiteral(node) && node.text === 'output_overflow') {
+        const isTypeLiteral = ts.isLiteralTypeNode(node.parent)
+        const isComparison = ts.isBinaryExpression(node.parent)
+          && node.parent.operatorToken.kind === ts.SyntaxKind.EqualsEqualsEqualsToken
+        if (!isTypeLiteral && !isComparison) producers.push(node)
+      }
+      ts.forEachChild(node, visit)
+    }
+    visit(sourceFile)
+    expect(producers).toHaveLength(1)
+
+    // その1件は `return { ..., outcome: 'output_overflow', ... }` の形で直接返される
+    const literal = producers[0]!
+    const assignment = literal.parent
+    expect(ts.isPropertyAssignment(assignment) && assignment.name.getText(sourceFile) === 'outcome').toBe(true)
+    const objectLiteral = assignment.parent
+    expect(ts.isObjectLiteralExpression(objectLiteral)).toBe(true)
+    const returnStatement = objectLiteral.parent
+    expect(ts.isReturnStatement(returnStatement)).toBe(true)
+
+    // その return の祖先に「`isContainmentSafe(cleanup.outcome)` の if の then 側」があり、
+    // その if は runInsideCgroup()（runContainedCommand の本体）の直下にある（別の if の else 側に入れ子にされていない）
+    let guardIf: ts.IfStatement | undefined
+    let child: ts.Node = returnStatement
+    for (let parent = child.parent; parent !== undefined; child = parent, parent = parent.parent) {
+      if (
+        ts.isIfStatement(parent)
+        && parent.thenStatement === child
+        && parent.expression.getText(sourceFile).replace(/\s+/g, '') === 'isContainmentSafe(cleanup.outcome)'
+      ) {
+        guardIf = parent
+        break
+      }
+    }
+    expect(guardIf).toBeDefined()
+    const functionBody = guardIf!.parent
+    expect(ts.isBlock(functionBody)).toBe(true)
+    const fn = functionBody.parent
+    expect(ts.isFunctionDeclaration(fn) && fn.name?.text === 'runInsideCgroup').toBe(true)
   })
 })
 
@@ -309,6 +418,10 @@ describeLinux('runContainedCommand — 実 cgroup（Linux のみ）', () => {
     expect(result.outcome).toBe('output_overflow')
     expect(isContainmentSafe(result.outcome)).toBe(false)
     expect(Buffer.byteLength(result.stdout, 'utf-8')).toBeLessThanOrEqual(1024)
+    // 後始末は完了している（cgroup は削除済み）。jobRunner が通常失敗へ回せるのはこのため
+    expect(result.cgroupPath).toBeDefined()
+    expect(existsSync(result.cgroupPath!)).toBe(false)
+    expect(isOutputOverflowAfterSafeCleanup(new ContainmentInfrastructureError(result))).toBe(true)
   })
 
   it('abort されたら containment kill される', async () => {
