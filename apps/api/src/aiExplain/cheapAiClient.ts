@@ -35,7 +35,7 @@ export const CHEAP_AI_ATTEMPT_TIMEOUT_MS = 60_000
 export const CHEAP_AI_CONFIG = {
   role: 'cheap_explainer',
   provider: 'opencode-go',
-  model: 'mimo-v2.5',
+  model: 'mimo-v2.6-flash',
   timeoutMs: CHEAP_AI_ATTEMPT_TIMEOUT_MS,
 } as const
 
